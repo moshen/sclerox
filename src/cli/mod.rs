@@ -5,13 +5,16 @@ pub mod migrate;
 pub mod people;
 pub mod projects;
 pub mod repos;
+pub mod research;
 pub mod search;
+pub mod todos;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::output::OutputFormat;
 
 #[derive(Parser)]
 #[command(
@@ -20,6 +23,10 @@ use crate::db::Database;
     version
 )]
 pub struct Cli {
+    /// Output format
+    #[arg(long, global = true, default_value = "text", value_enum)]
+    pub output: OutputFormat,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -42,6 +49,14 @@ pub enum Commands {
     #[command(subcommand)]
     Project(projects::ProjectCommand),
 
+    /// Track todos with full done history
+    #[command(subcommand)]
+    Todo(todos::TodoCommand),
+
+    /// Manage research investigations
+    #[command(subcommand)]
+    Research(research::ResearchCommand),
+
     /// Index and search code repositories
     #[command(subcommand)]
     Repo(repos::RepoCommand),
@@ -60,20 +75,23 @@ pub enum Commands {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    let format = cli.output;
+
     match cli.command {
         Commands::Install(args) => install::run_install(args),
         Commands::Uninstall(args) => install::run_uninstall(args),
-        // All other commands need the database
         cmd => {
             let config = Config::from_env();
             let db = Database::open(&config.db_path)?;
             match cmd {
-                Commands::Memory(c) => memory::run(&db, c),
-                Commands::People(c) => people::run(&db, c),
+                Commands::Memory(c) => memory::run(&db, c, format),
+                Commands::People(c) => people::run(&db, c, format),
                 Commands::Meeting(c) => meetings::run(&db, c),
                 Commands::Project(c) => projects::run(&db, c),
+                Commands::Todo(c) => todos::run(&db, c, format),
+                Commands::Research(c) => research::run(&db, c, format),
                 Commands::Repo(c) => repos::run(&db, c),
-                Commands::Search(a) => search::run(&db, a),
+                Commands::Search(a) => search::run(&db, a, format),
                 Commands::Migrate(a) => migrate::run(&db, a),
                 Commands::Install(_) | Commands::Uninstall(_) => unreachable!(),
             }

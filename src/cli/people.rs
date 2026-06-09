@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::db::{people::PersonUpdate, Database};
+use crate::output::{print_output, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum PeopleCommand {
@@ -46,7 +47,7 @@ pub enum PeopleCommand {
     Delete { id: i64 },
 }
 
-pub fn run(db: &Database, cmd: PeopleCommand) -> Result<()> {
+pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()> {
     match cmd {
         PeopleCommand::Add {
             name,
@@ -70,37 +71,41 @@ pub fn run(db: &Database, cmd: PeopleCommand) -> Result<()> {
         }
 
         PeopleCommand::Get { id } => match db.people_get(id)? {
-            Some(p) => print_person(&p),
+            Some(p) => print_output(format, &p, || print_person(&p)),
             None => println!("Person #{id} not found"),
         },
 
         PeopleCommand::List => {
             let people = db.people_list()?;
-            if people.is_empty() {
-                println!("No people recorded.");
-            } else {
-                for p in &people {
-                    let email = p.email.as_deref().unwrap_or("-");
-                    let github = p
-                        .github_username
-                        .as_deref()
-                        .map(|g| format!(" @{g}"))
-                        .unwrap_or_default();
-                    println!("#{} {} <{}>{}", p.id, p.name, email, github);
+            print_output(format, &people, || {
+                if people.is_empty() {
+                    println!("No people recorded.");
+                } else {
+                    for p in &people {
+                        let email = p.email.as_deref().unwrap_or("-");
+                        let github = p
+                            .github_username
+                            .as_deref()
+                            .map(|g| format!(" @{g}"))
+                            .unwrap_or_default();
+                        println!("#{} {} <{}>{}", p.id, p.name, email, github);
+                    }
+                    println!("\n{} people", people.len());
                 }
-                println!("\n{} people", people.len());
-            }
+            });
         }
 
         PeopleCommand::Search { query } => {
             let results = db.people_search(&query)?;
-            if results.is_empty() {
-                println!("No matches for: {query}");
-            } else {
-                for p in &results {
-                    println!("#{} {}", p.id, p.name);
+            print_output(format, &results, || {
+                if results.is_empty() {
+                    println!("No matches for: {query}");
+                } else {
+                    for p in &results {
+                        println!("#{} {}", p.id, p.name);
+                    }
                 }
-            }
+            });
         }
 
         PeopleCommand::Update {

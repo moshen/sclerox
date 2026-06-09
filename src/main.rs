@@ -4,6 +4,7 @@ mod db;
 mod embed;
 mod error;
 mod index;
+mod output;
 mod search;
 
 use anyhow::Result;
