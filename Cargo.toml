@@ -8,6 +8,10 @@ description = "Operating Layer CLI - SQLite-backed knowledge base for AI-augment
 name = "ol"
 path = "src/main.rs"
 
+[lib]
+name = "ol"
+path = "src/lib.rs"
+
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }

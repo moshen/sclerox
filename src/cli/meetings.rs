@@ -4,7 +4,10 @@ use clap::Subcommand;
 use crate::db::Database;
 use crate::embed::{chunk_text, Embedder};
 
-const CHUNK_SIZE: usize = 1500;
+// AllMiniLML6V2 has a 256-token context window (~4 chars/token = ~1024 chars).
+// 800 chars gives ~200 tokens with a safety margin for subword tokenization.
+// Overlap of 200 chars (~50 words) keeps context across chunk boundaries.
+const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]

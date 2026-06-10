@@ -20,14 +20,6 @@ impl TodoStatus {
             TodoStatus::Watch => "watch",
         }
     }
-    #[allow(dead_code)]
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "done" => TodoStatus::Done,
-            "watch" => TodoStatus::Watch,
-            _ => TodoStatus::Open,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
