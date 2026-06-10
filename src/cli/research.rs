@@ -40,6 +40,8 @@ pub enum ResearchCommand {
         #[arg(long)]
         findings: Option<String>,
     },
+    /// Reopen a concluded investigation
+    Reopen { id: i64 },
     /// Conclude an investigation with final findings
     Conclude {
         id: i64,
@@ -157,6 +159,14 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                 println!("Updated investigation #{id}");
             } else {
                 println!("Investigation #{id} not found or no changes");
+            }
+        }
+
+        ResearchCommand::Reopen { id } => {
+            if db.investigation_reopen(id)? {
+                println!("Investigation #{id} reopened");
+            } else {
+                println!("Investigation #{id} not found");
             }
         }
 

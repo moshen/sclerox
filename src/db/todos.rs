@@ -133,6 +133,44 @@ impl Database {
         Ok(n > 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn todo_update(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        notes: Option<&str>,
+        source_url: Option<&str>,
+        deadline_date: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<bool> {
+        let mut parts = vec!["updated_at = datetime('now')".to_string()];
+        let mut vals: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        let mut idx = 1usize;
+
+        macro_rules! push {
+            ($opt:expr, $col:expr) => {
+                if let Some(v) = $opt {
+                    parts.push(format!("{} = ?{idx}", $col));
+                    vals.push(Box::new(v.to_string()));
+                    idx += 1;
+                }
+            };
+        }
+        push!(title, "title");
+        push!(notes, "notes");
+        push!(source_url, "source_url");
+        push!(deadline_date, "deadline_date");
+        push!(category, "category");
+
+        if parts.len() == 1 {
+            return Ok(false);
+        }
+        let sql = format!("UPDATE todos SET {} WHERE id = ?{idx}", parts.join(", "));
+        vals.push(Box::new(id));
+        let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
     pub fn todo_set_status(&self, id: i64, status: TodoStatus) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE todos SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -406,5 +444,46 @@ mod tests {
         let results = db.todo_history(Some("migration"), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].title.contains("Migrate"));
+    }
+
+    #[test]
+    fn test_todo_update() {
+        let db = db();
+        let id = db
+            .todo_add(
+                "Original title",
+                None,
+                TodoStatus::Open,
+                None,
+                "general",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(db
+            .todo_update(
+                id,
+                Some("Updated title"),
+                Some("some notes"),
+                None,
+                None,
+                None
+            )
+            .unwrap());
+
+        let todo = db.todo_get(id).unwrap().unwrap();
+        assert_eq!(todo.title, "Updated title");
+        assert_eq!(todo.notes.as_deref(), Some("some notes"));
+    }
+
+    #[test]
+    fn test_todo_update_no_changes_returns_false() {
+        let db = db();
+        let id = db
+            .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
+            .unwrap();
+        // No fields provided - should return false
+        assert!(!db.todo_update(id, None, None, None, None, None).unwrap());
     }
 }

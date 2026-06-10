@@ -140,6 +140,16 @@ impl Database {
         Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
     }
 
+    pub fn investigation_reopen(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE investigations
+             SET status = 'open', concluded_at = NULL, updated_at = datetime('now')
+             WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn investigation_conclude(&self, id: i64, findings: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE investigations SET
@@ -326,5 +336,27 @@ mod tests {
 
         let all = db.investigation_list(Some("all")).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_investigation_reopen() {
+        let db = db();
+        let id = db
+            .investigation_start("Perf issue", "perf-issue", None)
+            .unwrap();
+        db.investigation_conclude(id, "Fixed in v2.").unwrap();
+
+        let inv = db.investigation_get(id).unwrap().unwrap();
+        assert_eq!(inv.status, "concluded");
+        assert!(inv.concluded_at.is_some());
+
+        assert!(db.investigation_reopen(id).unwrap());
+
+        let inv = db.investigation_get(id).unwrap().unwrap();
+        assert_eq!(inv.status, "open");
+        assert!(
+            inv.concluded_at.is_none(),
+            "concluded_at should be cleared on reopen"
+        );
     }
 }

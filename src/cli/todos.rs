@@ -42,6 +42,20 @@ pub enum TodoCommand {
     },
     /// Full-text search todos (includes done items)
     Search { query: String },
+    /// Edit a todo's fields
+    Update {
+        id: i64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        source_url: Option<String>,
+        #[arg(long)]
+        deadline: Option<String>,
+        #[arg(long, value_parser = ["slack","github","email","meeting","project","general"])]
+        category: Option<String>,
+    },
     /// Mark a todo as done
     Done {
         id: i64,
@@ -95,6 +109,28 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             print_output(format, &todo, || {
                 println!("Added todo #{id}: {title}");
             });
+        }
+
+        TodoCommand::Update {
+            id,
+            title,
+            notes,
+            source_url,
+            deadline,
+            category,
+        } => {
+            if db.todo_update(
+                id,
+                title.as_deref(),
+                notes.as_deref(),
+                source_url.as_deref(),
+                deadline.as_deref(),
+                category.as_deref(),
+            )? {
+                println!("Updated todo #{id}");
+            } else {
+                println!("Todo #{id} not found or no changes");
+            }
         }
 
         TodoCommand::Get { id } => match db.todo_get(id)? {

@@ -1,3 +1,4 @@
+pub mod completions;
 pub mod install;
 pub mod meetings;
 pub mod memory;
@@ -67,10 +68,13 @@ pub enum Commands {
     /// Show database schema version and migration status
     Migrate(migrate::MigrateArgs),
 
-    /// Install ol into your Claude Code setup (skill, hooks, CLAUDE.md)
+    /// Generate shell completions
+    Completions(completions::CompletionsArgs),
+
+    /// Install ol into your AI tool setup (Claude Code, OpenCode, Codex)
     Install(install::InstallArgs),
 
-    /// Remove ol integrations from your Claude Code setup
+    /// Remove ol integrations from your AI tool setup
     Uninstall(install::InstallArgs),
 }
 
@@ -80,6 +84,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Install(args) => install::run_install(args),
         Commands::Uninstall(args) => install::run_uninstall(args),
+        Commands::Completions(args) => completions::run(args),
         cmd => {
             let config = Config::from_env();
             let db = Database::open(&config.db_path)?;
@@ -93,7 +98,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Repo(c) => repos::run(&db, c),
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Migrate(a) => migrate::run(&db, a),
-                Commands::Install(_) | Commands::Uninstall(_) => unreachable!(),
+                Commands::Install(_) | Commands::Uninstall(_) | Commands::Completions(_) => {
+                    unreachable!()
+                }
             }
         }
     }
