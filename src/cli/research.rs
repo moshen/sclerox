@@ -24,14 +24,12 @@ pub enum ResearchCommand {
     },
     /// List investigations
     List {
-        #[arg(long, default_value = "active",
-              value_parser = ["planning","active","concluded","all"])]
+        #[arg(long, default_value = "open",
+              value_parser = ["open","concluded","all"])]
         status: String,
     },
     /// Full-text search across all investigations (name, plan, findings)
     Search { query: String },
-    /// Mark investigation as active (move from planning)
-    Activate { id: i64 },
     /// Update plan, findings, or status
     Update {
         id: i64,
@@ -77,9 +75,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             print_output(format, &inv, || {
                 println!("Started investigation #{id}: {name}");
                 println!("  slug: {slug}");
-                println!("  status: planning");
                 println!("\nNext: add sources with `ol research add-source {id} --url <url>`");
-                println!("      activate with `ol research activate {id}`");
+                println!("      conclude with `ol research conclude {id} --findings <...>`");
             });
         }
 
@@ -142,14 +139,6 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     }
                 }
             });
-        }
-
-        ResearchCommand::Activate { id } => {
-            if db.investigation_activate(id)? {
-                println!("Investigation #{id} is now active");
-            } else {
-                println!("Investigation #{id} not found");
-            }
         }
 
         ResearchCommand::Update {

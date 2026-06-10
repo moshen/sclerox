@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS investigations (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL DEFAULT 'planning',
+    status TEXT NOT NULL DEFAULT 'open',
     plan TEXT,
     findings TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),

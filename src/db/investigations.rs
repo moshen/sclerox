@@ -31,7 +31,7 @@ impl Database {
     pub fn investigation_start(&self, name: &str, slug: &str, plan: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO investigations (name, slug, plan, status)
-             VALUES (?1, ?2, ?3, 'planning')",
+             VALUES (?1, ?2, ?3, 'open')",
             params![name, slug, plan],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -153,14 +153,6 @@ impl Database {
         Ok(n > 0)
     }
 
-    pub fn investigation_activate(&self, id: i64) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE investigations SET status = 'active', updated_at = datetime('now') WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(n > 0)
-    }
-
     pub fn investigation_add_source(
         &self,
         investigation_id: i64,
@@ -246,12 +238,8 @@ mod tests {
             .unwrap();
 
         let inv = db.investigation_get(id).unwrap().unwrap();
-        assert_eq!(inv.status, "planning");
+        assert_eq!(inv.status, "open");
         assert_eq!(inv.slug, "bill-attach-traffic");
-
-        db.investigation_activate(id).unwrap();
-        let inv = db.investigation_get(id).unwrap().unwrap();
-        assert_eq!(inv.status, "active");
 
         db.investigation_conclude(
             id,
@@ -323,15 +311,15 @@ mod tests {
     #[test]
     fn test_investigation_list_by_status() {
         let db = db();
-        db.investigation_start("Active inv", "active-inv", None)
+        db.investigation_start("Open inv", "open-inv", None)
             .unwrap();
         let id2 = db
             .investigation_start("Concluded inv", "concluded-inv", None)
             .unwrap();
         db.investigation_conclude(id2, "Done.").unwrap();
 
-        let active = db.investigation_list(Some("planning")).unwrap();
-        assert_eq!(active.len(), 1);
+        let open = db.investigation_list(Some("open")).unwrap();
+        assert_eq!(open.len(), 1);
 
         let concluded = db.investigation_list(Some("concluded")).unwrap();
         assert_eq!(concluded.len(), 1);
