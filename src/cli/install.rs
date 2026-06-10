@@ -75,31 +75,33 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Claude => {
             let dir = claude_dir()?;
             if !args.no_skill {
-                install_skill(&dir.join("skills"), "ol-kb.md", ol_bin, args.dry_run)?;
+                // Skill file uses bare `ol` - it's documentation Claude reads, not executed.
+                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
             }
             if !args.no_hooks {
+                // Hook uses full path - runs without the user's shell profile.
                 install_claude_hook(&dir, ol_bin, args.dry_run)?;
             }
             if !args.no_project_md {
-                install_project_section("CLAUDE.md", ol_bin, args.dry_run)?;
+                install_project_section("CLAUDE.md", args.dry_run)?;
             }
         }
         InstallTarget::Opencode => {
             let dir = opencode_dir()?;
             if !args.no_skill {
-                install_skill(&dir.join("skills"), "ol-kb.md", ol_bin, args.dry_run)?;
+                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
             }
             if !args.no_project_md {
-                install_project_section("AGENTS.md", ol_bin, args.dry_run)?;
+                install_project_section("AGENTS.md", args.dry_run)?;
             }
         }
         InstallTarget::Codex => {
             if !args.no_skill {
                 let path = codex_dir()?.join("instructions.md");
-                append_or_create_section(&path, &project_md_section(ol_bin), args.dry_run)?;
+                append_or_create_section(&path, &project_md_section(), args.dry_run)?;
             }
             if !args.no_project_md {
-                install_project_section("AGENTS.md", ol_bin, args.dry_run)?;
+                install_project_section("AGENTS.md", args.dry_run)?;
             }
         }
         InstallTarget::All => unreachable!(),
@@ -144,14 +146,14 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
     Ok(())
 }
 
-fn install_skill(dir: &Path, filename: &str, ol_bin: &str, dry_run: bool) -> Result<()> {
+fn install_skill(dir: &Path, filename: &str, dry_run: bool) -> Result<()> {
     let path = dir.join(filename);
     if dry_run {
         println!("  would write: {}", path.display());
     } else {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
-        std::fs::write(&path, skill_file_content(ol_bin))
+        std::fs::write(&path, skill_file_content())
             .with_context(|| format!("failed to write {}", path.display()))?;
         println!("  wrote skill: {}", path.display());
     }
@@ -255,12 +257,8 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
 
 const SECTION_MARKER: &str = "<!-- ol-kb -->";
 
-fn install_project_section(filename: &str, ol_bin: &str, dry_run: bool) -> Result<()> {
-    append_or_create_section(
-        &PathBuf::from(filename),
-        &project_md_section(ol_bin),
-        dry_run,
-    )
+fn install_project_section(filename: &str, dry_run: bool) -> Result<()> {
+    append_or_create_section(&PathBuf::from(filename), &project_md_section(), dry_run)
 }
 
 fn append_or_create_section(path: &Path, content: &str, dry_run: bool) -> Result<()> {
@@ -308,9 +306,8 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn skill_file_content(ol_bin: &str) -> String {
-    format!(
-        r#"# ol - Operating Layer Knowledge Base
+fn skill_file_content() -> &'static str {
+    r#"# ol - Operating Layer Knowledge Base
 
 Use when the user asks about people, meetings, projects, todos, past decisions, or research — or when knowledge base context would help.
 
@@ -325,74 +322,60 @@ Use when the user asks about people, meetings, projects, todos, past decisions, 
 
 ```bash
 # Global search across all tables
-{ol} search "<query>"
+ol search "<query>"
 
 # Memory
-{ol} memory set <key> "<value>" --type user|feedback|project|reference
-{ol} memory search "<query>"
+ol memory set <key> "<value>" --type user|feedback|project|reference
+ol memory search "<query>"
 
 # People
-{ol} people search "<name or email>"
-{ol} people add --name "<name>" --email "<email>"
+ol people search "<name or email>"
+ol people add --name "<name>" --email "<email>"
 
 # Meetings
-{ol} meeting search "<topic>"
-{ol} meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
+ol meeting search "<topic>"
+ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
 
 # Todos
-{ol} todo list                         # open todos
-{ol} todo add --title "<title>" [--category slack|github|email|meeting|general]
-{ol} todo done <id> [--note "<resolution>"]
-{ol} todo history [<query>]            # search completed todos
+ol todo list                         # open todos
+ol todo add --title "<title>" [--category slack|github|email|meeting|general]
+ol todo done <id> [--note "<resolution>"]
+ol todo history [<query>]            # search completed todos
 
 # Research / Investigations
-{ol} research list                     # open investigations
-{ol} research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
-{ol} research add-source <id> --url "<url>" --label "<label>"
-{ol} research conclude <id> --findings "<findings>"
-{ol} research search "<query>"
+ol research list                     # open investigations
+ol research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
+ol research add-source <id> --url "<url>" --label "<label>"
+ol research conclude <id> --findings "<findings>"
+ol research search "<query>"
 
 # Projects
-{ol} project search "<description>"
+ol project search "<description>"
 
 # Repos
-{ol} repo show [path] [--symbols "<query>"]
+ol repo show [path] [--symbols "<query>"]
 ```
 
 ## Patterns
 
-**Before any task:** `{ol} search "<topic>"`
-**After a decision:** `{ol} memory set "<key>" "<decision>" --type project`
-**After research:** `{ol} research conclude <id> --findings "<findings>"`
-"#,
-        ol = ol_bin
-    )
+**Before any task:** `ol search "<topic>"`
+**After a decision:** `ol memory set "<key>" "<decision>" --type project`
+**After research:** `ol research conclude <id> --findings "<findings>"`
+"#
 }
 
-fn project_md_section(ol_bin: &str) -> String {
+fn project_md_section() -> String {
     format!(
-        r#"
-{SECTION_MARKER}
-# Knowledge Base (ol)
-
-Search before starting work:
-
-```bash
-{ol} search "<topic>"           # all tables
-{ol} todo list                  # open todos
-{ol} research list              # open investigations
-{ol} meeting search "<topic>"   # past decisions
-```
-
-Record outcomes:
-
-```bash
-{ol} todo done <id> --note "<resolution>"
-{ol} research conclude <id> --findings "<findings>"
-{ol} memory set "<key>" "<value>" --type project
-```
-"#,
-        ol = ol_bin
+        "\n{SECTION_MARKER}\n# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
+ol search \"<topic>\"           # all tables\n\
+ol todo list                  # open todos\n\
+ol research list              # open investigations\n\
+ol meeting search \"<topic>\"   # past decisions\n\
+```\n\nRecord outcomes:\n\n```bash\n\
+ol todo done <id> --note \"<resolution>\"\n\
+ol research conclude <id> --findings \"<findings>\"\n\
+ol memory set \"<key>\" \"<value>\" --type project\n\
+```\n"
     )
 }
 
