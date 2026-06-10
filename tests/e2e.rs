@@ -1,0 +1,704 @@
+/// End-to-end tests: invoke the compiled `ol` binary against a real SQLite database.
+/// Each test gets an isolated temp directory so tests are fully independent.
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::path::PathBuf;
+use tempfile::TempDir;
+
+// ─── Test harness ────────────────────────────────────────────────────────────
+
+struct Env {
+    _dir: TempDir,
+    db: PathBuf,
+}
+
+impl Env {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("ol.db");
+        Self { _dir: dir, db }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = Command::cargo_bin("ol").unwrap();
+        c.env("OL_DB", &self.db);
+        c
+    }
+
+    /// Run a command and return trimmed stdout. Panics if it fails.
+    fn run(&self, args: &[&str]) -> String {
+        let out = self.cmd().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "ol {} failed:\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Parse the ID from "Added <noun> #<id>: ..." output.
+    fn run_get_id(&self, args: &[&str]) -> i64 {
+        let out = self.run(args);
+        out.split('#')
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or_else(|| panic!("could not parse id from: {out}"))
+    }
+}
+
+// ─── Memory ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn memory_set_get_delete() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "test-key",
+        "test value",
+        "--type",
+        "feedback",
+    ]);
+
+    let out = e.run(&["memory", "get", "test-key"]);
+    assert!(out.contains("test value"));
+    assert!(out.contains("feedback"));
+
+    e.run(&["memory", "delete", "test-key"]);
+    e.cmd()
+        .args(["memory", "get", "test-key"])
+        .assert()
+        .stdout(predicate::str::contains("Not found"));
+}
+
+#[test]
+fn memory_list_filters_by_type() {
+    let e = Env::new();
+    e.run(&["memory", "set", "a", "val", "--type", "user"]);
+    e.run(&["memory", "set", "b", "val", "--type", "feedback"]);
+    e.run(&["memory", "set", "c", "val", "--type", "user"]);
+
+    let user = e.run(&["memory", "list", "--type", "user"]);
+    assert!(user.contains("[user] a"));
+    assert!(user.contains("[user] c"));
+    assert!(!user.contains("[feedback]"));
+
+    let all = e.run(&["memory", "list"]);
+    assert!(all.contains("[feedback] b"));
+}
+
+#[test]
+fn memory_search() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "rust-pref",
+        "prefer Rust for systems code",
+        "--type",
+        "feedback",
+    ]);
+    e.run(&[
+        "memory",
+        "set",
+        "py-pref",
+        "Python for scripts",
+        "--type",
+        "feedback",
+    ]);
+
+    let out = e.run(&["memory", "search", "Rust"]);
+    assert!(out.contains("rust-pref"));
+    assert!(!out.contains("py-pref"));
+}
+
+#[test]
+fn memory_json_output() {
+    let e = Env::new();
+    e.run(&[
+        "memory", "set", "k", "v", "--type", "project", "--tags", "a,b",
+    ]);
+
+    let out = e.run(&["--output", "json", "memory", "list"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
+    assert!(parsed.is_array());
+    assert_eq!(parsed[0]["key"], "k");
+    assert_eq!(parsed[0]["memory_type"], "project");
+}
+
+// ─── People ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn people_lifecycle() {
+    let e = Env::new();
+    let id = e.run_get_id(&[
+        "people",
+        "add",
+        "--name",
+        "Alice Smith",
+        "--email",
+        "alice@example.com",
+        "--github-username",
+        "alicegit",
+    ]);
+
+    let out = e.run(&["people", "get", &id.to_string()]);
+    assert!(out.contains("Alice Smith"));
+    assert!(out.contains("alice@example.com"));
+    assert!(out.contains("alicegit"));
+
+    let list = e.run(&["people", "list"]);
+    assert!(list.contains("Alice Smith"));
+
+    let search = e.run(&["people", "search", "alice"]);
+    assert!(search.contains(&format!("#{id}")));
+
+    e.run(&["people", "delete", &id.to_string()]);
+    e.cmd()
+        .args(["people", "get", &id.to_string()])
+        .assert()
+        .stdout(predicate::str::contains("not found"));
+}
+
+#[test]
+fn people_json_output() {
+    let e = Env::new();
+    e.run(&[
+        "people",
+        "add",
+        "--name",
+        "Bob",
+        "--email",
+        "bob@example.com",
+    ]);
+
+    let out = e.run(&["--output", "json", "people", "list"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
+    assert!(parsed.is_array());
+    assert_eq!(parsed[0]["name"], "Bob");
+    assert_eq!(parsed[0]["email"], "bob@example.com");
+}
+
+// ─── Meetings ────────────────────────────────────────────────────────────────
+
+#[test]
+fn meeting_lifecycle() {
+    let e = Env::new();
+    let person_id = e.run_get_id(&["people", "add", "--name", "Carol"]);
+    let meeting_id = e.run_get_id(&[
+        "meeting",
+        "add",
+        "--title",
+        "Sprint Planning",
+        "--date",
+        "2026-06-09",
+        "--notes",
+        "discussed auth migration and timeline",
+    ]);
+
+    let out = e.run(&["meeting", "get", &meeting_id.to_string()]);
+    assert!(out.contains("Sprint Planning"));
+    assert!(out.contains("2026-06-09"));
+    assert!(out.contains("auth migration"));
+
+    e.run(&[
+        "meeting",
+        "link-person",
+        &meeting_id.to_string(),
+        &person_id.to_string(),
+        "--role",
+        "facilitator",
+    ]);
+    let detail = e.run(&["meeting", "get", &meeting_id.to_string()]);
+    assert!(detail.contains("Carol"));
+    assert!(detail.contains("facilitator"));
+
+    let search = e.run(&["meeting", "search", "auth"]);
+    assert!(search.contains("Sprint Planning"));
+
+    let list = e.run(&["meeting", "list"]);
+    assert!(list.contains("Sprint Planning"));
+}
+
+// ─── Todos ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn todo_full_lifecycle() {
+    let e = Env::new();
+    let id = e.run_get_id(&[
+        "todo",
+        "add",
+        "--title",
+        "Fix the login bug",
+        "--category",
+        "github",
+        "--source-url",
+        "https://github.com/org/repo/issues/42",
+    ]);
+
+    // Appears in open list
+    let list = e.run(&["todo", "list"]);
+    assert!(list.contains("Fix the login bug"));
+    assert!(list.contains("[ ]"));
+
+    // Update title and notes
+    e.run(&[
+        "todo",
+        "update",
+        &id.to_string(),
+        "--title",
+        "Fix the login redirect bug",
+        "--notes",
+        "traced to OAuth callback handler",
+    ]);
+    let detail = e.run(&["todo", "get", &id.to_string()]);
+    assert!(detail.contains("Fix the login redirect bug"));
+    assert!(detail.contains("OAuth callback handler"));
+
+    // Mark done with resolution
+    e.run(&["todo", "done", &id.to_string(), "--note", "fixed in PR #99"]);
+    let done_detail = e.run(&["todo", "get", &id.to_string()]);
+    assert!(done_detail.contains("[x]"));
+    assert!(done_detail.contains("fixed in PR #99"));
+
+    // No longer in open list
+    let open = e.run(&["todo", "list", "--status", "open"]);
+    assert!(!open.contains("login redirect"));
+
+    // Appears in history
+    let hist = e.run(&["todo", "history"]);
+    assert!(hist.contains("login redirect"));
+
+    // History search finds it
+    let hist_search = e.run(&["todo", "history", "OAuth"]);
+    assert!(hist_search.contains("login redirect"));
+
+    // Reopen
+    e.run(&["todo", "reopen", &id.to_string()]);
+    let reopened = e.run(&["todo", "list", "--status", "open"]);
+    assert!(reopened.contains("login redirect"));
+}
+
+#[test]
+fn todo_watch_items() {
+    let e = Env::new();
+    let id = e.run_get_id(&["todo", "add", "--title", "Monitor auth latency"]);
+
+    e.run(&["todo", "watch", &id.to_string()]);
+    let detail = e.run(&["todo", "get", &id.to_string()]);
+    assert!(detail.contains("[~]"));
+
+    // Watch items appear in full list, not in open
+    let open = e.run(&["todo", "list", "--status", "open"]);
+    assert!(!open.contains("Monitor auth latency"));
+    let all = e.run(&["todo", "list", "--status", "all"]);
+    assert!(all.contains("Monitor auth latency"));
+}
+
+#[test]
+fn todo_search() {
+    let e = Env::new();
+    e.run_get_id(&["todo", "add", "--title", "Review Kubernetes manifests"]);
+    e.run_get_id(&["todo", "add", "--title", "Update Python dependencies"]);
+
+    let out = e.run(&["todo", "search", "Kubernetes"]);
+    assert!(out.contains("Kubernetes"));
+    assert!(!out.contains("Python"));
+}
+
+#[test]
+fn todo_json_output() {
+    let e = Env::new();
+    e.run(&[
+        "todo",
+        "add",
+        "--title",
+        "JSON test todo",
+        "--category",
+        "slack",
+    ]);
+
+    let out = e.run(&["--output", "json", "todo", "list"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
+    assert!(parsed.is_array());
+    assert_eq!(parsed[0]["title"], "JSON test todo");
+    assert_eq!(parsed[0]["category"], "slack");
+    assert_eq!(parsed[0]["status"], "open");
+}
+
+// ─── Research ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn research_full_lifecycle() {
+    let e = Env::new();
+
+    // Start
+    let id = e.run_get_id(&[
+        "research",
+        "start",
+        "--name",
+        "Auth latency spike",
+        "--slug",
+        "auth-latency",
+        "--plan",
+        "Investigate why auth latency spiked to 4s on 2026-06-09",
+    ]);
+
+    let detail = e.run(&["research", "get", "auth-latency"]);
+    assert!(detail.contains("Auth latency spike"));
+    assert!(detail.contains("open"));
+    assert!(detail.contains("Investigate why"));
+
+    // Add sources
+    e.run(&[
+        "research",
+        "add-source",
+        &id.to_string(),
+        "--url",
+        "https://newrelic.com/query/123",
+        "--label",
+        "New Relic p99 latency",
+        "--notes",
+        "shows spike at 14:32",
+    ]);
+    let with_sources = e.run(&["research", "get", &id.to_string()]);
+    assert!(with_sources.contains("New Relic p99 latency"));
+
+    // Conclude
+    e.run(&[
+        "research",
+        "conclude",
+        &id.to_string(),
+        "--findings",
+        "Root cause: connection pool exhaustion. Fixed by increasing pool size to 50.",
+    ]);
+    let concluded = e.run(&["research", "get", &id.to_string()]);
+    assert!(concluded.contains("concluded"));
+    assert!(concluded.contains("connection pool exhaustion"));
+
+    // Not in open list
+    let open = e.run(&["research", "list"]);
+    assert!(!open.contains("auth-latency"));
+
+    let all = e.run(&["research", "list", "--status", "all"]);
+    assert!(all.contains("auth-latency"));
+
+    // Reopen
+    e.run(&["research", "reopen", &id.to_string()]);
+    let reopened = e.run(&["research", "get", &id.to_string()]);
+    assert!(reopened.contains("open"));
+    // concluded_at should be gone
+    assert!(!reopened.contains("Concluded:"));
+}
+
+#[test]
+fn research_search_plan_and_findings() {
+    let e = Env::new();
+    let id = e.run_get_id(&[
+        "research",
+        "start",
+        "--name",
+        "Timeout investigation",
+        "--slug",
+        "timeouts",
+        "--plan",
+        "Check Temporal workflow timeouts across services",
+    ]);
+    e.run(&[
+        "research",
+        "conclude",
+        &id.to_string(),
+        "--findings",
+        "accounting-doc-worker had 30s limit; increased to 120s",
+    ]);
+
+    // Search by plan content
+    let by_plan = e.run(&["research", "search", "Temporal"]);
+    assert!(by_plan.contains("Timeout investigation"));
+
+    // Search by findings content (hyphenated identifier)
+    let by_findings = e.run(&["research", "search", "accounting-doc-worker"]);
+    assert!(by_findings.contains("Timeout investigation"));
+}
+
+#[test]
+fn research_json_output() {
+    let e = Env::new();
+    e.run(&[
+        "research",
+        "start",
+        "--name",
+        "Perf test",
+        "--slug",
+        "perf-test",
+    ]);
+
+    let out = e.run(&["--output", "json", "research", "list", "--status", "open"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
+    assert!(parsed.is_array());
+    assert_eq!(parsed[0]["name"], "Perf test");
+    assert_eq!(parsed[0]["status"], "open");
+}
+
+// ─── Projects ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn project_lifecycle() {
+    let e = Env::new();
+    let person_id = e.run_get_id(&["people", "add", "--name", "Dave"]);
+    let meeting_id = e.run_get_id(&[
+        "meeting",
+        "add",
+        "--title",
+        "Project Kickoff",
+        "--date",
+        "2026-06-09",
+    ]);
+    let project_id = e.run_get_id(&[
+        "project",
+        "add",
+        "--name",
+        "Auth Overhaul",
+        "--description",
+        "Replace legacy auth with OAuth2 PKCE",
+        "--link",
+        "https://jira.example.com/AUTH|JIRA",
+    ]);
+
+    let detail = e.run(&["project", "get", &project_id.to_string()]);
+    assert!(detail.contains("Auth Overhaul"));
+    assert!(detail.contains("OAuth2 PKCE"));
+    assert!(detail.contains("JIRA"));
+
+    e.run(&[
+        "project",
+        "link-person",
+        &project_id.to_string(),
+        &person_id.to_string(),
+        "--role",
+        "lead",
+    ]);
+    e.run(&[
+        "project",
+        "link-meeting",
+        &project_id.to_string(),
+        &meeting_id.to_string(),
+    ]);
+
+    let linked = e.run(&["project", "get", &project_id.to_string()]);
+    assert!(linked.contains("Dave"));
+
+    let meetings = e.run(&["project", "meetings", &project_id.to_string()]);
+    assert!(meetings.contains("Kickoff"));
+
+    let search = e.run(&["project", "search", "OAuth2"]);
+    assert!(search.contains("Auth Overhaul"));
+}
+
+// ─── Global search ────────────────────────────────────────────────────────────
+
+#[test]
+fn global_search_finds_all_types() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "auth-note",
+        "prefer JWT tokens",
+        "--type",
+        "project",
+    ]);
+    e.run(&["people", "add", "--name", "Auth Engineer"]);
+    e.run(&[
+        "meeting",
+        "add",
+        "--title",
+        "Auth Review",
+        "--date",
+        "2026-06-09",
+        "--notes",
+        "auth migration plan",
+    ]);
+    e.run(&[
+        "project",
+        "add",
+        "--name",
+        "Auth Service",
+        "--description",
+        "auth refactor",
+    ]);
+    e.run(&["todo", "add", "--title", "Fix auth timeout"]);
+    e.run(&[
+        "research",
+        "start",
+        "--name",
+        "Auth perf",
+        "--slug",
+        "auth-perf",
+    ]);
+
+    let out = e.run(&["search", "auth"]);
+
+    assert!(out.contains("[memory]"), "missing memory result");
+    assert!(out.contains("[person]"), "missing person result");
+    assert!(out.contains("[meeting]"), "missing meeting result");
+    assert!(out.contains("[project]"), "missing project result");
+    assert!(out.contains("[todo]"), "missing todo result");
+    assert!(out.contains("[research]"), "missing research result");
+}
+
+#[test]
+fn global_search_json_output() {
+    let e = Env::new();
+    e.run(&["memory", "set", "widget-note", "widgets are important"]);
+    e.run(&["todo", "add", "--title", "Fix widget rendering"]);
+
+    let out = e.run(&["--output", "json", "search", "widget"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
+    assert!(parsed.is_array());
+    assert!(parsed.as_array().unwrap().len() >= 2);
+
+    let types: Vec<&str> = parsed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["type"].as_str())
+        .collect();
+    assert!(types.contains(&"Memory"), "missing Memory type");
+    assert!(types.contains(&"Todo"), "missing Todo type");
+}
+
+// ─── Migration ────────────────────────────────────────────────────────────────
+
+#[test]
+fn fresh_database_is_at_current_version() {
+    let e = Env::new();
+    let out = e.run(&["migrate"]);
+    assert!(
+        out.contains("up to date"),
+        "expected 'up to date', got: {out}"
+    );
+    assert!(!out.contains("pending"));
+}
+
+#[test]
+fn migrate_repos_flag() {
+    let e = Env::new();
+    let out = e.run(&["migrate", "--repos"]);
+    // No repos indexed, should say so
+    assert!(out.contains("No repos") || out.contains("up to date"));
+}
+
+// ─── Shell completions ────────────────────────────────────────────────────────
+
+#[test]
+fn completions_bash() {
+    let e = Env::new();
+    let out = e.run(&["completions", "bash"]);
+    // bash completions start with a function definition
+    assert!(out.contains("_ol"), "expected bash completion function");
+}
+
+#[test]
+fn completions_zsh() {
+    let e = Env::new();
+    let out = e.run(&["completions", "zsh"]);
+    assert!(!out.is_empty());
+}
+
+// ─── Install dry-run ─────────────────────────────────────────────────────────
+
+#[test]
+fn install_dry_run_writes_nothing() {
+    let e = Env::new();
+    // dry-run should succeed and print "would ..."
+    e.cmd()
+        .args(["install", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would"))
+        .stdout(predicate::str::contains("dry-run: nothing was written"));
+}
+
+// ─── Error handling ───────────────────────────────────────────────────────────
+
+#[test]
+fn unknown_subcommand_exits_nonzero() {
+    let e = Env::new();
+    e.cmd().args(["nonexistent-command"]).assert().failure();
+}
+
+#[test]
+fn get_missing_person_prints_not_found() {
+    let e = Env::new();
+    e.cmd()
+        .args(["people", "get", "9999"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not found"));
+}
+
+#[test]
+fn todo_done_already_done_is_idempotent() {
+    let e = Env::new();
+    let id = e.run_get_id(&["todo", "add", "--title", "Idempotent task"]);
+    e.run(&["todo", "done", &id.to_string()]);
+    // Second done should not error, just print "not found or already done"
+    e.cmd()
+        .args(["todo", "done", &id.to_string()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already done"));
+}
+
+// ─── Performance ──────────────────────────────────────────────────────────────
+
+#[test]
+fn commands_complete_within_200ms() {
+    use std::time::Instant;
+
+    let e = Env::new();
+
+    // Populate with some data
+    e.run(&["memory", "set", "perf-key", "performance test value"]);
+    e.run(&[
+        "people",
+        "add",
+        "--name",
+        "Perf User",
+        "--email",
+        "perf@test.com",
+    ]);
+    e.run(&["todo", "add", "--title", "Performance todo"]);
+    e.run(&[
+        "research",
+        "start",
+        "--name",
+        "Perf research",
+        "--slug",
+        "perf-research",
+    ]);
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["memory", "list"], "memory list"),
+        (&["people", "list"], "people list"),
+        (&["todo", "list"], "todo list"),
+        (&["research", "list"], "research list"),
+        (&["search", "perf"], "search"),
+        (&["migrate"], "migrate"),
+    ];
+
+    for (args, label) in cases {
+        let start = Instant::now();
+        e.run(args);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 200,
+            "{label} took {}ms, expected < 200ms",
+            elapsed.as_millis()
+        );
+    }
+}
