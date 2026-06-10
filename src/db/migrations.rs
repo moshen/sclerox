@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 1;
+pub const PRIMARY_VERSION: u32 = 2;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 1;
@@ -25,9 +25,11 @@ pub const REPO_VERSION: u32 = 1;
 ///       description: "add linkedin_url to people",
 ///       sql: "ALTER TABLE people ADD COLUMN linkedin_url TEXT;",
 ///   },
-pub const PRIMARY_MIGRATIONS: &[Migration] = &[
-    // (no migrations beyond baseline v1 yet)
-];
+pub const PRIMARY_MIGRATIONS: &[Migration] = &[Migration {
+    version: 2,
+    description: "add todos and investigations tables",
+    sql: crate::db::schema::MIGRATION_V2,
+}];
 
 /// Migrations for per-repo databases (<repo>/.ol/repo.db).
 pub const REPO_MIGRATIONS: &[Migration] = &[

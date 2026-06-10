@@ -1,3 +1,5 @@
+pub mod fts;
+pub mod investigations;
 pub mod meetings;
 pub mod memory;
 pub mod migrations;
@@ -5,6 +7,7 @@ pub mod people;
 pub mod projects;
 pub mod repos;
 pub mod schema;
+pub mod todos;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -38,14 +41,15 @@ impl Database {
     fn init(&self) -> Result<()> {
         let current = self.user_version()?;
         if current == 0 {
-            // Fresh database: apply the full baseline schema and mark as current version.
+            // Fresh database: apply the v1 baseline schema, then run all migrations in order.
+            // This ensures fresh and upgraded databases end up in exactly the same state.
             self.conn.execute_batch(schema::PRIMARY_SCHEMA)?;
-            self.set_user_version(PRIMARY_VERSION)?;
-        } else {
-            // Existing database: run any pending migrations.
-            run_migrations(&self.conn, current, PRIMARY_MIGRATIONS, PRIMARY_VERSION)
-                .context("primary database migration failed")?;
+            self.set_user_version(1)?;
         }
+        // Run any pending migrations (including those just queued for a fresh DB).
+        let current = self.user_version()?;
+        run_migrations(&self.conn, current, PRIMARY_MIGRATIONS, PRIMARY_VERSION)
+            .context("primary database migration failed")?;
         Ok(())
     }
 

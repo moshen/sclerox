@@ -179,6 +179,106 @@ CREATE TRIGGER IF NOT EXISTS repos_ad AFTER DELETE ON repos BEGIN
 END;
 ";
 
+/// Migration v2: todos and investigations tables.
+pub const MIGRATION_V2: &str = "
+-- Todos: task tracking with complete done history
+-- status: open | done | watch
+-- category: slack | github | email | meeting | project | general
+CREATE TABLE IF NOT EXISTS todos (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    source_url TEXT,
+    category TEXT NOT NULL DEFAULT 'general',
+    originated_date TEXT NOT NULL DEFAULT (date('now')),
+    deadline_date TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS todos_fts USING fts5(
+    title, notes, category, status,
+    content=todos, content_rowid=id
+);
+CREATE TRIGGER IF NOT EXISTS todos_ai AFTER INSERT ON todos BEGIN
+    INSERT INTO todos_fts(rowid, title, notes, category, status)
+    VALUES (new.id, new.title, new.notes, new.category, new.status);
+END;
+CREATE TRIGGER IF NOT EXISTS todos_au AFTER UPDATE ON todos BEGIN
+    INSERT INTO todos_fts(todos_fts, rowid, title, notes, category, status)
+    VALUES ('delete', old.id, old.title, old.notes, old.category, old.status);
+    INSERT INTO todos_fts(rowid, title, notes, category, status)
+    VALUES (new.id, new.title, new.notes, new.category, new.status);
+END;
+CREATE TRIGGER IF NOT EXISTS todos_ad AFTER DELETE ON todos BEGIN
+    INSERT INTO todos_fts(todos_fts, rowid, title, notes, category, status)
+    VALUES ('delete', old.id, old.title, old.notes, old.category, old.status);
+END;
+
+CREATE TABLE IF NOT EXISTS todo_people (
+    todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    PRIMARY KEY (todo_id, person_id)
+);
+CREATE TABLE IF NOT EXISTS todo_projects (
+    todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (todo_id, project_id)
+);
+
+-- Investigations / Research
+-- status: planning | active | concluded
+CREATE TABLE IF NOT EXISTS investigations (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'planning',
+    plan TEXT,
+    findings TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    concluded_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS investigations_fts USING fts5(
+    name, slug, plan, findings,
+    content=investigations, content_rowid=id
+);
+CREATE TRIGGER IF NOT EXISTS investigations_ai AFTER INSERT ON investigations BEGIN
+    INSERT INTO investigations_fts(rowid, name, slug, plan, findings)
+    VALUES (new.id, new.name, new.slug, new.plan, new.findings);
+END;
+CREATE TRIGGER IF NOT EXISTS investigations_au AFTER UPDATE ON investigations BEGIN
+    INSERT INTO investigations_fts(investigations_fts, rowid, name, slug, plan, findings)
+    VALUES ('delete', old.id, old.name, old.slug, old.plan, old.findings);
+    INSERT INTO investigations_fts(rowid, name, slug, plan, findings)
+    VALUES (new.id, new.name, new.slug, new.plan, new.findings);
+END;
+CREATE TRIGGER IF NOT EXISTS investigations_ad AFTER DELETE ON investigations BEGIN
+    INSERT INTO investigations_fts(investigations_fts, rowid, name, slug, plan, findings)
+    VALUES ('delete', old.id, old.name, old.slug, old.plan, old.findings);
+END;
+
+CREATE TABLE IF NOT EXISTS investigation_sources (
+    id INTEGER PRIMARY KEY,
+    investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    label TEXT,
+    notes TEXT,
+    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS investigation_people (
+    investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    PRIMARY KEY (investigation_id, person_id)
+);
+CREATE TABLE IF NOT EXISTS investigation_projects (
+    investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (investigation_id, project_id)
+);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
