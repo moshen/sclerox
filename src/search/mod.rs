@@ -29,6 +29,19 @@ pub enum SearchResult {
         name: String,
         description: Option<String>,
     },
+    Todo {
+        id: i64,
+        title: String,
+        status: String,
+        category: String,
+    },
+    Investigation {
+        id: i64,
+        name: String,
+        slug: String,
+        status: String,
+        snippet: String,
+    },
     Repo {
         id: i64,
         name: String,
@@ -79,6 +92,31 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
 
+    for t in db.todo_search(query)? {
+        results.push(SearchResult::Todo {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            category: t.category,
+        });
+    }
+
+    for i in db.investigation_search(query)? {
+        let snippet = i
+            .findings
+            .as_deref()
+            .or(i.plan.as_deref())
+            .map(|s| truncate(s, 120))
+            .unwrap_or_default();
+        results.push(SearchResult::Investigation {
+            id: i.id,
+            name: i.name,
+            slug: i.slug,
+            status: i.status,
+            snippet,
+        });
+    }
+
     for r in db.repo_search(query)? {
         results.push(SearchResult::Repo {
             id: r.id,
@@ -114,9 +152,46 @@ mod tests {
             .unwrap();
         db.project_add("Rust Migration", Some("Moving to Rust"), &[])
             .unwrap();
+        db.todo_add(
+            "Migrate to Rust",
+            None,
+            crate::db::todos::TodoStatus::Open,
+            None,
+            "general",
+            None,
+            None,
+        )
+        .unwrap();
+        db.investigation_start(
+            "Rust performance",
+            "rust-perf",
+            Some("Investigate Rust perf"),
+        )
+        .unwrap();
 
         let results = global_search(&db, "Rust").unwrap();
-        // Should find entries in memory, people, meetings, projects
-        assert!(results.len() >= 3);
+        assert!(
+            results.len() >= 5,
+            "expected at least 5, got {}",
+            results.len()
+        );
+
+        let types: Vec<&str> = results
+            .iter()
+            .map(|r| match r {
+                SearchResult::Memory { .. } => "memory",
+                SearchResult::Person { .. } => "person",
+                SearchResult::Meeting { .. } => "meeting",
+                SearchResult::Project { .. } => "project",
+                SearchResult::Todo { .. } => "todo",
+                SearchResult::Investigation { .. } => "investigation",
+                SearchResult::Repo { .. } => "repo",
+            })
+            .collect();
+        assert!(types.contains(&"todo"), "missing todo results");
+        assert!(
+            types.contains(&"investigation"),
+            "missing investigation results"
+        );
     }
 }

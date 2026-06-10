@@ -1,30 +1,34 @@
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::{Args, ValueEnum};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-#[derive(Subcommand)]
-pub enum InstallCommand {
-    /// Install skill, hooks, and project CLAUDE.md into your Claude Code setup
-    Install(InstallArgs),
-    /// Remove ol integrations from your Claude Code setup
-    Uninstall(InstallArgs),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InstallTarget {
+    /// Claude Code CLI (~/.claude/)
+    Claude,
+    /// OpenCode (~/.config/opencode/)
+    Opencode,
+    /// OpenAI Codex CLI (~/.codex/)
+    Codex,
+    /// All supported tools
+    All,
 }
 
 #[derive(Args)]
 pub struct InstallArgs {
-    /// Skip writing the skill file to ~/.claude/skills/ol-kb.md
+    /// Which tool to install for
+    #[arg(long, default_value = "claude", value_enum)]
+    pub target: InstallTarget,
+    /// Skip writing the skill file
     #[arg(long)]
     no_skill: bool,
-
-    /// Skip adding the Stop hook to ~/.claude/settings.json
+    /// Skip adding the Stop hook (Claude Code only)
     #[arg(long)]
     no_hooks: bool,
-
-    /// Skip creating CLAUDE.md in the current project directory
+    /// Skip adding an ol-kb section to CLAUDE.md / AGENTS.md
     #[arg(long)]
     no_project_md: bool,
-
     /// Show what would be done without writing anything
     #[arg(long)]
     dry_run: bool,
@@ -32,81 +36,274 @@ pub struct InstallArgs {
 
 pub fn run_install(args: InstallArgs) -> Result<()> {
     let ol_bin = current_binary_path()?;
-    let claude_dir = claude_dir()?;
-
-    if !args.no_skill {
-        install_skill(&claude_dir, &ol_bin, args.dry_run)?;
+    for target in resolve_targets(args.target) {
+        println!("Installing for {}...", target_name(target));
+        install_for_target(target, &ol_bin, &args)?;
     }
-    if !args.no_hooks {
-        install_hooks(&claude_dir, &ol_bin, args.dry_run)?;
-    }
-    if !args.no_project_md {
-        install_project_md(&ol_bin, args.dry_run)?;
-    }
-
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
-        println!("\nInstallation complete. Claude Code will use `ol` as your knowledge base.");
-        println!("Reload any open Claude Code sessions to pick up the new skill.");
+        println!("\nDone. Reload any open sessions to pick up the new skill.");
     }
     Ok(())
 }
 
 pub fn run_uninstall(args: InstallArgs) -> Result<()> {
-    let claude_dir = claude_dir()?;
-
-    if !args.no_skill {
-        uninstall_skill(&claude_dir, args.dry_run)?;
+    for target in resolve_targets(args.target) {
+        println!("Uninstalling for {}...", target_name(target));
+        uninstall_for_target(target, &args)?;
     }
-    if !args.no_hooks {
-        uninstall_hooks(&claude_dir, args.dry_run)?;
-    }
-    if !args.no_project_md {
-        uninstall_project_md(args.dry_run)?;
-    }
-
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
-    } else {
-        println!("\nUninstall complete.");
     }
     Ok(())
 }
 
-// --- Skill ---
+fn resolve_targets(target: InstallTarget) -> Vec<InstallTarget> {
+    match target {
+        InstallTarget::All => vec![
+            InstallTarget::Claude,
+            InstallTarget::Opencode,
+            InstallTarget::Codex,
+        ],
+        t => vec![t],
+    }
+}
 
-fn install_skill(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
-    let skills_dir = claude_dir.join("skills");
-    let skill_path = skills_dir.join("ol-kb.md");
+fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -> Result<()> {
+    match target {
+        InstallTarget::Claude => {
+            let dir = claude_dir()?;
+            if !args.no_skill {
+                install_skill(&dir.join("skills"), "ol-kb.md", ol_bin, args.dry_run)?;
+            }
+            if !args.no_hooks {
+                install_claude_hook(&dir, ol_bin, args.dry_run)?;
+            }
+            if !args.no_project_md {
+                install_project_section("CLAUDE.md", ol_bin, args.dry_run)?;
+            }
+        }
+        InstallTarget::Opencode => {
+            let dir = opencode_dir()?;
+            if !args.no_skill {
+                install_skill(&dir.join("skills"), "ol-kb.md", ol_bin, args.dry_run)?;
+            }
+            if !args.no_project_md {
+                install_project_section("AGENTS.md", ol_bin, args.dry_run)?;
+            }
+        }
+        InstallTarget::Codex => {
+            if !args.no_skill {
+                let path = codex_dir()?.join("instructions.md");
+                append_or_create_section(&path, &project_md_section(ol_bin), args.dry_run)?;
+            }
+            if !args.no_project_md {
+                install_project_section("AGENTS.md", ol_bin, args.dry_run)?;
+            }
+        }
+        InstallTarget::All => unreachable!(),
+    }
+    Ok(())
+}
 
-    let content = skill_file_content(ol_bin);
+fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()> {
+    match target {
+        InstallTarget::Claude => {
+            let dir = claude_dir()?;
+            if !args.no_skill {
+                remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
+            }
+            if !args.no_hooks {
+                uninstall_claude_hook(&dir, args.dry_run)?;
+            }
+            if !args.no_project_md {
+                uninstall_section("CLAUDE.md", args.dry_run)?;
+            }
+        }
+        InstallTarget::Opencode => {
+            let dir = opencode_dir()?;
+            if !args.no_skill {
+                remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
+            }
+            if !args.no_project_md {
+                uninstall_section("AGENTS.md", args.dry_run)?;
+            }
+        }
+        InstallTarget::Codex => {
+            if !args.no_skill {
+                let path = codex_dir()?.join("instructions.md");
+                uninstall_section(&path.to_string_lossy(), args.dry_run)?;
+            }
+            if !args.no_project_md {
+                uninstall_section("AGENTS.md", args.dry_run)?;
+            }
+        }
+        InstallTarget::All => unreachable!(),
+    }
+    Ok(())
+}
 
+fn install_skill(dir: &Path, filename: &str, ol_bin: &str, dry_run: bool) -> Result<()> {
+    let path = dir.join(filename);
     if dry_run {
-        println!("Would write skill: {}", skill_path.display());
-        println!("--- ol-kb.md ---");
-        println!("{content}");
-        println!("---");
+        println!("  would write: {}", path.display());
     } else {
-        std::fs::create_dir_all(&skills_dir).context("failed to create ~/.claude/skills/")?;
-        std::fs::write(&skill_path, &content)
-            .with_context(|| format!("failed to write {}", skill_path.display()))?;
-        println!("Wrote skill: {}", skill_path.display());
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        std::fs::write(&path, skill_file_content(ol_bin))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        println!("  wrote skill: {}", path.display());
     }
     Ok(())
 }
 
-fn uninstall_skill(claude_dir: &Path, dry_run: bool) -> Result<()> {
-    let skill_path = claude_dir.join("skills").join("ol-kb.md");
-    if skill_path.exists() {
+fn remove_if_exists(path: &Path, dry_run: bool) -> Result<()> {
+    if path.exists() {
         if dry_run {
-            println!("Would remove: {}", skill_path.display());
+            println!("  would remove: {}", path.display());
         } else {
-            std::fs::remove_file(&skill_path)?;
-            println!("Removed: {}", skill_path.display());
+            std::fs::remove_file(path)?;
+            println!("  removed: {}", path.display());
         }
     } else {
-        println!("Skill not installed, skipping.");
+        println!("  not found: {}", path.display());
+    }
+    Ok(())
+}
+
+const HOOK_MARKER: &str = "# ol-kb-hook";
+
+fn install_claude_hook(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings = read_json(&settings_path)?;
+
+    let hook_command = format!(
+        "{HOOK_MARKER}\n{ol_bin} repo index . --description \"$(basename \"$PWD\") repo\" 2>/dev/null || true"
+    );
+    let new_hook = serde_json::json!({ "type": "command", "command": hook_command });
+
+    let stop = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("hooks is not an object")?
+        .entry("Stop")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let arr = stop.as_array_mut().context("hooks.Stop is not an array")?;
+    strip_ol_hooks(arr);
+    arr.push(serde_json::json!({ "hooks": [new_hook] }));
+
+    if dry_run {
+        println!("  would add Stop hook to: {}", settings_path.display());
+    } else {
+        write_json(&settings_path, &settings)?;
+        println!("  added Stop hook: {}", settings_path.display());
+    }
+    Ok(())
+}
+
+fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
+    let settings_path = claude_dir.join("settings.json");
+    if !settings_path.exists() {
+        println!("  no settings.json found");
+        return Ok(());
+    }
+    let mut settings = read_json(&settings_path)?;
+    let modified = settings
+        .pointer_mut("/hooks/Stop")
+        .and_then(|v| v.as_array_mut())
+        .map(|arr| {
+            let before = arr.len();
+            strip_ol_hooks(arr);
+            arr.len() < before
+        })
+        .unwrap_or(false);
+
+    if modified {
+        if dry_run {
+            println!("  would remove Stop hook from: {}", settings_path.display());
+        } else {
+            write_json(&settings_path, &settings)?;
+            println!("  removed Stop hook: {}", settings_path.display());
+        }
+    } else {
+        println!("  no ol hook found");
+    }
+    Ok(())
+}
+
+fn strip_ol_hooks(arr: &mut Vec<Value>) {
+    arr.retain(|entry| {
+        !entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains(HOOK_MARKER))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+}
+
+const SECTION_MARKER: &str = "<!-- ol-kb -->";
+
+fn install_project_section(filename: &str, ol_bin: &str, dry_run: bool) -> Result<()> {
+    append_or_create_section(
+        &PathBuf::from(filename),
+        &project_md_section(ol_bin),
+        dry_run,
+    )
+}
+
+fn append_or_create_section(path: &Path, content: &str, dry_run: bool) -> Result<()> {
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        if existing.contains(SECTION_MARKER) {
+            println!("  {}: already has ol-kb section", path.display());
+            return Ok(());
+        }
+        if dry_run {
+            println!("  would append to: {}", path.display());
+        } else {
+            std::fs::write(path, format!("{}\n{content}", existing.trim_end()))?;
+            println!("  appended to: {}", path.display());
+        }
+    } else if dry_run {
+        println!("  would create: {}", path.display());
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)?;
+        println!("  created: {}", path.display());
+    }
+    Ok(())
+}
+
+fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
+    let path = PathBuf::from(filename);
+    if !path.exists() {
+        println!("  {filename}: not found");
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    if let Some(start) = content.find(SECTION_MARKER) {
+        if dry_run {
+            println!("  would remove ol-kb section from {filename}");
+        } else {
+            std::fs::write(&path, format!("{}\n", content[..start].trim_end()))?;
+            println!("  removed ol-kb section from {filename}");
+        }
+    } else {
+        println!("  {filename}: no ol-kb section");
     }
     Ok(())
 }
@@ -115,302 +312,138 @@ fn skill_file_content(ol_bin: &str) -> String {
     format!(
         r#"# ol - Operating Layer Knowledge Base
 
-Use this skill when the user asks about people, meetings, projects, or past decisions — or when context from the knowledge base would help with the current task.
+Use when the user asks about people, meetings, projects, todos, past decisions, or research — or when knowledge base context would help.
 
 ## When to use
 
-- Starting work on a feature: search for related past meetings and project context
-- Mentioning a colleague by name: look them up to get contact details and links
-- Referencing a past decision: search meetings and memory for relevant context
-- After learning something important: save it to memory so future sessions benefit
-- Exploring an unfamiliar codebase: check if it's indexed, search symbols
+- Starting work: search for related meetings, todos, investigations, project context
+- Colleague mentioned: look them up for contact details
+- Past decision referenced: search memory and investigations
+- After learning something: save to memory for future sessions
 
 ## Commands
 
 ```bash
-# Memory (persistent key/value, survives across sessions)
-{ol} memory set <key> "<value>" [--type user|feedback|project|reference] [--tags tag1,tag2]
-{ol} memory get <key>
+# Global search across all tables
+{ol} search "<query>"
+
+# Memory
+{ol} memory set <key> "<value>" --type user|feedback|project|reference
 {ol} memory search "<query>"
-{ol} memory list [--type feedback]
 
 # People
 {ol} people search "<name or email>"
-{ol} people add --name "<name>" --email "<email>" [--slack-url <url>] [--github-username <handle>]
-{ol} people get <id>
+{ol} people add --name "<name>" --email "<email>"
 
 # Meetings
 {ol} meeting search "<topic>"
-{ol} meeting similar "<description>"   # semantic search (requires --embed on add)
-{ol} meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>" [--embed]
-{ol} meeting link-person <meeting-id> <person-id> [--role <role>]
+{ol} meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
+
+# Todos
+{ol} todo list                         # open todos
+{ol} todo add --title "<title>" [--category slack|github|email|meeting|general]
+{ol} todo done <id> [--note "<resolution>"]
+{ol} todo history [<query>]            # search completed todos
+
+# Research / Investigations
+{ol} research list                     # open investigations
+{ol} research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
+{ol} research add-source <id> --url "<url>" --label "<label>"
+{ol} research conclude <id> --findings "<findings>"
+{ol} research search "<query>"
 
 # Projects
-{ol} project search "<name or description>"
-{ol} project get <id>
-{ol} project add --name "<name>" --description "<desc>" [--link "url|label"]
+{ol} project search "<description>"
 
 # Repos
-{ol} repo show [path] [--symbols "<query>"]   # explore indexed symbols
-{ol} repo search "<description>"
-{ol} repo similar "<description>"             # semantic repo search
-
-# Global search across all tables
-{ol} search "<query>"
+{ol} repo show [path] [--symbols "<query>"]
 ```
 
-## Usage patterns
+## Patterns
 
-**Before starting a task:**
-```bash
-{ol} search "<feature or area>"
-{ol} meeting search "<feature or area>"
-```
-
-**When a colleague is mentioned:**
-```bash
-{ol} people search "<name>"
-```
-
-**After a decision is made:**
-```bash
-{ol} memory set "<slug>" "<decision and rationale>" --type project
-```
-
-**After learning a team preference:**
-```bash
-{ol} memory set "<slug>" "<preference>" --type feedback
-```
+**Before any task:** `{ol} search "<topic>"`
+**After a decision:** `{ol} memory set "<key>" "<decision>" --type project`
+**After research:** `{ol} research conclude <id> --findings "<findings>"`
 "#,
         ol = ol_bin
     )
 }
 
-// --- Hooks ---
-
-const HOOK_COMMAND_PREFIX: &str = "# ol-kb-hook";
-
-fn install_hooks(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
-    let settings_path = claude_dir.join("settings.json");
-    let mut settings = read_settings_json(&settings_path)?;
-
-    let hook_command = format!(
-        "{HOOK_COMMAND_PREFIX}\n{ol_bin} repo index . --description \"$(basename \"$PWD\") repo\" 2>/dev/null || true",
-        ol_bin = ol_bin
-    );
-
-    // Build the hook entry
-    let new_hook = serde_json::json!({
-        "type": "command",
-        "command": hook_command
-    });
-
-    // Get or create hooks.Stop array
-    let hooks = settings
-        .as_object_mut()
-        .context("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let stop_hooks = hooks
-        .as_object_mut()
-        .context("hooks is not an object")?
-        .entry("Stop")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let stop_array = stop_hooks
-        .as_array_mut()
-        .context("hooks.Stop is not an array")?;
-
-    // Remove any existing ol hook, then append fresh
-    remove_ol_hooks_from_stop(stop_array);
-
-    // Wrap in a matcher object (empty matcher = all sessions)
-    let matcher_entry = serde_json::json!({
-        "hooks": [new_hook]
-    });
-    stop_array.push(matcher_entry);
-
-    if dry_run {
-        println!("Would update hooks in: {}", settings_path.display());
-        println!("  hooks.Stop: add `ol repo index .` command");
-    } else {
-        write_settings_json(&settings_path, &settings)?;
-        println!("Updated hooks: {}", settings_path.display());
-        println!("  Stop hook: `ol repo index .` after each session");
-    }
-    Ok(())
-}
-
-fn uninstall_hooks(claude_dir: &Path, dry_run: bool) -> Result<()> {
-    let settings_path = claude_dir.join("settings.json");
-    if !settings_path.exists() {
-        println!("No settings.json found, skipping hook removal.");
-        return Ok(());
-    }
-
-    let mut settings = read_settings_json(&settings_path)?;
-
-    let modified = if let Some(stop) = settings
-        .pointer_mut("/hooks/Stop")
-        .and_then(|v| v.as_array_mut())
-    {
-        let before = stop.len();
-        remove_ol_hooks_from_stop(stop);
-        stop.len() < before
-    } else {
-        false
-    };
-
-    if modified {
-        if dry_run {
-            println!(
-                "Would remove ol Stop hook from: {}",
-                settings_path.display()
-            );
-        } else {
-            write_settings_json(&settings_path, &settings)?;
-            println!("Removed ol Stop hook from: {}", settings_path.display());
-        }
-    } else {
-        println!("No ol hooks found in settings.json, skipping.");
-    }
-    Ok(())
-}
-
-fn remove_ol_hooks_from_stop(stop_array: &mut Vec<Value>) {
-    stop_array.retain(|entry| {
-        let hooks = match entry.get("hooks").and_then(|h| h.as_array()) {
-            Some(h) => h,
-            None => return true,
-        };
-        !hooks.iter().any(|h| {
-            h.get("command")
-                .and_then(|c| c.as_str())
-                .map(|c| c.contains(HOOK_COMMAND_PREFIX))
-                .unwrap_or(false)
-        })
-    });
-}
-
-// --- Project CLAUDE.md ---
-
-fn install_project_md(ol_bin: &str, dry_run: bool) -> Result<()> {
-    let claude_md_path = PathBuf::from("CLAUDE.md");
-    let content = project_claude_md_content(ol_bin);
-
-    if claude_md_path.exists() {
-        // Check if ol section already present
-        let existing = std::fs::read_to_string(&claude_md_path)?;
-        if existing.contains("<!-- ol-kb -->") {
-            println!("CLAUDE.md already has ol-kb section, skipping.");
-            return Ok(());
-        }
-        // Append ol section
-        let appended = format!("{existing}\n{content}");
-        if dry_run {
-            println!(
-                "Would append ol-kb section to: {}",
-                claude_md_path.display()
-            );
-        } else {
-            std::fs::write(&claude_md_path, appended)?;
-            println!("Appended ol-kb section to: {}", claude_md_path.display());
-        }
-    } else {
-        if dry_run {
-            println!("Would create: {}", claude_md_path.display());
-            println!("--- CLAUDE.md ---");
-            println!("{content}");
-            println!("---");
-        } else {
-            std::fs::write(&claude_md_path, &content)?;
-            println!("Created: {}", claude_md_path.display());
-        }
-    }
-    Ok(())
-}
-
-fn uninstall_project_md(dry_run: bool) -> Result<()> {
-    let claude_md_path = PathBuf::from("CLAUDE.md");
-    if !claude_md_path.exists() {
-        println!("No CLAUDE.md found, skipping.");
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&claude_md_path)?;
-    if !content.contains("<!-- ol-kb -->") {
-        println!("No ol-kb section in CLAUDE.md, skipping.");
-        return Ok(());
-    }
-
-    // Remove the ol-kb section (everything from the marker to the next H2 or EOF)
-    if let Some(start) = content.find("<!-- ol-kb -->") {
-        let trimmed = content[..start].trim_end().to_string();
-        if dry_run {
-            println!("Would remove ol-kb section from CLAUDE.md");
-        } else {
-            std::fs::write(&claude_md_path, format!("{trimmed}\n"))?;
-            println!("Removed ol-kb section from CLAUDE.md");
-        }
-    }
-    Ok(())
-}
-
-fn project_claude_md_content(ol_bin: &str) -> String {
+fn project_md_section(ol_bin: &str) -> String {
     format!(
-        r#"<!-- ol-kb -->
+        r#"
+{SECTION_MARKER}
 # Knowledge Base (ol)
 
-This project uses `ol` as a local knowledge base. Before starting work, search for relevant context:
+Search before starting work:
 
 ```bash
-{ol} search "<topic>"          # search across all tables
-{ol} meeting search "<topic>"  # find past decisions in meeting notes
-{ol} repo show . --symbols "<name>"  # find symbols in this codebase
+{ol} search "<topic>"           # all tables
+{ol} todo list                  # open todos
+{ol} research list              # open investigations
+{ol} meeting search "<topic>"   # past decisions
 ```
 
-Save important learnings during or after your session:
+Record outcomes:
 
 ```bash
-{ol} memory set "<key>" "<value>" --type feedback
+{ol} todo done <id> --note "<resolution>"
+{ol} research conclude <id> --findings "<findings>"
 {ol} memory set "<key>" "<value>" --type project
 ```
-
-The `ol-kb` skill has full command reference.
 "#,
         ol = ol_bin
     )
 }
 
-// --- Helpers ---
+fn target_name(target: InstallTarget) -> &'static str {
+    match target {
+        InstallTarget::Claude => "Claude Code",
+        InstallTarget::Opencode => "OpenCode",
+        InstallTarget::Codex => "Codex",
+        InstallTarget::All => "all",
+    }
+}
 
 fn claude_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not find home directory")?;
-    Ok(home.join(".claude"))
+    Ok(dirs::home_dir().context("no home")?.join(".claude"))
+}
+
+fn opencode_dir() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("no home")?
+        .join(".config")
+        .join("opencode"))
+}
+
+fn codex_dir() -> Result<PathBuf> {
+    Ok(dirs::home_dir().context("no home")?.join(".codex"))
 }
 
 fn current_binary_path() -> Result<String> {
-    let path = std::env::current_exe().context("could not determine current binary path")?;
-    Ok(path.to_string_lossy().into_owned())
+    Ok(std::env::current_exe()
+        .context("could not determine binary path")?
+        .to_string_lossy()
+        .into_owned())
 }
 
-fn read_settings_json(path: &Path) -> Result<Value> {
+fn read_json(path: &Path) -> Result<Value> {
     if path.exists() {
-        let content = std::fs::read_to_string(path)
+        let s = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        serde_json::from_str(&s).with_context(|| format!("failed to parse {}", path.display()))
     } else {
         Ok(serde_json::json!({}))
     }
 }
 
-fn write_settings_json(path: &Path, value: &Value) -> Result<()> {
+fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content =
-        serde_json::to_string_pretty(value).context("failed to serialize settings.json")?;
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(value).context("failed to serialize")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
 }

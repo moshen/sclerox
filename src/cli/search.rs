@@ -46,6 +46,32 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     let desc = description.as_deref().unwrap_or("-");
                     println!("[project] #{id} {name} - {desc}");
                 }
+                SearchResult::Todo {
+                    id,
+                    title,
+                    status,
+                    category,
+                } => {
+                    let checkbox = match status.as_str() {
+                        "done" => "[x]",
+                        "watch" => "[~]",
+                        _ => "[ ]",
+                    };
+                    println!("[todo] {checkbox} #{id} [{category}] {title}");
+                }
+                SearchResult::Investigation {
+                    id,
+                    name,
+                    slug,
+                    status,
+                    snippet,
+                } => {
+                    let icon = if status == "concluded" { "✓" } else { "→" };
+                    println!("[research] {icon} #{id} {name} ({slug})");
+                    if !snippet.is_empty() {
+                        println!("           {snippet}");
+                    }
+                }
                 SearchResult::Repo {
                     id,
                     name,
