@@ -26,9 +26,10 @@ pub struct InstallArgs {
     /// Skip adding the Stop hook (Claude Code only)
     #[arg(long)]
     no_hooks: bool,
-    /// Skip adding an ol-kb section to CLAUDE.md / AGENTS.md
+    /// Skip appending ol-kb instructions to the global instructions file
+    /// (~/.claude/CLAUDE.md, ~/.config/opencode/AGENTS.md, ~/.codex/instructions.md)
     #[arg(long)]
-    no_project_md: bool,
+    no_instructions: bool,
     /// Show what would be done without writing anything
     #[arg(long)]
     dry_run: bool,
@@ -82,8 +83,13 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
                 // Hook uses full path - runs without the user's shell profile.
                 install_claude_hook(&dir, ol_bin, args.dry_run)?;
             }
-            if !args.no_project_md {
-                install_project_section("CLAUDE.md", args.dry_run)?;
+            if !args.no_instructions {
+                // Write to the global user CLAUDE.md, never to a per-repo file.
+                append_or_create_section(
+                    &dir.join("CLAUDE.md"),
+                    &project_md_section(),
+                    args.dry_run,
+                )?;
             }
         }
         InstallTarget::Opencode => {
@@ -91,17 +97,23 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
             if !args.no_skill {
                 install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
             }
-            if !args.no_project_md {
-                install_project_section("AGENTS.md", args.dry_run)?;
+            if !args.no_instructions {
+                // Global OpenCode instructions file, not a per-repo AGENTS.md.
+                append_or_create_section(
+                    &dir.join("AGENTS.md"),
+                    &project_md_section(),
+                    args.dry_run,
+                )?;
             }
         }
         InstallTarget::Codex => {
-            if !args.no_skill {
-                let path = codex_dir()?.join("instructions.md");
-                append_or_create_section(&path, &project_md_section(), args.dry_run)?;
-            }
-            if !args.no_project_md {
-                install_project_section("AGENTS.md", args.dry_run)?;
+            if !args.no_instructions {
+                // ~/.codex/instructions.md is the global Codex instructions file.
+                append_or_create_section(
+                    &codex_dir()?.join("instructions.md"),
+                    &project_md_section(),
+                    args.dry_run,
+                )?;
             }
         }
         InstallTarget::All => unreachable!(),
@@ -119,8 +131,8 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
             if !args.no_hooks {
                 uninstall_claude_hook(&dir, args.dry_run)?;
             }
-            if !args.no_project_md {
-                uninstall_section("CLAUDE.md", args.dry_run)?;
+            if !args.no_instructions {
+                uninstall_section(&dir.join("CLAUDE.md").to_string_lossy(), args.dry_run)?;
             }
         }
         InstallTarget::Opencode => {
@@ -128,17 +140,14 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
             if !args.no_skill {
                 remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
             }
-            if !args.no_project_md {
-                uninstall_section("AGENTS.md", args.dry_run)?;
+            if !args.no_instructions {
+                uninstall_section(&dir.join("AGENTS.md").to_string_lossy(), args.dry_run)?;
             }
         }
         InstallTarget::Codex => {
-            if !args.no_skill {
+            if !args.no_instructions {
                 let path = codex_dir()?.join("instructions.md");
                 uninstall_section(&path.to_string_lossy(), args.dry_run)?;
-            }
-            if !args.no_project_md {
-                uninstall_section("AGENTS.md", args.dry_run)?;
             }
         }
         InstallTarget::All => unreachable!(),
@@ -256,10 +265,6 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
 }
 
 const SECTION_MARKER: &str = "<!-- ol-kb -->";
-
-fn install_project_section(filename: &str, dry_run: bool) -> Result<()> {
-    append_or_create_section(&PathBuf::from(filename), &project_md_section(), dry_run)
-}
 
 fn append_or_create_section(path: &Path, content: &str, dry_run: bool) -> Result<()> {
     if path.exists() {
