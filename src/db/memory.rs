@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::Database;
+use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -71,12 +71,12 @@ impl Database {
     }
 
     pub fn memory_search(&self, query: &str) -> Result<Vec<MemoryEntry>> {
+        let query = fts::sanitize(query);
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.key, m.value, m.memory_type, m.tags, m.created_at, m.updated_at
-             FROM memory m
-             JOIN memory_fts f ON m.id = f.rowid
-             WHERE memory_fts MATCH ?1
-             ORDER BY rank",
+            "SELECT id, key, value, memory_type, tags, created_at, updated_at
+             FROM memory
+             WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
+             ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map(params![query], row_to_memory)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

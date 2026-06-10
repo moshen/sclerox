@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::Database;
+use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Person {
@@ -71,12 +71,12 @@ impl Database {
     }
 
     pub fn people_search(&self, query: &str) -> Result<Vec<Person>> {
+        let query = fts::sanitize(query);
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url, p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
-             FROM people p
-             JOIN people_fts f ON p.id = f.rowid
-             WHERE people_fts MATCH ?1
-             ORDER BY rank",
+            "SELECT id, name, email, slack_id, slack_url, github_username, github_url, notes, created_at, updated_at
+             FROM people
+             WHERE id IN (SELECT rowid FROM people_fts WHERE people_fts MATCH ?1)
+             ORDER BY name",
         )?;
         let rows = stmt.query_map(params![query], row_to_person)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

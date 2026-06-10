@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::Database;
+use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectLink {
@@ -65,12 +65,12 @@ impl Database {
     }
 
     pub fn project_search(&self, query: &str) -> Result<Vec<Project>> {
+        let query = fts::sanitize(query);
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.description, p.links, p.created_at, p.updated_at
-             FROM projects p
-             JOIN projects_fts f ON p.id = f.rowid
-             WHERE projects_fts MATCH ?1
-             ORDER BY rank",
+            "SELECT id, name, description, links, created_at, updated_at
+             FROM projects
+             WHERE id IN (SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1)
+             ORDER BY name",
         )?;
         let rows = stmt.query_map(params![query], row_to_project)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

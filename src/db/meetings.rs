@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{bytes_to_embedding, embedding_to_bytes, Database};
+use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meeting {
@@ -95,12 +95,12 @@ impl Database {
     }
 
     pub fn meeting_search(&self, query: &str) -> Result<Vec<Meeting>> {
+        let query = fts::sanitize(query);
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at
-             FROM meetings m
-             JOIN meetings_fts f ON m.id = f.rowid
-             WHERE meetings_fts MATCH ?1
-             ORDER BY rank",
+            "SELECT id, title, meeting_date, transcript, notes, created_at
+             FROM meetings
+             WHERE id IN (SELECT rowid FROM meetings_fts WHERE meetings_fts MATCH ?1)
+             ORDER BY meeting_date DESC",
         )?;
         let rows = stmt.query_map(params![query], row_to_meeting)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

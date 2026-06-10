@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{bytes_to_embedding, embedding_to_bytes, Database};
+use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoEntry {
@@ -80,12 +80,12 @@ impl Database {
     }
 
     pub fn repo_search(&self, query: &str) -> Result<Vec<RepoEntry>> {
+        let query = fts::sanitize(query);
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at
-             FROM repos r
-             JOIN repos_fts f ON r.id = f.rowid
-             WHERE repos_fts MATCH ?1
-             ORDER BY rank",
+            "SELECT id, path, name, description, db_path, last_indexed, created_at
+             FROM repos
+             WHERE id IN (SELECT rowid FROM repos_fts WHERE repos_fts MATCH ?1)
+             ORDER BY name",
         )?;
         let rows = stmt.query_map(params![query], row_to_repo)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
