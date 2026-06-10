@@ -12,7 +12,16 @@ use crate::embed::Embedder;
 use parser::{detect_language, parse_file};
 use repo_db::RepoDb;
 
-const CHUNK_SIZE_LINES: usize = 60;
+// Fallback line count for languages without a tree-sitter grammar.
+// ~15 lines × 50 chars/line ≈ 750 chars, within AllMiniLML6V2's 256-token window.
+pub const CHUNK_SIZE_LINES: usize = 15;
+
+// Maximum chars per embedded chunk. Anything larger gets split by split_large_chunk().
+// AllMiniLML6V2 max tokens = 256 ≈ 1024 chars; 800 gives a safety margin.
+pub const MAX_EMBED_CHARS: usize = 800;
+
+// Overlap when splitting an oversized function chunk into sub-chunks.
+const SPLIT_OVERLAP_LINES: usize = 3;
 const IGNORED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
@@ -94,7 +103,14 @@ impl<'a> RepoIndexer<'a> {
             let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
             repo_db.delete_file_data(file_id)?;
 
-            let (symbols, chunks) = parse_file(&source, lang, CHUNK_SIZE_LINES);
+            let (symbols, raw_chunks) = parse_file(&source, lang, CHUNK_SIZE_LINES);
+
+            // Split any chunk that exceeds the embedding model's context window.
+            // Tree-sitter emits whole functions regardless of size; large ones get sub-chunked.
+            let chunks: Vec<parser::CodeChunk> = raw_chunks
+                .into_iter()
+                .flat_map(|c| parser::split_large_chunk(c, MAX_EMBED_CHARS, SPLIT_OVERLAP_LINES))
+                .collect();
 
             for sym in &symbols {
                 repo_db.insert_symbol(

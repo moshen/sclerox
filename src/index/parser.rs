@@ -215,6 +215,56 @@ fn chunk_by_lines(source: &str, chunk_size: usize) -> Vec<CodeChunk> {
     chunks
 }
 
+/// Split a chunk that exceeds `max_chars` into smaller overlapping pieces.
+/// Uses line boundaries to avoid splitting mid-statement.
+/// `overlap_lines` controls how many lines are repeated between consecutive sub-chunks.
+pub fn split_large_chunk(
+    chunk: CodeChunk,
+    max_chars: usize,
+    overlap_lines: usize,
+) -> Vec<CodeChunk> {
+    if chunk.text.len() <= max_chars {
+        return vec![chunk];
+    }
+
+    let lines: Vec<&str> = chunk.text.lines().collect();
+    let mut result = Vec::new();
+    let mut start = 0usize;
+
+    while start < lines.len() {
+        let mut char_count = 0usize;
+        let mut end = start;
+
+        // Accumulate lines until we hit the char budget
+        while end < lines.len() {
+            let line_chars = lines[end].len() + 1; // +1 for '\n'
+            if char_count + line_chars > max_chars && end > start {
+                break;
+            }
+            char_count += line_chars;
+            end += 1;
+        }
+
+        if end == start {
+            end += 1; // always include at least one line
+        }
+
+        result.push(CodeChunk {
+            text: lines[start..end].join("\n"),
+            start_line: chunk.start_line + start as u32,
+            end_line: chunk.start_line + end as u32 - 1,
+        });
+
+        if end >= lines.len() {
+            break;
+        }
+
+        start = end.saturating_sub(overlap_lines);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +347,114 @@ fn bar() {}
             assert!(sym.start_line > 0);
             assert!(sym.end_line >= sym.start_line);
         }
+    }
+
+    #[test]
+    fn test_split_large_chunk_small_is_passthrough() {
+        let chunk = CodeChunk {
+            text: "fn small() { 42 }".to_string(),
+            start_line: 1,
+            end_line: 1,
+        };
+        let result = split_large_chunk(chunk, 800, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "fn small() { 42 }");
+    }
+
+    #[test]
+    fn test_split_large_chunk_splits_oversized() {
+        // Build a fake large function: 50 lines of ~30 chars each = ~1500 chars
+        let source = (1..=50u32)
+            .map(|i| format!("    let variable_{i} = {i} * {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(source.len() > 800, "test source too short");
+
+        let chunk = CodeChunk {
+            text: source.clone(),
+            start_line: 10,
+            end_line: 59,
+        };
+        let result = split_large_chunk(chunk, 800, 3);
+
+        // Should have produced multiple sub-chunks
+        assert!(
+            result.len() > 1,
+            "expected multiple chunks, got {}",
+            result.len()
+        );
+
+        // Each sub-chunk must fit within the char budget
+        for c in &result {
+            assert!(
+                c.text.len() <= 850,
+                "sub-chunk too large: {} chars",
+                c.text.len()
+            );
+        }
+
+        // All content is covered: first and last lines appear somewhere
+        let all_text = result
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("variable_1"), "first line missing");
+        assert!(all_text.contains("variable_50"), "last line missing");
+
+        // Line numbers are correctly offset from the original start_line
+        assert_eq!(result[0].start_line, 10);
+        assert!(result.last().unwrap().end_line <= 59);
+    }
+
+    #[test]
+    fn test_split_large_chunk_overlap_repeats_lines() {
+        // 30 lines × 40 chars = 1200 chars; split at 400 chars with 3-line overlap
+        let source = (1..=30u32)
+            .map(|i| format!("line-content-{i:02}-padding-here"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let chunk = CodeChunk {
+            text: source,
+            start_line: 1,
+            end_line: 30,
+        };
+        let chunks = split_large_chunk(chunk, 400, 3);
+
+        // Overlapping lines should appear in consecutive chunks
+        if chunks.len() >= 2 {
+            let last_lines_of_first: Vec<&str> = chunks[0].text.lines().rev().take(3).collect();
+            let first_lines_of_second: Vec<&str> = chunks[1].text.lines().take(3).collect();
+            // At least one overlap line should appear in both
+            let overlap_count = last_lines_of_first
+                .iter()
+                .filter(|l| first_lines_of_second.contains(l))
+                .count();
+            assert!(overlap_count > 0, "no overlap between consecutive chunks");
+        }
+    }
+
+    #[test]
+    fn test_repo_indexer_uses_correct_chunk_size() {
+        // Verify that the constants we ship stay within the model's context window.
+        // AllMiniLML6V2: 256 tokens max ≈ 1024 chars at 4 chars/token.
+        let max_safe_chars = 1024usize;
+
+        // Fallback line-based chunks: CHUNK_SIZE_LINES lines × avg 60 chars/line
+        let max_fallback_chars = super::super::CHUNK_SIZE_LINES * 60;
+        assert!(
+            max_fallback_chars <= max_safe_chars,
+            "CHUNK_SIZE_LINES ({}) produces chunks up to {max_fallback_chars} chars, \
+             exceeding model limit of {max_safe_chars}",
+            super::super::CHUNK_SIZE_LINES,
+        );
+
+        // MAX_EMBED_CHARS is the hard ceiling applied after tree-sitter extraction
+        assert!(
+            super::super::MAX_EMBED_CHARS <= max_safe_chars,
+            "MAX_EMBED_CHARS ({}) exceeds model limit",
+            super::super::MAX_EMBED_CHARS,
+        );
     }
 }
