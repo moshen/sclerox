@@ -140,12 +140,28 @@ impl Database {
         Ok(())
     }
 
+    pub fn project_unlink_person(&self, project_id: i64, person_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM project_people WHERE project_id = ?1 AND person_id = ?2",
+            params![project_id, person_id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn project_link_meeting(&self, project_id: i64, meeting_id: i64) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO project_meetings (project_id, meeting_id) VALUES (?1, ?2)",
             params![project_id, meeting_id],
         )?;
         Ok(())
+    }
+
+    pub fn project_unlink_meeting(&self, project_id: i64, meeting_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM project_meetings WHERE project_id = ?1 AND meeting_id = ?2",
+            params![project_id, meeting_id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn project_people(&self, project_id: i64) -> Result<Vec<ProjectPerson>> {

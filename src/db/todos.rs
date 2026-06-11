@@ -220,6 +220,48 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn todo_link_project(&self, todo_id: i64, project_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO todo_projects (todo_id, project_id) VALUES (?1, ?2)",
+            params![todo_id, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn todo_unlink_project(&self, todo_id: i64, project_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM todo_projects WHERE todo_id = ?1 AND project_id = ?2",
+            params![todo_id, project_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn todo_projects(&self, todo_id: i64) -> Result<Vec<crate::db::projects::Project>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.description, p.links, p.created_at, p.updated_at
+             FROM projects p
+             JOIN todo_projects tp ON p.id = tp.project_id
+             WHERE tp.todo_id = ?1
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map(params![todo_id], |row| {
+            let links_json: Option<String> = row.get(3)?;
+            let links = links_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            Ok(crate::db::projects::Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                links,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// History: search completed items, optionally filtered by date range.
     pub fn todo_history(
         &self,

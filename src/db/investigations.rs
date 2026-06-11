@@ -253,6 +253,47 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn investigation_unlink_project(
+        &self,
+        investigation_id: i64,
+        project_id: i64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM investigation_projects WHERE investigation_id = ?1 AND project_id = ?2",
+            params![investigation_id, project_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn investigation_projects(
+        &self,
+        investigation_id: i64,
+    ) -> Result<Vec<crate::db::projects::Project>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.description, p.links, p.created_at, p.updated_at
+             FROM projects p
+             JOIN investigation_projects ip ON p.id = ip.project_id
+             WHERE ip.investigation_id = ?1
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map(params![investigation_id], |row| {
+            let links_json: Option<String> = row.get(3)?;
+            let links = links_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            Ok(crate::db::projects::Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                links,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn row_to_investigation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Investigation> {

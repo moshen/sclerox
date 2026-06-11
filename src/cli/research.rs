@@ -66,8 +66,19 @@ pub enum ResearchCommand {
     /// Manage people linked to an investigation
     #[command(subcommand)]
     People(ResearchPeopleCmd),
-    /// Link a project to an investigation
-    LinkProject { id: i64, project_id: i64 },
+    /// Manage projects linked to an investigation
+    #[command(subcommand)]
+    Projects(ResearchProjectsCmd),
+}
+
+#[derive(clap::Subcommand)]
+pub enum ResearchProjectsCmd {
+    /// Link a project to this investigation
+    Add { id: i64, project_id: i64 },
+    /// Remove a project from this investigation
+    Remove { id: i64, project_id: i64 },
+    /// List projects on this investigation
+    List { id: i64 },
 }
 
 #[derive(clap::Subcommand)]
@@ -257,10 +268,31 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             }
         },
 
-        ResearchCommand::LinkProject { id, project_id } => {
-            db.investigation_link_project(id, project_id)?;
-            println!("Linked project #{project_id} to investigation #{id}");
-        }
+        ResearchCommand::Projects(sub) => match sub {
+            ResearchProjectsCmd::Add { id, project_id } => {
+                db.investigation_link_project(id, project_id)?;
+                println!("Linked project #{project_id} to investigation #{id}");
+            }
+            ResearchProjectsCmd::Remove { id, project_id } => {
+                if db.investigation_unlink_project(id, project_id)? {
+                    println!("Removed project #{project_id} from investigation #{id}");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            ResearchProjectsCmd::List { id } => {
+                let projects = db.investigation_projects(id)?;
+                print_output(format, &projects, || {
+                    if projects.is_empty() {
+                        println!("No projects on investigation #{id}");
+                    } else {
+                        for p in &projects {
+                            println!("#{} {}", p.id, p.name);
+                        }
+                    }
+                });
+            }
+        },
     }
     Ok(())
 }

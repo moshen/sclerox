@@ -29,21 +29,39 @@ pub enum ProjectCommand {
         #[arg(long)]
         description: Option<String>,
     },
+    /// Manage people on this project
+    #[command(subcommand)]
+    People(ProjectPeopleCmd),
+    /// Manage meetings on this project
+    #[command(subcommand)]
+    Meetings(ProjectMeetingsCmd),
+    /// Delete a project
+    Delete { id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ProjectPeopleCmd {
     /// Link a person to this project
-    LinkPerson {
+    Add {
         project_id: i64,
         person_id: i64,
         #[arg(long)]
         role: Option<String>,
     },
+    /// Remove a person from this project
+    Remove { project_id: i64, person_id: i64 },
+    /// List people on this project
+    List { project_id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ProjectMeetingsCmd {
     /// Link a meeting to this project
-    LinkMeeting { project_id: i64, meeting_id: i64 },
-    /// List people on a project
-    People { project_id: i64 },
-    /// List meetings on a project
-    Meetings { project_id: i64 },
-    /// Delete a project
-    Delete { id: i64 },
+    Add { project_id: i64, meeting_id: i64 },
+    /// Remove a meeting from this project
+    Remove { project_id: i64, meeting_id: i64 },
+    /// List meetings on this project
+    List { project_id: i64 },
 }
 
 pub fn run(db: &Database, cmd: ProjectCommand) -> Result<()> {
@@ -128,46 +146,68 @@ pub fn run(db: &Database, cmd: ProjectCommand) -> Result<()> {
             }
         }
 
-        ProjectCommand::LinkPerson {
-            project_id,
-            person_id,
-            role,
-        } => {
-            db.project_link_person(project_id, person_id, role.as_deref())?;
-            println!("Linked person #{person_id} to project #{project_id}");
-        }
-
-        ProjectCommand::LinkMeeting {
-            project_id,
-            meeting_id,
-        } => {
-            db.project_link_meeting(project_id, meeting_id)?;
-            println!("Linked meeting #{meeting_id} to project #{project_id}");
-        }
-
-        ProjectCommand::People { project_id } => {
-            let people = db.project_people(project_id)?;
-            if people.is_empty() {
-                println!("No people on project #{project_id}");
-            } else {
-                for p in &people {
-                    let role = p.role.as_deref().unwrap_or("member");
-                    println!("#{} {} ({})", p.person_id, p.person_name, role);
+        ProjectCommand::People(sub) => match sub {
+            ProjectPeopleCmd::Add {
+                project_id,
+                person_id,
+                role,
+            } => {
+                db.project_link_person(project_id, person_id, role.as_deref())?;
+                println!("Linked person #{person_id} to project #{project_id}");
+            }
+            ProjectPeopleCmd::Remove {
+                project_id,
+                person_id,
+            } => {
+                if db.project_unlink_person(project_id, person_id)? {
+                    println!("Removed person #{person_id} from project #{project_id}");
+                } else {
+                    println!("Link not found");
                 }
             }
-        }
-
-        ProjectCommand::Meetings { project_id } => {
-            let meetings = db.project_meetings_list(project_id)?;
-            if meetings.is_empty() {
-                println!("No meetings linked to project #{project_id}");
-            } else {
-                for m in &meetings {
-                    let date = m.meeting_date.as_deref().unwrap_or("no date");
-                    println!("#{} [{}] {}", m.id, date, m.title);
+            ProjectPeopleCmd::List { project_id } => {
+                let people = db.project_people(project_id)?;
+                if people.is_empty() {
+                    println!("No people on project #{project_id}");
+                } else {
+                    for p in &people {
+                        let role = p.role.as_deref().unwrap_or("member");
+                        println!("#{} {} ({})", p.person_id, p.person_name, role);
+                    }
                 }
             }
-        }
+        },
+
+        ProjectCommand::Meetings(sub) => match sub {
+            ProjectMeetingsCmd::Add {
+                project_id,
+                meeting_id,
+            } => {
+                db.project_link_meeting(project_id, meeting_id)?;
+                println!("Linked meeting #{meeting_id} to project #{project_id}");
+            }
+            ProjectMeetingsCmd::Remove {
+                project_id,
+                meeting_id,
+            } => {
+                if db.project_unlink_meeting(project_id, meeting_id)? {
+                    println!("Removed meeting #{meeting_id} from project #{project_id}");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            ProjectMeetingsCmd::List { project_id } => {
+                let meetings = db.project_meetings_list(project_id)?;
+                if meetings.is_empty() {
+                    println!("No meetings on project #{project_id}");
+                } else {
+                    for m in &meetings {
+                        let date = m.meeting_date.as_deref().unwrap_or("no date");
+                        println!("#{} [{}] {}", m.id, date, m.title);
+                    }
+                }
+            }
+        },
 
         ProjectCommand::Delete { id } => {
             if db.project_delete(id)? {

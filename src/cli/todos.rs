@@ -81,6 +81,9 @@ pub enum TodoCommand {
     /// Manage people linked to a todo
     #[command(subcommand)]
     People(PeopleCmd),
+    /// Manage projects linked to a todo
+    #[command(subcommand)]
+    Projects(TodoProjectsCmd),
 }
 
 #[derive(clap::Subcommand)]
@@ -90,6 +93,16 @@ pub enum PeopleCmd {
     /// Remove a person link from this todo
     Remove { todo_id: i64, person_id: i64 },
     /// List people linked to this todo
+    List { todo_id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum TodoProjectsCmd {
+    /// Link a project to this todo
+    Add { todo_id: i64, project_id: i64 },
+    /// Remove a project link from this todo
+    Remove { todo_id: i64, project_id: i64 },
+    /// List projects linked to this todo
     List { todo_id: i64 },
 }
 
@@ -255,6 +268,38 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                         for p in &people {
                             let email = p.email.as_deref().unwrap_or("-");
                             println!("#{} {} <{}>", p.id, p.name, email);
+                        }
+                    }
+                });
+            }
+        },
+
+        TodoCommand::Projects(sub) => match sub {
+            TodoProjectsCmd::Add {
+                todo_id,
+                project_id,
+            } => {
+                db.todo_link_project(todo_id, project_id)?;
+                println!("Linked project #{project_id} to todo #{todo_id}");
+            }
+            TodoProjectsCmd::Remove {
+                todo_id,
+                project_id,
+            } => {
+                if db.todo_unlink_project(todo_id, project_id)? {
+                    println!("Removed project #{project_id} from todo #{todo_id}");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            TodoProjectsCmd::List { todo_id } => {
+                let projects = db.todo_projects(todo_id)?;
+                print_output(format, &projects, || {
+                    if projects.is_empty() {
+                        println!("No projects linked to todo #{todo_id}");
+                    } else {
+                        for p in &projects {
+                            println!("#{} {}", p.id, p.name);
                         }
                     }
                 });

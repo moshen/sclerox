@@ -476,7 +476,8 @@ fn project_lifecycle() {
 
     e.run(&[
         "project",
-        "link-person",
+        "people",
+        "add",
         &project_id.to_string(),
         &person_id.to_string(),
         "--role",
@@ -484,7 +485,8 @@ fn project_lifecycle() {
     ]);
     e.run(&[
         "project",
-        "link-meeting",
+        "meetings",
+        "add",
         &project_id.to_string(),
         &meeting_id.to_string(),
     ]);
@@ -492,7 +494,7 @@ fn project_lifecycle() {
     let linked = e.run(&["project", "get", &project_id.to_string()]);
     assert!(linked.contains("Dave"));
 
-    let meetings = e.run(&["project", "meetings", &project_id.to_string()]);
+    let meetings = e.run(&["project", "meetings", "list", &project_id.to_string()]);
     assert!(meetings.contains("Kickoff"));
 
     let search = e.run(&["project", "search", "OAuth2"]);
