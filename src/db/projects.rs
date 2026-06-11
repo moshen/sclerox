@@ -205,6 +205,44 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub fn project_link_repo(&self, project_id: i64, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO project_repos (project_id, repo_id) VALUES (?1, ?2)",
+            params![project_id, repo_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn project_unlink_repo(&self, project_id: i64, repo_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM project_repos WHERE project_id = ?1 AND repo_id = ?2",
+            params![project_id, repo_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn project_repos_list(&self, project_id: i64) -> Result<Vec<crate::db::repos::RepoEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at
+             FROM repos r
+             JOIN project_repos pr ON r.id = pr.repo_id
+             WHERE pr.project_id = ?1
+             ORDER BY r.name",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(crate::db::repos::RepoEntry {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                db_path: row.get(4)?,
+                last_indexed: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -277,6 +315,55 @@ mod tests {
         let meetings = db.project_meetings_list(project_id).unwrap();
         assert_eq!(meetings.len(), 1);
         assert_eq!(meetings[0].title, "Kickoff");
+    }
+
+    #[test]
+    fn test_project_link_repos() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = db.project_add("Auth Platform", None, &[]).unwrap();
+        let repo_a = db
+            .repo_register(
+                "/repos/auth-service",
+                "auth-service",
+                None,
+                "/repos/auth-service/.ol/repo.db",
+                None,
+            )
+            .unwrap();
+        let repo_b = db
+            .repo_register(
+                "/repos/user-service",
+                "user-service",
+                None,
+                "/repos/user-service/.ol/repo.db",
+                None,
+            )
+            .unwrap();
+
+        db.project_link_repo(project_id, repo_a).unwrap();
+        db.project_link_repo(project_id, repo_b).unwrap();
+
+        let repos = db.project_repos_list(project_id).unwrap();
+        assert_eq!(repos.len(), 2);
+        let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"auth-service"));
+        assert!(names.contains(&"user-service"));
+    }
+
+    #[test]
+    fn test_project_unlink_repo() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = db.project_add("Proj", None, &[]).unwrap();
+        let repo_id = db
+            .repo_register("/repos/svc", "svc", None, "/repos/svc/.ol/repo.db", None)
+            .unwrap();
+
+        db.project_link_repo(project_id, repo_id).unwrap();
+        assert_eq!(db.project_repos_list(project_id).unwrap().len(), 1);
+
+        assert!(db.project_unlink_repo(project_id, repo_id).unwrap());
+        assert!(db.project_repos_list(project_id).unwrap().is_empty());
+        assert!(!db.project_unlink_repo(project_id, repo_id).unwrap());
     }
 
     #[test]

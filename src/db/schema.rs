@@ -288,6 +288,15 @@ CREATE TABLE IF NOT EXISTS memory_people (
 );
 ";
 
+/// Migration v4: project_repos junction table.
+pub const MIGRATION_V4: &str = "
+CREATE TABLE IF NOT EXISTS project_repos (
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    repo_id    INTEGER NOT NULL REFERENCES repos(id)    ON DELETE CASCADE,
+    PRIMARY KEY (project_id, repo_id)
+);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;

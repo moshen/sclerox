@@ -35,6 +35,9 @@ pub enum ProjectCommand {
     /// Manage meetings on this project
     #[command(subcommand)]
     Meetings(ProjectMeetingsCmd),
+    /// Manage repos on this project
+    #[command(subcommand)]
+    Repos(ProjectReposCmd),
     /// Delete a project
     Delete { id: i64 },
 }
@@ -61,6 +64,16 @@ pub enum ProjectMeetingsCmd {
     /// Remove a meeting from this project
     Remove { project_id: i64, meeting_id: i64 },
     /// List meetings on this project
+    List { project_id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ProjectReposCmd {
+    /// Link a repo to this project (use the repo ID from `ol repo list`)
+    Add { project_id: i64, repo_id: i64 },
+    /// Remove a repo from this project
+    Remove { project_id: i64, repo_id: i64 },
+    /// List repos on this project
     List { project_id: i64 },
 }
 
@@ -204,6 +217,36 @@ pub fn run(db: &Database, cmd: ProjectCommand) -> Result<()> {
                     for m in &meetings {
                         let date = m.meeting_date.as_deref().unwrap_or("no date");
                         println!("#{} [{}] {}", m.id, date, m.title);
+                    }
+                }
+            }
+        },
+
+        ProjectCommand::Repos(sub) => match sub {
+            ProjectReposCmd::Add {
+                project_id,
+                repo_id,
+            } => {
+                db.project_link_repo(project_id, repo_id)?;
+                println!("Linked repo #{repo_id} to project #{project_id}");
+            }
+            ProjectReposCmd::Remove {
+                project_id,
+                repo_id,
+            } => {
+                if db.project_unlink_repo(project_id, repo_id)? {
+                    println!("Removed repo #{repo_id} from project #{project_id}");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            ProjectReposCmd::List { project_id } => {
+                let repos = db.project_repos_list(project_id)?;
+                if repos.is_empty() {
+                    println!("No repos on project #{project_id}");
+                } else {
+                    for r in &repos {
+                        println!("#{} {} - {}", r.id, r.name, r.path);
                     }
                 }
             }

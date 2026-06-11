@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 3;
+pub const PRIMARY_VERSION: u32 = 4;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 1;
@@ -35,6 +35,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 3,
         description: "add memory_people junction table",
         sql: crate::db::schema::MIGRATION_V3,
+    },
+    Migration {
+        version: 4,
+        description: "add project_repos junction table",
+        sql: crate::db::schema::MIGRATION_V4,
     },
 ];
 
