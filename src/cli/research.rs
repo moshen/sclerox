@@ -63,10 +63,21 @@ pub enum ResearchCommand {
     },
     /// List sources for an investigation
     Sources { id: i64 },
-    /// Link a person to an investigation
-    LinkPerson { id: i64, person_id: i64 },
+    /// Manage people linked to an investigation
+    #[command(subcommand)]
+    People(ResearchPeopleCmd),
     /// Link a project to an investigation
     LinkProject { id: i64, project_id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ResearchPeopleCmd {
+    /// Link a person to this investigation
+    Add { id: i64, person_id: i64 },
+    /// Remove a person from this investigation
+    Remove { id: i64, person_id: i64 },
+    /// List people on this investigation
+    List { id: i64 },
 }
 
 pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<()> {
@@ -219,10 +230,32 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             });
         }
 
-        ResearchCommand::LinkPerson { id, person_id } => {
-            db.investigation_link_person(id, person_id)?;
-            println!("Linked person #{person_id} to investigation #{id}");
-        }
+        ResearchCommand::People(sub) => match sub {
+            ResearchPeopleCmd::Add { id, person_id } => {
+                db.investigation_link_person(id, person_id)?;
+                println!("Linked person #{person_id} to investigation #{id}");
+            }
+            ResearchPeopleCmd::Remove { id, person_id } => {
+                if db.investigation_unlink_person(id, person_id)? {
+                    println!("Removed person #{person_id} from investigation #{id}");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            ResearchPeopleCmd::List { id } => {
+                let people = db.investigation_people(id)?;
+                print_output(format, &people, || {
+                    if people.is_empty() {
+                        println!("No people on investigation #{id}");
+                    } else {
+                        for p in &people {
+                            let email = p.email.as_deref().unwrap_or("-");
+                            println!("#{} {} <{}>", p.id, p.name, email);
+                        }
+                    }
+                });
+            }
+        },
 
         ResearchCommand::LinkProject { id, project_id } => {
             db.investigation_link_project(id, project_id)?;

@@ -205,6 +205,47 @@ impl Database {
         Ok(())
     }
 
+    pub fn investigation_unlink_person(
+        &self,
+        investigation_id: i64,
+        person_id: i64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM investigation_people WHERE investigation_id = ?1 AND person_id = ?2",
+            params![investigation_id, person_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn investigation_people(
+        &self,
+        investigation_id: i64,
+    ) -> Result<Vec<crate::db::people::Person>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url,
+                    p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
+             FROM people p
+             JOIN investigation_people ip ON p.id = ip.person_id
+             WHERE ip.investigation_id = ?1
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map(params![investigation_id], |row| {
+            Ok(crate::db::people::Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                email: row.get(2)?,
+                slack_id: row.get(3)?,
+                slack_url: row.get(4)?,
+                github_username: row.get(5)?,
+                github_url: row.get(6)?,
+                notes: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn investigation_link_project(&self, investigation_id: i64, project_id: i64) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO investigation_projects (investigation_id, project_id) VALUES (?1, ?2)",
@@ -358,5 +399,44 @@ mod tests {
             inv.concluded_at.is_none(),
             "concluded_at should be cleared on reopen"
         );
+    }
+
+    #[test]
+    fn test_investigation_link_people() {
+        let db = db();
+        let inv_id = db
+            .investigation_start("Auth spike", "auth-spike", None)
+            .unwrap();
+        let alice = db
+            .people_add("Alice", Some("alice@x.com"), None, None, None, None, None)
+            .unwrap();
+        let bob = db
+            .people_add("Bob", Some("bob@x.com"), None, None, None, None, None)
+            .unwrap();
+
+        db.investigation_link_person(inv_id, alice).unwrap();
+        db.investigation_link_person(inv_id, bob).unwrap();
+
+        let people = db.investigation_people(inv_id).unwrap();
+        assert_eq!(people.len(), 2);
+        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Alice"));
+        assert!(names.contains(&"Bob"));
+    }
+
+    #[test]
+    fn test_investigation_unlink_person() {
+        let db = db();
+        let inv_id = db.investigation_start("Perf", "perf", None).unwrap();
+        let person_id = db
+            .people_add("Carol", None, None, None, None, None, None)
+            .unwrap();
+
+        db.investigation_link_person(inv_id, person_id).unwrap();
+        assert_eq!(db.investigation_people(inv_id).unwrap().len(), 1);
+
+        assert!(db.investigation_unlink_person(inv_id, person_id).unwrap());
+        assert!(db.investigation_people(inv_id).unwrap().is_empty());
+        assert!(!db.investigation_unlink_person(inv_id, person_id).unwrap());
     }
 }
