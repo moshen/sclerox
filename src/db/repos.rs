@@ -134,6 +134,60 @@ impl Database {
             .execute("DELETE FROM repos WHERE path = ?1", params![path])?;
         Ok(n > 0)
     }
+
+    /// Check all registered repos and return health actions for each.
+    /// Does not perform any writes - callers act on the returned report.
+    pub fn repo_health_check(&self) -> Result<Vec<RepoHealth>> {
+        let repos = self.repo_list()?;
+        let mut report = Vec::new();
+
+        for repo in repos {
+            let path = std::path::Path::new(&repo.path);
+            let db_path = std::path::Path::new(&repo.db_path);
+
+            let status = if !path.exists() {
+                RepoHealthStatus::DirectoryGone
+            } else if !db_path.exists() {
+                RepoHealthStatus::DbMissing
+            } else {
+                // Check repo DB schema version
+                match crate::index::repo_db::RepoDb::open(db_path) {
+                    Ok(rdb) => match rdb.migration_status() {
+                        Ok((current, target, _)) if current < target => {
+                            RepoHealthStatus::SchemaBehind { current, target }
+                        }
+                        Ok(_) => RepoHealthStatus::Ok,
+                        Err(e) => RepoHealthStatus::Error(e.to_string()),
+                    },
+                    Err(e) => RepoHealthStatus::Error(e.to_string()),
+                }
+            };
+
+            report.push(RepoHealth { repo, status });
+        }
+
+        Ok(report)
+    }
+}
+
+#[derive(Debug)]
+pub struct RepoHealth {
+    pub repo: RepoEntry,
+    pub status: RepoHealthStatus,
+}
+
+#[derive(Debug)]
+pub enum RepoHealthStatus {
+    /// Repo is indexed and schema is current.
+    Ok,
+    /// Repo directory no longer exists - should be removed from registry.
+    DirectoryGone,
+    /// Repo directory exists but the DB file is missing - needs reindex.
+    DbMissing,
+    /// DB exists but its schema is behind the current version.
+    SchemaBehind { current: u32, target: u32 },
+    /// Could not open the DB.
+    Error(String),
 }
 
 fn row_to_repo(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoEntry> {

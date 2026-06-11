@@ -41,6 +41,20 @@ pub enum RepoCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Search symbols across all indexed repos
+    ///
+    /// Automatically heals the registry before searching:
+    /// removes repos whose directories are gone, reindexes repos whose
+    /// DB is missing, and migrates DBs that are behind the current schema.
+    SearchSymbols { query: String },
+    /// Check and heal all registered repos
+    ///
+    /// Removes stale entries, reindexes missing DBs, migrates old schemas.
+    Sync {
+        /// Also re-index all repos even if their DB is current
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
@@ -169,7 +183,100 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 println!("Repo not found in registry: {}", canonical.display());
             }
         }
+
+        RepoCommand::SearchSymbols { query } => {
+            heal_repos(db, false)?;
+
+            let repos = db.repo_list()?;
+            if repos.is_empty() {
+                println!("No repos indexed. Run `ol repo index [path]` first.");
+                return Ok(());
+            }
+
+            let mut any = false;
+            for repo in &repos {
+                let db_path = PathBuf::from(&repo.db_path);
+                if !db_path.exists() {
+                    continue;
+                }
+                let repo_db = match RepoDb::open(&db_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let results = repo_db.search_symbols(&query)?;
+                for s in &results {
+                    let sig = s.signature.as_deref().unwrap_or(&s.name);
+                    println!(
+                        "[{}] {} ({}/{}:{})",
+                        s.kind, sig, repo.name, s.file_path, s.start_line
+                    );
+                    any = true;
+                }
+            }
+            if !any {
+                println!("No symbols match: {query}");
+                println!("Tip: run `ol repo index [path]` to index a repository first.");
+            }
+        }
+
+        RepoCommand::Sync { force } => {
+            heal_repos(db, force)?;
+        }
     }
+    Ok(())
+}
+
+/// Check all registered repos, apply automatic repairs, and print a summary.
+/// If `force` is true, reindex every repo regardless of current state.
+fn heal_repos(db: &Database, force: bool) -> anyhow::Result<()> {
+    use crate::db::repos::RepoHealthStatus;
+
+    let health = db.repo_health_check()?;
+    if health.is_empty() {
+        return Ok(());
+    }
+
+    for h in &health {
+        match &h.status {
+            RepoHealthStatus::Ok if !force => {} // nothing to do
+
+            RepoHealthStatus::DirectoryGone => {
+                println!("Removing stale entry: {} (directory gone)", h.repo.name);
+                db.repo_remove(&h.repo.path)?;
+            }
+
+            RepoHealthStatus::DbMissing | RepoHealthStatus::Ok => {
+                // DbMissing: reindex from scratch.  Ok + force: reindex anyway.
+                let action = if force {
+                    "Re-indexing"
+                } else {
+                    "Reindexing missing DB for"
+                };
+                println!("{action}: {}", h.repo.name);
+                let path = std::path::Path::new(&h.repo.path);
+                let mut indexer = crate::index::RepoIndexer::new(None);
+                match indexer.index_repo(db, path, h.repo.description.as_deref()) {
+                    Ok(r) => println!("  {} files indexed, {} symbols", r.files_indexed, r.symbols),
+                    Err(e) => println!("  failed: {e}"),
+                }
+            }
+
+            RepoHealthStatus::SchemaBehind { current, target } => {
+                println!("Migrating {}: schema v{current} → v{target}", h.repo.name);
+                // Opening the repo DB runs migrations automatically.
+                let db_path = std::path::Path::new(&h.repo.db_path);
+                match RepoDb::open(db_path) {
+                    Ok(_) => println!("  migrated"),
+                    Err(e) => println!("  failed: {e}"),
+                }
+            }
+
+            RepoHealthStatus::Error(e) => {
+                println!("Error with {}: {e}", h.repo.name);
+            }
+        }
+    }
+
     Ok(())
 }
 

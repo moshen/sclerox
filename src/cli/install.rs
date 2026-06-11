@@ -314,7 +314,7 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
 fn skill_file_content() -> &'static str {
     r#"# ol - Operating Layer Knowledge Base
 
-Use when the user asks about people, meetings, projects, todos, past decisions, or research — or when knowledge base context would help.
+Use when the user asks about people, meetings, projects, todos, past decisions, research, or code — or when knowledge base context would help.
 
 ## When to use
 
@@ -322,18 +322,19 @@ Use when the user asks about people, meetings, projects, todos, past decisions, 
 - Colleague mentioned: look them up for contact details
 - Past decision referenced: search memory and investigations
 - After learning something: save to memory for future sessions
+- Looking for code: search symbols across all indexed repos
 
 ## Commands
 
 ```bash
-# Global search across all tables
+# Global search (memory, people, meetings, projects, todos, investigations)
 ol search "<query>"
 
 # Memory
 ol memory set <key> "<value>" --type user|feedback|project|reference
+ol memory get <key>
 ol memory search "<query>"
-ol memory people add <key> <person_id>    # attribute a memory to someone
-ol memory people list <key>
+ol memory people add|remove|list <key> <person_id>
 
 # People
 ol people search "<name or email>"
@@ -342,36 +343,46 @@ ol people add --name "<name>" --email "<email>"
 # Meetings
 ol meeting search "<topic>"
 ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
-ol meeting people add <meeting_id> <person_id> [--role "<role>"]
-ol meeting people list <meeting_id>
+ol meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"]
 
 # Todos
-ol todo list                         # open todos
+ol todo list                                    # open todos
 ol todo add --title "<title>" [--category slack|github|email|meeting|general]
 ol todo done <id> [--note "<resolution>"]
-ol todo history [<query>]            # search completed todos
-ol todo people add <todo_id> <person_id>
-ol todo people list <todo_id>
+ol todo history [<query>]                       # search completed todos
+ol todo people add|remove|list <todo_id> <person_id>
+ol todo projects add|remove|list <todo_id> <project_id>
 
 # Research / Investigations
-ol research list                     # open investigations
+ol research list                                # open investigations
 ol research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
 ol research add-source <id> --url "<url>" --label "<label>"
+ol research update <id> [--plan "<text>"] [--findings "<text>"]
 ol research conclude <id> --findings "<findings>"
+ol research reopen <id>
 ol research search "<query>"
-ol research people add <id> <person_id>
-ol research people list <id>
+ol research people add|remove|list <id> <person_id>
+ol research projects add|remove|list <id> <project_id>
 
 # Projects
 ol project search "<description>"
+ol project get <id>
+ol project add --name "<name>" [--description "<desc>"] [--link "url|label"]
+ol project people add|remove|list <project_id> <person_id> [--role "<role>"]
+ol project meetings add|remove|list <project_id> <meeting_id>
+ol project repos add|remove|list <project_id> <repo_id>
 
-# Repos
-ol repo show [path] [--symbols "<query>"]
+# Repos (code search)
+ol repo list                                    # all indexed repos
+ol repo search-symbols "<query>"                # search symbols across all repos
+ol repo show [path] [--symbols "<query>"]       # symbols in a specific repo
+ol repo index [path]                            # index (or re-index) a repo
 ```
 
 ## Patterns
 
 **Before any task:** `ol search "<topic>"`
+**Finding code:** `ol repo search-symbols "<function or type name>"`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **After research:** `ol research conclude <id> --findings "<findings>"`
 **Attributing a memory:** `ol memory people add <key> <person_id>`
