@@ -13,7 +13,17 @@ pub struct MemoryEntry {
     pub tags: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
+    /// active | stale | superseded
+    pub status: String,
+    /// manual | claude-auto | session
+    pub source: String,
+    /// key of the memory that replaced this one
+    pub superseded_by: Option<String>,
+    pub reviewed_at: Option<String>,
 }
+
+const MEMORY_COLS: &str =
+    "id, key, value, memory_type, tags, created_at, updated_at, status, source, superseded_by, reviewed_at";
 
 impl Database {
     pub fn memory_set(
@@ -23,45 +33,67 @@ impl Database {
         memory_type: &str,
         tags: Option<&[String]>,
     ) -> Result<i64> {
+        self.memory_set_full(key, value, memory_type, tags, "manual")
+    }
+
+    /// Insert or update a memory entry with explicit source tracking.
+    pub fn memory_set_full(
+        &self,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        tags: Option<&[String]>,
+        source: &str,
+    ) -> Result<i64> {
         let tags_json = tags.map(|t| serde_json::to_string(t).unwrap());
         self.conn.execute(
-            "INSERT INTO memory (key, value, memory_type, tags)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO memory (key, value, memory_type, tags, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) DO UPDATE SET
-               value = excluded.value,
+               value      = excluded.value,
                memory_type = excluded.memory_type,
-               tags = excluded.tags,
+               tags       = excluded.tags,
+               status     = 'active',
                updated_at = datetime('now')",
-            params![key, value, memory_type, tags_json],
+            params![key, value, memory_type, tags_json, source],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub fn memory_get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, key, value, memory_type, tags, created_at, updated_at
-             FROM memory WHERE key = ?1",
-        )?;
-        let result = stmt.query_row(params![key], row_to_memory);
-        match result {
-            Ok(entry) => Ok(Some(entry)),
+        let sql = format!("SELECT {MEMORY_COLS} FROM memory WHERE key = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        match stmt.query_row(params![key], row_to_memory) {
+            Ok(e) => Ok(Some(e)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn memory_list(&self, memory_type: Option<&str>) -> Result<Vec<MemoryEntry>> {
-        let sql = match memory_type {
-            Some(_) => {
-                "SELECT id, key, value, memory_type, tags, created_at, updated_at
-                        FROM memory WHERE memory_type = ?1 ORDER BY updated_at DESC"
-            }
-            None => {
-                "SELECT id, key, value, memory_type, tags, created_at, updated_at
-                     FROM memory ORDER BY updated_at DESC"
-            }
+    /// List memories. Defaults to active only; pass status="all" to include stale/superseded.
+    pub fn memory_list(
+        &self,
+        memory_type: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let status_clause = match status {
+            Some("all") => "1=1".to_string(),
+            Some(s) => format!("status = '{s}'"),
+            None => "status = 'active'".to_string(),
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = match memory_type {
+            Some(_) => format!(
+                "SELECT {MEMORY_COLS} FROM memory
+                 WHERE memory_type = ?1 AND {status_clause}
+                 ORDER BY updated_at DESC"
+            ),
+            None => format!(
+                "SELECT {MEMORY_COLS} FROM memory
+                 WHERE {status_clause}
+                 ORDER BY updated_at DESC"
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = if let Some(t) = memory_type {
             stmt.query_map(params![t], row_to_memory)?
         } else {
@@ -70,14 +102,25 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Search active memories by default. Pass status="all" to search everything.
     pub fn memory_search(&self, query: &str) -> Result<Vec<MemoryEntry>> {
+        self.memory_search_filtered(query, "active")
+    }
+
+    pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
         let query = fts::sanitize(query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, key, value, memory_type, tags, created_at, updated_at
-             FROM memory
+        let status_clause = if status == "all" {
+            "1=1".to_string()
+        } else {
+            format!("status = '{status}'")
+        };
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory
              WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
-             ORDER BY updated_at DESC",
-        )?;
+               AND {status_clause}
+             ORDER BY updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![query], row_to_memory)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -87,6 +130,93 @@ impl Database {
             .conn
             .execute("DELETE FROM memory WHERE key = ?1", params![key])?;
         Ok(n > 0)
+    }
+
+    /// Mark a memory as stale (no longer reliable). Appends an optional reason to the value.
+    /// Stale memories are excluded from default list/search but preserved for history.
+    pub fn memory_stale(&self, key: &str, reason: Option<&str>) -> Result<bool> {
+        let note = reason
+            .map(|r| format!("\n[stale: {r}]"))
+            .unwrap_or_default();
+        let n = self.conn.execute(
+            "UPDATE memory
+             SET status = 'stale',
+                 value = value || ?1,
+                 updated_at = datetime('now')
+             WHERE key = ?2 AND status = 'active'",
+            params![note, key],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Replace an old memory with a new one in a single atomic operation.
+    /// The old entry is marked superseded and its superseded_by field points to the new key.
+    pub fn memory_supersede(
+        &self,
+        old_key: &str,
+        new_key: &str,
+        new_value: &str,
+        memory_type: &str,
+    ) -> Result<bool> {
+        // Check old key exists
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT count(*) > 0 FROM memory WHERE key = ?1",
+                params![old_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        // Create new entry
+        tx.execute(
+            "INSERT INTO memory (key, value, memory_type, source)
+             VALUES (?1, ?2, ?3, 'manual')
+             ON CONFLICT(key) DO UPDATE SET
+               value = excluded.value,
+               memory_type = excluded.memory_type,
+               status = 'active',
+               updated_at = datetime('now')",
+            params![new_key, new_value, memory_type],
+        )?;
+        // Mark old as superseded
+        tx.execute(
+            "UPDATE memory
+             SET status = 'superseded',
+                 superseded_by = ?1,
+                 updated_at = datetime('now')
+             WHERE key = ?2",
+            params![new_key, old_key],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Mark a memory as reviewed (you've confirmed it's still accurate).
+    pub fn memory_review(&self, key: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory SET reviewed_at = datetime('now') WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// List active memories not reviewed in the last `days` days (or never reviewed).
+    pub fn memory_review_needed(&self, days: u32) -> Result<Vec<MemoryEntry>> {
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory
+             WHERE status = 'active'
+               AND (reviewed_at IS NULL
+                    OR reviewed_at < datetime('now', '-{days} days'))
+             ORDER BY COALESCE(reviewed_at, created_at) ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn memory_link_person(&self, memory_key: &str, person_id: i64) -> Result<bool> {
@@ -168,6 +298,10 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         tags,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        status: row.get(7).unwrap_or_else(|_| "active".to_string()),
+        source: row.get(8).unwrap_or_else(|_| "manual".to_string()),
+        superseded_by: row.get(9).unwrap_or(None),
+        reviewed_at: row.get(10).unwrap_or(None),
     })
 }
 
@@ -203,10 +337,10 @@ mod tests {
         db.memory_set("b", "val", "feedback", None).unwrap();
         db.memory_set("c", "val", "user", None).unwrap();
 
-        let user = db.memory_list(Some("user")).unwrap();
+        let user = db.memory_list(Some("user"), None).unwrap();
         assert_eq!(user.len(), 2);
 
-        let all = db.memory_list(None).unwrap();
+        let all = db.memory_list(None, None).unwrap();
         assert_eq!(all.len(), 3);
     }
 

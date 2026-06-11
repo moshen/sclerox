@@ -18,15 +18,57 @@ pub enum MemoryCommand {
     },
     /// Get a memory entry by key
     Get { key: String },
-    /// List all memory entries
+    /// List memory entries (active only by default)
     List {
-        #[arg(long, value_parser = ["general","user","feedback","project","reference"])]
+        #[arg(long, value_parser = ["general","user","feedback","project","reference","session"])]
         r#type: Option<String>,
+        /// Include stale and superseded entries
+        #[arg(long)]
+        all: bool,
     },
-    /// Full-text search memory
-    Search { query: String },
-    /// Delete a memory entry
+    /// Full-text search memory (active only by default)
+    Search {
+        query: String,
+        /// Also search stale and superseded entries
+        #[arg(long)]
+        all: bool,
+    },
+    /// Delete a memory entry permanently
     Delete { key: String },
+    /// Mark a memory as stale (no longer reliable, but kept for history)
+    Stale {
+        key: String,
+        /// Brief reason why this memory is stale
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Replace a memory with an updated version, marking the old one as superseded
+    Supersede {
+        /// Key of the memory being replaced
+        old_key: String,
+        /// Key for the new memory entry
+        new_key: String,
+        new_value: String,
+        #[arg(long, default_value = "project", value_parser = ["general","user","feedback","project","reference","session"])]
+        r#type: String,
+    },
+    /// Mark a memory as reviewed (you've confirmed it's still accurate)
+    Review { key: String },
+    /// List memories that haven't been reviewed recently
+    NeedsReview {
+        /// Flag memories not reviewed in this many days (default: 30)
+        #[arg(long, default_value = "30")]
+        days: u32,
+    },
+    /// Import memories from Claude Code's auto-memory markdown files
+    ImportClaude {
+        /// Override the default ~/.claude/projects path
+        #[arg(long)]
+        path: Option<String>,
+        /// Dry run - show what would be imported without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Manage people linked to a memory entry
     #[command(subcommand)]
     People(MemoryPeopleCmd),
@@ -70,8 +112,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             None => println!("Not found: {key}"),
         },
 
-        MemoryCommand::List { r#type } => {
-            let entries = db.memory_list(r#type.as_deref())?;
+        MemoryCommand::List { r#type, all } => {
+            let status = if all { Some("all") } else { None };
+            let entries = db.memory_list(r#type.as_deref(), status)?;
             print_output(format, &entries, || {
                 if entries.is_empty() {
                     println!("No entries.");
@@ -95,8 +138,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             });
         }
 
-        MemoryCommand::Search { query } => {
-            let results = db.memory_search(&query)?;
+        MemoryCommand::Search { query, all } => {
+            let results = if all {
+                db.memory_search_filtered(&query, "all")?
+            } else {
+                db.memory_search(&query)?
+            };
             print_output(format, &results, || {
                 if results.is_empty() {
                     println!("No matches for: {query}");
@@ -115,6 +162,55 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             } else {
                 println!("Not found: {key}");
             }
+        }
+
+        MemoryCommand::Stale { key, reason } => {
+            if db.memory_stale(&key, reason.as_deref())? {
+                println!("Marked stale: {key}");
+            } else {
+                println!("Not found or already stale: {key}");
+            }
+        }
+
+        MemoryCommand::Supersede {
+            old_key,
+            new_key,
+            new_value,
+            r#type,
+        } => {
+            if db.memory_supersede(&old_key, &new_key, &new_value, &r#type)? {
+                println!("Superseded '{old_key}' → '{new_key}'");
+            } else {
+                println!("Not found: {old_key}");
+            }
+        }
+
+        MemoryCommand::Review { key } => {
+            if db.memory_review(&key)? {
+                println!("Marked reviewed: {key}");
+            } else {
+                println!("Not found: {key}");
+            }
+        }
+
+        MemoryCommand::NeedsReview { days } => {
+            let entries = db.memory_review_needed(days)?;
+            print_output(format, &entries, || {
+                if entries.is_empty() {
+                    println!("All memories reviewed within {days} days.");
+                } else {
+                    for e in &entries {
+                        let last = e.reviewed_at.as_deref().unwrap_or("never");
+                        println!("[{}] {} (last reviewed: {})", e.memory_type, e.key, last);
+                        println!("  {}", truncate(&e.value, 80));
+                    }
+                    println!("\n{} entries need review", entries.len());
+                }
+            });
+        }
+
+        MemoryCommand::ImportClaude { path, dry_run } => {
+            import_claude_memories(db, path.as_deref(), dry_run)?;
         }
 
         MemoryCommand::People(sub) => match sub {
@@ -156,4 +252,132 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max])
     }
+}
+
+/// Parse a Claude Code auto-memory markdown file.
+/// Returns (key_slug, value, memory_type) or None if unparseable.
+fn parse_claude_memory_file(path: &std::path::Path) -> Option<(String, String, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let slug = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Split on frontmatter delimiters
+    let parts: Vec<&str> = content.splitn(3, "---").collect();
+    let (frontmatter, body) = if parts.len() >= 3 {
+        (parts[1], parts[2].trim())
+    } else {
+        ("", content.trim())
+    };
+
+    // Extract type from frontmatter: "type: feedback" or "  type: project"
+    let memory_type = frontmatter
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            // Handle both top-level and nested under metadata:
+            line.strip_prefix("type:")
+                .map(|rest| rest.trim().to_string())
+        })
+        .unwrap_or_else(|| "project".to_string());
+
+    // Use body as value; fall back to description from frontmatter
+    let value = if body.is_empty() {
+        frontmatter
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("description:")
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| slug.clone())
+    } else {
+        body.to_string()
+    };
+
+    // Skip empty or index files
+    if value.is_empty() || slug == "MEMORY" {
+        return None;
+    }
+
+    Some((slug, value, memory_type))
+}
+
+fn import_claude_memories(
+    db: &crate::db::Database,
+    base_path: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let search_root = if let Some(p) = base_path {
+        std::path::PathBuf::from(p)
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("no home directory"))?
+            .join(".claude")
+            .join("projects")
+    };
+
+    if !search_root.exists() {
+        println!(
+            "No Claude projects directory found at {}",
+            search_root.display()
+        );
+        return Ok(());
+    }
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    // Walk ~/.claude/projects/*/memory/*.md
+    for project_entry in std::fs::read_dir(&search_root)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", search_root.display()))?
+        .flatten()
+    {
+        let memory_dir = project_entry.path().join("memory");
+        if !memory_dir.is_dir() {
+            continue;
+        }
+
+        for file_entry in std::fs::read_dir(&memory_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = file_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+
+            let Some((key, value, memory_type)) = parse_claude_memory_file(&path) else {
+                continue;
+            };
+
+            if dry_run {
+                println!("[would import] {key} ({memory_type})");
+                println!("  {}", truncate(&value, 80));
+                imported += 1;
+            } else {
+                // INSERT OR IGNORE - don't overwrite existing manual memories
+                let existing = db.memory_get(&key)?;
+                if existing.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                db.memory_set_full(&key, &value, &memory_type, None, "claude-auto")?;
+                imported += 1;
+            }
+        }
+    }
+
+    if dry_run {
+        println!("\n{imported} entries would be imported (dry-run: nothing written)");
+    } else {
+        println!("Imported {imported} entries, skipped {skipped} (already exist)");
+        if imported > 0 {
+            println!("Run `ol memory list` to see imported entries.");
+        }
+    }
+    Ok(())
 }

@@ -297,6 +297,19 @@ CREATE TABLE IF NOT EXISTS project_repos (
 );
 ";
 
+/// Migration v5: memory status, source, and supersession chain.
+///
+/// status:        active | stale | superseded
+/// source:        manual | claude-auto | session
+/// superseded_by: key of the memory that replaced this one (nullable)
+/// reviewed_at:   when the user last confirmed this memory is still valid
+pub const MIGRATION_V5: &str = "
+ALTER TABLE memory ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE memory ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE memory ADD COLUMN superseded_by TEXT;
+ALTER TABLE memory ADD COLUMN reviewed_at TEXT;
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
