@@ -76,8 +76,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Claude => {
             let dir = claude_dir()?;
             if !args.no_skill {
-                // Skill file uses bare `ol` - it's documentation Claude reads, not executed.
-                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
+                install_skill(&dir.join("skills"), "ol-kb.md", "claude", args.dry_run)?;
             }
             if !args.no_hooks {
                 // Hook uses full path - runs without the user's shell profile.
@@ -95,7 +94,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Opencode => {
             let dir = opencode_dir()?;
             if !args.no_skill {
-                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
+                install_skill(&dir.join("skills"), "ol-kb.md", "opencode", args.dry_run)?;
             }
             if !args.no_instructions {
                 // Global OpenCode instructions file, not a per-repo AGENTS.md.
@@ -155,14 +154,14 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
     Ok(())
 }
 
-fn install_skill(dir: &Path, filename: &str, dry_run: bool) -> Result<()> {
+fn install_skill(dir: &Path, filename: &str, agent_bin: &str, dry_run: bool) -> Result<()> {
     let path = dir.join(filename);
     if dry_run {
         println!("  would write: {}", path.display());
     } else {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
-        std::fs::write(&path, skill_file_content())
+        std::fs::write(&path, skill_file_content(agent_bin))
             .with_context(|| format!("failed to write {}", path.display()))?;
         println!("  wrote skill: {}", path.display());
     }
@@ -311,8 +310,9 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn skill_file_content() -> &'static str {
-    r#"# ol - Operating Layer Knowledge Base
+fn skill_file_content(agent_bin: &str) -> String {
+    format!(
+        r#"# ol - Operating Layer Knowledge Base
 
 Use when the user asks about people, meetings, projects, todos, past decisions, research, or code — or when knowledge base context would help.
 
@@ -340,6 +340,9 @@ ol memory stale <key> [--reason "why it's no longer valid"]
 ol memory supersede <old_key> <new_key> "<new_value>"
 ol memory review <key>               # confirm memory is still accurate
 ol memory needs-review [--days 30]   # list memories not reviewed recently
+ol memory distill <key>              # compress verbose entry via {agent_bin}
+ol memory distill --from <file>      # extract memories from a file via {agent_bin}
+ol memory distill --from <file> --model <model>  # specify model explicitly
 ol memory import --agent claude      # import from Claude Code auto-memory
 ol memory import --path <dir>        # import from any directory of .md files
 ol memory people add|remove|list <key> <person_id>
@@ -404,7 +407,9 @@ ol repo sync                         # heal registry: remove stale, reindex miss
 **After research:** `ol research conclude <id> --findings "<findings>"`
 **Attributing a memory:** `ol memory people add <key> <person_id>`
 **Session summary:** `ol memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
-"#
+"#,
+        agent_bin = agent_bin
+    )
 }
 
 fn project_md_section() -> String {

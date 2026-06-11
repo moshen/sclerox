@@ -60,6 +60,37 @@ pub enum MemoryCommand {
         #[arg(long, default_value = "30")]
         days: u32,
     },
+    /// Distill text into structured memories using an AI CLI
+    ///
+    /// Compresses a verbose memory entry OR extracts multiple memories from a
+    /// transcript/document file. Shells out to any AI CLI that accepts a
+    /// prompt via its -p / --print flag.
+    ///
+    /// Binary resolution order:
+    ///   1. --via <bin>
+    ///   2. $OL_AI_BIN environment variable
+    ///   3. claude (default)
+    ///
+    /// Model resolution order:
+    ///   1. --model <model>
+    ///   2. $OL_AI_MODEL environment variable
+    ///   3. agent default (no --model flag passed)
+    Distill {
+        /// Compress an existing memory entry (supersedes it with the distilled version)
+        key: Option<String>,
+        /// Extract memories from a transcript or document file
+        #[arg(long)]
+        from: Option<String>,
+        /// AI CLI binary to use (default: claude, or $OL_AI_BIN)
+        #[arg(long)]
+        via: Option<String>,
+        /// Model to pass to the AI binary via --model (optional, uses agent default if omitted)
+        #[arg(long)]
+        model: Option<String>,
+        /// Show extracted memories without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Import memories from markdown files (any agent or custom directory)
     Import {
         /// Directory to scan for .md memory files.
@@ -214,6 +245,68 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     println!("\n{} entries need review", entries.len());
                 }
             });
+        }
+
+        MemoryCommand::Distill {
+            key,
+            from,
+            via,
+            model,
+            dry_run,
+        } => {
+            let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
+            let bin = via
+                .as_deref()
+                .or(if env_bin.is_empty() {
+                    None
+                } else {
+                    Some(env_bin.as_str())
+                })
+                .unwrap_or("claude");
+
+            let env_model = std::env::var("OL_AI_MODEL").unwrap_or_default();
+            let resolved_model = model.as_deref().or(if env_model.is_empty() {
+                None
+            } else {
+                Some(env_model.as_str())
+            });
+
+            let (text, existing_key) = match (&key, &from) {
+                (Some(k), None) => {
+                    let entry = db
+                        .memory_get(k)?
+                        .ok_or_else(|| anyhow::anyhow!("memory key '{k}' not found"))?;
+                    (entry.value.clone(), Some(k.clone()))
+                }
+                (None, Some(f)) => (std::fs::read_to_string(f)?, None),
+                (Some(_), Some(_)) => anyhow::bail!("use either <key> or --from, not both"),
+                (None, None) => anyhow::bail!("provide a memory key or --from <file>"),
+            };
+
+            let memories = distill_with_ai(bin, resolved_model, &text)?;
+
+            if memories.is_empty() {
+                println!("No memories extracted.");
+                return Ok(());
+            }
+
+            for m in &memories {
+                println!("[{}] {} - {}", m.memory_type, m.key, truncate(&m.value, 80));
+            }
+
+            if dry_run {
+                println!("\n{} memories (dry-run: nothing written)", memories.len());
+            } else {
+                for m in &memories {
+                    if let Some(ref old_key) = existing_key {
+                        // Compressing a single existing entry: supersede it
+                        db.memory_supersede(old_key, &m.key, &m.value, &m.memory_type)?;
+                    } else {
+                        db.memory_set_full(&m.key, &m.value, &m.memory_type, None, "distilled")?;
+                    }
+                }
+                println!("\nSaved {} memories.", memories.len());
+            }
         }
 
         MemoryCommand::Import {
@@ -422,4 +515,108 @@ fn import_memories(
         }
     }
     Ok(())
+}
+
+// ─── AI distillation ─────────────────────────────────────────────────────────
+
+struct DistilledMemory {
+    key: String,
+    value: String,
+    memory_type: String,
+}
+
+const DISTILL_PROMPT: &str = r#"You are extracting structured memory entries from the provided text.
+
+Extract 1-8 concise, factual memory entries. Each entry should capture a single
+distinct fact, preference, decision, or piece of context worth remembering.
+
+Output ONLY a JSON array with no surrounding text or markdown fences:
+[
+  {"key": "kebab-case-slug", "value": "concise 1-3 sentence statement", "type": "feedback|project|user|reference|session"},
+  ...
+]
+
+Type guide:
+  feedback    - preferences, constraints, lessons learned
+  project     - decisions, facts specific to a project
+  user        - facts about the user's role, context, or goals
+  reference   - pointers to external resources
+  session     - summary of what happened in a session
+
+Text to distill:
+"#;
+
+/// Call an AI CLI subprocess with the distillation prompt and parse the JSON response.
+///
+/// The binary must support: `<bin> -p "<prompt>"` → prints response to stdout.
+/// If model is provided, it is forwarded as `--model <model>`.
+fn distill_with_ai(
+    bin: &str,
+    model: Option<&str>,
+    text: &str,
+) -> anyhow::Result<Vec<DistilledMemory>> {
+    let prompt = format!("{DISTILL_PROMPT}{text}");
+
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["-p", &prompt]);
+    if let Some(m) = model {
+        cmd.args(["--model", m]);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "AI binary '{bin}' not found in PATH. \
+                     Install it or set OL_AI_BIN to the binary name."
+            )
+        } else {
+            anyhow::anyhow!("failed to run '{bin}': {e}")
+        }
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("'{bin}' exited with error:\n{stderr}");
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout);
+    parse_distilled_json(&response)
+}
+
+/// Extract a JSON array from LLM output that may contain prose or markdown fences.
+fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> {
+    // Find the first '[' and last ']' to tolerate leading/trailing prose
+    let start = response
+        .find('[')
+        .ok_or_else(|| anyhow::anyhow!("no JSON array found in response"))?;
+    let end = response
+        .rfind(']')
+        .ok_or_else(|| anyhow::anyhow!("unclosed JSON array in response"))?;
+
+    let json_slice = &response[start..=end];
+    let raw: Vec<serde_json::Value> = serde_json::from_str(json_slice)
+        .map_err(|e| anyhow::anyhow!("failed to parse JSON from response: {e}\n{json_slice}"))?;
+
+    let mut memories = Vec::new();
+    for item in raw {
+        let key = item["key"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("entry missing 'key' field"))?
+            .to_string();
+        let value = item["value"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("entry missing 'value' field"))?
+            .to_string();
+        let memory_type = item["type"].as_str().unwrap_or("project").to_string();
+
+        if !key.is_empty() && !value.is_empty() {
+            memories.push(DistilledMemory {
+                key,
+                value,
+                memory_type,
+            });
+        }
+    }
+
+    Ok(memories)
 }
