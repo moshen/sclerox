@@ -60,12 +60,19 @@ pub enum MemoryCommand {
         #[arg(long, default_value = "30")]
         days: u32,
     },
-    /// Import memories from Claude Code's auto-memory markdown files
-    ImportClaude {
-        /// Override the default ~/.claude/projects path
+    /// Import memories from markdown files (any agent or custom directory)
+    Import {
+        /// Directory to scan for .md memory files.
+        /// Use --agent as a shorthand for known agent defaults.
         #[arg(long)]
         path: Option<String>,
-        /// Dry run - show what would be imported without writing
+        /// Resolve the default memory path for a known agent:
+        ///   claude   → ~/.claude/projects  (Claude Code auto-memory)
+        ///   opencode → ~/.config/opencode/memory
+        ///   codex    → ~/.codex
+        #[arg(long, value_parser = ["claude", "opencode", "codex"])]
+        agent: Option<String>,
+        /// Show what would be imported without writing
         #[arg(long)]
         dry_run: bool,
     },
@@ -209,8 +216,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             });
         }
 
-        MemoryCommand::ImportClaude { path, dry_run } => {
-            import_claude_memories(db, path.as_deref(), dry_run)?;
+        MemoryCommand::Import {
+            path,
+            agent,
+            dry_run,
+        } => {
+            let resolved = resolve_import_path(path.as_deref(), agent.as_deref())?;
+            import_memories(db, &resolved, dry_run)?;
         }
 
         MemoryCommand::People(sub) => match sub {
@@ -254,17 +266,46 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Parse a Claude Code auto-memory markdown file.
-/// Returns (key_slug, value, memory_type) or None if unparseable.
-fn parse_claude_memory_file(path: &std::path::Path) -> Option<(String, String, String)> {
+/// Resolve the search root from explicit --path or --agent shorthand.
+fn resolve_import_path(
+    path: Option<&str>,
+    agent: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(p) = path {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let resolved = match agent {
+        Some("claude") | None => home.join(".claude").join("projects"),
+        Some("opencode") => home.join(".config").join("opencode").join("memory"),
+        Some("codex") => home.join(".codex"),
+        Some(other) => anyhow::bail!(
+            "unknown agent '{other}'. Use --path to specify a directory directly, \
+             or --agent claude|opencode|codex"
+        ),
+    };
+    Ok(resolved)
+}
+
+/// Parse a markdown memory file with YAML-ish frontmatter.
+/// Returns (key_slug, value, memory_type) or None if unparseable / should be skipped.
+///
+/// Supported frontmatter fields (any agent):
+///   type / memory_type  → memory type  (fallback: "project")
+///   description         → used as value when body is empty
+///   name / title        → used as key slug override
+fn parse_memory_file(path: &std::path::Path) -> Option<(String, String, String)> {
     let content = std::fs::read_to_string(path).ok()?;
-    let slug = path
+    let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .unwrap_or("unknown");
 
-    // Split on frontmatter delimiters
+    // Skip index/meta files
+    if matches!(stem, "MEMORY" | "AGENTS" | "README" | "INDEX") {
+        return None;
+    }
+
     let parts: Vec<&str> = content.splitn(3, "---").collect();
     let (frontmatter, body) = if parts.len() >= 3 {
         (parts[1], parts[2].trim())
@@ -272,102 +313,103 @@ fn parse_claude_memory_file(path: &std::path::Path) -> Option<(String, String, S
         ("", content.trim())
     };
 
-    // Extract type from frontmatter: "type: feedback" or "  type: project"
+    // Key: use frontmatter name/slug if present, else filename stem
+    let key = frontmatter
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("name:")
+                .or_else(|| line.strip_prefix("slug:"))
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| stem.to_string());
+
+    // Type: accept "type:", "memory_type:", or nested under metadata
     let memory_type = frontmatter
         .lines()
         .find_map(|line| {
             let line = line.trim();
-            // Handle both top-level and nested under metadata:
             line.strip_prefix("type:")
-                .map(|rest| rest.trim().to_string())
+                .or_else(|| line.strip_prefix("memory_type:"))
+                .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "project".to_string());
 
-    // Use body as value; fall back to description from frontmatter
-    let value = if body.is_empty() {
+    // Value: body if present, else description field
+    let value = if !body.is_empty() {
+        body.to_string()
+    } else {
         frontmatter
             .lines()
             .find_map(|line| {
-                line.trim()
-                    .strip_prefix("description:")
+                let line = line.trim();
+                line.strip_prefix("description:")
+                    .or_else(|| line.strip_prefix("title:"))
                     .map(|s| s.trim().to_string())
             })
-            .unwrap_or_else(|| slug.clone())
-    } else {
-        body.to_string()
+            .unwrap_or_default()
     };
 
-    // Skip empty or index files
-    if value.is_empty() || slug == "MEMORY" {
+    if value.is_empty() {
         return None;
     }
 
-    Some((slug, value, memory_type))
+    Some((key, value, memory_type))
 }
 
-fn import_claude_memories(
+/// Recursively collect all .md files under a directory.
+fn collect_md_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(collect_md_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn import_memories(
     db: &crate::db::Database,
-    base_path: Option<&str>,
+    root: &std::path::Path,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let search_root = if let Some(p) = base_path {
-        std::path::PathBuf::from(p)
-    } else {
-        dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("no home directory"))?
-            .join(".claude")
-            .join("projects")
-    };
+    if !root.exists() {
+        println!("Path not found: {}", root.display());
+        println!("Tip: use --path <dir> to point at any directory of .md memory files.");
+        return Ok(());
+    }
 
-    if !search_root.exists() {
-        println!(
-            "No Claude projects directory found at {}",
-            search_root.display()
-        );
+    let files = collect_md_files(root);
+    if files.is_empty() {
+        println!("No .md files found under {}", root.display());
         return Ok(());
     }
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
 
-    // Walk ~/.claude/projects/*/memory/*.md
-    for project_entry in std::fs::read_dir(&search_root)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", search_root.display()))?
-        .flatten()
-    {
-        let memory_dir = project_entry.path().join("memory");
-        if !memory_dir.is_dir() {
+    for path in &files {
+        let Some((key, value, memory_type)) = parse_memory_file(path) else {
             continue;
-        }
+        };
 
-        for file_entry in std::fs::read_dir(&memory_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if dry_run {
+            println!("[would import] {key} ({memory_type})");
+            println!("  {}", truncate(&value, 80));
+            imported += 1;
+        } else {
+            if db.memory_get(&key)?.is_some() {
+                skipped += 1;
                 continue;
             }
-
-            let Some((key, value, memory_type)) = parse_claude_memory_file(&path) else {
-                continue;
-            };
-
-            if dry_run {
-                println!("[would import] {key} ({memory_type})");
-                println!("  {}", truncate(&value, 80));
-                imported += 1;
-            } else {
-                // INSERT OR IGNORE - don't overwrite existing manual memories
-                let existing = db.memory_get(&key)?;
-                if existing.is_some() {
-                    skipped += 1;
-                    continue;
-                }
-                db.memory_set_full(&key, &value, &memory_type, None, "claude-auto")?;
-                imported += 1;
-            }
+            db.memory_set_full(&key, &value, &memory_type, None, "imported")?;
+            imported += 1;
         }
     }
 
