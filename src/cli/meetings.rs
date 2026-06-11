@@ -45,19 +45,26 @@ pub enum MeetingCommand {
         #[arg(long, default_value = "5")]
         limit: usize,
     },
+    /// Manage people linked to a meeting
+    #[command(subcommand)]
+    People(MeetingPeopleCmd),
+    /// Delete a meeting
+    Delete { id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum MeetingPeopleCmd {
     /// Link a person to this meeting
-    LinkPerson {
+    Add {
         meeting_id: i64,
         person_id: i64,
         #[arg(long)]
         role: Option<String>,
     },
-    /// Remove a person link from a meeting
-    UnlinkPerson { meeting_id: i64, person_id: i64 },
-    /// List people in a meeting
-    People { meeting_id: i64 },
-    /// Delete a meeting
-    Delete { id: i64 },
+    /// Remove a person link from this meeting
+    Remove { meeting_id: i64, person_id: i64 },
+    /// List people in this meeting
+    List { meeting_id: i64 },
 }
 
 pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
@@ -175,37 +182,37 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             }
         }
 
-        MeetingCommand::LinkPerson {
-            meeting_id,
-            person_id,
-            role,
-        } => {
-            db.meeting_link_person(meeting_id, person_id, role.as_deref())?;
-            println!("Linked person #{person_id} to meeting #{meeting_id}");
-        }
-
-        MeetingCommand::UnlinkPerson {
-            meeting_id,
-            person_id,
-        } => {
-            if db.meeting_unlink_person(meeting_id, person_id)? {
-                println!("Unlinked person #{person_id} from meeting #{meeting_id}");
-            } else {
-                println!("Link not found");
+        MeetingCommand::People(sub) => match sub {
+            MeetingPeopleCmd::Add {
+                meeting_id,
+                person_id,
+                role,
+            } => {
+                db.meeting_link_person(meeting_id, person_id, role.as_deref())?;
+                println!("Linked person #{person_id} to meeting #{meeting_id}");
             }
-        }
-
-        MeetingCommand::People { meeting_id } => {
-            let people = db.meeting_people(meeting_id)?;
-            if people.is_empty() {
-                println!("No people linked to meeting #{meeting_id}");
-            } else {
-                for p in &people {
-                    let role = p.role.as_deref().unwrap_or("attendee");
-                    println!("#{} {} ({})", p.person_id, p.person_name, role);
+            MeetingPeopleCmd::Remove {
+                meeting_id,
+                person_id,
+            } => {
+                if db.meeting_unlink_person(meeting_id, person_id)? {
+                    println!("Removed person #{person_id} from meeting #{meeting_id}");
+                } else {
+                    println!("Link not found");
                 }
             }
-        }
+            MeetingPeopleCmd::List { meeting_id } => {
+                let people = db.meeting_people(meeting_id)?;
+                if people.is_empty() {
+                    println!("No people linked to meeting #{meeting_id}");
+                } else {
+                    for p in &people {
+                        let role = p.role.as_deref().unwrap_or("attendee");
+                        println!("#{} {} ({})", p.person_id, p.person_name, role);
+                    }
+                }
+            }
+        },
 
         MeetingCommand::Delete { id } => {
             if db.meeting_delete(id)? {

@@ -178,6 +178,48 @@ impl Database {
         Ok(n > 0)
     }
 
+    pub fn todo_link_person(&self, todo_id: i64, person_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO todo_people (todo_id, person_id) VALUES (?1, ?2)",
+            params![todo_id, person_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn todo_unlink_person(&self, todo_id: i64, person_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM todo_people WHERE todo_id = ?1 AND person_id = ?2",
+            params![todo_id, person_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn todo_people(&self, todo_id: i64) -> Result<Vec<crate::db::people::Person>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url,
+                    p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
+             FROM people p
+             JOIN todo_people tp ON p.id = tp.person_id
+             WHERE tp.todo_id = ?1
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map(params![todo_id], |row| {
+            Ok(crate::db::people::Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                email: row.get(2)?,
+                slack_id: row.get(3)?,
+                slack_url: row.get(4)?,
+                github_username: row.get(5)?,
+                github_url: row.get(6)?,
+                notes: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// History: search completed items, optionally filtered by date range.
     pub fn todo_history(
         &self,
@@ -475,7 +517,73 @@ mod tests {
         let id = db
             .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
             .unwrap();
-        // No fields provided - should return false
         assert!(!db.todo_update(id, None, None, None, None, None).unwrap());
+    }
+
+    #[test]
+    fn test_todo_link_people() {
+        let db = db();
+        let todo_id = db
+            .todo_add(
+                "Review PR",
+                None,
+                TodoStatus::Open,
+                None,
+                "github",
+                None,
+                None,
+            )
+            .unwrap();
+        let alice = db
+            .people_add("Alice", Some("alice@x.com"), None, None, None, None, None)
+            .unwrap();
+        let bob = db
+            .people_add("Bob", Some("bob@x.com"), None, None, None, None, None)
+            .unwrap();
+
+        db.todo_link_person(todo_id, alice).unwrap();
+        db.todo_link_person(todo_id, bob).unwrap();
+
+        let people = db.todo_people(todo_id).unwrap();
+        assert_eq!(people.len(), 2);
+        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Alice"));
+        assert!(names.contains(&"Bob"));
+    }
+
+    #[test]
+    fn test_todo_unlink_person() {
+        let db = db();
+        let todo_id = db
+            .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
+            .unwrap();
+        let person_id = db
+            .people_add("Carol", None, None, None, None, None, None)
+            .unwrap();
+
+        db.todo_link_person(todo_id, person_id).unwrap();
+        assert_eq!(db.todo_people(todo_id).unwrap().len(), 1);
+
+        assert!(db.todo_unlink_person(todo_id, person_id).unwrap());
+        assert!(db.todo_people(todo_id).unwrap().is_empty());
+
+        // Second remove returns false
+        assert!(!db.todo_unlink_person(todo_id, person_id).unwrap());
+    }
+
+    #[test]
+    fn test_todo_delete_cascades_people() {
+        let db = db();
+        let todo_id = db
+            .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
+            .unwrap();
+        let person_id = db
+            .people_add("Dave", None, None, None, None, None, None)
+            .unwrap();
+        db.todo_link_person(todo_id, person_id).unwrap();
+
+        db.todo_delete(todo_id).unwrap();
+        // Junction row should be gone (CASCADE)
+        assert!(db.todo_people(todo_id).unwrap().is_empty());
     }
 }

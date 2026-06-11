@@ -206,7 +206,8 @@ fn meeting_lifecycle() {
 
     e.run(&[
         "meeting",
-        "link-person",
+        "people",
+        "add",
         &meeting_id.to_string(),
         &person_id.to_string(),
         "--role",
