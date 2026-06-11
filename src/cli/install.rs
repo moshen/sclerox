@@ -332,6 +332,8 @@ ol search "<query>"
 # Memory
 ol memory set <key> "<value>" --type user|feedback|project|reference
 ol memory search "<query>"
+ol memory people add <key> <person_id>    # attribute a memory to someone
+ol memory people list <key>
 
 # People
 ol people search "<name or email>"
@@ -340,12 +342,16 @@ ol people add --name "<name>" --email "<email>"
 # Meetings
 ol meeting search "<topic>"
 ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
+ol meeting people add <meeting_id> <person_id> [--role "<role>"]
+ol meeting people list <meeting_id>
 
 # Todos
 ol todo list                         # open todos
 ol todo add --title "<title>" [--category slack|github|email|meeting|general]
 ol todo done <id> [--note "<resolution>"]
 ol todo history [<query>]            # search completed todos
+ol todo people add <todo_id> <person_id>
+ol todo people list <todo_id>
 
 # Research / Investigations
 ol research list                     # open investigations
@@ -353,6 +359,8 @@ ol research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
 ol research add-source <id> --url "<url>" --label "<label>"
 ol research conclude <id> --findings "<findings>"
 ol research search "<query>"
+ol research people add <id> <person_id>
+ol research people list <id>
 
 # Projects
 ol project search "<description>"
@@ -366,6 +374,7 @@ ol repo show [path] [--symbols "<query>"]
 **Before any task:** `ol search "<topic>"`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **After research:** `ol research conclude <id> --findings "<findings>"`
+**Attributing a memory:** `ol memory people add <key> <person_id>`
 "#
 }
 

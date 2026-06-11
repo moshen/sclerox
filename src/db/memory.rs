@@ -88,6 +88,71 @@ impl Database {
             .execute("DELETE FROM memory WHERE key = ?1", params![key])?;
         Ok(n > 0)
     }
+
+    pub fn memory_link_person(&self, memory_key: &str, person_id: i64) -> Result<bool> {
+        let memory_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM memory WHERE key = ?1",
+                params![memory_key],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(memory_id) = memory_id else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_people (memory_id, person_id) VALUES (?1, ?2)",
+            params![memory_id, person_id],
+        )?;
+        Ok(true)
+    }
+
+    pub fn memory_unlink_person(&self, memory_key: &str, person_id: i64) -> Result<bool> {
+        let memory_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM memory WHERE key = ?1",
+                params![memory_key],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(memory_id) = memory_id else {
+            return Ok(false);
+        };
+        let n = self.conn.execute(
+            "DELETE FROM memory_people WHERE memory_id = ?1 AND person_id = ?2",
+            params![memory_id, person_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn memory_people(&self, memory_key: &str) -> Result<Vec<crate::db::people::Person>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url,
+                    p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
+             FROM people p
+             JOIN memory_people mp ON p.id = mp.person_id
+             JOIN memory m ON mp.memory_id = m.id
+             WHERE m.key = ?1
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map(params![memory_key], |row| {
+            Ok(crate::db::people::Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                email: row.get(2)?,
+                slack_id: row.get(3)?,
+                slack_url: row.get(4)?,
+                github_username: row.get(5)?,
+                github_url: row.get(6)?,
+                notes: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
@@ -170,6 +235,53 @@ mod tests {
         assert!(db.memory_delete("del_me").unwrap());
         assert!(!db.memory_delete("del_me").unwrap());
         assert!(db.memory_get("del_me").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_memory_link_people() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("auth-pref", "prefer JWT", "project", None)
+            .unwrap();
+        let alice = db
+            .people_add("Alice", Some("alice@x.com"), None, None, None, None, None)
+            .unwrap();
+        let bob = db
+            .people_add("Bob", None, None, None, None, None, None)
+            .unwrap();
+
+        assert!(db.memory_link_person("auth-pref", alice).unwrap());
+        assert!(db.memory_link_person("auth-pref", bob).unwrap());
+
+        let people = db.memory_people("auth-pref").unwrap();
+        assert_eq!(people.len(), 2);
+        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Alice"));
+        assert!(names.contains(&"Bob"));
+    }
+
+    #[test]
+    fn test_memory_link_missing_key_returns_false() {
+        let db = Database::open_in_memory().unwrap();
+        let person_id = db
+            .people_add("Carol", None, None, None, None, None, None)
+            .unwrap();
+        assert!(!db.memory_link_person("no-such-key", person_id).unwrap());
+    }
+
+    #[test]
+    fn test_memory_unlink_person() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("k", "v", "general", None).unwrap();
+        let person_id = db
+            .people_add("Dave", None, None, None, None, None, None)
+            .unwrap();
+
+        db.memory_link_person("k", person_id).unwrap();
+        assert_eq!(db.memory_people("k").unwrap().len(), 1);
+
+        assert!(db.memory_unlink_person("k", person_id).unwrap());
+        assert!(db.memory_people("k").unwrap().is_empty());
+        assert!(!db.memory_unlink_person("k", person_id).unwrap());
     }
 
     #[test]

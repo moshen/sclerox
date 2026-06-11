@@ -27,6 +27,19 @@ pub enum MemoryCommand {
     Search { query: String },
     /// Delete a memory entry
     Delete { key: String },
+    /// Manage people linked to a memory entry
+    #[command(subcommand)]
+    People(MemoryPeopleCmd),
+}
+
+#[derive(clap::Subcommand)]
+pub enum MemoryPeopleCmd {
+    /// Link a person to a memory entry
+    Add { key: String, person_id: i64 },
+    /// Remove a person link from a memory entry
+    Remove { key: String, person_id: i64 },
+    /// List people linked to a memory entry
+    List { key: String },
 }
 
 pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()> {
@@ -103,6 +116,36 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 println!("Not found: {key}");
             }
         }
+
+        MemoryCommand::People(sub) => match sub {
+            MemoryPeopleCmd::Add { key, person_id } => {
+                if db.memory_link_person(&key, person_id)? {
+                    println!("Linked person #{person_id} to memory '{key}'");
+                } else {
+                    println!("Memory key '{key}' not found");
+                }
+            }
+            MemoryPeopleCmd::Remove { key, person_id } => {
+                if db.memory_unlink_person(&key, person_id)? {
+                    println!("Removed person #{person_id} from memory '{key}'");
+                } else {
+                    println!("Link not found");
+                }
+            }
+            MemoryPeopleCmd::List { key } => {
+                let people = db.memory_people(&key)?;
+                print_output(format, &people, || {
+                    if people.is_empty() {
+                        println!("No people linked to memory '{key}'");
+                    } else {
+                        for p in &people {
+                            let email = p.email.as_deref().unwrap_or("-");
+                            println!("#{} {} <{}>", p.id, p.name, email);
+                        }
+                    }
+                });
+            }
+        },
     }
     Ok(())
 }

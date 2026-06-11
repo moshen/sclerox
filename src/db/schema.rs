@@ -279,6 +279,15 @@ CREATE TABLE IF NOT EXISTS investigation_projects (
 );
 ";
 
+/// Migration v3: memory_people junction table.
+pub const MIGRATION_V3: &str = "
+CREATE TABLE IF NOT EXISTS memory_people (
+    memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    PRIMARY KEY (memory_id, person_id)
+);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
