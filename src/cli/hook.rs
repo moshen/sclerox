@@ -6,6 +6,12 @@ use crate::db::Database;
 
 #[derive(Subcommand)]
 pub enum HookCommand {
+    /// Run the Claude Code SessionStart hook: index repo if in a git directory.
+    ///
+    /// Only indexes if the current directory contains a .git folder.
+    /// Fast because indexing is incremental (skips unchanged files).
+    Start,
+
     /// Run the Claude Code Stop hook: index repo + distill session memories.
     ///
     /// Reads the hook JSON from stdin (Claude Code passes session metadata this way).
@@ -25,12 +31,36 @@ pub enum HookCommand {
 
 pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
     match cmd {
+        HookCommand::Start => run_start(db),
         HookCommand::Stop {
             via,
             model,
             no_distill,
         } => run_stop(db, via.as_deref(), model.as_deref(), no_distill),
     }
+}
+
+fn run_start(db: &Database) -> Result<()> {
+    // Consume stdin - SessionStart also sends JSON, ignore broken-pipe if not read.
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buf);
+
+    let cwd = std::env::current_dir()?;
+
+    // Only index if this is a git repository.
+    if !cwd.join(".git").exists() {
+        return Ok(());
+    }
+
+    let description = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n} repo"));
+
+    let mut indexer = crate::index::RepoIndexer::new(None);
+    let _ = indexer.index_repo(db, &cwd, description.as_deref());
+
+    Ok(())
 }
 
 fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: bool) -> Result<()> {

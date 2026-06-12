@@ -299,30 +299,47 @@ fn install_claude_hook(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json(&settings_path)?;
 
-    // Single entry point: ol hook stop reads stdin (avoiding broken-pipe),
-    // indexes the repo, and distills session memories from the transcript.
-    let hook_command = format!("{HOOK_MARKER}\n{ol_bin} hook stop 2>/dev/null || true");
-    let new_hook = serde_json::json!({ "type": "command", "command": hook_command });
-
-    let stop = settings
+    let hooks_obj = settings
         .as_object_mut()
         .context("settings.json is not an object")?
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .context("hooks is not an object")?
+        .context("hooks is not an object")?;
+
+    // SessionStart: index the repo immediately when entering a git directory.
+    let start_cmd = format!("{HOOK_MARKER}\n{ol_bin} hook start 2>/dev/null || true");
+    let start_arr = hooks_obj
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    let start_arr = start_arr
+        .as_array_mut()
+        .context("hooks.SessionStart is not an array")?;
+    strip_ol_hooks(start_arr);
+    start_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": start_cmd }] }));
+
+    // Stop: index the repo + distill session memories from the transcript.
+    let stop_cmd = format!("{HOOK_MARKER}\n{ol_bin} hook stop 2>/dev/null || true");
+    let stop_arr = hooks_obj
         .entry("Stop")
         .or_insert_with(|| serde_json::json!([]));
-
-    let arr = stop.as_array_mut().context("hooks.Stop is not an array")?;
-    strip_ol_hooks(arr);
-    arr.push(serde_json::json!({ "hooks": [new_hook] }));
+    let stop_arr = stop_arr
+        .as_array_mut()
+        .context("hooks.Stop is not an array")?;
+    strip_ol_hooks(stop_arr);
+    stop_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": stop_cmd }] }));
 
     if dry_run {
-        println!("  would add Stop hook to: {}", settings_path.display());
+        println!(
+            "  would add SessionStart + Stop hooks to: {}",
+            settings_path.display()
+        );
     } else {
         write_json(&settings_path, &settings)?;
-        println!("  added Stop hook: {}", settings_path.display());
+        println!(
+            "  added SessionStart + Stop hooks: {}",
+            settings_path.display()
+        );
     }
     Ok(())
 }
@@ -334,25 +351,31 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let mut settings = read_json(&settings_path)?;
-    let modified = settings
-        .pointer_mut("/hooks/Stop")
-        .and_then(|v| v.as_array_mut())
-        .map(|arr| {
+    let mut modified = false;
+
+    for event in ["SessionStart", "Stop"] {
+        let key = format!("/hooks/{event}");
+        if let Some(arr) = settings.pointer_mut(&key).and_then(|v| v.as_array_mut()) {
             let before = arr.len();
             strip_ol_hooks(arr);
-            arr.len() < before
-        })
-        .unwrap_or(false);
+            if arr.len() < before {
+                modified = true;
+            }
+        }
+    }
 
     if modified {
         if dry_run {
-            println!("  would remove Stop hook from: {}", settings_path.display());
+            println!(
+                "  would remove SessionStart + Stop hooks from: {}",
+                settings_path.display()
+            );
         } else {
             write_json(&settings_path, &settings)?;
-            println!("  removed Stop hook: {}", settings_path.display());
+            println!("  removed hooks: {}", settings_path.display());
         }
     } else {
-        println!("  no ol hook found");
+        println!("  no ol hooks found");
     }
     Ok(())
 }
