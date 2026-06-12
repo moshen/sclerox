@@ -144,10 +144,7 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
                 remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
             }
             if !args.no_hooks {
-                remove_if_exists(
-                    &dir.join("plugins").join("ol-session.js"),
-                    args.dry_run,
-                )?;
+                remove_if_exists(&dir.join("plugins").join("ol-session.js"), args.dry_run)?;
             }
             if !args.no_instructions {
                 uninstall_section(&dir.join("AGENTS.md").to_string_lossy(), args.dry_run)?;

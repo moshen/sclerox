@@ -63,7 +63,14 @@ pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
             via,
             model,
             no_distill,
-        } => run_opencode(db, &session_id, directory.as_deref(), via.as_deref(), model.as_deref(), no_distill),
+        } => run_opencode(
+            db,
+            &session_id,
+            directory.as_deref(),
+            via.as_deref(),
+            model.as_deref(),
+            no_distill,
+        ),
     }
 }
 
@@ -135,15 +142,14 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         return Ok(());
     };
 
-    // Extract conversation text from the JSONL transcript
-    let text = match extract_conversation_text(&transcript_path) {
-        Ok(t) if t.trim().is_empty() => return Ok(()),
+    // Extract conversation turns from the JSONL transcript
+    let turns = match extract_conversation_turns(&transcript_path) {
+        Ok(t) if t.is_empty() => return Ok(()),
         Ok(t) => t,
         Err(_) => return Ok(()),
     };
 
-    // Skip very short sessions (fewer than ~5 turns worth of content)
-    if text.lines().count() < 10 {
+    if turns.len() < 5 {
         return Ok(());
     }
 
@@ -164,19 +170,9 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         Some(env_model.as_str())
     });
 
-    // Distill memories - failures are silent (hook must not block session exit)
-    let memories = match crate::cli::memory::distill_with_ai_pub(bin, resolved_model, &text) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-
-    for m in &memories {
-        let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, "session");
-    }
-
-    if !memories.is_empty() {
-        // Print to stderr so it shows in the Claude Code output but doesn't interfere
-        eprintln!("[ol] distilled {} memories from session", memories.len());
+    let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
+    if total > 0 {
+        eprintln!("[ol] distilled {total} memories from session");
     }
 
     Ok(())
@@ -214,13 +210,13 @@ fn run_opencode(
         return Ok(());
     }
 
-    let text = match extract_opencode_conversation(session_id) {
-        Ok(t) if t.trim().is_empty() => return Ok(()),
+    let turns = match extract_opencode_turns(session_id) {
+        Ok(t) if t.is_empty() => return Ok(()),
         Ok(t) => t,
         Err(_) => return Ok(()),
     };
 
-    if text.lines().count() < 10 {
+    if turns.len() < 5 {
         return Ok(());
     }
 
@@ -240,25 +236,16 @@ fn run_opencode(
         Some(env_model.as_str())
     });
 
-    let memories = match crate::cli::memory::distill_with_ai_pub(bin, resolved_model, &text) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-
-    for m in &memories {
-        let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, "session");
-    }
-
-    if !memories.is_empty() {
-        eprintln!("[ol] distilled {} memories from opencode session", memories.len());
+    let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
+    if total > 0 {
+        eprintln!("[ol] distilled {total} memories from opencode session");
     }
 
     Ok(())
 }
 
-/// Extract conversation text from OpenCode's SQLite database for a given session.
-/// OpenCode stores messages and parts in `~/.local/share/opencode/opencode.db`.
-fn extract_opencode_conversation(session_id: &str) -> Result<String> {
+/// Extract conversation turns from OpenCode's SQLite database for a given session.
+fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
     let db_path = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?
         .join(".local/share/opencode/opencode.db");
@@ -283,31 +270,27 @@ fn extract_opencode_conversation(session_id: &str) -> Result<String> {
          ORDER BY m.time_created, p.time_created",
     )?;
 
-    let mut text = String::new();
     let rows = stmt.query_map([session_id], |row| {
         let role: String = row.get(0)?;
         let content: String = row.get(1).unwrap_or_default();
         Ok((role, content))
     })?;
 
+    let mut turns = Vec::new();
     for row in rows.flatten() {
         let (role, content) = row;
         if content.trim().is_empty() {
             continue;
         }
-        let label = match role.as_str() {
-            "user" => "User",
-            "assistant" => "Assistant",
+        let (label, limit) = match role.as_str() {
+            "user" => ("User", 500usize),
+            "assistant" => ("Assistant", 1000usize),
             _ => continue,
         };
-        text.push_str(label);
-        text.push_str(": ");
-        let limit = if label == "User" { 1000 } else { 2000 };
-        text.push_str(&truncate_content(&content, limit));
-        text.push('\n');
+        turns.push(format!("{label}: {}\n", truncate_content(&content, limit)));
     }
 
-    Ok(text)
+    Ok(turns)
 }
 
 /// Derive the Claude Code project hash from a working directory path.
@@ -341,13 +324,60 @@ fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path:
     }
 }
 
-/// Extract human-readable conversation text from a Claude Code session JSONL.
-/// Returns a condensed text suitable for memory distillation.
-fn extract_conversation_text(path: &std::path::Path) -> Result<String> {
+/// Each chunk sent to the AI for distillation.
+/// Keeping chunks small prevents memory spikes from large prompts.
+const CHUNK_CHARS: usize = 20_000;
+
+/// Distill a full list of turns in chunks, deduplicating by key.
+/// Returns total number of memories stored.
+fn distill_chunked(
+    db: &Database,
+    bin: &str,
+    model: Option<&str>,
+    turns: &[String],
+    source: &str,
+) -> Result<usize> {
+    let mut stored = 0usize;
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for chunk in chunk_turns(turns, CHUNK_CHARS) {
+        let Ok(memories) = crate::cli::memory::distill_with_ai_pub(bin, model, &chunk) else {
+            continue;
+        };
+        for m in &memories {
+            if seen_keys.insert(m.key.clone()) {
+                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+                stored += 1;
+            }
+        }
+    }
+
+    Ok(stored)
+}
+
+/// Split turns into chunks of up to `max_chars` each.
+fn chunk_turns(turns: &[String], max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for turn in turns {
+        if !current.is_empty() && current.len() + turn.len() > max_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(turn);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Extract conversation turns from a Claude Code session JSONL.
+fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
     use std::io::BufRead;
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let mut text = String::new();
+    let mut turns = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -359,18 +389,14 @@ fn extract_conversation_text(path: &std::path::Path) -> Result<String> {
             Some("user") => {
                 if let Some(content) = extract_text_content(&obj["message"]["content"]) {
                     if !content.trim().is_empty() {
-                        text.push_str("User: ");
-                        text.push_str(&truncate_content(&content, 1000));
-                        text.push('\n');
+                        turns.push(format!("User: {}\n", truncate_content(&content, 500)));
                     }
                 }
             }
             Some("assistant") => {
                 if let Some(content) = extract_text_content(&obj["message"]["content"]) {
                     if !content.trim().is_empty() {
-                        text.push_str("Assistant: ");
-                        text.push_str(&truncate_content(&content, 2000));
-                        text.push('\n');
+                        turns.push(format!("Assistant: {}\n", truncate_content(&content, 1000)));
                     }
                 }
             }
@@ -378,7 +404,7 @@ fn extract_conversation_text(path: &std::path::Path) -> Result<String> {
         }
     }
 
-    Ok(text)
+    Ok(turns)
 }
 
 /// Extract plain text from a Claude message content field (string or array of blocks).
@@ -453,5 +479,32 @@ mod tests {
     fn test_extract_text_content_empty_blocks() {
         let val = serde_json::json!([{"type": "tool_use", "id": "x"}]);
         assert_eq!(extract_text_content(&val), None);
+    }
+
+    #[test]
+    fn test_chunk_turns_splits_at_limit() {
+        let turns: Vec<String> = (0..10)
+            .map(|i| "x".repeat(6_000) + &format!(" turn{i}\n"))
+            .collect();
+        let chunks = chunk_turns(&turns, 20_000);
+        // Each chunk should be at most CHUNK_CHARS
+        for chunk in &chunks {
+            assert!(chunk.len() <= 25_000, "chunk too large: {}", chunk.len());
+        }
+        // All turns should be covered
+        let all: String = chunks.join("");
+        for i in 0..10 {
+            assert!(all.contains(&format!("turn{i}")));
+        }
+    }
+
+    #[test]
+    fn test_chunk_turns_single_chunk_if_small() {
+        let turns = vec![
+            "User: hello\n".to_string(),
+            "Assistant: world\n".to_string(),
+        ];
+        let chunks = chunk_turns(&turns, 20_000);
+        assert_eq!(chunks.len(), 1);
     }
 }
