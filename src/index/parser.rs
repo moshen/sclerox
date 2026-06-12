@@ -288,7 +288,12 @@ pub fn split_large_chunk(
             break;
         }
 
-        start = end.saturating_sub(overlap_lines);
+        // Always advance by at least 1 line. Without this guard, when a single
+        // line is longer than max_chars the overlap calculation can send start
+        // back to its previous position, creating an infinite loop that
+        // allocates memory until the OOM killer terminates the process.
+        let next = end.saturating_sub(overlap_lines);
+        start = next.max(start + 1);
     }
 
     result
@@ -488,5 +493,42 @@ fn bar() {}
             "MAX_EMBED_CHARS ({}) exceeds model limit",
             super::super::MAX_EMBED_CHARS,
         );
+    }
+
+    #[test]
+    fn test_split_large_chunk_no_infinite_loop_on_long_lines() {
+        // Regression test for OOM bug: when a single line is longer than
+        // max_chars, the overlap calculation previously sent start back to 0,
+        // creating an infinite loop that allocated 64GB before being killed.
+        let long_line = "x".repeat(2000); // 2000 chars > max_chars=800
+        let source = (0..10)
+            .map(|_| long_line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let chunk = CodeChunk {
+            text: source.clone(),
+            start_line: 1,
+            end_line: 10,
+        };
+
+        // Must terminate and produce a bounded number of chunks
+        let chunks = split_large_chunk(chunk, 800, 3);
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
+        assert!(
+            chunks.len() <= 20,
+            "should not loop indefinitely: {} chunks",
+            chunks.len()
+        );
+
+        // Every chunk start must be strictly after the previous chunk start
+        for window in chunks.windows(2) {
+            assert!(
+                window[1].start_line > window[0].start_line,
+                "start_line must strictly increase: {} -> {}",
+                window[0].start_line,
+                window[1].start_line
+            );
+        }
     }
 }
