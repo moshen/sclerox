@@ -41,6 +41,7 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         println!("Installing for {}...", target_name(target));
         install_for_target(target, &ol_bin, &args)?;
     }
+    install_shell_completions(args.dry_run)?;
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
@@ -151,6 +152,116 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
         }
         InstallTarget::All => unreachable!(),
     }
+    Ok(())
+}
+
+// ─── Shell completions ───────────────────────────────────────────────────────
+
+fn detect_shell() -> Option<&'static str> {
+    let shell_path = std::env::var("SHELL").unwrap_or_default();
+    let name = std::path::Path::new(&shell_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    // Leak is fine for this short-lived CLI process
+    match name.as_str() {
+        "zsh" => Some("zsh"),
+        "bash" => Some("bash"),
+        "fish" => Some("fish"),
+        _ => None,
+    }
+}
+
+fn install_shell_completions(dry_run: bool) -> Result<()> {
+    use clap_complete::Shell;
+
+    let shell_name = match detect_shell() {
+        Some(s) => s,
+        None => {
+            println!(
+                "Completions: unknown shell (set $SHELL). \
+                 Run `ol completions <bash|zsh|fish>` manually."
+            );
+            return Ok(());
+        }
+    };
+
+    let shell: Shell = shell_name
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unsupported shell: {shell_name}"))?;
+    let content = super::completions::generate_to_string(shell);
+    let home = dirs::home_dir().context("no home directory")?;
+
+    match shell_name {
+        "zsh" => {
+            let comp_dir = home.join(".zsh").join("completions");
+            let comp_file = comp_dir.join("_ol");
+            let zshrc = home.join(".zshrc");
+            let fpath_line = "fpath=(~/.zsh/completions $fpath)";
+
+            if dry_run {
+                println!("Completions (zsh):");
+                println!("  would write: {}", comp_file.display());
+                // Check if fpath line already present
+                let existing = if zshrc.exists() {
+                    std::fs::read_to_string(&zshrc).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let already = existing.contains(fpath_line);
+                if !already {
+                    println!("  would append to ~/.zshrc: {fpath_line}");
+                }
+            } else {
+                std::fs::create_dir_all(&comp_dir)?;
+                std::fs::write(&comp_file, &content)?;
+                println!("Completions (zsh): {}", comp_file.display());
+
+                // Append fpath setup to .zshrc if not already present
+                let zshrc_content = if zshrc.exists() {
+                    std::fs::read_to_string(&zshrc)?
+                } else {
+                    String::new()
+                };
+                if !zshrc_content.contains(fpath_line) {
+                    let append = format!(
+                        "\n# ol completions\n{fpath_line}\nautoload -Uz compinit && compinit\n"
+                    );
+                    std::fs::write(&zshrc, format!("{}{}", zshrc_content.trim_end(), append))?;
+                    println!("  appended fpath setup to ~/.zshrc");
+                    println!("  run: source ~/.zshrc");
+                }
+            }
+        }
+        "bash" => {
+            // XDG user completions dir, picked up automatically by bash-completion ≥ 2.x
+            let comp_dir = home.join(".local/share/bash-completion/completions");
+            let comp_file = comp_dir.join("ol");
+            if dry_run {
+                println!("Completions (bash): would write {}", comp_file.display());
+            } else {
+                std::fs::create_dir_all(&comp_dir)?;
+                std::fs::write(&comp_file, &content)?;
+                println!("Completions (bash): {}", comp_file.display());
+                println!("  run: source ~/.bashrc  (or open a new shell)");
+            }
+        }
+        "fish" => {
+            let comp_dir = home.join(".config/fish/completions");
+            let comp_file = comp_dir.join("ol.fish");
+            if dry_run {
+                println!("Completions (fish): would write {}", comp_file.display());
+            } else {
+                std::fs::create_dir_all(&comp_dir)?;
+                std::fs::write(&comp_file, &content)?;
+                println!("Completions (fish): {}", comp_file.display());
+                println!("  completions active in new fish sessions automatically");
+            }
+        }
+        _ => {}
+    }
+
     Ok(())
 }
 
