@@ -407,6 +407,41 @@ ol repo sync                         # heal registry: remove stale, reindex miss
 **After research:** `ol research conclude <id> --findings "<findings>"`
 **Attributing a memory:** `ol memory people add <key> <person_id>`
 **Session summary:** `ol memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
+
+## Workflows
+
+### When working on a repo
+
+After `ol repo index` or when the user asks about a codebase:
+1. Check whether a project already tracks this repo: `ol project search "<repo name>"`
+2. **If found:** link if not already linked: `ol project repos add <project_id> <repo_id>`
+3. **If not found:** create one from the repo metadata, then link:
+   ```
+   ol project add --name "<repo name>" --description "<what this service does>" \
+     [--link "<git remote url>|GitHub"]
+   ol project repos add <new_project_id> <repo_id>
+   ```
+   Use `git remote get-url origin` to get the remote URL for the project link.
+
+### When starting a research investigation
+
+After `ol research start`:
+1. Search for a related project: `ol project search "<investigation topic>"`
+2. If found, link the investigation: `ol research projects add <investigation_id> <project_id>`
+3. When the investigation concludes, save the key finding as a memory:
+   `ol memory set "research/<slug>/finding" "<one-line finding>" --type project`
+
+### When creating a todo that belongs to a project
+
+1. Add the todo: `ol todo add --title "..." --category github`
+2. Find or confirm the project: `ol project search "<area>"`
+3. Link it: `ol todo projects add <todo_id> <project_id>`
+
+### When meeting notes mention a project
+
+After `ol meeting add`:
+1. Search for the project: `ol project search "<project name from notes>"`
+2. Link the meeting: `ol project meetings add <project_id> <meeting_id>`
 "#,
         agent_bin = agent_bin
     )
