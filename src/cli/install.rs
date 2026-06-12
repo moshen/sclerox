@@ -97,6 +97,9 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
             if !args.no_skill {
                 install_skill(&dir.join("skills"), "ol-kb.md", "opencode", args.dry_run)?;
             }
+            if !args.no_hooks {
+                install_opencode_plugin(&dir, ol_bin, args.dry_run)?;
+            }
             if !args.no_instructions {
                 // Global OpenCode instructions file, not a per-repo AGENTS.md.
                 append_or_create_section(
@@ -139,6 +142,12 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
             let dir = opencode_dir()?;
             if !args.no_skill {
                 remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
+            }
+            if !args.no_hooks {
+                remove_if_exists(
+                    &dir.join("plugins").join("ol-session.js"),
+                    args.dry_run,
+                )?;
             }
             if !args.no_instructions {
                 uninstall_section(&dir.join("AGENTS.md").to_string_lossy(), args.dry_run)?;
@@ -395,6 +404,51 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
             })
             .unwrap_or(false)
     });
+}
+
+const OPENCODE_PLUGIN_MARKER: &str = "// ol-kb-plugin";
+
+fn install_opencode_plugin(opencode_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
+    let plugins_dir = opencode_dir.join("plugins");
+    let plugin_path = plugins_dir.join("ol-session.js");
+    let content = opencode_plugin_content(ol_bin);
+
+    if dry_run {
+        println!("  would write OpenCode plugin: {}", plugin_path.display());
+    } else {
+        std::fs::create_dir_all(&plugins_dir)
+            .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
+        std::fs::write(&plugin_path, content)
+            .with_context(|| format!("failed to write {}", plugin_path.display()))?;
+        println!("  wrote OpenCode plugin: {}", plugin_path.display());
+    }
+    Ok(())
+}
+
+fn opencode_plugin_content(ol_bin: &str) -> String {
+    format!(
+        r#"{OPENCODE_PLUGIN_MARKER}
+// ol Operating Layer - session hook for OpenCode
+// Indexes the current repo and distills session memories on idle.
+// Installed by: ol install --target opencode
+
+const OL_BIN = "{ol_bin}";
+
+export default function(ctx) {{
+  return {{
+    "session.idle": async ({{ session }}) => {{
+      try {{
+        // Guard against recursion if opencode is the distillation binary
+        if (process.env.OL_HOOK_RUNNING) return;
+        await ctx.$`${{OL_BIN}} hook opencode ${{session.id}} ${{ctx.directory}}`.quiet();
+      }} catch (_) {{
+        // Never block session exit
+      }}
+    }},
+  }};
+}}
+"#
+    )
 }
 
 const SECTION_MARKER: &str = "<!-- ol-kb -->";
