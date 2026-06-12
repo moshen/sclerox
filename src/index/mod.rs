@@ -4,7 +4,6 @@ pub mod repo_db;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use walkdir::WalkDir;
 
 use crate::db::Database;
 use crate::embed::Embedder;
@@ -22,23 +21,33 @@ pub const MAX_EMBED_CHARS: usize = 800;
 
 // Overlap when splitting an oversized function chunk into sub-chunks.
 const SPLIT_OVERLAP_LINES: usize = 3;
-const IGNORED_DIRS: &[&str] = &[
+
+// Directories always excluded regardless of .gitignore.
+// .gitignore is the primary source of truth (via the ignore crate), but these
+// cover universal build/cache dirs that repos commonly omit from .gitignore,
+// plus our own .ol dir which should never appear in .gitignore.
+const HARDCODED_IGNORED: &[&str] = &[
+    ".ol",
     ".git",
     "node_modules",
-    "target",
-    ".ol",
-    "dist",
-    "build",
+    "target", // Rust build output
     "__pycache__",
     ".venv",
     "vendor",
-    // .NET / C# build artifacts
     "obj",
-    "bin",
-    // JVM
-    ".gradle",
-    "out",
+    "bin", // .NET build output
 ];
+
+// Default tree-sitter file size limit. Override with OL_MAX_INDEX_FILE_BYTES env var.
+// Files above this fall back to line-based chunking (still indexed, no symbol extraction).
+const DEFAULT_MAX_TREE_SITTER_BYTES: usize = 1_000_000; // 1 MB
+
+fn max_tree_sitter_bytes() -> usize {
+    std::env::var("OL_MAX_INDEX_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_TREE_SITTER_BYTES)
+}
 
 pub struct RepoIndexer<'a> {
     embedder: Option<&'a mut Embedder>,
@@ -72,22 +81,31 @@ impl<'a> RepoIndexer<'a> {
 
         let mut result = IndexResult::default();
 
-        for entry in WalkDir::new(repo_root)
+        // Use the `ignore` crate (same engine as ripgrep) so .gitignore,
+        // .ignore, and global gitignore are all automatically respected.
+        let walker = ignore::WalkBuilder::new(repo_root)
             .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| e.file_type().is_file() || !is_ignored_dir(e.path()))
+            .hidden(false) // don't skip dot-files by default (we handle .ol ourselves)
+            .git_ignore(true) // respect .gitignore
+            .git_global(true) // respect ~/.config/git/ignore
+            .git_exclude(true) // respect .git/info/exclude
+            .require_git(false) // respect .gitignore even outside a git repo
+            .filter_entry(|e| {
+                // Still explicitly exclude our own .ol dir and other noise
+                let name = e.file_name().to_str().unwrap_or("");
+                !HARDCODED_IGNORED.contains(&name)
+            })
+            .build();
+
+        for entry in walker
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
             let path = entry.path();
             let rel_path = match path.strip_prefix(repo_root) {
                 Ok(p) => p.to_string_lossy().to_string(),
                 Err(_) => continue,
             };
-
-            if is_ignored_path(&rel_path) {
-                continue;
-            }
 
             let lang = match detect_language(path) {
                 Some(l) => l,
@@ -97,6 +115,20 @@ impl<'a> RepoIndexer<'a> {
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(_) => continue,
+            };
+
+            // For very large files, skip tree-sitter to avoid unbounded memory
+            // usage (tree-sitter requires the whole file in memory at once).
+            // The file is still indexed via line-based chunking - it will be
+            // searchable but without symbol extraction.
+            let effective_lang = if source.len() > max_tree_sitter_bytes() {
+                log::debug!(
+                    "{rel_path} is {}KB, skipping tree-sitter (line-based only)",
+                    source.len() / 1024
+                );
+                "text" // no tree-sitter grammar → falls back to chunk_by_lines
+            } else {
+                lang
             };
 
             let hash = sha256_hex(source.as_bytes());
@@ -110,7 +142,7 @@ impl<'a> RepoIndexer<'a> {
             let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
             repo_db.delete_file_data(file_id)?;
 
-            let (symbols, raw_chunks) = parse_file(&source, lang, CHUNK_SIZE_LINES);
+            let (symbols, raw_chunks) = parse_file(&source, effective_lang, CHUNK_SIZE_LINES);
 
             // Split any chunk that exceeds the embedding model's context window.
             // Tree-sitter emits whole functions regardless of size; large ones get sub-chunked.
@@ -210,19 +242,6 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn is_ignored_dir(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| IGNORED_DIRS.contains(&name))
-        .unwrap_or(false)
-}
-
-fn is_ignored_path(rel_path: &str) -> bool {
-    IGNORED_DIRS
-        .iter()
-        .any(|dir| rel_path.starts_with(&format!("{dir}/")) || rel_path == *dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +336,61 @@ class Handler:
         let data = b"hello world";
         assert_eq!(sha256_hex(data), sha256_hex(data));
         assert_ne!(sha256_hex(data), sha256_hex(b"different"));
+    }
+
+    #[test]
+    fn test_gitignore_excludes_dirs() {
+        let dir = TempDir::new().unwrap();
+        // Write source files
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        // Write a .gitignore that excludes a build-output dir
+        std::fs::write(dir.path().join(".gitignore"), "build_output/\n").unwrap();
+        // Create the excluded dir with a source file inside
+        std::fs::create_dir_all(dir.path().join("build_output")).unwrap();
+        std::fs::write(
+            dir.path().join("build_output").join("gen.rs"),
+            "fn gen() {}",
+        )
+        .unwrap();
+
+        let primary_db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        let _ = indexer.index_repo(&primary_db, dir.path(), None).unwrap();
+
+        let db_path = dir.path().join(".ol").join("repo.db");
+        let repo_db = RepoDb::open(&db_path).unwrap();
+        let files = repo_db.list_files().unwrap();
+        assert!(
+            !files.iter().any(|f| f.path.starts_with("build_output/")),
+            ".gitignore exclusion should be respected"
+        );
+        assert!(
+            files.iter().any(|f| f.path == "main.rs"),
+            "main.rs should still be indexed"
+        );
+    }
+
+    #[test]
+    fn test_large_file_falls_back_to_line_chunks() {
+        let dir = TempDir::new().unwrap();
+
+        // ~480 bytes - small file, but we set a tiny limit so the fallback triggers
+        // without needing to write a huge file in a test.
+        let source = "def func_a():\n    pass\n\n".repeat(20);
+        std::fs::write(dir.path().join("normal.py"), &source).unwrap();
+
+        // Set limit to 100 bytes so our ~480-byte file triggers the fallback
+        std::env::set_var("OL_MAX_INDEX_FILE_BYTES", "100");
+        let primary_db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        let result = indexer.index_repo(&primary_db, dir.path(), None).unwrap();
+        std::env::remove_var("OL_MAX_INDEX_FILE_BYTES");
+
+        assert_eq!(
+            result.files_indexed, 1,
+            "file should be indexed via fallback"
+        );
+        assert!(result.chunks > 0, "should produce line-based chunks");
+        assert_eq!(result.symbols, 0, "no symbols when tree-sitter is skipped");
     }
 }
