@@ -1,4 +1,5 @@
 pub mod completions;
+pub mod format;
 pub mod hook;
 pub mod install;
 pub mod meetings;

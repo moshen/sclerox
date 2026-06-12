@@ -52,12 +52,10 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     status,
                     category,
                 } => {
-                    let checkbox = match status.as_str() {
-                        "done" => "[x]",
-                        "watch" => "[~]",
-                        _ => "[ ]",
-                    };
-                    println!("[todo] {checkbox} #{id} [{category}] {title}");
+                    let cb = crate::cli::format::status_checkbox(status);
+                    let id_col = format!("{:<5}", format!("#{id}"));
+                    let cat_col = format!("{:<9}", format!("[{category}]"));
+                    println!("[todo] {cb} {id_col} {cat_col} {title}");
                 }
                 SearchResult::Investigation {
                     id,
@@ -66,8 +64,9 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     status,
                     snippet,
                 } => {
-                    let checkbox = if status == "concluded" { "[x]" } else { "[ ]" };
-                    println!("[research] {checkbox} #{id} {name} ({slug})");
+                    let cb = crate::cli::format::status_checkbox(status);
+                    let id_col = format!("{:<5}", format!("#{id}"));
+                    println!("[research] {cb} {id_col} {name}  ({slug})");
                     if !snippet.is_empty() {
                         println!("           {snippet}");
                     }

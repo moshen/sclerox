@@ -317,15 +317,8 @@ fn print_investigation_detail(inv: &crate::db::investigations::Investigation) {
     }
 }
 
-/// Single-line summary matching the todo list format:
-/// [x] #26   OpenCode plugin for session recording  (opencode-session-plugin)
 fn research_line(inv: &crate::db::investigations::Investigation) -> String {
-    let checkbox = match inv.status.as_str() {
-        "concluded" => "[x]",
-        _ => "[ ]",
-    };
-    let id_col = format!("{:<5}", format!("#{}", inv.id));
-    format!("{checkbox} {id_col} {}  ({})", inv.name, inv.slug)
+    crate::cli::format::research_line(inv)
 }
 
 fn truncate(s: &str, max: usize) -> String {

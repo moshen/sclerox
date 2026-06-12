@@ -310,28 +310,7 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
 }
 
 fn print_todo_line(t: &crate::db::todos::Todo) {
-    let checkbox = match t.status.as_str() {
-        "done" => "[x]",
-        "watch" => "[~]",
-        _ => "[ ]",
-    };
-    // Fixed-width columns: ID left-aligned with # prefix in 5 chars, category left-aligned in 9
-    let id_col = format!("{:<5}", format!("#{}", t.id));
-    let cat_col = format!("{:<9}", format!("[{}]", t.category));
-    let deadline = t
-        .deadline_date
-        .as_deref()
-        .map(|d| format!("  deadline:{d}"))
-        .unwrap_or_default();
-    let source = t
-        .source_url
-        .as_deref()
-        .map(|u| format!("  {u}"))
-        .unwrap_or_default();
-    println!(
-        "{checkbox} {id_col} {cat_col} {}{deadline}{source}",
-        t.title
-    );
+    println!("{}", crate::cli::format::todo_line(t));
 }
 
 fn print_todo_detail(t: &crate::db::todos::Todo) {
