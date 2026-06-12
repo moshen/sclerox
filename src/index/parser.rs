@@ -304,8 +304,8 @@ mod tests {
         assert_eq!(detect_language(Path::new("app.py")), Some("python"));
         assert_eq!(detect_language(Path::new("index.ts")), Some("typescript"));
         assert_eq!(detect_language(Path::new("main.go")), Some("go"));
-        assert_eq!(detect_language(Path::new("Program.cs")), Some("csharp"));
-        assert_eq!(detect_language(Path::new("Main.java")), Some("java"));
+        assert_eq!(detect_language(Path::new("main.cs")), Some("csharp"));
+        assert_eq!(detect_language(Path::new("main.java")), Some("java"));
         assert_eq!(detect_language(Path::new("readme.md")), Some("markdown"));
         assert_eq!(detect_language(Path::new("makefile")), None);
     }
