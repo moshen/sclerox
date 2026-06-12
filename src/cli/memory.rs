@@ -519,10 +519,10 @@ fn import_memories(
 
 // ─── AI distillation ─────────────────────────────────────────────────────────
 
-struct DistilledMemory {
-    key: String,
-    value: String,
-    memory_type: String,
+pub struct DistilledMemory {
+    pub key: String,
+    pub value: String,
+    pub memory_type: String,
 }
 
 const DISTILL_PROMPT: &str = r#"You are extracting structured memory entries from the provided text.
@@ -550,6 +550,14 @@ Text to distill:
 ///
 /// The binary must support: `<bin> -p "<prompt>"` → prints response to stdout.
 /// If model is provided, it is forwarded as `--model <model>`.
+pub fn distill_with_ai_pub(
+    bin: &str,
+    model: Option<&str>,
+    text: &str,
+) -> anyhow::Result<Vec<DistilledMemory>> {
+    distill_with_ai(bin, model, text)
+}
+
 fn distill_with_ai(
     bin: &str,
     model: Option<&str>,

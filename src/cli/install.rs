@@ -188,9 +188,9 @@ fn install_claude_hook(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json(&settings_path)?;
 
-    let hook_command = format!(
-        "{HOOK_MARKER}\n{ol_bin} repo index . --description \"$(basename \"$PWD\") repo\" 2>/dev/null || true"
-    );
+    // Single entry point: ol hook stop reads stdin (avoiding broken-pipe),
+    // indexes the repo, and distills session memories from the transcript.
+    let hook_command = format!("{HOOK_MARKER}\n{ol_bin} hook stop 2>/dev/null || true");
     let new_hook = serde_json::json!({ "type": "command", "command": hook_command });
 
     let stop = settings

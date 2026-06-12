@@ -1,4 +1,5 @@
 pub mod completions;
+pub mod hook;
 pub mod install;
 pub mod meetings;
 pub mod memory;
@@ -71,6 +72,10 @@ pub enum Commands {
     /// Generate shell completions
     Completions(completions::CompletionsArgs),
 
+    /// Internal: run as a Claude Code lifecycle hook (reads hook JSON from stdin)
+    #[command(subcommand)]
+    Hook(hook::HookCommand),
+
     /// Install ol into your AI tool setup (Claude Code, OpenCode, Codex)
     Install(install::InstallArgs),
 
@@ -85,6 +90,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => install::run_install(args),
         Commands::Uninstall(args) => install::run_uninstall(args),
         Commands::Completions(args) => completions::run(args),
+        Commands::Hook(cmd) => {
+            let config = Config::from_env();
+            let db = Database::open(&config.db_path)?;
+            hook::run(&db, cmd)
+        }
         cmd => {
             let config = Config::from_env();
             let db = Database::open(&config.db_path)?;
@@ -98,9 +108,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Repo(c) => repos::run(&db, c),
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Migrate(a) => migrate::run(&db, a),
-                Commands::Install(_) | Commands::Uninstall(_) | Commands::Completions(_) => {
-                    unreachable!()
-                }
+                Commands::Install(_)
+                | Commands::Uninstall(_)
+                | Commands::Completions(_)
+                | Commands::Hook(_) => unreachable!(),
             }
         }
     }
