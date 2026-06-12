@@ -298,12 +298,12 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
 }
 
 fn print_investigation_detail(inv: &crate::db::investigations::Investigation) {
-    let status_icon = match inv.status.as_str() {
-        "concluded" => "✓",
-        "active" => "→",
-        _ => "○",
+    let checkbox = if inv.status == "concluded" {
+        "[x]"
+    } else {
+        "[ ]"
     };
-    println!("{status_icon} #{} {} [{}]", inv.id, inv.name, inv.slug);
+    println!("{checkbox} #{} {} [{}]", inv.id, inv.name, inv.slug);
     println!("  Status:  {}", inv.status);
     println!("  Started: {}", inv.created_at);
     if let Some(at) = &inv.concluded_at {

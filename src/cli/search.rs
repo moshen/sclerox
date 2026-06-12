@@ -66,8 +66,8 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     status,
                     snippet,
                 } => {
-                    let icon = if status == "concluded" { "✓" } else { "→" };
-                    println!("[research] {icon} #{id} {name} ({slug})");
+                    let checkbox = if status == "concluded" { "[x]" } else { "[ ]" };
+                    println!("[research] {checkbox} #{id} {name} ({slug})");
                     if !snippet.is_empty() {
                         println!("           {snippet}");
                     }
