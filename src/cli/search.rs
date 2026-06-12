@@ -81,6 +81,17 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     let desc = description.as_deref().unwrap_or("-");
                     println!("[repo] #{id} {name} ({path}) - {desc}");
                 }
+                SearchResult::Symbol {
+                    repo_name,
+                    kind,
+                    name,
+                    signature,
+                    file_path,
+                    start_line,
+                } => {
+                    let sig = signature.as_deref().unwrap_or(name);
+                    println!("[symbol] [{kind}] {sig} ({repo_name}/{file_path}:{start_line})");
+                }
             }
         }
         println!("\n{} results", results.len());

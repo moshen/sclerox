@@ -48,6 +48,14 @@ pub enum SearchResult {
         path: String,
         description: Option<String>,
     },
+    Symbol {
+        repo_name: String,
+        kind: String,
+        name: String,
+        signature: Option<String>,
+        file_path: String,
+        start_line: i64,
+    },
 }
 
 pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
@@ -126,6 +134,30 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
 
+    // Fan out to all registered repo DBs and search symbols
+    for repo in db.repo_list()? {
+        let db_path = std::path::Path::new(&repo.db_path);
+        if !db_path.exists() {
+            continue;
+        }
+        let Ok(repo_db) = crate::index::repo_db::RepoDb::open(db_path) else {
+            continue;
+        };
+        let Ok(symbols) = repo_db.search_symbols(query) else {
+            continue;
+        };
+        for sym in symbols {
+            results.push(SearchResult::Symbol {
+                repo_name: repo.name.clone(),
+                kind: sym.kind,
+                name: sym.name,
+                signature: sym.signature,
+                file_path: sym.file_path,
+                start_line: sym.start_line,
+            });
+        }
+    }
+
     Ok(results)
 }
 
@@ -186,6 +218,7 @@ mod tests {
                 SearchResult::Todo { .. } => "todo",
                 SearchResult::Investigation { .. } => "investigation",
                 SearchResult::Repo { .. } => "repo",
+                SearchResult::Symbol { .. } => "symbol",
             })
             .collect();
         assert!(types.contains(&"todo"), "missing todo results");
