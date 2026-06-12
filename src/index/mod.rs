@@ -63,6 +63,7 @@ impl<'a> RepoIndexer<'a> {
             .unwrap_or("unknown")
             .to_string();
 
+        log::info!("indexing repo '{}' at {}", name, repo_root.display());
         let db_path = repo_root.join(".ol").join("repo.db");
         let repo_db = RepoDb::open(&db_path)?;
 
@@ -148,7 +149,23 @@ impl<'a> RepoIndexer<'a> {
             }
 
             result.files_indexed += 1;
+            log::debug!(
+                "indexed {} ({}, {} symbols, {} chunks)",
+                rel_path,
+                lang,
+                symbols.len(),
+                chunks.len()
+            );
         }
+
+        log::info!(
+            "repo '{}' done: {} indexed, {} skipped, {} symbols, {} chunks",
+            name,
+            result.files_indexed,
+            result.skipped,
+            result.symbols,
+            result.chunks
+        );
 
         // Generate description embedding for the repo registry
         let desc_embedding = if let Some(ref mut emb) = self.embedder {

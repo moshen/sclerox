@@ -68,10 +68,14 @@ impl Embedder {
     }
 
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        log::debug!("embedding {} chars", text.len());
         let mut results = self
             .inner
             .embed(std::slice::from_ref(&text), None)
-            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+            .map_err(|e| {
+                log::error!("embedding failed: {e}");
+                anyhow::anyhow!("embedding failed: {e}")
+            })?;
         results
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))

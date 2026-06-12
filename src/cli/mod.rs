@@ -29,8 +29,17 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "text", value_enum)]
     pub output: OutputFormat,
 
+    /// Log level (also reads $OL_LOG). Logs go to ~/.ol/logs/ol-YYYY-MM-DD.log
+    #[arg(long, global = true, value_parser = parse_level_filter)]
+    pub log_level: Option<crate::logging::LevelFilter>,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+fn parse_level_filter(s: &str) -> Result<crate::logging::LevelFilter, String> {
+    s.parse::<crate::logging::LevelFilter>()
+        .map_err(|_| format!("unknown log level '{s}' (try: error, warn, info, debug, trace)"))
 }
 
 #[derive(Subcommand)]

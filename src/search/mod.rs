@@ -138,14 +138,23 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
     for repo in db.repo_list()? {
         let db_path = std::path::Path::new(&repo.db_path);
         if !db_path.exists() {
+            log::debug!("repo '{}' db missing, skipping symbol search", repo.name);
             continue;
         }
         let Ok(repo_db) = crate::index::repo_db::RepoDb::open(db_path) else {
+            log::error!("could not open repo db for '{}'", repo.name);
             continue;
         };
         let Ok(symbols) = repo_db.search_symbols(query) else {
+            log::error!("symbol search failed for repo '{}'", repo.name);
             continue;
         };
+        log::debug!(
+            "repo '{}': {} symbol hits for '{}'",
+            repo.name,
+            symbols.len(),
+            query
+        );
         for sym in symbols {
             results.push(SearchResult::Symbol {
                 repo_name: repo.name.clone(),

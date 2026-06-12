@@ -21,12 +21,17 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
+        log::debug!("opening primary db: {}", path.display());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
         let db = Self { conn };
         db.init()?;
+        log::debug!(
+            "primary db ready (schema v{})",
+            db.user_version().unwrap_or(0)
+        );
         Ok(db)
     }
 
@@ -89,12 +94,13 @@ pub fn run_migrations(
         if m.version <= current || m.version > target {
             continue;
         }
+        log::info!("applying migration v{}: {}", m.version, m.description);
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(m.sql)
             .with_context(|| format!("migration v{} ({}) failed", m.version, m.description))?;
-        // user_version inside a transaction is committed atomically with the DDL.
         tx.execute_batch(&format!("PRAGMA user_version = {}", m.version))?;
         tx.commit()?;
+        log::debug!("migration v{} applied", m.version);
     }
     Ok(())
 }

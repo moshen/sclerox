@@ -170,9 +170,15 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         Some(env_model.as_str())
     });
 
+    log::debug!(
+        "distilling {} turns from session {} in chunks",
+        turns.len(),
+        session_id
+    );
     let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
     if total > 0 {
         eprintln!("[ol] distilled {total} memories from session");
+        log::info!("distilled {total} memories from session {session_id}");
     }
 
     Ok(())
