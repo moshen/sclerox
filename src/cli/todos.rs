@@ -323,7 +323,7 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
     let source = t
         .source_url
         .as_deref()
-        .map(|_| " [src]")
+        .map(|u| format!(" {u}"))
         .unwrap_or_default();
     println!(
         "{checkbox} #{} [{}] {}{}{}",
