@@ -315,8 +315,8 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
         "watch" => "[~]",
         _ => "[ ]",
     };
-    // Fixed-width columns: ID right-aligned in 4 chars, category left-aligned in 9
-    let id_col = format!("{:>4}", t.id);
+    // Fixed-width columns: ID left-aligned with # prefix in 5 chars, category left-aligned in 9
+    let id_col = format!("{:<5}", format!("#{}", t.id));
     let cat_col = format!("{:<9}", format!("[{}]", t.category));
     let deadline = t
         .deadline_date
@@ -328,7 +328,10 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
         .as_deref()
         .map(|u| format!("  {u}"))
         .unwrap_or_default();
-    println!("{checkbox} #{id_col} {cat_col} {}{deadline}{source}", t.title);
+    println!(
+        "{checkbox} {id_col} {cat_col} {}{deadline}{source}",
+        t.title
+    );
 }
 
 fn print_todo_detail(t: &crate::db::todos::Todo) {
