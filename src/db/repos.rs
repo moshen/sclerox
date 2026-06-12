@@ -39,7 +39,7 @@ impl Database {
                description = excluded.description,
                db_path = excluded.db_path,
                last_indexed = datetime('now'),
-               description_embedding = excluded.description_embedding",
+               description_embedding = COALESCE(excluded.description_embedding, repos.description_embedding)",
             params![path, name, description, db_path, emb_bytes],
         )?;
         Ok(self.conn.last_insert_rowid())

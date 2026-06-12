@@ -167,13 +167,21 @@ impl<'a> RepoIndexer<'a> {
             result.chunks
         );
 
-        // Generate description embedding for the repo registry
-        let desc_embedding = if let Some(ref mut emb) = self.embedder {
-            description
-                .and_then(|d| emb.embed_one(d).ok())
-                .or_else(|| emb.embed_one(&name).ok())
+        // Only (re-)embed the description when something actually changed.
+        // Loading the ONNX model costs ~280MB RSS; skip it on no-op runs.
+        // The upsert uses COALESCE so passing None preserves any existing embedding.
+        let desc_embedding = if result.files_indexed > 0 {
+            if let Some(ref mut emb) = self.embedder {
+                log::debug!("generating repo description embedding");
+                description
+                    .and_then(|d| emb.embed_one(d).ok())
+                    .or_else(|| emb.embed_one(&name).ok())
+            } else {
+                None
+            }
         } else {
-            None
+            log::debug!("no files changed, skipping description re-embedding");
+            None // repo_register COALESCE preserves the stored embedding
         };
 
         db.repo_register(
