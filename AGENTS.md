@@ -4,6 +4,12 @@
 - Run `cargo clippy`, fix all clippy issues
 - Run `cargo test`, fix all failing tests
 
+# When changing how a record type is displayed
+
+Update `src/cli/format.rs` - it owns the canonical single-line renderers for
+todos and investigations. Do not duplicate formatting logic in individual
+command handlers; call the shared function instead.
+
 # When adding or changing CLI commands
 
 Update the skill file in `src/cli/install.rs` (`skill_file_content()`):
