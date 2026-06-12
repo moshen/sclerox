@@ -20,13 +20,28 @@ pub struct CodeChunk {
 }
 
 /// Detect language from file extension.
+/// Languages with a tree-sitter grammar get full symbol extraction.
+/// Others fall back to line-based chunking (still indexed and searchable).
 pub fn detect_language(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()? {
+        // Tree-sitter backed (full symbol extraction)
         "rs" => Some("rust"),
-        "py" => Some("python"),
+        "py" | "pyi" => Some("python"),
         "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
         "go" => Some("go"),
+        "cs" => Some("csharp"),
+        // Line-based fallback (indexed but no symbol extraction)
+        "java" => Some("java"),
+        "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" => Some("cpp"),
+        "rb" => Some("ruby"),
+        "swift" => Some("swift"),
+        "kt" | "kts" => Some("kotlin"),
+        "scala" => Some("scala"),
+        "php" => Some("php"),
+        "sh" | "bash" | "zsh" => Some("shell"),
+        "sql" => Some("sql"),
+        "md" | "mdx" => Some("markdown"),
         _ => None,
     }
 }
@@ -38,6 +53,8 @@ fn get_tree_sitter_language(lang: &str) -> Option<Language> {
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
+        "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        // Everything else falls back to line-based chunking in parse_file
         _ => None,
     }
 }
@@ -127,6 +144,18 @@ fn collect_symbols(
                 | "type_declaration"
                 | "var_declaration"
                 | "const_declaration"
+        ),
+        "csharp" => matches!(
+            kind,
+            "class_declaration"
+                | "interface_declaration"
+                | "method_declaration"
+                | "constructor_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "struct_declaration"
+                | "namespace_declaration"
+                | "property_declaration"
         ),
         _ => false,
     };
@@ -275,7 +304,10 @@ mod tests {
         assert_eq!(detect_language(Path::new("app.py")), Some("python"));
         assert_eq!(detect_language(Path::new("index.ts")), Some("typescript"));
         assert_eq!(detect_language(Path::new("main.go")), Some("go"));
-        assert_eq!(detect_language(Path::new("readme.md")), None);
+        assert_eq!(detect_language(Path::new("Program.cs")), Some("csharp"));
+        assert_eq!(detect_language(Path::new("Main.java")), Some("java"));
+        assert_eq!(detect_language(Path::new("readme.md")), Some("markdown"));
+        assert_eq!(detect_language(Path::new("makefile")), None);
     }
 
     #[test]

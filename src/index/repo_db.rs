@@ -202,15 +202,18 @@ impl RepoDb {
     }
 
     pub fn search_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
+        // Use LIKE for substring matching so "Sumo" finds "SumoClient" and
+        // "SearchJob" finds "CreateSearchJobRequest". Symbol tables are small
+        // (hundreds to low thousands), so a full scan is fast enough.
+        let pattern = format!("%{query}%");
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line
              FROM symbols s
-             JOIN symbols_fts sf ON s.id = sf.rowid
              JOIN files f ON s.file_id = f.id
-             WHERE symbols_fts MATCH ?1
-             ORDER BY rank",
+             WHERE s.name LIKE ?1 ESCAPE '\\' OR s.signature LIKE ?1 ESCAPE '\\'
+             ORDER BY s.name",
         )?;
-        let rows = stmt.query_map(params![query], |row| {
+        let rows = stmt.query_map(params![pattern], |row| {
             Ok(Symbol {
                 id: row.get(0)?,
                 file_id: row.get(1)?,
@@ -323,10 +326,29 @@ mod tests {
         db.insert_symbol(file_id, "struct", "Config", Some("struct Config"), 12, 20)
             .unwrap();
 
+        // Exact match
         let syms = db.search_symbols("main").unwrap();
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "main");
         assert_eq!(syms[0].file_path, "src/main.rs");
+
+        // Substring match (e.g. "Config" inside "ConfigBuilder")
+        db.insert_symbol(
+            file_id,
+            "struct",
+            "ConfigBuilder",
+            Some("struct ConfigBuilder"),
+            22,
+            40,
+        )
+        .unwrap();
+        let by_prefix = db.search_symbols("Config").unwrap();
+        assert_eq!(by_prefix.len(), 2, "should match Config and ConfigBuilder");
+
+        // CamelCase substring
+        let by_mid = db.search_symbols("Builder").unwrap();
+        assert_eq!(by_mid.len(), 1);
+        assert_eq!(by_mid[0].name, "ConfigBuilder");
     }
 
     #[test]

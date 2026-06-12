@@ -32,6 +32,12 @@ const IGNORED_DIRS: &[&str] = &[
     "__pycache__",
     ".venv",
     "vendor",
+    // .NET / C# build artifacts
+    "obj",
+    "bin",
+    // JVM
+    ".gradle",
+    "out",
 ];
 
 pub struct RepoIndexer<'a> {
