@@ -34,6 +34,16 @@ pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
 }
 
 fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: bool) -> Result<()> {
+    // Guard against re-entrant calls: if `claude -p` (used for distillation)
+    // also fires the Stop hook we'd recurse infinitely. The env var is inherited
+    // by child processes, so the inner `claude -p` session sees it and skips.
+    if std::env::var("OL_HOOK_RUNNING").is_ok() {
+        return Ok(());
+    }
+    // Safety: set before any subprocess is spawned; this process exits after
+    // the hook returns so there's no need to unset it.
+    unsafe { std::env::set_var("OL_HOOK_RUNNING", "1") };
+
     // Always read stdin - Claude Code sends hook JSON here.
     // Consuming it prevents broken-pipe errors even if we don't use it all.
     let mut stdin_buf = String::new();
