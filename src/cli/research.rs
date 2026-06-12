@@ -142,7 +142,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     println!("No investigations.");
                 } else {
                     for inv in &invs {
-                        println!("[{}] #{} {} ({})", inv.status, inv.id, inv.name, inv.slug);
+                        println!("{}", research_line(inv));
                     }
                     println!("\n{} investigations", invs.len());
                 }
@@ -156,7 +156,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     println!("No matches for: {query}");
                 } else {
                     for inv in &results {
-                        println!("[{}] #{} {}", inv.status, inv.id, inv.name);
+                        println!("{}", research_line(inv));
                         if let Some(f) = &inv.findings {
                             println!("  {}", truncate(f, 100));
                         }
@@ -315,6 +315,17 @@ fn print_investigation_detail(inv: &crate::db::investigations::Investigation) {
     if let Some(findings) = &inv.findings {
         println!("\nFindings:\n  {}", findings.trim().replace('\n', "\n  "));
     }
+}
+
+/// Single-line summary matching the todo list format:
+/// [x] #26   OpenCode plugin for session recording  (opencode-session-plugin)
+fn research_line(inv: &crate::db::investigations::Investigation) -> String {
+    let checkbox = match inv.status.as_str() {
+        "concluded" => "[x]",
+        _ => "[ ]",
+    };
+    let id_col = format!("{:<5}", format!("#{}", inv.id));
+    format!("{checkbox} {id_col} {}  ({})", inv.name, inv.slug)
 }
 
 fn truncate(s: &str, max: usize) -> String {
