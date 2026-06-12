@@ -156,9 +156,19 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
 }
 
 /// Derive the Claude Code project hash from a working directory path.
-/// Claude Code replaces every `/` with `-`, giving `-Users-foo-code-project`.
+/// Claude Code replaces every non-alphanumeric character (slash, dot, etc.)
+/// with `-`, so `/Users/colin.kennedy/code/proj` → `-Users-colin-kennedy-code-proj`.
 fn path_to_project_hash(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('/', "-")
+    path.to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
@@ -256,9 +266,15 @@ mod tests {
 
     #[test]
     fn test_path_to_project_hash() {
+        // Plain path
         assert_eq!(
             path_to_project_hash(std::path::Path::new("/Users/colin/code/myproject")),
             "-Users-colin-code-myproject"
+        );
+        // Dots in username are also replaced
+        assert_eq!(
+            path_to_project_hash(std::path::Path::new("/Users/colin.kennedy/code/my-project")),
+            "-Users-colin-kennedy-code-my-project"
         );
     }
 
