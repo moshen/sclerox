@@ -170,6 +170,28 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         return Ok(());
     }
 
+    // Skip if we've already distilled this session at this turn count.
+    // Prevents repeated distillation when claude -p sub-sessions fire
+    // their own Stop hooks, and avoids redundant work on re-runs.
+    // Re-distills only if the session has grown by at least 50 turns
+    // since last time (picking up genuinely new content).
+    let marker = distill_marker_path(session_id);
+    let last_distilled = marker
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    const MIN_NEW_TURNS: usize = 50;
+    if turn_count <= last_distilled + MIN_NEW_TURNS {
+        log::debug!(
+            "session {} already distilled at {} turns (now {}), skipping",
+            session_id,
+            last_distilled,
+            turn_count
+        );
+        return Ok(());
+    }
+
     // Resolve the current binary path for the background spawn
     let Ok(current_exe) = std::env::current_exe() else {
         return Ok(());
@@ -201,10 +223,20 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         .stderr(std::process::Stdio::null())
         .spawn();
 
+    // Write the marker immediately so concurrent Stop hooks spawned by
+    // the background claude -p calls don't start a second distillation.
+    if let Some(p) = &marker {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, turn_count.to_string());
+    }
+
     log::debug!(
-        "spawned background distillation for session {} ({} turns)",
+        "spawned background distillation for session {} ({} turns, last {})",
         session_id,
-        turn_count
+        turn_count,
+        last_distilled
     );
 
     Ok(())
@@ -391,6 +423,17 @@ fn path_to_project_hash(path: &std::path::Path) -> String {
             }
         })
         .collect()
+}
+
+/// Path to the per-session distillation marker: ~/.ol/distilled/<session-id>
+/// Contains the turn count at which we last distilled this session.
+fn distill_marker_path(session_id: &str) -> Option<std::path::PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join(".ol")
+            .join("distilled")
+            .join(session_id),
+    )
 }
 
 fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
