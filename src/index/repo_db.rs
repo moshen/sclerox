@@ -127,6 +127,23 @@ impl RepoDb {
         }
     }
 
+    /// Returns true if all chunks for this file have embeddings (none are NULL).
+    /// Used to detect files that were indexed without --embed and need re-indexing.
+    pub fn file_chunks_all_embedded(&self, path: &str) -> Result<bool> {
+        let result: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM chunks c
+             JOIN files f ON c.file_id = f.id
+             WHERE f.path = ?1 AND c.embedding IS NULL",
+                params![path],
+                |r| r.get(0),
+            )
+            .ok();
+        // 0 missing embeddings = all embedded (also true for files with 0 chunks)
+        Ok(result.unwrap_or(0) == 0)
+    }
+
     pub fn upsert_file(
         &self,
         path: &str,

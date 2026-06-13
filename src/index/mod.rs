@@ -133,8 +133,14 @@ impl<'a> RepoIndexer<'a> {
 
             let hash = sha256_hex(source.as_bytes());
 
-            // Skip unchanged files
-            if repo_db.file_hash(&rel_path)?.as_deref() == Some(&hash) {
+            // Skip unchanged files - but if --embed is active, also re-index
+            // files whose chunks have no embeddings (previously indexed without --embed).
+            let hash_matches = repo_db.file_hash(&rel_path)?.as_deref() == Some(&hash);
+            let needs_embed = self.embedder.is_some()
+                && hash_matches
+                && !repo_db.file_chunks_all_embedded(&rel_path)?;
+
+            if hash_matches && !needs_embed {
                 result.skipped += 1;
                 continue;
             }

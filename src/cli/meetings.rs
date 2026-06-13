@@ -23,9 +23,9 @@ pub enum MeetingCommand {
         /// Path to a transcript text file
         #[arg(long)]
         transcript_file: Option<String>,
-        /// Generate embeddings for similarity search (requires model download on first run)
+        /// Skip embedding generation (embeddings are on by default)
         #[arg(long)]
-        embed: bool,
+        no_embed: bool,
     },
     /// Get a meeting by ID
     Get { id: i64 },
@@ -74,7 +74,7 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             date,
             notes,
             transcript_file,
-            embed,
+            no_embed,
         } => {
             let transcript = transcript_file
                 .as_deref()
@@ -93,7 +93,7 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
 
             if !text_to_chunk.is_empty() {
                 let raw_chunks = chunk_text(text_to_chunk, CHUNK_SIZE, CHUNK_OVERLAP);
-                let chunks: Vec<(String, Option<Vec<f32>>)> = if embed {
+                let chunks: Vec<(String, Option<Vec<f32>>)> = if !no_embed {
                     let mut embedder = Embedder::new()?;
                     let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();
                     let embeddings = embedder.embed_batch(&texts)?;
@@ -167,7 +167,9 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             let query_emb = embedder.embed_one(&query)?;
             let results = db.meeting_similar(&query_emb, limit)?;
             if results.is_empty() {
-                println!("No similar meetings found. Run 'ol meeting add --embed' to enable similarity search.");
+                println!(
+                    "No similar meetings found. Add meeting notes to enable similarity search."
+                );
             } else {
                 for r in &results {
                     println!(

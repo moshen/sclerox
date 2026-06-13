@@ -14,9 +14,9 @@ pub enum RepoCommand {
         path: PathBuf,
         #[arg(long)]
         description: Option<String>,
-        /// Generate embeddings for similarity search (downloads model on first run)
+        /// Skip embedding generation (embeddings are on by default)
         #[arg(long)]
-        embed: bool,
+        no_embed: bool,
     },
     /// List all indexed repositories
     List,
@@ -62,11 +62,14 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         RepoCommand::Index {
             path,
             description,
-            embed,
+            no_embed,
         } => {
             let canonical = path.canonicalize().unwrap_or(path);
-            let mut embedder_opt: Option<Embedder> =
-                if embed { Some(Embedder::new()?) } else { None };
+            let mut embedder_opt: Option<Embedder> = if no_embed {
+                None
+            } else {
+                Some(Embedder::new()?)
+            };
             let mut indexer = RepoIndexer::new(embedder_opt.as_mut());
             println!("Indexing {}...", canonical.display());
             let result = indexer.index_repo(db, &canonical, description.as_deref())?;
@@ -74,9 +77,6 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 "Done: {} files indexed, {} skipped, {} symbols, {} chunks",
                 result.files_indexed, result.skipped, result.symbols, result.chunks
             );
-            if !embed {
-                println!("Tip: run with --embed to enable semantic similarity search");
-            }
         }
 
         RepoCommand::List => {
@@ -117,7 +117,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let query_emb = embedder.embed_one(&query)?;
             let results = db.repo_similar(&query_emb, limit)?;
             if results.is_empty() {
-                println!("No similar repos. Index repos with --embed to enable similarity search.");
+                println!("No similar repos. Run `ol repo index [path]` to generate embeddings.");
             } else {
                 for r in &results {
                     println!(
