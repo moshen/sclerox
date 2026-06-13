@@ -20,14 +20,8 @@ pub enum RepoCommand {
     },
     /// List all indexed repositories
     List,
-    /// Search the repo registry by name/description
+    /// Search repos by name/description (FTS + semantic combined)
     Search { query: String },
-    /// Find repos semantically similar to a query
-    Similar {
-        query: String,
-        #[arg(long, default_value = "5")]
-        limit: usize,
-    },
     /// Show indexed files and symbols for a repo
     Show {
         #[arg(default_value = ".")]
@@ -99,35 +93,46 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         }
 
         RepoCommand::Search { query } => {
-            let results = db.repo_search(&query)?;
-            if results.is_empty() {
-                println!("No repos match: {query}");
-            } else {
-                for r in &results {
-                    println!("#{} {} - {}", r.id, r.name, r.path);
-                    if let Some(desc) = &r.description {
-                        println!("   {}", truncate(desc, 100));
+            // FTS on name/description first
+            let fts_hits = db.repo_search(&query)?;
+            let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|r| r.id).collect();
+
+            for r in &fts_hits {
+                println!("#{} {} - {}", r.id, r.name, r.path);
+                if let Some(desc) = &r.description {
+                    println!("   {}", truncate(desc, 100));
+                }
+            }
+
+            // Semantic results deduped against FTS
+            let mut embedder = Embedder::new()?;
+            if let Ok(query_emb) = embedder.embed_one(&query) {
+                let similar = db.repo_similar(&query_emb, 5).unwrap_or_default();
+                let semantic: Vec<_> = similar
+                    .iter()
+                    .filter(|r| !fts_ids.contains(&r.repo.id))
+                    .collect();
+                if !semantic.is_empty() {
+                    if !fts_hits.is_empty() {
+                        println!();
+                    }
+                    for r in &semantic {
+                        println!(
+                            "#{} {}  ({:.0}% match)",
+                            r.repo.id,
+                            r.repo.name,
+                            r.score * 100.0
+                        );
+                        println!("   {}", r.repo.path);
+                        if let Some(desc) = &r.repo.description {
+                            println!("   {}", truncate(desc, 100));
+                        }
                     }
                 }
             }
-        }
 
-        RepoCommand::Similar { query, limit } => {
-            let mut embedder = Embedder::new()?;
-            let query_emb = embedder.embed_one(&query)?;
-            let results = db.repo_similar(&query_emb, limit)?;
-            if results.is_empty() {
-                println!("No similar repos. Run `ol repo index [path]` to generate embeddings.");
-            } else {
-                for r in &results {
-                    println!(
-                        "{:.3} #{} {} - {}",
-                        r.score, r.repo.id, r.repo.name, r.repo.path
-                    );
-                    if let Some(desc) = &r.repo.description {
-                        println!("      {}", truncate(desc, 100));
-                    }
-                }
+            if fts_hits.is_empty() {
+                println!("No repos match: {query}");
             }
         }
 
