@@ -607,7 +607,7 @@ ol people add --name "<name>" --email "<email>"
 ol meeting search "<topic>"
 ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
 ol meeting add --no-embed ...        # skip embedding generation
-ol meeting similar "<description>"   # semantic similarity search
+
 ol meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"]
 
 # Todos
@@ -630,8 +630,7 @@ ol research sources <id>             # list evidence sources
 ol research update <id> [--plan "<text>"] [--findings "<text>"]
 ol research conclude <id> --findings "<findings>"
 ol research reopen <id>
-ol research search "<query>"         # FTS: searches name, plan, and findings
-ol research similar "<description>"  # semantic: finds related investigations
+ol research search "<query>"         # FTS + semantic, combined
 ol research people add|remove|list <id> <person_id>
 ol research projects add|remove|list <id> <project_id>
 

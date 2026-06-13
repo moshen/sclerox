@@ -36,15 +36,8 @@ pub enum MeetingCommand {
         #[arg(long)]
         to: Option<String>,
     },
-    /// Full-text search meetings
+    /// Search meetings (FTS + semantic similarity combined)
     Search { query: String },
-    /// Find similar meetings using embedding similarity
-    Similar {
-        /// Query text to find similar meetings
-        query: String,
-        #[arg(long, default_value = "5")]
-        limit: usize,
-    },
     /// Manage people linked to a meeting
     #[command(subcommand)]
     People(MeetingPeopleCmd),
@@ -151,36 +144,43 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
         }
 
         MeetingCommand::Search { query } => {
-            let results = db.meeting_search(&query)?;
-            if results.is_empty() {
-                println!("No matches for: {query}");
-            } else {
-                for m in &results {
-                    let date = m.meeting_date.as_deref().unwrap_or("no date");
-                    println!("#{} [{}] {}", m.id, date, m.title);
+            // FTS results first (exact keyword matches)
+            let fts_hits = db.meeting_search(&query)?;
+            let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
+
+            for m in &fts_hits {
+                let date = m.meeting_date.as_deref().unwrap_or("no date");
+                println!("#{} [{}] {}", m.id, date, m.title);
+            }
+
+            // Semantic results - appended, deduped against FTS hits
+            let mut embedder = Embedder::new()?;
+            if let Ok(query_emb) = embedder.embed_one(&query) {
+                let similar = db.meeting_similar(&query_emb, 5).unwrap_or_default();
+                let semantic: Vec<_> = similar
+                    .iter()
+                    .filter(|r| !fts_ids.contains(&r.meeting.id))
+                    .collect();
+                if !semantic.is_empty() {
+                    if !fts_hits.is_empty() {
+                        println!();
+                    }
+                    for r in &semantic {
+                        let date = r.meeting.meeting_date.as_deref().unwrap_or("no date");
+                        println!(
+                            "#{} [{}] {}  ({:.0}% match)",
+                            r.meeting.id,
+                            date,
+                            r.meeting.title,
+                            r.score * 100.0
+                        );
+                        println!("  > {}", truncate(&r.matched_chunk, 100));
+                    }
                 }
             }
-        }
 
-        MeetingCommand::Similar { query, limit } => {
-            let mut embedder = Embedder::new()?;
-            let query_emb = embedder.embed_one(&query)?;
-            let results = db.meeting_similar(&query_emb, limit)?;
-            if results.is_empty() {
-                println!(
-                    "No similar meetings found. Add meeting notes to enable similarity search."
-                );
-            } else {
-                for r in &results {
-                    println!(
-                        "#{} {:.3} - {} [{}]",
-                        r.meeting.id,
-                        r.score,
-                        r.meeting.title,
-                        r.meeting.meeting_date.as_deref().unwrap_or("no date")
-                    );
-                    println!("  > {}", truncate(&r.matched_chunk, 100));
-                }
+            if fts_hits.is_empty() {
+                println!("No matches for: {query}");
             }
         }
 

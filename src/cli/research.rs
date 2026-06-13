@@ -32,14 +32,8 @@ pub enum ResearchCommand {
               value_parser = ["open","concluded","all"])]
         status: String,
     },
-    /// Full-text search across all investigations (name, plan, findings)
+    /// Search investigations (FTS + semantic similarity combined)
     Search { query: String },
-    /// Find semantically similar investigations
-    Similar {
-        query: String,
-        #[arg(long, default_value = "5")]
-        limit: usize,
-    },
     /// Update plan, findings, or status
     Update {
         id: i64,
@@ -160,42 +154,42 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
         }
 
         ResearchCommand::Search { query } => {
-            let results = db.investigation_search(&query)?;
-            print_output(format, &results, || {
-                if results.is_empty() {
-                    println!("No matches for: {query}");
-                } else {
-                    for inv in &results {
-                        println!("{}", research_line(inv));
-                        if let Some(f) = &inv.findings {
-                            println!("  {}", truncate(f, 100));
-                        }
+            // FTS results first
+            let fts_hits = db.investigation_search(&query)?;
+            let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
+
+            for inv in &fts_hits {
+                println!("{}", research_line(inv));
+                if let Some(f) = &inv.findings {
+                    println!("  {}", truncate(f, 100));
+                }
+            }
+
+            // Semantic results - appended, deduped against FTS hits
+            let mut embedder = Embedder::new()?;
+            if let Ok(query_emb) = embedder.embed_one(&query) {
+                let similar = db.investigation_similar(&query_emb, 5).unwrap_or_default();
+                let semantic: Vec<_> = similar
+                    .iter()
+                    .filter(|r| !fts_ids.contains(&r.investigation.id))
+                    .collect();
+                if !semantic.is_empty() {
+                    if !fts_hits.is_empty() {
+                        println!();
+                    }
+                    for r in &semantic {
+                        println!(
+                            "{} ({:.0}% match)",
+                            research_line(&r.investigation),
+                            r.score * 100.0
+                        );
+                        println!("  > {}", truncate(&r.matched_chunk, 100));
                     }
                 }
-            });
-        }
+            }
 
-        ResearchCommand::Similar { query, limit } => {
-            let mut embedder = Embedder::new()?;
-            let query_emb = embedder.embed_one(&query)?;
-            let results = db.investigation_similar(&query_emb, limit)?;
-            if results.is_empty() {
-                println!("No similar investigations found.");
-            } else {
-                for r in &results {
-                    println!(
-                        "{:.3} {} #{} [{}]",
-                        r.score,
-                        if r.investigation.status == "concluded" {
-                            "[x]"
-                        } else {
-                            "[ ]"
-                        },
-                        r.investigation.id,
-                        r.investigation.name
-                    );
-                    println!("  > {}", truncate(&r.matched_chunk, 100));
-                }
+            if fts_hits.is_empty() {
+                println!("No matches for: {query}");
             }
         }
 
