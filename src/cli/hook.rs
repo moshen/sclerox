@@ -28,6 +28,22 @@ pub enum HookCommand {
         no_distill: bool,
     },
 
+    /// Background distillation worker spawned by `hook stop`.
+    ///
+    /// Not intended to be called directly; `hook stop` spawns this detached
+    /// so the Stop hook itself returns in under a second.
+    DistillSession {
+        /// Claude Code session ID
+        #[arg(long)]
+        session_id: String,
+        /// AI CLI binary (default: claude or $OL_AI_BIN)
+        #[arg(long)]
+        via: Option<String>,
+        /// Model to pass to the AI binary
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// Run the OpenCode session.idle hook: index repo + distill session memories.
     ///
     /// Called by the ol-session OpenCode plugin with the session ID and directory.
@@ -52,6 +68,11 @@ pub enum HookCommand {
 pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
     match cmd {
         HookCommand::Start => run_start(db),
+        HookCommand::DistillSession {
+            session_id,
+            via,
+            model,
+        } => run_distill_session(db, &session_id, via.as_deref(), model.as_deref()),
         HookCommand::Stop {
             via,
             model,
@@ -131,18 +152,78 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         return Ok(());
     }
 
-    // Try to distill memories from the session transcript
+    // Distillation calls `claude -p` N times and can take 2-5 minutes for long
+    // sessions. Spawn it as a fully detached background process so the Stop hook
+    // returns immediately and Claude Code is unblocked.
     let session_id = hook_data["session_id"].as_str().unwrap_or_default();
     if session_id.is_empty() {
-        return Ok(()); // not in a hook context, or old Claude Code version
+        return Ok(());
     }
 
+    // Quick pre-check: is the transcript even worth distilling?
+    let transcript = find_transcript(&cwd, session_id);
+    let Some(transcript_path) = transcript else {
+        return Ok(());
+    };
+    let turn_count = count_turns(&transcript_path).unwrap_or(0);
+    if turn_count < 5 {
+        return Ok(());
+    }
+
+    // Resolve the current binary path for the background spawn
+    let Ok(current_exe) = std::env::current_exe() else {
+        return Ok(());
+    };
+
+    // Build args for `ol hook distill-session --session-id <id> [--via <bin>] [--model <m>]`
+    let mut bg_args = vec![
+        "hook".to_string(),
+        "distill-session".to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+    ];
+    if let Some(v) = via {
+        bg_args.push("--via".to_string());
+        bg_args.push(v.to_string());
+    }
+    if let Some(m) = model {
+        bg_args.push("--model".to_string());
+        bg_args.push(m.to_string());
+    }
+
+    // Inherit OL_DB and OL_HOOK_RUNNING so the background process uses the
+    // same database and does not trigger further distillation recursively.
+    let _ = std::process::Command::new(&current_exe)
+        .args(&bg_args)
+        .env("OL_HOOK_RUNNING", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    log::debug!(
+        "spawned background distillation for session {} ({} turns)",
+        session_id,
+        turn_count
+    );
+
+    Ok(())
+}
+
+/// Background distillation: reads transcript and calls AI in chunks.
+/// Spawned detached by run_stop so the Stop hook itself returns quickly.
+fn run_distill_session(
+    db: &Database,
+    session_id: &str,
+    via: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
     let transcript = find_transcript(&cwd, session_id);
     let Some(transcript_path) = transcript else {
         return Ok(());
     };
 
-    // Extract conversation turns from the JSONL transcript
     let turns = match extract_conversation_turns(&transcript_path) {
         Ok(t) if t.is_empty() => return Ok(()),
         Ok(t) => t,
@@ -153,7 +234,6 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         return Ok(());
     }
 
-    // Resolve AI binary
     let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
     let bin = via
         .or(if env_bin.is_empty() {
@@ -171,16 +251,14 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     });
 
     log::debug!(
-        "distilling {} turns from session {} in chunks",
+        "background: distilling {} turns from {}",
         turns.len(),
         session_id
     );
     let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
     if total > 0 {
-        eprintln!("[ol] distilled {total} memories from session");
-        log::info!("distilled {total} memories from session {session_id}");
+        log::info!("background: distilled {total} memories from session {session_id}");
     }
-
     Ok(())
 }
 
@@ -333,6 +411,22 @@ fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path:
 /// Each chunk sent to the AI for distillation.
 /// Keeping chunks small prevents memory spikes from large prompts.
 const CHUNK_CHARS: usize = 20_000;
+
+/// Count the number of user/assistant turns in a transcript without reading it fully.
+/// Used for a quick gate before spawning the background distillation process.
+fn count_turns(path: &std::path::Path) -> Result<usize> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut count = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        if line.contains(r#""type":"user""#) || line.contains(r#""type":"assistant""#) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
 
 /// Distill a full list of turns in chunks, deduplicating by key.
 /// Returns total number of memories stored.
