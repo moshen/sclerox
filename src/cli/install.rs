@@ -606,7 +606,8 @@ ol people add --name "<name>" --email "<email>"
 # Meetings
 ol meeting search "<topic>"
 ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
-ol meeting similar "<description>"   # semantic search (needs --embed on add)
+ol meeting add --no-embed ...        # skip embedding generation
+ol meeting similar "<description>"   # semantic similarity search
 ol meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"]
 
 # Todos
@@ -641,20 +642,23 @@ ol project people add|remove|list <project_id> <person_id> [--role "<role>"]
 ol project meetings add|remove|list <project_id> <meeting_id>
 ol project repos add|remove|list <project_id> <repo_id>
 
-# Repos (code)
+# Repos
 ol repo list                         # all indexed repos
-ol repo search "<query>"          # find repos by name/description
-ol code search "<query>"          # search symbols across all repos
-ol code search --repo "<name>" "<query>" # scoped to one repo
+ol repo search "<query>"             # find repos by name/description
+ol repo index [path]                 # index a repo (embeddings on by default)
+ol repo index --no-embed [path]      # index without generating embeddings
 ol repo show [path] [--symbols "<query>"]
-ol repo index [path]                 # index (or re-index) a repo
 ol repo sync                         # heal registry: remove stale, reindex missing
+
+# Code search (symbols across indexed repos)
+ol code search "<query>"                       # all repos
+ol code search --repo "<name>" "<query>"       # scoped to one repo
 ```
 
 ## Patterns
 
 **Before any task:** `ol search "<topic>"`
-**Finding code:** `ol code search "<function or type name>"`
+**Finding code:** `ol code search "<function or type name>"` or `ol code search --repo <name> "<query>"`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
 **When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`
