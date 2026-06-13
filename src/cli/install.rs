@@ -643,7 +643,7 @@ ol project repos add|remove|list <project_id> <repo_id>
 
 # Repos (code)
 ol repo list                         # all indexed repos
-ol repo search-symbols "<query>"     # search symbols across all repos
+ol repo search "<query>"     # search symbols across all repos
 ol repo show [path] [--symbols "<query>"]
 ol repo index [path]                 # index (or re-index) a repo
 ol repo sync                         # heal registry: remove stale, reindex missing
@@ -652,7 +652,7 @@ ol repo sync                         # heal registry: remove stale, reindex miss
 ## Patterns
 
 **Before any task:** `ol search "<topic>"`
-**Finding code:** `ol repo search-symbols "<function or type name>"`
+**Finding code:** `ol repo search "<function or type name>"`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
 **When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`
