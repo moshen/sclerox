@@ -78,6 +78,6 @@ mod tests {
         // Due to floating point, ensure result is clamped
         let v = vec![1.0f32; 100];
         let score = cosine_similarity(&v, &v);
-        assert!(score >= -1.0 && score <= 1.0);
+        assert!((-1.0..=1.0).contains(&score));
     }
 }

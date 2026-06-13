@@ -331,7 +331,7 @@ fn main() {
     println!("ok");
 }
 "#;
-        let (symbols, chunks) = parse_file(source, "rust", 50);
+        let (symbols, _chunks) = parse_file(source, "rust", 50);
         assert!(!symbols.is_empty(), "should extract symbols");
         let fn_names: Vec<&str> = symbols
             .iter()

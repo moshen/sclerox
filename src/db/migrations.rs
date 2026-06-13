@@ -65,14 +65,12 @@ mod tests {
     #[test]
     fn primary_migrations_are_dense_ascending() {
         // Versions must start at 2 (1 is the baseline) and be contiguous
-        let mut expected = 2u32;
-        for m in PRIMARY_MIGRATIONS {
+        for (expected, m) in (2u32..).zip(PRIMARY_MIGRATIONS.iter()) {
             assert_eq!(
                 m.version, expected,
                 "primary migration gap: expected v{expected}, found v{}",
                 m.version
             );
-            expected += 1;
         }
         // PRIMARY_VERSION must equal the last migration version (or 1 if empty)
         let expected_current = if PRIMARY_MIGRATIONS.is_empty() {
@@ -88,14 +86,12 @@ mod tests {
 
     #[test]
     fn repo_migrations_are_dense_ascending() {
-        let mut expected = 2u32;
-        for m in REPO_MIGRATIONS {
+        for (expected, m) in (2u32..).zip(REPO_MIGRATIONS.iter()) {
             assert_eq!(
                 m.version, expected,
                 "repo migration gap: expected v{expected}, found v{}",
                 m.version
             );
-            expected += 1;
         }
         let expected_current = if REPO_MIGRATIONS.is_empty() {
             1

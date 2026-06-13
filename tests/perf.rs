@@ -167,8 +167,6 @@ fn per_table_search_500_research() {
 /// injected directly via the DB. This avoids needing the fastembed model.
 #[test]
 fn similarity_search_1000_chunks_unit_level() {
-    use ol::db::Database;
-    use ol::db::{embedding_to_bytes, meetings::Meeting};
     use ol::search::similarity::cosine_similarity;
 
     // Simulate what happens inside `db.meeting_similar()` with 1000 chunks
@@ -179,10 +177,7 @@ fn similarity_search_1000_chunks_unit_level() {
     let chunks: Vec<Vec<f32>> = (0..n_chunks)
         .map(|i| {
             (0..dims)
-                .map(|j| {
-                    let v = ((i * dims + j) as f32 * 0.001).sin();
-                    v
-                })
+                .map(|j| ((i * dims + j) as f32 * 0.001).sin())
                 .collect()
         })
         .collect();
