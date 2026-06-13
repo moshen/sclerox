@@ -99,6 +99,10 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
     match cmd {
         ResearchCommand::Start { name, slug, plan } => {
             let id = db.investigation_start(&name, &slug, plan.as_deref())?;
+            // Embed the plan immediately if one was provided
+            if let Some(ref plan_text) = plan {
+                embed_investigation(db, id, Some(plan_text), None)?;
+            }
             let inv = db.investigation_get(id)?.unwrap();
             print_output(format, &inv, || {
                 println!("Started investigation #{id}: {name}");
@@ -206,6 +210,12 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                 findings.as_deref(),
                 None,
             )? {
+                // Re-embed if plan or findings changed
+                if plan.is_some() || findings.is_some() {
+                    if let Some(inv) = db.investigation_get(id)? {
+                        embed_investigation(db, id, inv.plan.as_deref(), inv.findings.as_deref())?;
+                    }
+                }
                 println!("Updated investigation #{id}");
             } else {
                 println!("Investigation #{id} not found or no changes");
@@ -222,24 +232,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
 
         ResearchCommand::Conclude { id, findings } => {
             if db.investigation_conclude(id, &findings)? {
-                // Embed the full plan + findings so ol research similar works
                 if let Some(inv) = db.investigation_get(id)? {
-                    let text = [inv.plan.as_deref(), Some(findings.as_str())]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    if !text.trim().is_empty() {
-                        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
-                        let mut embedder = Embedder::new()?;
-                        let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
-                        let embeddings = embedder.embed_batch(&texts)?;
-                        let chunks: Vec<(String, Option<Vec<f32>>)> = raw
-                            .into_iter()
-                            .zip(embeddings.into_iter().map(Some))
-                            .collect();
-                        db.investigation_store_chunks(id, &chunks)?;
-                    }
+                    embed_investigation(db, id, inv.plan.as_deref(), Some(&findings))?;
                     if format == OutputFormat::Json {
                         println!("{}", serde_json::to_string_pretty(&inv)?);
                     } else {
@@ -366,6 +360,32 @@ fn print_investigation_detail(inv: &crate::db::investigations::Investigation) {
 
 fn research_line(inv: &crate::db::investigations::Investigation) -> String {
     crate::cli::format::research_line(inv)
+}
+
+fn embed_investigation(
+    db: &Database,
+    id: i64,
+    plan: Option<&str>,
+    findings: Option<&str>,
+) -> Result<()> {
+    let text = [plan, findings]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+    let mut embedder = Embedder::new()?;
+    let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+    let embeddings = embedder.embed_batch(&texts)?;
+    let chunks: Vec<(String, Option<Vec<f32>>)> = raw
+        .into_iter()
+        .zip(embeddings.into_iter().map(Some))
+        .collect();
+    db.investigation_store_chunks(id, &chunks)?;
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {

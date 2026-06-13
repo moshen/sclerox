@@ -205,21 +205,17 @@ impl<'a> RepoIndexer<'a> {
             result.chunks
         );
 
-        // Only (re-)embed the description when something actually changed.
-        // Loading the ONNX model costs ~280MB RSS; skip it on no-op runs.
-        // The upsert uses COALESCE so passing None preserves any existing embedding.
-        let desc_embedding = if result.files_indexed > 0 {
-            if let Some(ref mut emb) = self.embedder {
-                log::debug!("generating repo description embedding");
-                description
-                    .and_then(|d| emb.embed_one(d).ok())
-                    .or_else(|| emb.embed_one(&name).ok())
-            } else {
-                None
-            }
+        // Embed the description (or repo name as fallback) whenever the embedder
+        // is present. The model is already loaded for file chunks so the extra
+        // call is cheap. COALESCE in repo_register preserves any stored embedding
+        // when we pass None (i.e. no embedder).
+        let desc_embedding = if let Some(ref mut emb) = self.embedder {
+            log::debug!("generating repo description embedding");
+            description
+                .and_then(|d| emb.embed_one(d).ok())
+                .or_else(|| emb.embed_one(&name).ok())
         } else {
-            log::debug!("no files changed, skipping description re-embedding");
-            None // repo_register COALESCE preserves the stored embedding
+            None
         };
 
         db.repo_register(
