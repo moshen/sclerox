@@ -42,6 +42,7 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         install_for_target(target, &ol_bin, &args)?;
     }
     install_shell_completions(args.dry_run)?;
+    install_global_gitignore(args.dry_run)?;
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
@@ -157,6 +158,72 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
             }
         }
         InstallTarget::All => unreachable!(),
+    }
+    Ok(())
+}
+
+// ─── Global gitignore ────────────────────────────────────────────────────────
+
+fn global_gitignore_path() -> Option<std::path::PathBuf> {
+    // Respect git's configured excludesfile if set
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["config", "--global", "core.excludesfile"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            // Expand ~ if present
+            let path = if s.starts_with('~') {
+                dirs::home_dir()?.join(&s[2..])
+            } else {
+                std::path::PathBuf::from(&s)
+            };
+            return Some(path);
+        }
+    }
+    // XDG default: ~/.config/git/ignore
+    Some(dirs::home_dir()?.join(".config/git/ignore"))
+}
+
+fn install_global_gitignore(dry_run: bool) -> Result<()> {
+    let Some(path) = global_gitignore_path() else {
+        println!("Global gitignore: could not determine path");
+        return Ok(());
+    };
+
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Check if .ol is already ignored (handle variations like /.ol, .ol/, **/.ol)
+    if existing.lines().any(|l| {
+        let l = l.trim();
+        l == ".ol" || l == "/.ol" || l == ".ol/" || l == "**/.ol" || l == ".ol/**"
+    }) {
+        if dry_run {
+            println!(
+                "Global gitignore: .ol already present in {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let entry = "\n# ol - Operating Layer CLI\n.ol/\n";
+
+    if dry_run {
+        println!(
+            "Global gitignore: would append '.ol/' to {}",
+            path.display()
+        );
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, format!("{}{}", existing.trim_end(), entry))?;
+        println!("Global gitignore: added '.ol/' to {}", path.display());
     }
     Ok(())
 }
