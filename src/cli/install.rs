@@ -630,7 +630,8 @@ ol research sources <id>             # list evidence sources
 ol research update <id> [--plan "<text>"] [--findings "<text>"]
 ol research conclude <id> --findings "<findings>"
 ol research reopen <id>
-ol research search "<query>"         # searches name, plan, and findings
+ol research search "<query>"         # FTS: searches name, plan, and findings
+ol research similar "<description>"  # semantic: finds related investigations
 ol research people add|remove|list <id> <person_id>
 ol research projects add|remove|list <id> <project_id>
 

@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::db::Database;
+use crate::embed::{chunk_text, Embedder};
 use crate::output::{print_output, OutputFormat};
+
+const CHUNK_SIZE: usize = 800;
+const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]
 pub enum ResearchCommand {
@@ -30,6 +34,12 @@ pub enum ResearchCommand {
     },
     /// Full-text search across all investigations (name, plan, findings)
     Search { query: String },
+    /// Find semantically similar investigations
+    Similar {
+        query: String,
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
     /// Update plan, findings, or status
     Update {
         id: i64,
@@ -165,6 +175,30 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             });
         }
 
+        ResearchCommand::Similar { query, limit } => {
+            let mut embedder = Embedder::new()?;
+            let query_emb = embedder.embed_one(&query)?;
+            let results = db.investigation_similar(&query_emb, limit)?;
+            if results.is_empty() {
+                println!("No similar investigations found.");
+            } else {
+                for r in &results {
+                    println!(
+                        "{:.3} {} #{} [{}]",
+                        r.score,
+                        if r.investigation.status == "concluded" {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        },
+                        r.investigation.id,
+                        r.investigation.name
+                    );
+                    println!("  > {}", truncate(&r.matched_chunk, 100));
+                }
+            }
+        }
+
         ResearchCommand::Update {
             id,
             name,
@@ -194,14 +228,33 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
 
         ResearchCommand::Conclude { id, findings } => {
             if db.investigation_conclude(id, &findings)? {
-                if format == OutputFormat::Json {
-                    if let Some(inv) = db.investigation_get(id)? {
-                        println!("{}", serde_json::to_string_pretty(&inv)?);
+                // Embed the full plan + findings so ol research similar works
+                if let Some(inv) = db.investigation_get(id)? {
+                    let text = [inv.plan.as_deref(), Some(findings.as_str())]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !text.trim().is_empty() {
+                        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+                        let mut embedder = Embedder::new()?;
+                        let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+                        let embeddings = embedder.embed_batch(&texts)?;
+                        let chunks: Vec<(String, Option<Vec<f32>>)> = raw
+                            .into_iter()
+                            .zip(embeddings.into_iter().map(Some))
+                            .collect();
+                        db.investigation_store_chunks(id, &chunks)?;
                     }
-                } else {
-                    println!("Investigation #{id} concluded.");
-                    println!("\nFindings recorded. Consider saving key conclusions as memories:");
-                    println!("  ol memory set \"research/{id}/finding\" \"<key finding>\" --type project");
+                    if format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&inv)?);
+                    } else {
+                        println!("Investigation #{id} concluded.");
+                        println!(
+                            "\nFindings recorded. Consider saving key conclusions as memories:"
+                        );
+                        println!("  ol memory set \"research/{id}/finding\" \"<key finding>\" --type project");
+                    }
                 }
             } else {
                 println!("Investigation #{id} not found");

@@ -310,6 +310,17 @@ ALTER TABLE memory ADD COLUMN superseded_by TEXT;
 ALTER TABLE memory ADD COLUMN reviewed_at TEXT;
 ";
 
+/// Migration v6: investigation_chunks for semantic similarity search.
+pub const MIGRATION_V6: &str = "
+CREATE TABLE IF NOT EXISTS investigation_chunks (
+    id INTEGER PRIMARY KEY,
+    investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding BLOB
+);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;

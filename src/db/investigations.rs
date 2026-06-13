@@ -294,6 +294,89 @@ impl Database {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Store pre-chunked text with optional embeddings for an investigation.
+    pub fn investigation_store_chunks(
+        &self,
+        investigation_id: i64,
+        chunks: &[(String, Option<Vec<f32>>)],
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM investigation_chunks WHERE investigation_id = ?1",
+            params![investigation_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO investigation_chunks (investigation_id, chunk_index, chunk_text, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (i, (text, emb)) in chunks.iter().enumerate() {
+            let emb_bytes = emb.as_ref().map(|e| crate::db::embedding_to_bytes(e));
+            stmt.execute(params![investigation_id, i as i64, text, emb_bytes])?;
+        }
+        Ok(())
+    }
+
+    /// Find investigations semantically similar to a query embedding.
+    pub fn investigation_similar(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SimilarInvestigation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ic.investigation_id, ic.chunk_text, ic.embedding,
+                    i.id, i.name, i.slug, i.status, i.plan, i.findings,
+                    i.created_at, i.concluded_at, i.updated_at
+             FROM investigation_chunks ic
+             JOIN investigations i ON ic.investigation_id = i.id
+             WHERE ic.embedding IS NOT NULL",
+        )?;
+
+        let mut scored: Vec<(f32, String, Investigation)> = stmt
+            .query_map([], |row| {
+                let emb_bytes: Vec<u8> = row.get(2)?;
+                let chunk_text: String = row.get(1)?;
+                let inv = Investigation {
+                    id: row.get(3)?,
+                    name: row.get(4)?,
+                    slug: row.get(5)?,
+                    status: row.get(6)?,
+                    plan: row.get(7)?,
+                    findings: row.get(8)?,
+                    created_at: row.get(9)?,
+                    concluded_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                };
+                Ok((emb_bytes, chunk_text, inv))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(emb_bytes, chunk, inv)| {
+                let emb = crate::db::bytes_to_embedding(&emb_bytes);
+                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
+                (score, chunk, inv)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored
+            .into_iter()
+            .map(
+                |(score, matched_chunk, investigation)| SimilarInvestigation {
+                    investigation,
+                    score,
+                    matched_chunk,
+                },
+            )
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SimilarInvestigation {
+    pub investigation: Investigation,
+    pub score: f32,
+    pub matched_chunk: String,
 }
 
 fn row_to_investigation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Investigation> {
