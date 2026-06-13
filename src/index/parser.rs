@@ -61,6 +61,10 @@ fn get_tree_sitter_language(lang: &str) -> Option<Language> {
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -159,6 +163,25 @@ fn is_symbol_node(kind: &str, language: &str) -> bool {
                 | "namespace_declaration"
                 | "property_declaration"
         ),
+        "java" => matches!(
+            kind,
+            "method_declaration"
+                | "constructor_declaration"
+                | "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ),
+        "cpp" => matches!(
+            kind,
+            "function_definition" | "class_specifier" | "struct_specifier"
+        ),
+        "ruby" => matches!(kind, "method" | "singleton_method" | "class" | "module"),
+        "kotlin" => matches!(
+            kind,
+            "function_declaration" | "class_declaration" | "object_declaration" | "companion_object"
+        ),
         _ => false,
     }
 }
@@ -247,22 +270,64 @@ fn collect_symbols_and_edges(
 
 /// Extract call target name from a call expression node.
 fn extract_call_target(node: &Node, source: &str, language: &str) -> Option<String> {
-    let is_call = match language {
-        "rust" | "typescript" | "javascript" | "go" => node.kind() == "call_expression",
-        "python" => node.kind() == "call",
-        "csharp" => node.kind() == "invocation_expression",
-        _ => return None,
-    };
-    if !is_call {
-        return None;
+    match language {
+        "rust" | "typescript" | "javascript" | "go" | "cpp" => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let fn_node = node.child_by_field_name("function")?;
+            extract_leaf_name(&fn_node, source)
+        }
+        "python" => {
+            if node.kind() != "call" {
+                return None;
+            }
+            let fn_node = node.child_by_field_name("function")?;
+            extract_leaf_name(&fn_node, source)
+        }
+        "csharp" => {
+            if node.kind() != "invocation_expression" {
+                return None;
+            }
+            let fn_node = node.child_by_field_name("expression")?;
+            extract_leaf_name(&fn_node, source)
+        }
+        "java" => match node.kind() {
+            "method_invocation" => node
+                .child_by_field_name("name")
+                .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+            "object_creation_expression" => node
+                .child_by_field_name("type")
+                .and_then(|n| extract_leaf_name(&n, source)),
+            _ => None,
+        },
+        "ruby" => {
+            if node.kind() != "call" {
+                return None;
+            }
+            let method_node = node.child_by_field_name("method")?;
+            Some(source[method_node.start_byte()..method_node.end_byte()].to_string())
+        }
+        "kotlin" => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let callee = node.named_child(0)?;
+            match callee.kind() {
+                "identifier" | "simple_identifier" => {
+                    Some(source[callee.start_byte()..callee.end_byte()].to_string())
+                }
+                "navigation_expression" => {
+                    // obj.method() — last named child is the method identifier
+                    let n = callee.named_child_count();
+                    let last = callee.named_child(n.checked_sub(1)?)?;
+                    Some(source[last.start_byte()..last.end_byte()].to_string())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
-
-    let field = match language {
-        "csharp" => "expression",
-        _ => "function",
-    };
-    let fn_node = node.child_by_field_name(field)?;
-    extract_leaf_name(&fn_node, source)
 }
 
 /// Extract the leaf identifier from a function/expression node.
@@ -302,6 +367,11 @@ fn extract_leaf_name(node: &Node, source: &str) -> Option<String> {
 
         // C#: obj.Method — member_access_expression { expression, name }
         "member_access_expression" => node
+            .child_by_field_name("name")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // C++: Namespace::func — qualified_identifier { scope, name }
+        "qualified_identifier" => node
             .child_by_field_name("name")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
@@ -427,6 +497,62 @@ fn extract_structural_edges(
             }
         }
 
+        "java" => {
+            if node.kind() == "class_declaration" {
+                // extends: class_declaration.superclass → superclass wrapper → type_identifier
+                if let Some(sc) = node.child_by_field_name("superclass") {
+                    let mut cursor = sc.walk();
+                    for child in sc.named_children(&mut cursor) {
+                        if let Some(name) = extract_leaf_name(&child, source) {
+                            if !name.is_empty() {
+                                edges.push(ParsedEdge {
+                                    kind: "inherits".to_string(),
+                                    from_name: symbol_name.to_string(),
+                                    to_name: name,
+                                    line: child.start_position().row as u32 + 1,
+                                });
+                            }
+                        }
+                    }
+                }
+                // implements: class_declaration.interfaces → super_interfaces → type_list children
+                if let Some(ifaces) = node.child_by_field_name("interfaces") {
+                    let mut c1 = ifaces.walk();
+                    for type_list in ifaces.named_children(&mut c1) {
+                        let mut c2 = type_list.walk();
+                        for type_node in type_list.named_children(&mut c2) {
+                            if let Some(name) = extract_leaf_name(&type_node, source) {
+                                if !name.is_empty() {
+                                    edges.push(ParsedEdge {
+                                        kind: "implements".to_string(),
+                                        from_name: symbol_name.to_string(),
+                                        to_name: name,
+                                        line: type_node.start_position().row as u32 + 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        "ruby" if node.kind() == "class" => {
+            if let Some(sc) = node.child_by_field_name("superclass") {
+                if let Some(child) = sc.named_child(0) {
+                    let name = source[child.start_byte()..child.end_byte()].to_string();
+                    if !name.is_empty() {
+                        edges.push(ParsedEdge {
+                            kind: "inherits".to_string(),
+                            from_name: symbol_name.to_string(),
+                            to_name: name,
+                            line: child.start_position().row as u32 + 1,
+                        });
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 
@@ -434,9 +560,7 @@ fn extract_structural_edges(
 }
 
 /// Common method/function names that produce noise in the call graph.
-/// These are standard library/language builtins that aren't useful navigation targets.
 fn is_noise_call(name: &str, language: &str) -> bool {
-    // Very short names are almost always noise (e.g., `x`, `f`)
     if name.len() < 2 {
         return true;
     }
@@ -447,20 +571,36 @@ fn is_noise_call(name: &str, language: &str) -> bool {
         "to_string", "to_owned", "borrow", "borrow_mut", "deref",
     ];
     const PYTHON: &[&str] = &["append", "extend", "items", "keys", "values", "strip", "split"];
+    const JAVA_KOTLIN: &[&str] = &[
+        "toString", "equals", "hashCode", "compareTo", "size", "isEmpty", "contains",
+        "add", "remove", "put", "println", "print",
+    ];
+    const RUBY: &[&str] = &[
+        "to_s", "to_i", "to_f", "to_a", "inspect", "puts", "print",
+    ];
     match language {
         "rust" => UNIVERSAL.contains(&name) || RUST.contains(&name),
         "python" => UNIVERSAL.contains(&name) || PYTHON.contains(&name),
+        "java" | "kotlin" => UNIVERSAL.contains(&name) || JAVA_KOTLIN.contains(&name),
+        "ruby" => UNIVERSAL.contains(&name) || RUBY.contains(&name),
         _ => UNIVERSAL.contains(&name),
     }
 }
 
 fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
+    // C++ names are deeply nested; handle separately.
+    if language == "cpp" {
+        return extract_name_cpp(node, source);
+    }
+
     let name_kinds: &[&str] = match language {
         "rust" => &["identifier", "type_identifier"],
         "python" => &["identifier"],
         "typescript" | "javascript" => &["identifier", "property_identifier", "type_identifier"],
         "go" => &["identifier", "type_identifier"],
         "csharp" => &["identifier", "type_identifier"],
+        "ruby" => &["identifier", "constant"],
+        "java" | "kotlin" => &["identifier"],
         _ => &["identifier"],
     };
 
@@ -473,13 +613,57 @@ fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
     None
 }
 
+/// Extract the name from a C++ declaration node.
+fn extract_name_cpp(node: &Node, source: &str) -> Option<String> {
+    // class_specifier / struct_specifier: direct `type_identifier` child
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_identifier" {
+            return Some(source[child.start_byte()..child.end_byte()].to_string());
+        }
+    }
+    // function_definition: recurse through declarator chain to find the function name
+    if let Some(decl) = node.child_by_field_name("declarator") {
+        return extract_cpp_declarator_name(&decl, source);
+    }
+    None
+}
+
+/// Walk a C++ declarator chain to find the final identifier (function/method name).
+fn extract_cpp_declarator_name(node: &Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "destructor_name" => {
+            Some(source[node.start_byte()..node.end_byte()].to_string())
+        }
+        // Namespace::method → use `name` field
+        "qualified_identifier" => node
+            .child_by_field_name("name")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+        // function_declarator.declarator → recurse
+        "function_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|d| extract_cpp_declarator_name(&d, source)),
+        // *fn or &fn — skip the operator token and look at named children
+        "pointer_declarator" | "reference_declarator" | "abstract_pointer_declarator" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(name) = extract_cpp_declarator_name(&child, source) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn extract_signature(text: &str, language: &str) -> Option<String> {
     let sig = match language {
-        "rust" => text
+        "rust" | "cpp" => text
             .lines()
             .next()
             .map(|l| l.trim_end_matches('{').trim().to_string()),
-        "python" | "go" | "typescript" | "javascript" => {
+        "python" | "go" | "typescript" | "javascript" | "java" | "kotlin" | "ruby" => {
             text.lines().next().map(|l| l.to_string())
         }
         _ => None,
@@ -650,6 +834,142 @@ class Dog(Animal):
             inherits.contains(&("Dog", "Animal")),
             "expected Dog→Animal, got: {inherits:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_java_symbols_and_calls() {
+        let source = r#"
+public class PaymentService {
+    public void processPayment(String id) {
+        validateInput(id);
+        chargeCard(id);
+    }
+    private boolean validateInput(String id) {
+        return id != null;
+    }
+}
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "java", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"PaymentService"), "missing class: {names:?}");
+        assert!(names.contains(&"processPayment"), "missing method: {names:?}");
+        assert!(names.contains(&"validateInput"), "missing method: {names:?}");
+
+        let calls: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("processPayment", "validateInput")),
+            "expected processPayment→validateInput, got: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("processPayment", "chargeCard")),
+            "expected processPayment→chargeCard, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_java_inheritance() {
+        let source = r#"
+public class Dog extends Animal implements Runnable {
+    public void run() {}
+}
+"#;
+        let (_symbols, _chunks, edges) = parse_file(source, "java", 50);
+        let structural: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind != "calls")
+            .map(|e| (e.from_name.as_str(), e.kind.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            structural.iter().any(|(f, k, t)| *f == "Dog" && *k == "inherits" && *t == "Animal"),
+            "expected Dog inherits Animal: {structural:?}"
+        );
+        assert!(
+            structural.iter().any(|(f, k, t)| *f == "Dog" && *k == "implements" && *t == "Runnable"),
+            "expected Dog implements Runnable: {structural:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_cpp_symbols_and_calls() {
+        let source = r#"
+void process(int x) {
+    validate(x);
+    transform(x);
+}
+
+int validate(int x) {
+    return x > 0;
+}
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "cpp", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"process"), "missing fn process: {names:?}");
+        assert!(names.contains(&"validate"), "missing fn validate: {names:?}");
+
+        let calls: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("process", "validate")),
+            "expected process→validate, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_ruby_symbols_and_inheritance() {
+        let source = r#"
+class Dog < Animal
+  def bark
+    make_sound("woof")
+  end
+end
+
+module Runnable
+  def run
+    move
+  end
+end
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "ruby", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Dog"), "missing class Dog: {names:?}");
+        assert!(names.contains(&"bark"), "missing method bark: {names:?}");
+        assert!(names.contains(&"Runnable"), "missing module: {names:?}");
+
+        let inherits: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "inherits")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            inherits.contains(&("Dog", "Animal")),
+            "expected Dog→Animal, got: {inherits:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_kotlin_symbols() {
+        let source = r#"
+class PaymentProcessor {
+    fun processPayment(id: String): Boolean {
+        return validate(id)
+    }
+    fun validate(id: String): Boolean {
+        return id.isNotEmpty()
+    }
+}
+"#;
+        let (symbols, _chunks, _edges) = parse_file(source, "kotlin", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"PaymentProcessor"), "missing class: {names:?}");
+        assert!(names.contains(&"processPayment"), "missing fn: {names:?}");
+        assert!(names.contains(&"validate"), "missing fn: {names:?}");
     }
 
     #[test]
