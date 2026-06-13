@@ -1,7 +1,7 @@
 # Do when writing code
 
 - Run `cargo fmt`, fix all formatting issues
-- Run `cargo clippy`, fix all clippy issues
+- Run `cargo clippy --all-targets --all-features`, fix **every** warning - unused imports, dead code, style lints, all of it. Zero warnings is the bar, not "no new warnings".
 - Run `cargo test`, fix all failing tests
 
 # When changing how a record type is displayed
