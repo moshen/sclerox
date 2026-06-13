@@ -65,6 +65,9 @@ fn get_tree_sitter_language(lang: &str) -> Option<Language> {
         "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        "sql" => Some(tree_sitter_sequel::LANGUAGE.into()),
+        "shell" => Some(tree_sitter_bash::LANGUAGE.into()),
+        "lua" => Some(tree_sitter_lua::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -182,6 +185,12 @@ fn is_symbol_node(kind: &str, language: &str) -> bool {
             kind,
             "function_declaration" | "class_declaration" | "object_declaration" | "companion_object"
         ),
+        "sql" => matches!(
+            kind,
+            "create_function" | "create_table" | "create_view" | "create_type"
+        ),
+        "shell" => kind == "function_definition",
+        "lua" => matches!(kind, "function_declaration" | "local_function"),
         _ => false,
     }
 }
@@ -307,6 +316,57 @@ fn extract_call_target(node: &Node, source: &str, language: &str) -> Option<Stri
             }
             let method_node = node.child_by_field_name("method")?;
             Some(source[method_node.start_byte()..method_node.end_byte()].to_string())
+        }
+        // SQL: function/procedure call via invocation node
+        "sql" => {
+            if node.kind() != "invocation" {
+                return None;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "object_reference" {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        return Some(
+                            source[name_node.start_byte()..name_node.end_byte()].to_string(),
+                        );
+                    }
+                }
+            }
+            None
+        }
+        // Bash: any command is a "call" to the command name
+        "shell" => {
+            if node.kind() != "command" {
+                return None;
+            }
+            let name_node = node.child_by_field_name("name")?;
+            // command_name wraps the actual name token
+            let text = source[name_node.start_byte()..name_node.end_byte()].to_string();
+            // Filter built-ins and common external commands that aren't navigation targets
+            if is_shell_builtin(&text) {
+                return None;
+            }
+            Some(text)
+        }
+        // Lua: function_call.name → identifier or dot/method index expression
+        "lua" => {
+            if node.kind() != "function_call" {
+                return None;
+            }
+            let name_node = node.child_by_field_name("name")?;
+            match name_node.kind() {
+                "identifier" | "variable" => {
+                    Some(source[name_node.start_byte()..name_node.end_byte()].to_string())
+                }
+                "dot_index_expression" => name_node
+                    .child_by_field_name("field")
+                    .map(|f| source[f.start_byte()..f.end_byte()].to_string()),
+                "method_index_expression" => name_node
+                    .child_by_field_name("method")
+                    .map(|m| source[m.start_byte()..m.end_byte()].to_string()),
+                // chained call: already-resolved function_call as callee — skip
+                _ => None,
+            }
         }
         "kotlin" => {
             if node.kind() != "call_expression" {
@@ -559,6 +619,20 @@ fn extract_structural_edges(
     edges
 }
 
+/// Bash built-ins and common external commands that clutter the call graph.
+fn is_shell_builtin(name: &str) -> bool {
+    const BUILTINS: &[&str] = &[
+        "echo", "printf", "cd", "export", "source", ".", "return", "exit",
+        "if", "then", "else", "fi", "for", "while", "do", "done", "case", "esac",
+        "local", "readonly", "declare", "typeset", "set", "unset", "shift",
+        "true", "false", "test", "[", "[[",
+        // common external commands unlikely to be project-defined
+        "grep", "sed", "awk", "cut", "sort", "uniq", "cat", "ls", "cp", "mv",
+        "rm", "mkdir", "touch", "find", "xargs", "curl", "wget",
+    ];
+    BUILTINS.contains(&name)
+}
+
 /// Common method/function names that produce noise in the call graph.
 fn is_noise_call(name: &str, language: &str) -> bool {
     if name.len() < 2 {
@@ -588,9 +662,63 @@ fn is_noise_call(name: &str, language: &str) -> bool {
 }
 
 fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
-    // C++ names are deeply nested; handle separately.
-    if language == "cpp" {
-        return extract_name_cpp(node, source);
+    // Languages with non-standard name locations.
+    match language {
+        "cpp" => return extract_name_cpp(node, source),
+        // SQL: name is inside an object_reference child (name: identifier field)
+        "sql" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "object_reference" {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        return Some(
+                            source[name_node.start_byte()..name_node.end_byte()].to_string(),
+                        );
+                    }
+                }
+                // create_view sometimes has a bare identifier
+                if child.kind() == "identifier" {
+                    return Some(source[child.start_byte()..child.end_byte()].to_string());
+                }
+            }
+            return None;
+        }
+        // Bash: function name is a `word` node
+        "shell" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                return Some(source[name_node.start_byte()..name_node.end_byte()].to_string());
+            }
+            return None;
+        }
+        // Lua: function_declaration.name can be identifier or dot_index_expression.field
+        "lua" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                match name_node.kind() {
+                    "identifier" => {
+                        return Some(
+                            source[name_node.start_byte()..name_node.end_byte()].to_string(),
+                        )
+                    }
+                    "dot_index_expression" | "method_index_expression" => {
+                        if let Some(field) = name_node.child_by_field_name("field").or_else(|| name_node.child_by_field_name("method")) {
+                            return Some(
+                                source[field.start_byte()..field.end_byte()].to_string(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // local_function: name is a direct identifier child
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    return Some(source[child.start_byte()..child.end_byte()].to_string());
+                }
+            }
+            return None;
+        }
+        _ => {}
     }
 
     let name_kinds: &[&str] = match language {
@@ -659,13 +787,15 @@ fn extract_cpp_declarator_name(node: &Node, source: &str) -> Option<String> {
 
 fn extract_signature(text: &str, language: &str) -> Option<String> {
     let sig = match language {
-        "rust" | "cpp" => text
+        "rust" | "cpp" | "shell" => text
             .lines()
             .next()
             .map(|l| l.trim_end_matches('{').trim().to_string()),
-        "python" | "go" | "typescript" | "javascript" | "java" | "kotlin" | "ruby" => {
+        "python" | "go" | "typescript" | "javascript" | "java" | "kotlin" | "ruby" | "lua" => {
             text.lines().next().map(|l| l.to_string())
         }
+        // SQL: take up to and including the function/table name (first meaningful line)
+        "sql" => text.lines().next().map(|l| l.to_string()),
         _ => None,
     };
     sig.filter(|s| !s.is_empty())
@@ -970,6 +1100,94 @@ class PaymentProcessor {
         assert!(names.contains(&"PaymentProcessor"), "missing class: {names:?}");
         assert!(names.contains(&"processPayment"), "missing fn: {names:?}");
         assert!(names.contains(&"validate"), "missing fn: {names:?}");
+    }
+
+    #[test]
+    fn test_parse_bash_functions_and_calls() {
+        let source = r#"
+setup_database() {
+    create_tables
+    seed_data
+}
+
+create_tables() {
+    echo "creating tables"
+}
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "shell", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"setup_database"), "missing fn: {names:?}");
+        assert!(names.contains(&"create_tables"), "missing fn: {names:?}");
+
+        let calls: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("setup_database", "create_tables")),
+            "expected setup_database→create_tables, got: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("setup_database", "seed_data")),
+            "expected setup_database→seed_data, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sql_symbols() {
+        let source = r#"
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email TEXT NOT NULL
+);
+
+CREATE VIEW active_users AS
+    SELECT * FROM users WHERE active = true;
+
+CREATE FUNCTION get_user(user_id INT)
+RETURNS TABLE(id INT, email TEXT) AS $$
+    SELECT id, email FROM users WHERE id = user_id;
+$$ LANGUAGE sql;
+"#;
+        let (symbols, _chunks, _edges) = parse_file(source, "sql", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.is_empty(),
+            "should extract at least one SQL symbol, got none"
+        );
+    }
+
+    #[test]
+    fn test_parse_lua_symbols_and_calls() {
+        let source = r#"
+function process(data)
+    local result = validate(data)
+    return transform(result)
+end
+
+function validate(data)
+    return data ~= nil
+end
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "lua", 50);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"process"), "missing fn process: {names:?}");
+        assert!(names.contains(&"validate"), "missing fn validate: {names:?}");
+
+        let calls: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("process", "validate")),
+            "expected process→validate, got: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("process", "transform")),
+            "expected process→transform, got: {calls:?}"
+        );
     }
 
     #[test]
