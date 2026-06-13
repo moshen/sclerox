@@ -8,23 +8,10 @@ use crate::search::{global_search, SearchResult};
 #[derive(Args)]
 pub struct SearchArgs {
     pub query: String,
-    /// Restrict to a specific repo by name (substring match)
-    #[arg(long)]
-    pub repo: Option<String>,
 }
 
 pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> {
-    let mut results = global_search(db, &args.query)?;
-
-    // Filter to a specific repo if requested
-    if let Some(repo_filter) = &args.repo {
-        let filter = repo_filter.to_lowercase();
-        results.retain(|r| match r {
-            SearchResult::Symbol { repo_name, .. } => repo_name.to_lowercase().contains(&filter),
-            SearchResult::Repo { name, .. } => name.to_lowercase().contains(&filter),
-            _ => true, // non-repo results pass through
-        });
-    }
+    let results = global_search(db, &args.query)?;
     print_output(format, &results, || {
         if results.is_empty() {
             println!("No matches for: {}", args.query);

@@ -20,10 +20,8 @@ pub enum RepoCommand {
     },
     /// List all indexed repositories
     List,
-    /// Search symbols across all indexed repos (delegates to search-symbols)
-    Search { query: String },
     /// Search the repo registry by name/description
-    Find { query: String },
+    Search { query: String },
     /// Find repos semantically similar to a query
     Similar {
         query: String,
@@ -100,41 +98,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             }
         }
 
-        // `ol repo search` searches symbols inside repos - same as search-symbols
         RepoCommand::Search { query } => {
-            heal_repos(db, false)?;
-            let repos = db.repo_list()?;
-            if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
-                return Ok(());
-            }
-            let mut any = false;
-            for repo in &repos {
-                let db_path = PathBuf::from(&repo.db_path);
-                if !db_path.exists() {
-                    continue;
-                }
-                let repo_db = match RepoDb::open(&db_path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                for s in repo_db.search_symbols(&query)? {
-                    let sig = s.signature.as_deref().unwrap_or(&s.name);
-                    println!(
-                        "[{}] {} ({}/{}:{})",
-                        s.kind, sig, repo.name, s.file_path, s.start_line
-                    );
-                    any = true;
-                }
-            }
-            if !any {
-                println!("No symbols match: {query}");
-                println!("Tip: use `ol repo find {query}` to search repo names/descriptions");
-            }
-        }
-
-        // `ol repo find` searches the registry by name/description
-        RepoCommand::Find { query } => {
             let results = db.repo_search(&query)?;
             if results.is_empty() {
                 println!("No repos match: {query}");

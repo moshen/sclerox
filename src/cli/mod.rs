@@ -1,3 +1,4 @@
+pub mod code;
 pub mod completions;
 pub mod format;
 pub mod hook;
@@ -73,6 +74,10 @@ pub enum Commands {
     #[command(subcommand)]
     Repo(repos::RepoCommand),
 
+    /// Search code symbols across indexed repos
+    #[command(subcommand)]
+    Code(code::CodeCommand),
+
     /// Full-text search across all tables
     Search(search::SearchArgs),
 
@@ -116,6 +121,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Todo(c) => todos::run(&db, c, format),
                 Commands::Research(c) => research::run(&db, c, format),
                 Commands::Repo(c) => repos::run(&db, c),
+                Commands::Code(c) => code::run(&db, c),
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Migrate(a) => migrate::run(&db, a),
                 Commands::Install(_)
