@@ -650,15 +650,24 @@ ol repo index --no-embed [path]      # index without generating embeddings
 ol repo show [path] [--symbols "<query>"]
 ol repo sync                         # heal registry: remove stale, reindex missing
 
-# Code search (symbols across indexed repos)
-ol code search "<query>"                       # all repos
-ol code search --repo "<name>" "<query>"       # scoped to one repo
+# Code search and navigation (call graph across indexed repos)
+ol code search "<query>"                        # find symbols by name
+ol code search --repo "<name>" "<query>"        # scoped to one repo
+ol code calls <symbol>                          # what does this symbol call?
+ol code calls --repo "<name>" <symbol>          # scoped
+ol code refs <symbol>                           # what calls/uses this symbol?
+ol code refs --repo "<name>" <symbol>           # scoped
+ol code graph <symbol>                          # BFS call graph (depth 3)
+ol code graph --depth 5 <symbol>               # deeper traversal
 ```
 
 ## Patterns
 
 **Before any task:** `ol search "<topic>"`
 **Finding code:** `ol code search "<function or type name>"` or `ol code search --repo <name> "<query>"`
+**Understanding a function's dependencies:** `ol code calls <symbol_name>`
+**Finding what uses a function (impact of changes):** `ol code refs <symbol_name>`
+**Exploring call chains:** `ol code graph <symbol_name> --depth 4`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
 **When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`

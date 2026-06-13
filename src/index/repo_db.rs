@@ -184,14 +184,96 @@ impl RepoDb {
         signature: Option<&str>,
         start_line: i64,
         end_line: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO symbols (file_id, kind, name, signature, start_line, end_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![file_id, kind, name, signature, start_line, end_line],
         )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn insert_edge(
+        &self,
+        from_symbol_id: i64,
+        to_name: &str,
+        kind: &str,
+        line: u32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO symbol_edges (from_symbol_id, to_name, kind, line) VALUES (?1, ?2, ?3, ?4)",
+            params![from_symbol_id, to_name, kind, line as i64],
+        )?;
         Ok(())
     }
+
+    /// What does this symbol call/inherit/implement?
+    pub fn callees(&self, symbol_id: i64) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT to_name, kind, COALESCE(line, 0) FROM symbol_edges
+             WHERE from_symbol_id = ?1
+             ORDER BY kind, to_name",
+        )?;
+        let rows = stmt.query_map(params![symbol_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// What symbols call/inherit/implement the given name?
+    pub fn callers(&self, symbol_name: &str) -> Result<Vec<(Symbol, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line,
+                    e.kind, COALESCE(e.line, 0)
+             FROM symbol_edges e
+             JOIN symbols s ON s.id = e.from_symbol_id
+             JOIN files f ON f.id = s.file_id
+             WHERE e.to_name = ?1
+             ORDER BY s.name",
+        )?;
+        let rows = stmt.query_map(params![symbol_name], |r| {
+            Ok((
+                Symbol {
+                    id: r.get(0)?,
+                    file_id: r.get(1)?,
+                    file_path: r.get(2)?,
+                    kind: r.get(3)?,
+                    name: r.get(4)?,
+                    signature: r.get(5)?,
+                    start_line: r.get(6)?,
+                    end_line: r.get(7)?,
+                },
+                r.get::<_, String>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Find symbols by exact name match.
+    pub fn symbol_by_name(&self, name: &str) -> Result<Vec<Symbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line
+             FROM symbols s
+             JOIN files f ON s.file_id = f.id
+             WHERE s.name = ?1
+             ORDER BY s.file_id",
+        )?;
+        let rows = stmt.query_map(params![name], |r| {
+            Ok(Symbol {
+                id: r.get(0)?,
+                file_id: r.get(1)?,
+                file_path: r.get(2)?,
+                kind: r.get(3)?,
+                name: r.get(4)?,
+                signature: r.get(5)?,
+                start_line: r.get(6)?,
+                end_line: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
 
     pub fn insert_chunk(
         &self,
@@ -305,7 +387,7 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn stats(&self) -> Result<(i64, i64, i64)> {
+    pub fn stats(&self) -> Result<(i64, i64, i64, i64)> {
         let files: i64 = self
             .conn
             .query_row("SELECT count(*) FROM files", [], |r| r.get(0))?;
@@ -315,7 +397,10 @@ impl RepoDb {
         let chunks: i64 = self
             .conn
             .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
-        Ok((files, symbols, chunks))
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM symbol_edges", [], |r| r.get(0))?;
+        Ok((files, symbols, chunks, edges))
     }
 }
 
@@ -326,10 +411,11 @@ mod tests {
     #[test]
     fn test_repo_db_open_in_memory() {
         let db = RepoDb::open_in_memory().unwrap();
-        let (files, symbols, chunks) = db.stats().unwrap();
+        let (files, symbols, chunks, edges) = db.stats().unwrap();
         assert_eq!(files, 0);
         assert_eq!(symbols, 0);
         assert_eq!(chunks, 0);
+        assert_eq!(edges, 0);
     }
 
     #[test]

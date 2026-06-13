@@ -148,17 +148,20 @@ impl<'a> RepoIndexer<'a> {
             let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
             repo_db.delete_file_data(file_id)?;
 
-            let (symbols, raw_chunks) = parse_file(&source, effective_lang, CHUNK_SIZE_LINES);
+            let (symbols, raw_chunks, edges) =
+                parse_file(&source, effective_lang, CHUNK_SIZE_LINES);
 
             // Split any chunk that exceeds the embedding model's context window.
-            // Tree-sitter emits whole functions regardless of size; large ones get sub-chunked.
             let chunks: Vec<parser::CodeChunk> = raw_chunks
                 .into_iter()
                 .flat_map(|c| parser::split_large_chunk(c, MAX_EMBED_CHARS, SPLIT_OVERLAP_LINES))
                 .collect();
 
+            // Insert symbols and build a name→id map for resolving call edges.
+            let mut name_to_id: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             for sym in &symbols {
-                repo_db.insert_symbol(
+                let sym_id = repo_db.insert_symbol(
                     file_id,
                     &sym.kind,
                     &sym.name,
@@ -166,7 +169,16 @@ impl<'a> RepoIndexer<'a> {
                     sym.start_line as i64,
                     sym.end_line as i64,
                 )?;
+                name_to_id.insert(sym.name.clone(), sym_id);
                 result.symbols += 1;
+            }
+
+            // Insert call/inheritance edges for symbols found in this file.
+            for edge in &edges {
+                if let Some(&from_id) = name_to_id.get(&edge.from_name) {
+                    repo_db.insert_edge(from_id, &edge.to_name, &edge.kind, edge.line)?;
+                    result.edges += 1;
+                }
             }
 
             for (i, chunk) in chunks.iter().enumerate() {
@@ -188,21 +200,23 @@ impl<'a> RepoIndexer<'a> {
 
             result.files_indexed += 1;
             log::debug!(
-                "indexed {} ({}, {} symbols, {} chunks)",
+                "indexed {} ({}, {} symbols, {} chunks, {} edges)",
                 rel_path,
                 lang,
                 symbols.len(),
-                chunks.len()
+                chunks.len(),
+                edges.len(),
             );
         }
 
         log::info!(
-            "repo '{}' done: {} indexed, {} skipped, {} symbols, {} chunks",
+            "repo '{}' done: {} indexed, {} skipped, {} symbols, {} chunks, {} edges",
             name,
             result.files_indexed,
             result.skipped,
             result.symbols,
-            result.chunks
+            result.chunks,
+            result.edges,
         );
 
         // Embed the description (or repo name as fallback) whenever the embedder
@@ -235,6 +249,7 @@ pub struct IndexResult {
     pub files_indexed: usize,
     pub symbols: usize,
     pub chunks: usize,
+    pub edges: usize,
     pub skipped: usize,
 }
 

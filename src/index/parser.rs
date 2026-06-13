@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 
@@ -19,19 +20,25 @@ pub struct CodeChunk {
     pub end_line: u32,
 }
 
+/// A directed edge in the call/inheritance graph.
+#[derive(Debug, Clone)]
+pub struct ParsedEdge {
+    /// "calls", "inherits", or "implements"
+    pub kind: String,
+    pub from_name: String,
+    pub to_name: String,
+    pub line: u32,
+}
+
 /// Detect language from file extension.
-/// Languages with a tree-sitter grammar get full symbol extraction.
-/// Others fall back to line-based chunking (still indexed and searchable).
 pub fn detect_language(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()? {
-        // Tree-sitter backed (full symbol extraction)
         "rs" => Some("rust"),
         "py" | "pyi" => Some("python"),
         "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
         "go" => Some("go"),
         "cs" => Some("csharp"),
-        // Line-based fallback (indexed but no symbol extraction)
         "java" => Some("java"),
         "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" => Some("cpp"),
         "rb" => Some("ruby"),
@@ -54,22 +61,21 @@ fn get_tree_sitter_language(lang: &str) -> Option<Language> {
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
-        // Everything else falls back to line-based chunking in parse_file
         _ => None,
     }
 }
 
-/// Parse a source file, extracting top-level symbols and code chunks.
-/// Falls back to line-based chunking if no tree-sitter grammar is available.
+/// Parse a source file, extracting symbols, code chunks, and call graph edges.
+/// Falls back to line-based chunking (no symbols, no edges) for unknown languages.
 pub fn parse_file(
     source: &str,
     language: &str,
     chunk_size_lines: usize,
-) -> (Vec<ParsedSymbol>, Vec<CodeChunk>) {
+) -> (Vec<ParsedSymbol>, Vec<CodeChunk>, Vec<ParsedEdge>) {
     if let Some(ts_lang) = get_tree_sitter_language(language) {
         parse_with_tree_sitter(source, language, &ts_lang, chunk_size_lines)
     } else {
-        (vec![], chunk_by_lines(source, chunk_size_lines))
+        (vec![], chunk_by_lines(source, chunk_size_lines), vec![])
     }
 }
 
@@ -78,40 +84,36 @@ fn parse_with_tree_sitter(
     language: &str,
     ts_lang: &Language,
     chunk_size_lines: usize,
-) -> (Vec<ParsedSymbol>, Vec<CodeChunk>) {
+) -> (Vec<ParsedSymbol>, Vec<CodeChunk>, Vec<ParsedEdge>) {
     let mut parser = Parser::new();
     if parser.set_language(ts_lang).is_err() {
-        return (vec![], chunk_by_lines(source, chunk_size_lines));
+        return (vec![], chunk_by_lines(source, chunk_size_lines), vec![]);
     }
 
     let tree = match parser.parse(source.as_bytes(), None) {
         Some(t) => t,
-        None => return (vec![], chunk_by_lines(source, chunk_size_lines)),
+        None => return (vec![], chunk_by_lines(source, chunk_size_lines), vec![]),
     };
 
     let root = tree.root_node();
-    let mut symbols = Vec::new();
-    let mut chunks = Vec::new();
+    let mut out = ParseOutput {
+        symbols: Vec::new(),
+        chunks: Vec::new(),
+        edges: Vec::new(),
+        seen_edges: HashSet::new(),
+    };
 
-    collect_symbols(&root, source, language, &mut symbols, &mut chunks);
+    collect_symbols_and_edges(&root, source, language, &mut out, None);
 
-    // If no symbols found, fall back to line-based chunks
-    if chunks.is_empty() {
-        chunks = chunk_by_lines(source, chunk_size_lines);
+    if out.chunks.is_empty() {
+        out.chunks = chunk_by_lines(source, chunk_size_lines);
     }
 
-    (symbols, chunks)
+    (out.symbols, out.chunks, out.edges)
 }
 
-fn collect_symbols(
-    node: &Node,
-    source: &str,
-    language: &str,
-    symbols: &mut Vec<ParsedSymbol>,
-    chunks: &mut Vec<CodeChunk>,
-) {
-    let kind = node.kind();
-    let is_symbol = match language {
+fn is_symbol_node(kind: &str, language: &str) -> bool {
+    match language {
         "rust" => matches!(
             kind,
             "function_item"
@@ -158,44 +160,307 @@ fn collect_symbols(
                 | "property_declaration"
         ),
         _ => false,
-    };
+    }
+}
+
+struct ParseOutput {
+    symbols: Vec<ParsedSymbol>,
+    chunks: Vec<CodeChunk>,
+    edges: Vec<ParsedEdge>,
+    seen_edges: HashSet<(String, String)>,
+}
+
+fn collect_symbols_and_edges(
+    node: &Node,
+    source: &str,
+    language: &str,
+    out: &mut ParseOutput,
+    enclosing: Option<&str>,
+) {
+    let kind = node.kind();
+    let is_symbol = is_symbol_node(kind, language);
 
     if is_symbol {
         let start = node.start_position();
         let end = node.end_position();
-        let name = extract_name(node, source, language);
+        let name = extract_name(node, source, language)
+            .unwrap_or_else(|| "<anonymous>".to_string());
         let text = &source[node.start_byte()..node.end_byte()];
         let signature = extract_signature(text, language);
 
-        symbols.push(ParsedSymbol {
+        out.symbols.push(ParsedSymbol {
             kind: kind.to_string(),
-            name: name.unwrap_or_else(|| "<anonymous>".to_string()),
+            name: name.clone(),
             signature,
             start_line: start.row as u32 + 1,
             end_line: end.row as u32 + 1,
         });
 
-        // Use each top-level symbol as a chunk
-        chunks.push(CodeChunk {
+        out.chunks.push(CodeChunk {
             text: text.to_string(),
             start_line: start.row as u32 + 1,
             end_line: end.row as u32 + 1,
         });
-        return; // Don't recurse into the symbol's children for chunking
+
+        // Collect inheritance/implements edges for the current node itself.
+        if name != "<anonymous>" {
+            for edge in extract_structural_edges(node, source, language, &name) {
+                let key = (edge.from_name.clone(), edge.to_name.clone());
+                if out.seen_edges.insert(key) {
+                    out.edges.push(edge);
+                }
+            }
+        }
+
+        // Recurse into the symbol's body to find nested symbols and call edges.
+        let enc = if name == "<anonymous>" { enclosing } else { Some(name.as_str()) };
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_symbols_and_edges(&child, source, language, out, enc);
+        }
+        return;
     }
 
+    // If we're inside a named symbol, look for call expressions at this node.
+    if let Some(enc) = enclosing {
+        if let Some(callee) = extract_call_target(node, source, language) {
+            if !callee.is_empty() && callee != "<anonymous>" && !is_noise_call(&callee, language) {
+                let key = (enc.to_string(), callee.clone());
+                if out.seen_edges.insert(key) {
+                    out.edges.push(ParsedEdge {
+                        kind: "calls".to_string(),
+                        from_name: enc.to_string(),
+                        to_name: callee,
+                        line: node.start_position().row as u32 + 1,
+                    });
+                }
+            }
+        }
+    }
+
+    // Recurse into non-symbol children, preserving the current enclosing scope.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_symbols(&child, source, language, symbols, chunks);
+        collect_symbols_and_edges(&child, source, language, out, enclosing);
+    }
+}
+
+/// Extract call target name from a call expression node.
+fn extract_call_target(node: &Node, source: &str, language: &str) -> Option<String> {
+    let is_call = match language {
+        "rust" | "typescript" | "javascript" | "go" => node.kind() == "call_expression",
+        "python" => node.kind() == "call",
+        "csharp" => node.kind() == "invocation_expression",
+        _ => return None,
+    };
+    if !is_call {
+        return None;
+    }
+
+    let field = match language {
+        "csharp" => "expression",
+        _ => "function",
+    };
+    let fn_node = node.child_by_field_name(field)?;
+    extract_leaf_name(&fn_node, source)
+}
+
+/// Extract the leaf identifier from a function/expression node.
+fn extract_leaf_name(node: &Node, source: &str) -> Option<String> {
+    match node.kind() {
+        // Simple identifiers
+        "identifier"
+        | "property_identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "identifier_name" => Some(source[node.start_byte()..node.end_byte()].to_string()),
+
+        // Rust: self.method() — field_expression { value, field }
+        "field_expression" => node
+            .child_by_field_name("field")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // Rust: path::to::func — scoped_identifier { path, name }
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // JS/TS: obj.method — member_expression { object, property }
+        "member_expression" => node
+            .child_by_field_name("property")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // Python: obj.attr — attribute { object, attribute }
+        "attribute" => node
+            .child_by_field_name("attribute")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // Go: pkg.Func — selector_expression { operand, field }
+        "selector_expression" => node
+            .child_by_field_name("field")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        // C#: obj.Method — member_access_expression { expression, name }
+        "member_access_expression" => node
+            .child_by_field_name("name")
+            .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
+
+        _ => None,
+    }
+}
+
+/// Extract structural (non-call) edges: inheritance and interface implementation.
+fn extract_structural_edges(
+    node: &Node,
+    source: &str,
+    language: &str,
+    symbol_name: &str,
+) -> Vec<ParsedEdge> {
+    let mut edges = Vec::new();
+
+    match language {
+        "python" => {
+            if node.kind() == "class_definition" {
+                if let Some(bases) = node.child_by_field_name("superclasses") {
+                    let mut cursor = bases.walk();
+                    for child in bases.named_children(&mut cursor) {
+                        if let Some(name) = extract_leaf_name(&child, source) {
+                            if !name.is_empty() {
+                                edges.push(ParsedEdge {
+                                    kind: "inherits".to_string(),
+                                    from_name: symbol_name.to_string(),
+                                    to_name: name,
+                                    line: child.start_position().row as u32 + 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        "typescript" | "javascript" => {
+            if node.kind() == "class_declaration" {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "class_heritage" {
+                        let mut c2 = child.walk();
+                        for item in child.children(&mut c2) {
+                            let (kind, name_field) = match item.kind() {
+                                "extends_clause" => ("inherits", "value"),
+                                "implements_clause" => ("implements", "type"),
+                                _ => continue,
+                            };
+                            // Try field name first, fall back to first named child
+                            let target_node = item
+                                .child_by_field_name(name_field)
+                                .or_else(|| item.named_child(0));
+                            if let Some(n) = target_node {
+                                if let Some(name) = extract_leaf_name(&n, source) {
+                                    if !name.is_empty() {
+                                        edges.push(ParsedEdge {
+                                            kind: kind.to_string(),
+                                            from_name: symbol_name.to_string(),
+                                            to_name: name,
+                                            line: item.start_position().row as u32 + 1,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        "rust" => {
+            // impl Trait for Type — emit (Type → Trait, kind=implements)
+            if node.kind() == "impl_item" {
+                if let Some(trait_node) = node.child_by_field_name("trait") {
+                    if let Some(name) = extract_leaf_name(&trait_node, source) {
+                        if !name.is_empty() {
+                            edges.push(ParsedEdge {
+                                kind: "implements".to_string(),
+                                from_name: symbol_name.to_string(),
+                                to_name: name,
+                                line: trait_node.start_position().row as u32 + 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        "csharp" => {
+            if matches!(
+                node.kind(),
+                "class_declaration" | "interface_declaration" | "record_declaration"
+            ) {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "base_list" {
+                        let mut c2 = child.walk();
+                        for item in child.named_children(&mut c2) {
+                            if let Some(name) = extract_leaf_name(&item, source) {
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                // Heuristic: IFoo pattern = interface
+                                let kind = if name.starts_with('I')
+                                    && name.len() > 1
+                                    && name.chars().nth(1).is_some_and(|c| c.is_uppercase())
+                                {
+                                    "implements"
+                                } else {
+                                    "inherits"
+                                };
+                                edges.push(ParsedEdge {
+                                    kind: kind.to_string(),
+                                    from_name: symbol_name.to_string(),
+                                    to_name: name,
+                                    line: item.start_position().row as u32 + 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        _ => {}
+    }
+
+    edges
+}
+
+/// Common method/function names that produce noise in the call graph.
+/// These are standard library/language builtins that aren't useful navigation targets.
+fn is_noise_call(name: &str, language: &str) -> bool {
+    // Very short names are almost always noise (e.g., `x`, `f`)
+    if name.len() < 2 {
+        return true;
+    }
+    const UNIVERSAL: &[&str] = &["len", "push", "pop", "get", "set", "fmt"];
+    const RUST: &[&str] = &[
+        "unwrap", "expect", "ok", "err", "into", "from", "as_ref", "as_mut",
+        "map", "filter", "collect", "iter", "into_iter", "next", "clone",
+        "to_string", "to_owned", "borrow", "borrow_mut", "deref",
+    ];
+    const PYTHON: &[&str] = &["append", "extend", "items", "keys", "values", "strip", "split"];
+    match language {
+        "rust" => UNIVERSAL.contains(&name) || RUST.contains(&name),
+        "python" => UNIVERSAL.contains(&name) || PYTHON.contains(&name),
+        _ => UNIVERSAL.contains(&name),
     }
 }
 
 fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
     let name_kinds: &[&str] = match language {
-        "rust" => &["identifier"],
+        "rust" => &["identifier", "type_identifier"],
         "python" => &["identifier"],
-        "typescript" | "javascript" => &["identifier", "property_identifier"],
-        "go" => &["identifier"],
+        "typescript" | "javascript" => &["identifier", "property_identifier", "type_identifier"],
+        "go" => &["identifier", "type_identifier"],
+        "csharp" => &["identifier", "type_identifier"],
         _ => &["identifier"],
     };
 
@@ -210,13 +475,13 @@ fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
 
 fn extract_signature(text: &str, language: &str) -> Option<String> {
     let sig = match language {
-        "rust" => {
-            // Take everything up to the first `{` or the whole thing if no brace
-            text.lines()
-                .next()
-                .map(|l| l.trim_end_matches('{').trim().to_string())
+        "rust" => text
+            .lines()
+            .next()
+            .map(|l| l.trim_end_matches('{').trim().to_string()),
+        "python" | "go" | "typescript" | "javascript" => {
+            text.lines().next().map(|l| l.to_string())
         }
-        "python" | "go" | "typescript" | "javascript" => text.lines().next().map(|l| l.to_string()),
         _ => None,
     };
     sig.filter(|s| !s.is_empty())
@@ -245,8 +510,6 @@ fn chunk_by_lines(source: &str, chunk_size: usize) -> Vec<CodeChunk> {
 }
 
 /// Split a chunk that exceeds `max_chars` into smaller overlapping pieces.
-/// Uses line boundaries to avoid splitting mid-statement.
-/// `overlap_lines` controls how many lines are repeated between consecutive sub-chunks.
 pub fn split_large_chunk(
     chunk: CodeChunk,
     max_chars: usize,
@@ -264,9 +527,8 @@ pub fn split_large_chunk(
         let mut char_count = 0usize;
         let mut end = start;
 
-        // Accumulate lines until we hit the char budget
         while end < lines.len() {
-            let line_chars = lines[end].len() + 1; // +1 for '\n'
+            let line_chars = lines[end].len() + 1;
             if char_count + line_chars > max_chars && end > start {
                 break;
             }
@@ -275,7 +537,7 @@ pub fn split_large_chunk(
         }
 
         if end == start {
-            end += 1; // always include at least one line
+            end += 1;
         }
 
         result.push(CodeChunk {
@@ -288,10 +550,7 @@ pub fn split_large_chunk(
             break;
         }
 
-        // Always advance by at least 1 line. Without this guard, when a single
-        // line is longer than max_chars the overlap calculation can send start
-        // back to its previous position, creating an infinite loop that
-        // allocates memory until the OOM killer terminates the process.
+        // Always advance by at least 1 line to prevent infinite loop on lines > max_chars.
         let next = end.saturating_sub(overlap_lines);
         start = next.max(start + 1);
     }
@@ -331,7 +590,7 @@ fn main() {
     println!("ok");
 }
 "#;
-        let (symbols, _chunks) = parse_file(source, "rust", 50);
+        let (symbols, _chunks, _edges) = parse_file(source, "rust", 50);
         assert!(!symbols.is_empty(), "should extract symbols");
         let fn_names: Vec<&str> = symbols
             .iter()
@@ -340,6 +599,57 @@ fn main() {
             .collect();
         assert!(fn_names.contains(&"hello"), "missing fn hello");
         assert!(fn_names.contains(&"main"), "missing fn main");
+    }
+
+    #[test]
+    fn test_parse_rust_call_edges() {
+        let source = r#"
+fn process(data: &str) -> String {
+    let result = validate(data);
+    transform(result)
+}
+
+fn validate(_: &str) -> bool { true }
+fn transform(_: bool) -> String { String::new() }
+"#;
+        let (symbols, _chunks, edges) = parse_file(source, "rust", 50);
+        assert!(!symbols.is_empty());
+        let calls: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("process", "validate")),
+            "expected process→validate, got: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("process", "transform")),
+            "expected process→transform, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_python_inheritance() {
+        let source = r#"
+class Animal:
+    def speak(self):
+        pass
+
+class Dog(Animal):
+    def speak(self):
+        bark()
+"#;
+        let (_symbols, _chunks, edges) = parse_file(source, "python", 50);
+        let inherits: Vec<(&str, &str)> = edges
+            .iter()
+            .filter(|e| e.kind == "inherits")
+            .map(|e| (e.from_name.as_str(), e.to_name.as_str()))
+            .collect();
+        assert!(
+            inherits.contains(&("Dog", "Animal")),
+            "expected Dog→Animal, got: {inherits:?}"
+        );
     }
 
     #[test]
@@ -352,7 +662,7 @@ class MyClass:
     def method(self):
         pass
 "#;
-        let (symbols, _chunks) = parse_file(source, "python", 50);
+        let (symbols, _chunks, _edges) = parse_file(source, "python", 50);
         assert!(!symbols.is_empty());
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"greet"));
@@ -364,7 +674,7 @@ class MyClass:
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (_, chunks) = parse_file(&source, "unknown_lang", 50);
+        let (_, chunks, _) = parse_file(&source, "unknown_lang", 50);
         assert!(chunks.len() > 1);
         for chunk in &chunks {
             let line_count = chunk.text.lines().count();
@@ -379,7 +689,7 @@ fn foo() {}
 
 fn bar() {}
 "#;
-        let (symbols, _) = parse_file(source, "rust", 50);
+        let (symbols, _, _) = parse_file(source, "rust", 50);
         for sym in &symbols {
             assert!(sym.start_line > 0);
             assert!(sym.end_line >= sym.start_line);
@@ -400,7 +710,6 @@ fn bar() {}
 
     #[test]
     fn test_split_large_chunk_splits_oversized() {
-        // Build a fake large function: 50 lines of ~30 chars each = ~1500 chars
         let source = (1..=50u32)
             .map(|i| format!("    let variable_{i} = {i} * {i};"))
             .collect::<Vec<_>>()
@@ -414,14 +723,12 @@ fn bar() {}
         };
         let result = split_large_chunk(chunk, 800, 3);
 
-        // Should have produced multiple sub-chunks
         assert!(
             result.len() > 1,
             "expected multiple chunks, got {}",
             result.len()
         );
 
-        // Each sub-chunk must fit within the char budget
         for c in &result {
             assert!(
                 c.text.len() <= 850,
@@ -430,7 +737,6 @@ fn bar() {}
             );
         }
 
-        // All content is covered: first and last lines appear somewhere
         let all_text = result
             .iter()
             .map(|c| c.text.as_str())
@@ -439,14 +745,12 @@ fn bar() {}
         assert!(all_text.contains("variable_1"), "first line missing");
         assert!(all_text.contains("variable_50"), "last line missing");
 
-        // Line numbers are correctly offset from the original start_line
         assert_eq!(result[0].start_line, 10);
         assert!(result.last().unwrap().end_line <= 59);
     }
 
     #[test]
     fn test_split_large_chunk_overlap_repeats_lines() {
-        // 30 lines × 40 chars = 1200 chars; split at 400 chars with 3-line overlap
         let source = (1..=30u32)
             .map(|i| format!("line-content-{i:02}-padding-here"))
             .collect::<Vec<_>>()
@@ -459,11 +763,9 @@ fn bar() {}
         };
         let chunks = split_large_chunk(chunk, 400, 3);
 
-        // Overlapping lines should appear in consecutive chunks
         if chunks.len() >= 2 {
             let last_lines_of_first: Vec<&str> = chunks[0].text.lines().rev().take(3).collect();
             let first_lines_of_second: Vec<&str> = chunks[1].text.lines().take(3).collect();
-            // At least one overlap line should appear in both
             let overlap_count = last_lines_of_first
                 .iter()
                 .filter(|l| first_lines_of_second.contains(l))
@@ -474,11 +776,8 @@ fn bar() {}
 
     #[test]
     fn test_repo_indexer_uses_correct_chunk_size() {
-        // Verify that the constants we ship stay within the model's context window.
-        // AllMiniLML6V2: 256 tokens max ≈ 1024 chars at 4 chars/token.
         let max_safe_chars = 1024usize;
 
-        // Fallback line-based chunks: CHUNK_SIZE_LINES lines × avg 60 chars/line
         let max_fallback_chars = super::super::CHUNK_SIZE_LINES * 60;
         assert!(
             max_fallback_chars <= max_safe_chars,
@@ -487,7 +786,6 @@ fn bar() {}
             super::super::CHUNK_SIZE_LINES,
         );
 
-        // MAX_EMBED_CHARS is the hard ceiling applied after tree-sitter extraction
         assert!(
             super::super::MAX_EMBED_CHARS <= max_safe_chars,
             "MAX_EMBED_CHARS ({}) exceeds model limit",
@@ -497,10 +795,7 @@ fn bar() {}
 
     #[test]
     fn test_split_large_chunk_no_infinite_loop_on_long_lines() {
-        // Regression test for OOM bug: when a single line is longer than
-        // max_chars, the overlap calculation previously sent start back to 0,
-        // creating an infinite loop that allocated 64GB before being killed.
-        let long_line = "x".repeat(2000); // 2000 chars > max_chars=800
+        let long_line = "x".repeat(2000);
         let source = (0..10)
             .map(|_| long_line.as_str())
             .collect::<Vec<_>>()
@@ -512,7 +807,6 @@ fn bar() {}
             end_line: 10,
         };
 
-        // Must terminate and produce a bounded number of chunks
         let chunks = split_large_chunk(chunk, 800, 3);
         assert!(!chunks.is_empty(), "should produce at least one chunk");
         assert!(
@@ -521,7 +815,6 @@ fn bar() {}
             chunks.len()
         );
 
-        // Every chunk start must be strictly after the previous chunk start
         for window in chunks.windows(2) {
             assert!(
                 window[1].start_line > window[0].start_line,

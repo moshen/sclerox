@@ -321,6 +321,19 @@ CREATE TABLE IF NOT EXISTS investigation_chunks (
 );
 ";
 
+/// Migration v2: symbol_edges for call graph (callers, callees, graph traversal).
+pub const REPO_MIGRATION_V2: &str = "
+CREATE TABLE IF NOT EXISTS symbol_edges (
+    id INTEGER PRIMARY KEY,
+    from_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    to_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'calls',
+    line INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -375,4 +388,17 @@ CREATE TABLE IF NOT EXISTS chunks (
     end_line INTEGER,
     embedding BLOB
 );
+
+-- Call graph edges: records calls, inherits, implements relationships between symbols.
+-- from_symbol_id is the caller/child; to_name is the callee/parent as written in source.
+-- Deleting a symbol cascades to delete its outbound edges.
+CREATE TABLE IF NOT EXISTS symbol_edges (
+    id INTEGER PRIMARY KEY,
+    from_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    to_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'calls',
+    line INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
 ";

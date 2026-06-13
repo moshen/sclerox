@@ -68,8 +68,12 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             println!("Indexing {}...", canonical.display());
             let result = indexer.index_repo(db, &canonical, description.as_deref())?;
             println!(
-                "Done: {} files indexed, {} skipped, {} symbols, {} chunks",
-                result.files_indexed, result.skipped, result.symbols, result.chunks
+                "Done: {} files indexed, {} skipped, {} symbols, {} chunks, {} edges",
+                result.files_indexed,
+                result.skipped,
+                result.symbols,
+                result.chunks,
+                result.edges,
             );
         }
 
@@ -153,9 +157,9 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             }
 
             let repo_db = RepoDb::open(&db_path)?;
-            let (files, syms, chunks) = repo_db.stats()?;
+            let (files, syms, chunks, edges) = repo_db.stats()?;
             println!("Repo: {}", canonical.display());
-            println!("Files: {files}  Symbols: {syms}  Chunks: {chunks}");
+            println!("Files: {files}  Symbols: {syms}  Chunks: {chunks}  Edges: {edges}");
 
             if let Some(query) = symbols {
                 let results = repo_db.search_symbols(&query)?;
