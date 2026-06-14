@@ -675,15 +675,28 @@ ol code graph --depth 5 <symbol>               # deeper traversal
 **Attributing a memory:** `ol memory people add <key> <person_id>`
 **Session summary:** `ol memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
 
-## Privacy
+## Privacy — wrap secrets in `<private>` BEFORE you reply
 
-To prevent secrets, credentials, or sensitive discussion from being captured by
-session distillation, wrap them in `<private>...</private>` tags inline. The
-Stop hook strips these regions before they reach the AI distiller, so nothing
-inside ever lands in memory.
+The Stop hook distills every session into long-lived memory. **Anything you
+include in a reply that isn't wrapped in `<private>...</private>` is fair game
+for distillation and will persist.** The tags are stripped before the AI
+distiller sees the text, so wrapped regions never land in memory.
+
+**Wrap before responding** whenever output contains:
+
+- Credentials, API keys, tokens, passwords, session cookies
+- Output of commands that print secrets: `aws sts ...`, `gcloud auth ...`,
+  `kubectl config view`, `cat .env`, `printenv`, `op item get`, anything
+  reading from a credentials file
+- Customer PII, employee personal data, salary/comp, HR discussions
+- Private URLs containing tokens (`?key=...`, signed S3 URLs)
+- Internal hostnames, IPs, or infrastructure detail the user flags as sensitive
+
+When in doubt, wrap. Over-redacting is cheap; a leaked credential in memory
+is not.
 
 ```
-Here's the prod credentials I just pulled:
+Here are the prod credentials I just pulled:
 <private>
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
@@ -691,7 +704,12 @@ AWS_SECRET_ACCESS_KEY=...
 We need to rotate them tomorrow.
 ```
 
-Only the "We need to rotate them tomorrow" portion can be distilled.
+Only "Here are the prod credentials I just pulled:" and "We need to rotate
+them tomorrow." can be distilled. The keys themselves are dropped.
+
+**Do not** wrap normal technical discussion, error messages without
+credentials, file paths, or commit hashes — that's the content the agent
+needs to recall later.
 
 ## Session start context
 
