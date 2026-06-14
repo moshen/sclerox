@@ -102,20 +102,128 @@ fn run_start(db: &Database) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
 
-    // Only index if this is a git repository.
-    if !cwd.join(".git").exists() {
-        return Ok(());
+    // Index the repo if we're in one (silent on failure).
+    if cwd.join(".git").exists() {
+        let description = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n} repo"));
+        let mut indexer = crate::index::RepoIndexer::new(None);
+        let _ = indexer.index_repo(db, &cwd, description.as_deref());
     }
 
-    let description = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| format!("{n} repo"));
-
-    let mut indexer = crate::index::RepoIndexer::new(None);
-    let _ = indexer.index_repo(db, &cwd, description.as_deref());
+    // Emit compact session context for Claude Code to inject (layer-1 index only).
+    // Hard-capped at ~750 tokens so the agent knows what's available without
+    // loading full content. It then fetches detail via `ol memory get`, etc.
+    if let Ok(ctx) = build_session_context(db) {
+        if !ctx.is_empty() {
+            let payload = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": ctx,
+                }
+            });
+            println!("{payload}");
+        }
+    }
 
     Ok(())
+}
+
+/// Maximum characters in the injected session context. ~3000 chars ≈ 750 tokens.
+const SESSION_CONTEXT_MAX_CHARS: usize = 3000;
+
+/// Build a compact index of what's in the knowledge base so the agent knows
+/// what's available without loading every memory. The agent fetches detail
+/// on demand with `ol memory get`, `ol todo get`, etc.
+fn build_session_context(db: &Database) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("## ol context (run `ol memory get <key>` etc. for full content)\n\n");
+
+    let budget = SESSION_CONTEXT_MAX_CHARS;
+
+    // 1. Open todos (deadline-sorted, top 5). Highest priority — actionable now.
+    if let Ok(todos) = db.todo_list(Some("open")) {
+        if !todos.is_empty() {
+            let mut section = format!("### Open todos ({})\n", todos.len());
+            for t in todos.iter().take(5) {
+                let due = t
+                    .deadline_date
+                    .as_deref()
+                    .map(|d| format!(" (due {d})"))
+                    .unwrap_or_default();
+                section.push_str(&format!("- #{} {}{}\n", t.id, t.title, due));
+            }
+            section.push('\n');
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
+    // 2. Open research investigations (top 3).
+    if let Ok(invs) = db.investigation_list(Some("open")) {
+        if !invs.is_empty() {
+            let mut section = format!("### Open research ({})\n", invs.len());
+            for inv in invs.iter().take(3) {
+                section.push_str(&format!("- #{} {} [{}]\n", inv.id, inv.name, inv.slug));
+            }
+            section.push('\n');
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
+    // 3. Recent session memories (last 3) — chronological brief.
+    if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
+        if !sessions.is_empty() {
+            let mut section = String::from("### Recent sessions\n");
+            for m in sessions.iter().take(3) {
+                let summary = truncate_for_index(&m.value, 100);
+                section.push_str(&format!("- {}: {}\n", m.key, summary));
+            }
+            section.push('\n');
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
+    // 4. Other active memory keys (project/feedback/general) — keys only, no content.
+    // The agent fetches full content via `ol memory get <key>` when relevant.
+    if let Ok(all) = db.memory_list(None, Some("active")) {
+        let others: Vec<_> = all.iter().filter(|m| m.memory_type != "session").collect();
+        if !others.is_empty() {
+            let mut section = format!("### Memory keys ({})\n", others.len());
+            for m in others.iter().take(20) {
+                let hint = truncate_for_index(&m.value, 60);
+                section.push_str(&format!("- {} — {}\n", m.key, hint));
+            }
+            section.push('\n');
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
+    // Final safety cap — should already fit but guard against runaway growth.
+    if out.len() > budget {
+        out.truncate(budget);
+        out.push_str("\n…[truncated]");
+    }
+
+    Ok(out)
+}
+
+/// Append `section` to `out` only if doing so keeps `out` under `budget` chars.
+fn push_if_fits(out: &mut String, section: &str, budget: usize) {
+    if out.len() + section.len() <= budget {
+        out.push_str(section);
+    }
+}
+
+/// Truncate a value string to a single short line for use in the index.
+fn truncate_for_index(s: &str, max: usize) -> String {
+    let single_line = s.lines().next().unwrap_or("").trim();
+    if single_line.chars().count() <= max {
+        single_line.to_string()
+    } else {
+        let cut: String = single_line.chars().take(max).collect();
+        format!("{cut}...")
+    }
 }
 
 fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: bool) -> Result<()> {
@@ -551,8 +659,10 @@ fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
 }
 
 /// Extract plain text from a Claude message content field (string or array of blocks).
+/// Strips `<private>...</private>` regions before returning so secrets in the
+/// transcript never reach the AI distiller.
 fn extract_text_content(content: &serde_json::Value) -> Option<String> {
-    match content {
+    let raw = match content {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(blocks) => {
             let text: String = blocks
@@ -566,14 +676,36 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            (!text.is_empty()).then_some(text)
         }
         _ => None,
+    }?;
+    let cleaned = strip_private_sections(&raw);
+    (!cleaned.trim().is_empty()).then_some(cleaned)
+}
+
+/// Remove any text inside `<private>...</private>` markers (case-insensitive,
+/// spans newlines, supports multiple regions per string).
+fn strip_private_sections(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let lower = rest.to_lowercase();
+        let Some(open) = lower.find("<private>") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let after_open = open + "<private>".len();
+        match lower[after_open..].find("</private>") {
+            Some(close_rel) => {
+                let close_abs = after_open + close_rel + "</private>".len();
+                rest = &rest[close_abs..];
+            }
+            None => break, // unclosed tag: drop everything from here on
+        }
     }
+    out
 }
 
 fn truncate_content(s: &str, max: usize) -> String {
@@ -639,6 +771,116 @@ mod tests {
         for i in 0..10 {
             assert!(all.contains(&format!("turn{i}")));
         }
+    }
+
+    #[test]
+    fn test_strip_private_basic() {
+        let input = "before <private>secret</private> after";
+        assert_eq!(strip_private_sections(input), "before  after");
+    }
+
+    #[test]
+    fn test_strip_private_multiline() {
+        let input = "line1\n<private>\nAWS_KEY=abc\n</private>\nline2";
+        assert_eq!(strip_private_sections(input), "line1\n\nline2");
+    }
+
+    #[test]
+    fn test_strip_private_multiple_regions() {
+        let input = "a <private>x</private> b <PRIVATE>y</PRIVATE> c";
+        assert_eq!(strip_private_sections(input), "a  b  c");
+    }
+
+    #[test]
+    fn test_strip_private_unclosed_drops_to_end() {
+        let input = "before <private>oh no";
+        assert_eq!(strip_private_sections(input), "before ");
+    }
+
+    #[test]
+    fn test_strip_private_no_tags_passthrough() {
+        let input = "no secrets here";
+        assert_eq!(strip_private_sections(input), "no secrets here");
+    }
+
+    #[test]
+    fn test_extract_text_content_strips_private() {
+        let val = serde_json::json!("hello <private>secret</private> world");
+        assert_eq!(
+            extract_text_content(&val),
+            Some("hello  world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_text_content_only_private_returns_none() {
+        let val = serde_json::json!("<private>everything</private>");
+        assert_eq!(extract_text_content(&val), None);
+    }
+
+    #[test]
+    fn test_truncate_for_index_short_passthrough() {
+        assert_eq!(truncate_for_index("hello", 50), "hello");
+    }
+
+    #[test]
+    fn test_truncate_for_index_long_truncated() {
+        let result = truncate_for_index("a".repeat(200).as_str(), 50);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.chars().count(), 53); // 50 + "..."
+    }
+
+    #[test]
+    fn test_truncate_for_index_only_first_line() {
+        assert_eq!(truncate_for_index("first\nsecond", 50), "first");
+    }
+
+    #[test]
+    fn test_build_session_context_caps_at_budget() {
+        let db = Database::open_in_memory().unwrap();
+        // Add way more memory than the budget allows
+        for i in 0..200 {
+            let _ = db.memory_set(
+                &format!("project/test/{i}"),
+                &"x".repeat(300),
+                "project",
+                None,
+            );
+        }
+        let ctx = build_session_context(&db).unwrap();
+        assert!(
+            ctx.len() <= SESSION_CONTEXT_MAX_CHARS,
+            "context exceeded budget: {} > {}",
+            ctx.len(),
+            SESSION_CONTEXT_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn test_build_session_context_empty_db_has_header() {
+        let db = Database::open_in_memory().unwrap();
+        let ctx = build_session_context(&db).unwrap();
+        assert!(ctx.contains("ol context"));
+    }
+
+    #[test]
+    fn test_build_session_context_includes_open_todos() {
+        use crate::db::todos::TodoStatus;
+        let db = Database::open_in_memory().unwrap();
+        let _ = db
+            .todo_add(
+                "fix login bug",
+                None,
+                TodoStatus::Open,
+                None,
+                "general",
+                None,
+                None,
+            )
+            .unwrap();
+        let ctx = build_session_context(&db).unwrap();
+        assert!(ctx.contains("Open todos"));
+        assert!(ctx.contains("fix login bug"));
     }
 
     #[test]

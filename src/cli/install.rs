@@ -675,6 +675,32 @@ ol code graph --depth 5 <symbol>               # deeper traversal
 **Attributing a memory:** `ol memory people add <key> <person_id>`
 **Session summary:** `ol memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
 
+## Privacy
+
+To prevent secrets, credentials, or sensitive discussion from being captured by
+session distillation, wrap them in `<private>...</private>` tags inline. The
+Stop hook strips these regions before they reach the AI distiller, so nothing
+inside ever lands in memory.
+
+```
+Here's the prod credentials I just pulled:
+<private>
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+</private>
+We need to rotate them tomorrow.
+```
+
+Only the "We need to rotate them tomorrow" portion can be distilled.
+
+## Session start context
+
+When a session starts in a git repo, `ol hook start` automatically injects a
+compact index of open todos, open research, recent sessions, and memory keys
+(capped at ~750 tokens). You do NOT need to run `ol todo list` or `ol memory
+list` at session start — they're already visible. Use `ol memory get <key>`,
+`ol todo get <id>`, etc. to fetch full content for items that look relevant.
+
 ## Workflows
 
 ### When working on a repo
