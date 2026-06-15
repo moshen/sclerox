@@ -579,7 +579,7 @@ fn global_search_json_output() {
 #[test]
 fn fresh_database_is_at_current_version() {
     let e = Env::new();
-    let out = e.run(&["migrate"]);
+    let out = e.run(&["db", "migrate"]);
     assert!(
         out.contains("up to date"),
         "expected 'up to date', got: {out}"
@@ -590,8 +590,7 @@ fn fresh_database_is_at_current_version() {
 #[test]
 fn migrate_repos_flag() {
     let e = Env::new();
-    let out = e.run(&["migrate", "--repos"]);
-    // No repos indexed, should say so
+    let out = e.run(&["db", "migrate", "--repos"]);
     assert!(out.contains("No repos") || out.contains("up to date"));
 }
 
@@ -691,7 +690,7 @@ fn commands_complete_within_200ms() {
         (&["todo", "list"], "todo list"),
         (&["research", "list"], "research list"),
         (&["search", "perf"], "search"),
-        (&["migrate"], "migrate"),
+        (&["db", "migrate"], "db migrate"),
     ];
 
     for (args, label) in cases {

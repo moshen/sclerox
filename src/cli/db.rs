@@ -6,27 +6,88 @@ use std::path::{Path, PathBuf};
 use crate::db::Database;
 
 #[derive(Subcommand)]
-pub enum VaultCommand {
-    /// Export the entire knowledge base as plaintext markdown for git-backed sync.
+pub enum DbCommand {
+    /// Show database schema version and pending migrations.
+    Migrate {
+        /// Also show migration status for all indexed repos.
+        #[arg(long)]
+        repos: bool,
+    },
+
+    /// Export the knowledge base as plaintext markdown.
     ///
-    /// Creates one markdown file per record under <dir>/memory, /people, /projects,
-    /// /meetings, /todos, /research, /repos. Each file has YAML frontmatter plus
-    /// a body, with cross-links in Obsidian `[[link]]` form.
+    /// Writes one file per record under <dir>/memory, /people, /projects,
+    /// /meetings, /todos, /research, /repos. Files use YAML frontmatter
+    /// and Obsidian-style [[wikilinks]] for cross-references.
     ///
-    /// The export owns those subdirectories and rewrites them on every run, so
-    /// rerunning is safe and idempotent. Files at the vault root (README, .git,
-    /// user notes) are preserved.
+    /// Suitable for: git-tracked vaults (Obsidian, Logseq), feeding other
+    /// tools, backup, or sharing with teammates.
+    ///
+    /// The export rewrites owned subdirs on every run (idempotent). Files
+    /// at the vault root (.git, README, user notes) are left untouched.
     Export {
-        /// Target vault directory (created if missing).
+        /// Target directory (created if missing).
         dir: PathBuf,
     },
 }
 
-pub fn run(db: &Database, cmd: VaultCommand) -> Result<()> {
+pub fn run(db: &Database, cmd: DbCommand) -> Result<()> {
     match cmd {
-        VaultCommand::Export { dir } => export(db, &dir),
+        DbCommand::Migrate { repos } => migrate(db, repos),
+        DbCommand::Export { dir } => export(db, &dir),
     }
 }
+
+// ---------- migrate ----------
+
+fn migrate(db: &Database, show_repos: bool) -> Result<()> {
+    let (current, target, pending) = db.migration_status()?;
+
+    println!("Primary database (~/.ol/ol.db)");
+    println!("  schema version : {current}");
+    println!("  binary expects : {target}");
+    if pending == 0 {
+        println!("  status         : up to date");
+    } else {
+        println!("  status         : {pending} migration(s) will apply on next open");
+    }
+
+    if show_repos {
+        use crate::index::repo_db::RepoDb;
+
+        let repos = db.repo_list()?;
+        if repos.is_empty() {
+            println!("\nNo repos indexed.");
+        } else {
+            println!("\nRepo databases:");
+            for repo in &repos {
+                let db_path = PathBuf::from(&repo.db_path);
+                if !db_path.exists() {
+                    println!("  {} - db missing ({})", repo.name, repo.db_path);
+                    continue;
+                }
+                match RepoDb::open(&db_path) {
+                    Ok(rdb) => match rdb.migration_status() {
+                        Ok((cur, tgt, pend)) => {
+                            let status = if pend == 0 {
+                                "up to date".to_string()
+                            } else {
+                                format!("{pend} pending")
+                            };
+                            println!("  {} v{cur}/{tgt} ({status})", repo.name);
+                        }
+                        Err(e) => println!("  {} - error: {e}", repo.name),
+                    },
+                    Err(e) => println!("  {} - could not open: {e}", repo.name),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------- export ----------
 
 #[derive(Default)]
 struct ExportStats {
@@ -45,7 +106,7 @@ const OWNED_SUBDIRS: &[&str] = &[
 
 fn export(db: &Database, dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)
-        .with_context(|| format!("creating vault dir {}", dir.display()))?;
+        .with_context(|| format!("creating export dir {}", dir.display()))?;
 
     // Wipe owned subdirs so deleted records vanish on re-export.
     for sub in OWNED_SUBDIRS {
@@ -137,7 +198,6 @@ fn export_projects(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result
         fm.kv("created", &proj.created_at);
         fm.kv("updated", &proj.updated_at);
 
-        // Linked people, meetings, repos in frontmatter as list of slugs
         let project_people = db.project_people(proj.id).unwrap_or_default();
         if !project_people.is_empty() {
             let slugs: Vec<String> = project_people
@@ -201,7 +261,6 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
     let out_dir = dir.join("memory");
     fs::create_dir_all(&out_dir)?;
     for m in &entries {
-        // Key is namespace-with-slashes — use it directly as a relative path.
         let safe_key = sanitize_key_path(&m.key);
         let file_path = out_dir.join(format!("{safe_key}.md"));
         if let Some(parent) = file_path.parent() {
@@ -479,8 +538,8 @@ fn export_repos(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<()
 
 fn write_index(dir: &Path, stats: &ExportStats) -> Result<()> {
     let body = format!(
-        "# ol vault\n\n\
-         Plaintext export of the ol knowledge base. Regenerated by `ol vault export`.\n\n\
+        "# ol export\n\n\
+         Plaintext export of the ol knowledge base. Regenerated by `ol db export`.\n\n\
          ## Counts\n\n\
          - {} memory entries\n\
          - {} people\n\
@@ -503,8 +562,6 @@ fn write_index(dir: &Path, stats: &ExportStats) -> Result<()> {
 
 // ---------- helpers ----------
 
-/// Builder for YAML frontmatter blocks. Always quotes scalar values to avoid
-/// edge cases (colons, leading-dash, numbers-that-look-like-strings).
 struct Frontmatter {
     lines: Vec<String>,
 }
@@ -537,7 +594,6 @@ impl Frontmatter {
 }
 
 fn yaml_quote(s: &str) -> String {
-    // Always use double-quoted scalar to avoid ambiguity. Escape backslash + quote.
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -554,7 +610,6 @@ fn write_md(path: &Path, frontmatter: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lowercase, ASCII alphanumeric + hyphen, collapsed.
 fn slugify(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut last_was_hyphen = false;
@@ -575,8 +630,6 @@ fn slugify(input: &str) -> String {
     }
 }
 
-/// Memory keys use `/` as namespace separator — preserve as directory structure
-/// but slugify each segment.
 fn sanitize_key_path(key: &str) -> String {
     key.split('/')
         .map(slugify)
@@ -622,10 +675,6 @@ mod tests {
             sanitize_key_path("session/2026-06-12/foo-bar"),
             "session/2026-06-12/foo-bar"
         );
-        assert_eq!(
-            sanitize_key_path("feedback/em-dash"),
-            "feedback/em-dash"
-        );
     }
 
     #[test]
@@ -645,15 +694,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Database::open_in_memory().unwrap();
 
-        // User-created file at vault root should survive re-export.
         let user_file = dir.path().join("my-notes.md");
         fs::write(&user_file, "user content").unwrap();
 
-        // Add one of each type
         let pid = db
             .people_add("Colin Kennedy", Some("c@x"), None, None, None, None, None)
             .unwrap();
-        let _mid = db.memory_set("project/active", "ol-cli", "project", None).unwrap();
+        let _mid = db
+            .memory_set("project/active", "ol-cli", "project", None)
+            .unwrap();
         let _ = db.todo_add(
             "fix bug",
             None,
@@ -666,20 +715,14 @@ mod tests {
 
         export(&db, dir.path()).unwrap();
 
-        // Owned subdirs exist
         assert!(dir.path().join("people").exists());
         assert!(dir.path().join("memory").exists());
         assert!(dir.path().join("todos").exists());
-
-        // User file preserved
         assert!(user_file.exists());
-
-        // Specific files written
         assert!(dir.path().join("people/colin-kennedy.md").exists());
         assert!(dir.path().join("memory/project/active.md").exists());
 
-        // Re-run with the person removed: people dir should be empty (or gone),
-        // user file still there.
+        // Re-run after deleting the person — their file should vanish.
         let _ = db.people_delete(pid);
         export(&db, dir.path()).unwrap();
         assert!(!dir.path().join("people/colin-kennedy.md").exists());
@@ -687,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_memory_uses_key_as_path() {
+    fn test_export_memory_key_as_path() {
         let dir = TempDir::new().unwrap();
         let db = Database::open_in_memory().unwrap();
         db.memory_set("research/graphify/finding", "use rust", "project", None)

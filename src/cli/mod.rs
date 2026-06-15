@@ -1,18 +1,17 @@
 pub mod code;
 pub mod completions;
+pub mod db;
 pub mod format;
 pub mod hook;
 pub mod install;
 pub mod meetings;
 pub mod memory;
-pub mod migrate;
 pub mod people;
 pub mod projects;
 pub mod repos;
 pub mod research;
 pub mod search;
 pub mod todos;
-pub mod vault;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -79,15 +78,12 @@ pub enum Commands {
     #[command(subcommand)]
     Code(code::CodeCommand),
 
-    /// Export the knowledge base as plaintext markdown (git-backed vault)
+    /// Database utilities: schema migration status, plaintext export
     #[command(subcommand)]
-    Vault(vault::VaultCommand),
+    Db(db::DbCommand),
 
     /// Full-text search across all tables
     Search(search::SearchArgs),
-
-    /// Show database schema version and migration status
-    Migrate(migrate::MigrateArgs),
 
     /// Generate shell completions
     Completions(completions::CompletionsArgs),
@@ -127,9 +123,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Research(c) => research::run(&db, c, format),
                 Commands::Repo(c) => repos::run(&db, c),
                 Commands::Code(c) => code::run(&db, c),
-                Commands::Vault(c) => vault::run(&db, c),
+                Commands::Db(c) => db::run(&db, c),
                 Commands::Search(a) => search::run(&db, a, format),
-                Commands::Migrate(a) => migrate::run(&db, a),
                 Commands::Install(_)
                 | Commands::Uninstall(_)
                 | Commands::Completions(_)
