@@ -12,6 +12,7 @@ pub mod repos;
 pub mod research;
 pub mod search;
 pub mod todos;
+pub mod vault;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -78,6 +79,10 @@ pub enum Commands {
     #[command(subcommand)]
     Code(code::CodeCommand),
 
+    /// Export the knowledge base as plaintext markdown (git-backed vault)
+    #[command(subcommand)]
+    Vault(vault::VaultCommand),
+
     /// Full-text search across all tables
     Search(search::SearchArgs),
 
@@ -122,6 +127,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Research(c) => research::run(&db, c, format),
                 Commands::Repo(c) => repos::run(&db, c),
                 Commands::Code(c) => code::run(&db, c),
+                Commands::Vault(c) => vault::run(&db, c),
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Migrate(a) => migrate::run(&db, a),
                 Commands::Install(_)
