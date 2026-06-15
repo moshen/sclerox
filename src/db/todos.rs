@@ -196,8 +196,7 @@ impl Database {
 
     pub fn todo_people(&self, todo_id: i64) -> Result<Vec<crate::db::people::Person>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url,
-                    p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
+            "SELECT p.id, p.name, p.notes, p.created_at, p.updated_at
              FROM people p
              JOIN todo_people tp ON p.id = tp.person_id
              WHERE tp.todo_id = ?1
@@ -207,14 +206,9 @@ impl Database {
             Ok(crate::db::people::Person {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                email: row.get(2)?,
-                slack_id: row.get(3)?,
-                slack_url: row.get(4)?,
-                github_username: row.get(5)?,
-                github_url: row.get(6)?,
-                notes: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                notes: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -577,10 +571,10 @@ mod tests {
             )
             .unwrap();
         let alice = db
-            .people_add("Alice", Some("alice@x.com"), None, None, None, None, None)
+            .people_add("Alice", None)
             .unwrap();
         let bob = db
-            .people_add("Bob", Some("bob@x.com"), None, None, None, None, None)
+            .people_add("Bob", None)
             .unwrap();
 
         db.todo_link_person(todo_id, alice).unwrap();
@@ -600,7 +594,7 @@ mod tests {
             .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
             .unwrap();
         let person_id = db
-            .people_add("Carol", None, None, None, None, None, None)
+            .people_add("Carol", None)
             .unwrap();
 
         db.todo_link_person(todo_id, person_id).unwrap();
@@ -620,7 +614,7 @@ mod tests {
             .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
             .unwrap();
         let person_id = db
-            .people_add("Dave", None, None, None, None, None, None)
+            .people_add("Dave", None)
             .unwrap();
         db.todo_link_person(todo_id, person_id).unwrap();
 

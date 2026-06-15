@@ -22,9 +22,8 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                 SearchResult::Memory { key, snippet, .. } => {
                     println!("[memory] {} - {}", key, snippet);
                 }
-                SearchResult::Person { id, name, email } => {
-                    let email = email.as_deref().unwrap_or("-");
-                    println!("[person] #{id} {name} <{email}>");
+                SearchResult::Person { id, name } => {
+                    println!("[person] #{id} {name}");
                 }
                 SearchResult::Meeting {
                     id,

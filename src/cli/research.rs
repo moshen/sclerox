@@ -301,8 +301,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         println!("No people on investigation #{id}");
                     } else {
                         for p in &people {
-                            let email = p.email.as_deref().unwrap_or("-");
-                            println!("#{} {} <{}>", p.id, p.name, email);
+                            
+                            println!("#{} {}", p.id, p.name);
                         }
                     }
                 });

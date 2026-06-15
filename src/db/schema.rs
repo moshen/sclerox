@@ -31,7 +31,8 @@ CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
     VALUES ('delete', old.id, old.key, old.value, old.memory_type, old.tags);
 END;
 
--- People: with discrete columns for all known identity links
+-- People: v1 baseline retains inline identifier columns.
+-- Migration v7 moves them to people_identifiers and drops these columns.
 CREATE TABLE IF NOT EXISTS people (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -319,6 +320,78 @@ CREATE TABLE IF NOT EXISTS investigation_chunks (
     chunk_text TEXT NOT NULL,
     embedding BLOB
 );
+";
+
+/// Migration v7: people_identifiers + identifier_types; removes old inline identity columns.
+pub const MIGRATION_V7: &str = "
+-- Catalog of valid identifier types
+CREATE TABLE IF NOT EXISTS identifier_types (
+    name TEXT PRIMARY KEY,
+    description TEXT
+);
+INSERT OR IGNORE INTO identifier_types (name, description) VALUES
+    ('email',      'Email address'),
+    ('slack',      'Slack member ID (e.g. U1234ABC)'),
+    ('slack_url',  'Slack profile URL'),
+    ('github',     'GitHub username'),
+    ('github_url', 'GitHub profile URL'),
+    ('atlassian',  'Atlassian account ID or email'),
+    ('jira',       'Jira account ID or username'),
+    ('linear',     'Linear user ID or email'),
+    ('linkedin',   'LinkedIn profile URL or handle');
+
+-- Identifier rows per person
+CREATE TABLE IF NOT EXISTS people_identifiers (
+    id INTEGER PRIMARY KEY,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    type TEXT NOT NULL REFERENCES identifier_types(name),
+    identifier TEXT NOT NULL,
+    UNIQUE(person_id, type)
+);
+CREATE INDEX IF NOT EXISTS idx_pi_person ON people_identifiers(person_id);
+CREATE INDEX IF NOT EXISTS idx_pi_lookup ON people_identifiers(type, identifier);
+
+-- Migrate data from old inline columns (only if they still exist)
+INSERT OR IGNORE INTO people_identifiers (person_id, type, identifier)
+    SELECT id, 'email', email FROM people WHERE email IS NOT NULL;
+INSERT OR IGNORE INTO people_identifiers (person_id, type, identifier)
+    SELECT id, 'slack', slack_id FROM people WHERE slack_id IS NOT NULL;
+INSERT OR IGNORE INTO people_identifiers (person_id, type, identifier)
+    SELECT id, 'slack_url', slack_url FROM people WHERE slack_url IS NOT NULL;
+INSERT OR IGNORE INTO people_identifiers (person_id, type, identifier)
+    SELECT id, 'github', github_username FROM people WHERE github_username IS NOT NULL;
+INSERT OR IGNORE INTO people_identifiers (person_id, type, identifier)
+    SELECT id, 'github_url', github_url FROM people WHERE github_url IS NOT NULL;
+
+-- Rebuild FTS without identifier columns
+DROP TRIGGER IF EXISTS people_ai;
+DROP TRIGGER IF EXISTS people_au;
+DROP TRIGGER IF EXISTS people_ad;
+DROP TABLE IF EXISTS people_fts;
+CREATE VIRTUAL TABLE IF NOT EXISTS people_fts USING fts5(
+    name, notes,
+    content=people, content_rowid=id
+);
+INSERT INTO people_fts(rowid, name, notes) SELECT id, name, notes FROM people;
+CREATE TRIGGER IF NOT EXISTS people_ai AFTER INSERT ON people BEGIN
+    INSERT INTO people_fts(rowid, name, notes) VALUES (new.id, new.name, new.notes);
+END;
+CREATE TRIGGER IF NOT EXISTS people_au AFTER UPDATE ON people BEGIN
+    INSERT INTO people_fts(people_fts, rowid, name, notes)
+        VALUES ('delete', old.id, old.name, old.notes);
+    INSERT INTO people_fts(rowid, name, notes) VALUES (new.id, new.name, new.notes);
+END;
+CREATE TRIGGER IF NOT EXISTS people_ad AFTER DELETE ON people BEGIN
+    INSERT INTO people_fts(people_fts, rowid, name, notes)
+        VALUES ('delete', old.id, old.name, old.notes);
+END;
+
+-- Drop old columns (requires SQLite >= 3.35.0, bundled via rusqlite)
+ALTER TABLE people DROP COLUMN email;
+ALTER TABLE people DROP COLUMN slack_id;
+ALTER TABLE people DROP COLUMN slack_url;
+ALTER TABLE people DROP COLUMN github_username;
+ALTER TABLE people DROP COLUMN github_url;
 ";
 
 /// Migration v2: symbol_edges for call graph (callers, callees, graph traversal).

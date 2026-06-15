@@ -150,17 +150,13 @@ fn export_people(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
     fs::create_dir_all(&out_dir)?;
     for p in &people {
         let slug = slugify(&p.name);
+        let idents = db.people_identifiers_for(p.id).unwrap_or_default();
+
         let mut fm = Frontmatter::new();
         fm.kv("id", &p.id.to_string());
         fm.kv("name", &p.name);
-        if let Some(e) = &p.email {
-            fm.kv("email", e);
-        }
-        if let Some(s) = &p.slack_id {
-            fm.kv("slack_id", s);
-        }
-        if let Some(g) = &p.github_username {
-            fm.kv("github", g);
+        for i in &idents {
+            fm.kv(&i.identifier_type, &i.identifier);
         }
         fm.kv("created", &p.created_at);
         fm.kv("updated", &p.updated_at);
@@ -170,11 +166,12 @@ fn export_people(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
             body.push_str(notes);
             body.push_str("\n\n");
         }
-        if let Some(url) = &p.slack_url {
-            body.push_str(&format!("- Slack: {url}\n"));
-        }
-        if let Some(url) = &p.github_url {
-            body.push_str(&format!("- GitHub: {url}\n"));
+        if !idents.is_empty() {
+            body.push_str("## Identifiers\n\n");
+            for i in &idents {
+                body.push_str(&format!("- **{}**: {}\n", i.identifier_type, i.identifier));
+            }
+            body.push('\n');
         }
 
         write_md(&out_dir.join(format!("{slug}.md")), &fm.render(), &body)?;
@@ -697,9 +694,8 @@ mod tests {
         let user_file = dir.path().join("my-notes.md");
         fs::write(&user_file, "user content").unwrap();
 
-        let pid = db
-            .people_add("Colin Kennedy", Some("c@x"), None, None, None, None, None)
-            .unwrap();
+        let pid = db.people_add("Colin Kennedy", None).unwrap();
+        db.people_identifier_set(pid, "email", "c@x").unwrap();
         let _mid = db
             .memory_set("project/active", "ol-cli", "project", None)
             .unwrap();

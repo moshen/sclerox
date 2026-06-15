@@ -273,7 +273,7 @@ mod tests {
     fn test_meeting_link_person() {
         let db = Database::open_in_memory().unwrap();
         let person_id = db
-            .people_add("Alice", None, None, None, None, None, None)
+            .people_add("Alice", None)
             .unwrap();
         let meeting_id = db.meeting_add("Planning", None, None, None).unwrap();
 

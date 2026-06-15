@@ -141,7 +141,7 @@ fn people_lifecycle() {
         "Alice Smith",
         "--email",
         "alice@example.com",
-        "--github-username",
+        "--github",
         "alicegit",
     ]);
 
@@ -179,7 +179,8 @@ fn people_json_output() {
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("invalid JSON");
     assert!(parsed.is_array());
     assert_eq!(parsed[0]["name"], "Bob");
-    assert_eq!(parsed[0]["email"], "bob@example.com");
+    // email now lives in people_identifiers, not the person row
+    assert!(parsed[0].get("email").is_none());
 }
 
 // ─── Meetings ────────────────────────────────────────────────────────────────

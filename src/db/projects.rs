@@ -300,7 +300,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("Proj", None, &[]).unwrap();
         let person_id = db
-            .people_add("Bob", None, None, None, None, None, None)
+            .people_add("Bob", None)
             .unwrap();
         let meeting_id = db.meeting_add("Kickoff", None, None, None).unwrap();
 
@@ -371,7 +371,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("ToDelete", None, &[]).unwrap();
         let person_id = db
-            .people_add("Alice", None, None, None, None, None, None)
+            .people_add("Alice", None)
             .unwrap();
         db.project_link_person(project_id, person_id, None).unwrap();
 

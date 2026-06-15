@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 6;
+pub const PRIMARY_VERSION: u32 = 7;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 3;
@@ -50,6 +50,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 6,
         description: "add investigation_chunks for semantic similarity search",
         sql: crate::db::schema::MIGRATION_V6,
+    },
+    Migration {
+        version: 7,
+        description: "add people_identifiers + identifier_types; remove inline identity columns",
+        sql: crate::db::schema::MIGRATION_V7,
     },
 ];
 

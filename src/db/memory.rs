@@ -259,8 +259,7 @@ impl Database {
 
     pub fn memory_people(&self, memory_key: &str) -> Result<Vec<crate::db::people::Person>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.email, p.slack_id, p.slack_url,
-                    p.github_username, p.github_url, p.notes, p.created_at, p.updated_at
+            "SELECT p.id, p.name, p.notes, p.created_at, p.updated_at
              FROM people p
              JOIN memory_people mp ON p.id = mp.person_id
              JOIN memory m ON mp.memory_id = m.id
@@ -271,14 +270,9 @@ impl Database {
             Ok(crate::db::people::Person {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                email: row.get(2)?,
-                slack_id: row.get(3)?,
-                slack_url: row.get(4)?,
-                github_username: row.get(5)?,
-                github_url: row.get(6)?,
-                notes: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                notes: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -377,10 +371,10 @@ mod tests {
         db.memory_set("auth-pref", "prefer JWT", "project", None)
             .unwrap();
         let alice = db
-            .people_add("Alice", Some("alice@x.com"), None, None, None, None, None)
+            .people_add("Alice", None)
             .unwrap();
         let bob = db
-            .people_add("Bob", None, None, None, None, None, None)
+            .people_add("Bob", None)
             .unwrap();
 
         assert!(db.memory_link_person("auth-pref", alice).unwrap());
@@ -397,7 +391,7 @@ mod tests {
     fn test_memory_link_missing_key_returns_false() {
         let db = Database::open_in_memory().unwrap();
         let person_id = db
-            .people_add("Carol", None, None, None, None, None, None)
+            .people_add("Carol", None)
             .unwrap();
         assert!(!db.memory_link_person("no-such-key", person_id).unwrap());
     }
@@ -407,7 +401,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("k", "v", "general", None).unwrap();
         let person_id = db
-            .people_add("Dave", None, None, None, None, None, None)
+            .people_add("Dave", None)
             .unwrap();
 
         db.memory_link_person("k", person_id).unwrap();

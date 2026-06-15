@@ -16,7 +16,6 @@ pub enum SearchResult {
     Person {
         id: i64,
         name: String,
-        email: Option<String>,
     },
     Meeting {
         id: i64,
@@ -73,7 +72,6 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         results.push(SearchResult::Person {
             id: p.id,
             name: p.name,
-            email: p.email,
         });
     }
 
@@ -187,7 +185,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("rust-tip", "Rust lifetimes are key", "feedback", None)
             .unwrap();
-        db.people_add("Rustacean Bob", None, None, None, None, None, None)
+        db.people_add("Rustacean Bob", None)
             .unwrap();
         db.meeting_add("Rust Review", None, None, Some("discussed Rust async"))
             .unwrap();
