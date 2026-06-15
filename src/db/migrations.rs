@@ -11,7 +11,7 @@ pub struct Migration {
 pub const PRIMARY_VERSION: u32 = 6;
 
 /// Current target schema version for per-repo databases.
-pub const REPO_VERSION: u32 = 2;
+pub const REPO_VERSION: u32 = 3;
 
 /// Migrations for the primary database (~/.ol/ol.db).
 ///
@@ -59,6 +59,11 @@ pub const REPO_MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "add symbol_edges for call graph navigation",
         sql: crate::db::schema::REPO_MIGRATION_V2,
+    },
+    Migration {
+        version: 3,
+        description: "add confidence column to symbol_edges",
+        sql: crate::db::schema::REPO_MIGRATION_V3,
     },
 ];
 

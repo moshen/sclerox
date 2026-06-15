@@ -334,6 +334,12 @@ CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
 ";
 
+/// Migration v3: confidence tag on symbol_edges.
+/// extracted = seen directly in source via tree-sitter AST node.
+/// inferred  = derived through analysis (type inference, dynamic dispatch, etc.).
+pub const REPO_MIGRATION_V3: &str =
+    "ALTER TABLE symbol_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'extracted';";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -391,13 +397,15 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 -- Call graph edges: records calls, inherits, implements relationships between symbols.
 -- from_symbol_id is the caller/child; to_name is the callee/parent as written in source.
+-- confidence: 'extracted' = seen directly in source AST; 'inferred' = derived by analysis.
 -- Deleting a symbol cascades to delete its outbound edges.
 CREATE TABLE IF NOT EXISTS symbol_edges (
     id INTEGER PRIMARY KEY,
     from_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     to_name TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'calls',
-    line INTEGER
+    line INTEGER,
+    confidence TEXT NOT NULL DEFAULT 'extracted'
 );
 CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);

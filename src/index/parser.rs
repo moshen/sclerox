@@ -20,6 +20,27 @@ pub struct CodeChunk {
     pub end_line: u32,
 }
 
+/// How confidently the edge was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// Seen directly in source via an explicit AST node (call expression,
+    /// extends clause, impl trait, etc.). All tree-sitter edges are Extracted.
+    Extracted,
+    /// Derived through analysis rather than explicit syntax (type inference,
+    /// dynamic dispatch, higher-order function propagation, etc.).
+    #[allow(dead_code)]
+    Inferred,
+}
+
+impl Confidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Extracted => "extracted",
+            Confidence::Inferred => "inferred",
+        }
+    }
+}
+
 /// A directed edge in the call/inheritance graph.
 #[derive(Debug, Clone)]
 pub struct ParsedEdge {
@@ -28,6 +49,7 @@ pub struct ParsedEdge {
     pub from_name: String,
     pub to_name: String,
     pub line: u32,
+    pub confidence: Confidence,
 }
 
 /// Detect language from file extension.
@@ -264,6 +286,7 @@ fn collect_symbols_and_edges(
                         from_name: enc.to_string(),
                         to_name: callee,
                         line: node.start_position().row as u32 + 1,
+                        confidence: Confidence::Extracted,
                     });
                 }
             }
@@ -461,6 +484,7 @@ fn extract_structural_edges(
                                     from_name: symbol_name.to_string(),
                                     to_name: name,
                                     line: child.start_position().row as u32 + 1,
+                                    confidence: Confidence::Extracted,
                                 });
                             }
                         }
@@ -493,6 +517,7 @@ fn extract_structural_edges(
                                             from_name: symbol_name.to_string(),
                                             to_name: name,
                                             line: item.start_position().row as u32 + 1,
+                                            confidence: Confidence::Extracted,
                                         });
                                     }
                                 }
@@ -514,6 +539,7 @@ fn extract_structural_edges(
                                 from_name: symbol_name.to_string(),
                                 to_name: name,
                                 line: trait_node.start_position().row as u32 + 1,
+                                confidence: Confidence::Extracted,
                             });
                         }
                     }
@@ -549,6 +575,7 @@ fn extract_structural_edges(
                                     from_name: symbol_name.to_string(),
                                     to_name: name,
                                     line: item.start_position().row as u32 + 1,
+                                    confidence: Confidence::Extracted,
                                 });
                             }
                         }
@@ -570,6 +597,7 @@ fn extract_structural_edges(
                                     from_name: symbol_name.to_string(),
                                     to_name: name,
                                     line: child.start_position().row as u32 + 1,
+                                    confidence: Confidence::Extracted,
                                 });
                             }
                         }
@@ -588,6 +616,7 @@ fn extract_structural_edges(
                                         from_name: symbol_name.to_string(),
                                         to_name: name,
                                         line: type_node.start_position().row as u32 + 1,
+                                        confidence: Confidence::Extracted,
                                     });
                                 }
                             }
@@ -607,6 +636,7 @@ fn extract_structural_edges(
                             from_name: symbol_name.to_string(),
                             to_name: name,
                             line: child.start_position().row as u32 + 1,
+                            confidence: Confidence::Extracted,
                         });
                     }
                 }

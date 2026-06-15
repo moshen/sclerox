@@ -102,21 +102,29 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                     }
                     let sig = sym.signature.as_deref().unwrap_or(&sym.name);
                     println!("{} ({}/{}:{})", sig, entry_name, sym.file_path, sym.start_line);
-                    for (to_name, kind, line) in &callees {
-                        // Try to resolve to a symbol for file/line info
-                        let resolved = repo_db.symbol_by_name(to_name).ok().and_then(|v| {
-                            v.into_iter().next()
-                        });
+                    for (to_name, kind, line, confidence) in &callees {
+                        let resolved = repo_db
+                            .symbol_by_name(to_name)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
+                        let conf_tag = confidence_tag(confidence);
                         if let Some(target) = resolved {
                             println!(
-                                "  {} {} ({}:{})",
+                                "  {} {}{} ({}:{})",
                                 kind_arrow(kind),
                                 to_name,
+                                conf_tag,
                                 target.file_path,
                                 target.start_line
                             );
                         } else {
-                            println!("  {} {} [line {}]", kind_arrow(kind), to_name, line);
+                            println!(
+                                "  {} {}{} [unresolved, line {}]",
+                                kind_arrow(kind),
+                                to_name,
+                                conf_tag,
+                                line
+                            );
                         }
                     }
                     any = true;
@@ -139,12 +147,14 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             let mut any = false;
             for (entry_name, repo_db) in &repos {
                 let callers = repo_db.callers(&symbol)?;
-                for (caller_sym, kind, _line) in &callers {
+                for (caller_sym, kind, _line, confidence) in &callers {
                     let sig = caller_sym.signature.as_deref().unwrap_or(&caller_sym.name);
+                    let conf_tag = confidence_tag(confidence);
                     println!(
-                        "  {} {} ({}/{}:{})",
+                        "  {} {}{} ({}/{}:{})",
                         kind_arrow(kind),
                         sig,
+                        conf_tag,
                         entry_name,
                         caller_sym.file_path,
                         caller_sym.start_line
@@ -228,7 +238,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                         // Find the repo_db that owns this symbol
                         for (_rname, rdb) in &repos {
                             if let Ok(callees) = rdb.callees(sym.id) {
-                                for (to_name, kind, _) in callees {
+                                for (to_name, kind, _, _confidence) in callees {
                                     if !visited.contains(&to_name) {
                                         queue.push_back((to_name, depth + 1, kind));
                                     }
@@ -295,5 +305,15 @@ fn kind_arrow(kind: &str) -> &str {
         "inherits" => "⊂",
         "implements" => "⊃",
         _ => "→",
+    }
+}
+
+/// Returns a display tag for non-default confidence values.
+/// "extracted" is the default and adds no noise; "inferred" (future) is flagged.
+fn confidence_tag(confidence: &str) -> &str {
+    match confidence {
+        "extracted" | "" => "",
+        "inferred" => " [inferred]",
+        _ => " [?]",
     }
 }

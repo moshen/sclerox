@@ -176,7 +176,13 @@ impl<'a> RepoIndexer<'a> {
             // Insert call/inheritance edges for symbols found in this file.
             for edge in &edges {
                 if let Some(&from_id) = name_to_id.get(&edge.from_name) {
-                    repo_db.insert_edge(from_id, &edge.to_name, &edge.kind, edge.line)?;
+                    repo_db.insert_edge(
+                        from_id,
+                        &edge.to_name,
+                        &edge.kind,
+                        edge.line,
+                        edge.confidence.as_str(),
+                    )?;
                     result.edges += 1;
                 }
             }

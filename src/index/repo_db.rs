@@ -199,32 +199,42 @@ impl RepoDb {
         to_name: &str,
         kind: &str,
         line: u32,
+        confidence: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO symbol_edges (from_symbol_id, to_name, kind, line) VALUES (?1, ?2, ?3, ?4)",
-            params![from_symbol_id, to_name, kind, line as i64],
+            "INSERT INTO symbol_edges (from_symbol_id, to_name, kind, line, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![from_symbol_id, to_name, kind, line as i64, confidence],
         )?;
         Ok(())
     }
 
     /// What does this symbol call/inherit/implement?
-    pub fn callees(&self, symbol_id: i64) -> Result<Vec<(String, String, i64)>> {
+    /// Returns (to_name, kind, line, confidence).
+    pub fn callees(&self, symbol_id: i64) -> Result<Vec<(String, String, i64, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT to_name, kind, COALESCE(line, 0) FROM symbol_edges
+            "SELECT to_name, kind, COALESCE(line, 0), confidence
+             FROM symbol_edges
              WHERE from_symbol_id = ?1
              ORDER BY kind, to_name",
         )?;
         let rows = stmt.query_map(params![symbol_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// What symbols call/inherit/implement the given name?
-    pub fn callers(&self, symbol_name: &str) -> Result<Vec<(Symbol, String, i64)>> {
+    /// Returns (calling_symbol, edge_kind, line, confidence).
+    pub fn callers(&self, symbol_name: &str) -> Result<Vec<(Symbol, String, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line,
-                    e.kind, COALESCE(e.line, 0)
+                    e.kind, COALESCE(e.line, 0), e.confidence
              FROM symbol_edges e
              JOIN symbols s ON s.id = e.from_symbol_id
              JOIN files f ON f.id = s.file_id
@@ -245,6 +255,7 @@ impl RepoDb {
                 },
                 r.get::<_, String>(8)?,
                 r.get::<_, i64>(9)?,
+                r.get::<_, String>(10)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
