@@ -109,7 +109,7 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
             category: t.category,
         });
     }
-    // Semantic tier for todos (appended after FTS hits)
+    // Semantic tier for todos — always runs, deduped against FTS hits
     if let Ok(mut emb) = crate::embed::Embedder::new() {
         if let Ok(query_emb) = emb.embed_one(query) {
             for r in db.todo_similar(&query_emb, 10).unwrap_or_default() {

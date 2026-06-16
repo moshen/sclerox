@@ -195,11 +195,13 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
 
             // Tier 1+2: FTS prefix + LIKE substring
             let fts_results = db.todo_search(&query)?;
+
+            // Tier 3: semantic similarity — always runs alongside FTS+LIKE.
+            // Results are deduped against FTS hits and filtered by a minimum score.
+            // Model load costs ~1s; acceptable for a search that already has context.
+            const MIN_SEMANTIC_SCORE: f32 = 0.45;
             let fts_ids: std::collections::HashSet<i64> =
                 fts_results.iter().map(|t| t.id).collect();
-
-            // Tier 3: semantic similarity — threshold keeps noise out
-            const MIN_SEMANTIC_SCORE: f32 = 0.45;
             let semantic: Vec<_> = if let Ok(mut emb) = Embedder::new() {
                 if let Ok(query_emb) = emb.embed_one(&query) {
                     db.todo_similar(&query_emb, 10)
