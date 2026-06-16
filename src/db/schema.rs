@@ -335,8 +335,7 @@ INSERT OR IGNORE INTO identifier_types (name, description) VALUES
     ('slack_url',  'Slack profile URL'),
     ('github',     'GitHub username'),
     ('github_url', 'GitHub profile URL'),
-    ('atlassian',  'Atlassian account ID or email'),
-    ('jira',       'Jira account ID or username'),
+    ('atlassian',  'Atlassian account ID or email (covers Jira, Confluence, Bitbucket)'),
     ('linear',     'Linear user ID or email'),
     ('linkedin',   'LinkedIn profile URL or handle');
 
@@ -392,6 +391,14 @@ ALTER TABLE people DROP COLUMN slack_id;
 ALTER TABLE people DROP COLUMN slack_url;
 ALTER TABLE people DROP COLUMN github_username;
 ALTER TABLE people DROP COLUMN github_url;
+";
+
+/// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
+pub const MIGRATION_V8: &str = "
+DELETE FROM identifier_types WHERE name = 'jira';
+UPDATE identifier_types
+    SET description = 'Atlassian account ID or email (covers Jira, Confluence, Bitbucket)'
+    WHERE name = 'atlassian';
 ";
 
 /// Migration v2: symbol_edges for call graph (callers, callees, graph traversal).
