@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::db::{todos::TodoStatus, Database};
+use crate::embed::{chunk_text, Embedder};
 use crate::output::{print_output, OutputFormat};
+
+const CHUNK_SIZE: usize = 800;
+const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]
 pub enum TodoCommand {
@@ -131,6 +135,7 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                 originated.as_deref(),
                 deadline.as_deref(),
             )?;
+            embed_todo(db, id, &title, notes.as_deref());
             let todo = db.todo_get(id)?.unwrap();
             print_output(format, &todo, || {
                 println!("Added todo #{id}: {title}");
@@ -153,6 +158,11 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                 deadline.as_deref(),
                 category.as_deref(),
             )? {
+                if title.is_some() || notes.is_some() {
+                    if let Some(t) = db.todo_get(id)? {
+                        embed_todo(db, id, &t.title, t.notes.as_deref());
+                    }
+                }
                 println!("Updated todo #{id}");
             } else {
                 println!("Todo #{id} not found or no changes");
@@ -182,16 +192,58 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
         }
 
         TodoCommand::Search { query } => {
-            let results = db.todo_search(&query)?;
-            print_output(format, &results, || {
-                if results.is_empty() {
-                    println!("No matches for: {query}");
+
+            // Tier 1+2: FTS prefix + LIKE substring
+            let fts_results = db.todo_search(&query)?;
+            let fts_ids: std::collections::HashSet<i64> =
+                fts_results.iter().map(|t| t.id).collect();
+
+            // Tier 3: semantic similarity — threshold keeps noise out
+            const MIN_SEMANTIC_SCORE: f32 = 0.45;
+            let semantic: Vec<_> = if let Ok(mut emb) = Embedder::new() {
+                if let Ok(query_emb) = emb.embed_one(&query) {
+                    db.todo_similar(&query_emb, 10)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= MIN_SEMANTIC_SCORE)
+                        .take(5)
+                        .collect()
                 } else {
-                    for t in &results {
-                        print_todo_line(t);
-                    }
+                    vec![]
                 }
-            });
+            } else {
+                vec![]
+            };
+
+            print_output(
+                format,
+                &serde_json::json!({
+                    "fts": fts_results,
+                    "semantic": semantic.iter().map(|r| &r.todo).collect::<Vec<_>>()
+                }),
+                || {
+                    if fts_results.is_empty() && semantic.is_empty() {
+                        println!("No matches for: {query}");
+                    } else {
+                        for t in &fts_results {
+                            print_todo_line(t);
+                        }
+                        if !semantic.is_empty() {
+                            if !fts_results.is_empty() {
+                                println!();
+                            }
+                            for r in &semantic {
+                                println!(
+                                    "{}  ({:.0}% match)",
+                                    crate::cli::format::todo_line(&r.todo),
+                                    r.score * 100.0
+                                );
+                                println!("  > {}", truncate(&r.matched_chunk, 100));
+                            }
+                        }
+                    }
+                },
+            );
         }
 
         TodoCommand::Done { id, note } => {
@@ -313,6 +365,46 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
     println!("{}", crate::cli::format::todo_line(t));
 }
 
+/// Embed a single todo's title+notes and store the chunks. Silent on error.
+fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
+    let text = match notes {
+        Some(n) if !n.trim().is_empty() => format!("{title}\n\n{n}"),
+        _ => title.to_string(),
+    };
+    if let Ok(mut embedder) = Embedder::new() {
+        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+        if let Ok(embeddings) = embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
+            let chunks: Vec<(String, Option<Vec<f32>>)> =
+                raw.into_iter().zip(embeddings.into_iter().map(Some)).collect();
+            let _ = db.todo_store_chunks(id, &chunks);
+        }
+    }
+}
+
+/// Backfill embeddings for todos that have none. Called transparently on search.
+pub fn backfill_todo_embeddings_pub(db: &Database) {
+    let Ok(pending) = db.todos_without_embeddings() else { return };
+    if pending.is_empty() { return; }
+    let Ok(mut embedder) = Embedder::new() else { return };
+    log::debug!("backfilling embeddings for {} todos", pending.len());
+    for t in pending {
+        let text = match &t.notes {
+            Some(n) if !n.trim().is_empty() => format!("{}\n\n{n}", t.title),
+            _ => t.title.clone(),
+        };
+        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+        if let Ok(embeddings) = embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
+            let chunks: Vec<(String, Option<Vec<f32>>)> =
+                raw.into_iter().zip(embeddings.into_iter().map(Some)).collect();
+            let _ = db.todo_store_chunks(t.id, &chunks);
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+}
+
 fn print_todo_detail(t: &crate::db::todos::Todo) {
     let checkbox = match t.status.as_str() {
         "done" => "[x]",
@@ -335,3 +427,4 @@ fn print_todo_detail(t: &crate::db::todos::Todo) {
         println!("  Done at:    {at}");
     }
 }
+

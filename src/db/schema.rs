@@ -393,6 +393,17 @@ ALTER TABLE people DROP COLUMN github_username;
 ALTER TABLE people DROP COLUMN github_url;
 ";
 
+/// Migration v9: todo_chunks for semantic similarity search on todos.
+pub const MIGRATION_V9: &str = "
+CREATE TABLE IF NOT EXISTS todo_chunks (
+    id INTEGER PRIMARY KEY,
+    todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding BLOB
+);
+";
+
 /// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
 pub const MIGRATION_V8: &str = "
 DELETE FROM identifier_types WHERE name = 'jira';

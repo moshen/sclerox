@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 8;
+pub const PRIMARY_VERSION: u32 = 9;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 3;
@@ -60,6 +60,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 8,
         description: "merge jira into atlassian identifier type",
         sql: crate::db::schema::MIGRATION_V8,
+    },
+    Migration {
+        version: 9,
+        description: "add todo_chunks for semantic similarity search",
+        sql: crate::db::schema::MIGRATION_V9,
     },
 ];
 

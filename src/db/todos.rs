@@ -287,42 +287,120 @@ impl Database {
         from: Option<&str>,
         to: Option<&str>,
     ) -> Result<Vec<Todo>> {
-        // Build extra conditions using qualified column names.
-        let mut extra = vec!["t.status = 'done'".to_string()];
-        if let Some(f) = from {
-            extra.push(format!("t.completed_at >= '{f}'"));
-        }
-        if let Some(t_val) = to {
-            extra.push(format!("t.completed_at <= '{t_val}'"));
-        }
-        let extra_clause = extra.join(" AND ");
-
-        // Strip the "t." prefix for plain queries (no join).
-        let plain_clause = extra_clause.replace("t.", "");
+        // Use NULL-safe parameter binding so dates are always parameterized.
+        let base = "SELECT id, title, notes, status, source_url, category, originated_date,
+                    deadline_date, completed_at, created_at, updated_at
+                    FROM todos
+                    WHERE status = 'done'
+                      AND (?2 IS NULL OR completed_at >= ?2)
+                      AND (?3 IS NULL OR completed_at <= ?3)";
 
         if let Some(q) = query {
             let q = fts::sanitize(q);
-            let mut stmt = self.conn.prepare(&format!(
+            let sql =
                 "SELECT id, title, notes, status, source_url, category, originated_date,
                         deadline_date, completed_at, created_at, updated_at
                  FROM todos
                  WHERE id IN (SELECT rowid FROM todos_fts WHERE todos_fts MATCH ?1)
-                   AND {plain_clause}
-                 ORDER BY completed_at DESC"
-            ))?;
-            let rows = stmt.query_map(params![q], row_to_todo)?;
+                   AND status = 'done'
+                   AND (?2 IS NULL OR completed_at >= ?2)
+                   AND (?3 IS NULL OR completed_at <= ?3)
+                 ORDER BY completed_at DESC";
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(params![q, from, to], row_to_todo)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         } else {
-            let mut stmt = self.conn.prepare(&format!(
-                "SELECT id, title, notes, status, source_url, category, originated_date,
-                        deadline_date, completed_at, created_at, updated_at
-                 FROM todos WHERE {plain_clause}
-                 ORDER BY completed_at DESC"
-            ))?;
-            let rows = stmt.query_map([], row_to_todo)?;
+            let sql = format!("{base} ORDER BY completed_at DESC"); // base is a literal const str
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![rusqlite::types::Null, from, to], row_to_todo)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         }
     }
+
+    // ---------- embeddings ----------
+
+    pub fn todo_store_chunks(
+        &self,
+        todo_id: i64,
+        chunks: &[(String, Option<Vec<f32>>)],
+    ) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM todo_chunks WHERE todo_id = ?1", params![todo_id])?;
+        for (i, (text, emb)) in chunks.iter().enumerate() {
+            let emb_bytes = emb.as_deref().map(crate::db::embedding_to_bytes);
+            self.conn.execute(
+                "INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text, embedding)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![todo_id, i as i64, text, emb_bytes],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns todos that have no rows in todo_chunks yet (need embedding).
+    pub fn todos_without_embeddings(&self) -> Result<Vec<Todo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, notes, status, source_url, category, originated_date,
+                    deadline_date, completed_at, created_at, updated_at
+             FROM todos
+             WHERE id NOT IN (SELECT DISTINCT todo_id FROM todo_chunks)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], row_to_todo)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn todo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarTodo>> {
+        use crate::db::bytes_to_embedding;
+        use crate::search::similarity::cosine_similarity;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT tc.chunk_text, tc.embedding,
+                    t.id, t.title, t.notes, t.status, t.source_url, t.category,
+                    t.originated_date, t.deadline_date, t.completed_at, t.created_at, t.updated_at
+             FROM todo_chunks tc
+             JOIN todos t ON t.id = tc.todo_id
+             WHERE tc.embedding IS NOT NULL",
+        )?;
+
+        let mut scored: Vec<(f32, SimilarTodo)> = stmt
+            .query_map([], |r| {
+                let chunk_text: String = r.get(0)?;
+                let emb_bytes: Vec<u8> = r.get(1)?;
+                let todo = Todo {
+                    id: r.get(2)?,
+                    title: r.get(3)?,
+                    notes: r.get(4)?,
+                    status: r.get(5)?,
+                    source_url: r.get(6)?,
+                    category: r.get(7)?,
+                    originated_date: r.get(8)?,
+                    deadline_date: r.get(9)?,
+                    completed_at: r.get(10)?,
+                    created_at: r.get(11)?,
+                    updated_at: r.get(12)?,
+                };
+                Ok((chunk_text, emb_bytes, todo))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(chunk_text, emb_bytes, todo)| {
+                let emb = bytes_to_embedding(&emb_bytes);
+                let score = cosine_similarity(query_embedding, &emb);
+                (score, SimilarTodo { todo, score, matched_chunk: chunk_text })
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, t)| t).collect())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SimilarTodo {
+    pub todo: Todo,
+    pub score: f32,
+    pub matched_chunk: String,
 }
 
 fn row_to_todo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {

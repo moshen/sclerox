@@ -114,6 +114,11 @@ pub fn run(cli: Cli) -> Result<()> {
         cmd => {
             let config = Config::from_env();
             let db = Database::open(&config.db_path)?;
+            // Run any pending embedding backfills once, right after the DB opens.
+            // This is the Rust-level equivalent of what a schema migration can't do
+            // (migrations are pure SQL; fastembed is Rust). Runs once after upgrade,
+            // then the todos_without_embeddings() check returns empty immediately.
+            todos::backfill_todo_embeddings_pub(&db);
             match cmd {
                 Commands::Memory(c) => memory::run(&db, c, format),
                 Commands::People(c) => people::run(&db, c, format),

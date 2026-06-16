@@ -98,13 +98,31 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
 
-    for t in db.todo_search(query)? {
+    // FTS+LIKE tier for todos
+    let todo_fts: Vec<_> = db.todo_search(query)?;
+    let todo_fts_ids: std::collections::HashSet<i64> = todo_fts.iter().map(|t| t.id).collect();
+    for t in todo_fts {
         results.push(SearchResult::Todo {
             id: t.id,
             title: t.title,
             status: t.status,
             category: t.category,
         });
+    }
+    // Semantic tier for todos (appended after FTS hits)
+    if let Ok(mut emb) = crate::embed::Embedder::new() {
+        if let Ok(query_emb) = emb.embed_one(query) {
+            for r in db.todo_similar(&query_emb, 10).unwrap_or_default() {
+                if !todo_fts_ids.contains(&r.todo.id) && r.score >= 0.45 {
+                    results.push(SearchResult::Todo {
+                        id: r.todo.id,
+                        title: r.todo.title,
+                        status: r.todo.status,
+                        category: r.todo.category,
+                    });
+                }
+            }
+        }
     }
 
     for i in db.investigation_search(query)? {

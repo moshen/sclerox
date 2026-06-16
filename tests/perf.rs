@@ -50,12 +50,13 @@ impl Env {
 /// a global search query takes.
 #[test]
 fn fts_search_100_records() {
-    fts_search_at_scale(100, Duration::from_millis(100));
+    // Budget includes fastembed model load (~200-300ms) for the semantic tier.
+    fts_search_at_scale(100, Duration::from_millis(600));
 }
 
 #[test]
 fn fts_search_1000_records() {
-    fts_search_at_scale(1000, Duration::from_millis(500));
+    fts_search_at_scale(1000, Duration::from_millis(1000));
 }
 
 fn fts_search_at_scale(n: usize, budget: Duration) {
