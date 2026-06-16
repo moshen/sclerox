@@ -96,7 +96,10 @@ impl Database {
     }
 
     pub fn todo_search(&self, query: &str) -> Result<Vec<Todo>> {
-        let query = fts::sanitize(query);
+        let fts_query = fts::sanitize(query);
+        let like_pat = format!("%{query}%");
+
+        // Tier 1: FTS prefix matches (fast, word-boundary aware)
         let mut stmt = self.conn.prepare(
             "SELECT id, title, notes, status, source_url, category, originated_date,
                     deadline_date, completed_at, created_at, updated_at
@@ -104,8 +107,29 @@ impl Database {
              WHERE id IN (SELECT rowid FROM todos_fts WHERE todos_fts MATCH ?1)
              ORDER BY updated_at DESC",
         )?;
-        let rows = stmt.query_map(params![query], row_to_todo)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let fts_hits: Vec<Todo> = stmt
+            .query_map(params![fts_query], row_to_todo)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|t| t.id).collect();
+
+        // Tier 2: LIKE substring fallback — catches mid-word occurrences not found by FTS
+        let mut stmt2 = self.conn.prepare(
+            "SELECT id, title, notes, status, source_url, category, originated_date,
+                    deadline_date, completed_at, created_at, updated_at
+             FROM todos
+             WHERE (title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\')
+             ORDER BY updated_at DESC",
+        )?;
+        let like_extras: Vec<Todo> = stmt2
+            .query_map(params![like_pat], row_to_todo)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|t| !fts_ids.contains(&t.id))
+            .collect();
+
+        let mut results = fts_hits;
+        results.extend(like_extras);
+        Ok(results)
     }
 
     /// Mark a todo done and record a resolution note in notes.

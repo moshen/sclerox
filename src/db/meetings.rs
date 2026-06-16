@@ -95,15 +95,37 @@ impl Database {
     }
 
     pub fn meeting_search(&self, query: &str) -> Result<Vec<Meeting>> {
-        let query = fts::sanitize(query);
+        let fts_query = fts::sanitize(query);
+        let like_pat = format!("%{query}%");
+
         let mut stmt = self.conn.prepare(
             "SELECT id, title, meeting_date, transcript, notes, created_at
              FROM meetings
              WHERE id IN (SELECT rowid FROM meetings_fts WHERE meetings_fts MATCH ?1)
              ORDER BY meeting_date DESC",
         )?;
-        let rows = stmt.query_map(params![query], row_to_meeting)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let fts_hits: Vec<Meeting> = stmt
+            .query_map(params![fts_query], row_to_meeting)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
+
+        let mut stmt2 = self.conn.prepare(
+            "SELECT id, title, meeting_date, transcript, notes, created_at
+             FROM meetings
+             WHERE (title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\'
+                 OR transcript LIKE ?1 ESCAPE '\\')
+             ORDER BY meeting_date DESC",
+        )?;
+        let like_extras: Vec<Meeting> = stmt2
+            .query_map(params![like_pat], row_to_meeting)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|m| !fts_ids.contains(&m.id))
+            .collect();
+
+        let mut results = fts_hits;
+        results.extend(like_extras);
+        Ok(results)
     }
 
     pub fn meeting_delete(&self, id: i64) -> Result<bool> {

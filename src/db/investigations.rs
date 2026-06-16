@@ -84,15 +84,37 @@ impl Database {
     }
 
     pub fn investigation_search(&self, query: &str) -> Result<Vec<Investigation>> {
-        let query = fts::sanitize(query);
+        let fts_query = fts::sanitize(query);
+        let like_pat = format!("%{query}%");
+
         let mut stmt = self.conn.prepare(
             "SELECT id, name, slug, status, plan, findings, created_at, concluded_at, updated_at
              FROM investigations
              WHERE id IN (SELECT rowid FROM investigations_fts WHERE investigations_fts MATCH ?1)
              ORDER BY updated_at DESC",
         )?;
-        let rows = stmt.query_map(params![query], row_to_investigation)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let fts_hits: Vec<Investigation> = stmt
+            .query_map(params![fts_query], row_to_investigation)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
+
+        let mut stmt2 = self.conn.prepare(
+            "SELECT id, name, slug, status, plan, findings, created_at, concluded_at, updated_at
+             FROM investigations
+             WHERE (name LIKE ?1 ESCAPE '\\' OR slug LIKE ?1 ESCAPE '\\'
+                 OR plan LIKE ?1 ESCAPE '\\' OR findings LIKE ?1 ESCAPE '\\')
+             ORDER BY updated_at DESC",
+        )?;
+        let like_extras: Vec<Investigation> = stmt2
+            .query_map(params![like_pat], row_to_investigation)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|i| !fts_ids.contains(&i.id))
+            .collect();
+
+        let mut results = fts_hits;
+        results.extend(like_extras);
+        Ok(results)
     }
 
     pub fn investigation_update(

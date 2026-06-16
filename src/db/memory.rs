@@ -71,33 +71,33 @@ impl Database {
     }
 
     /// List memories. Defaults to active only; pass status="all" to include stale/superseded.
+    /// List memories. Defaults to active only; pass status="all" to include all.
     pub fn memory_list(
         &self,
         memory_type: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let status_clause = match status {
-            Some("all") => "1=1".to_string(),
-            Some(s) => format!("status = '{s}'"),
-            None => "status = 'active'".to_string(),
-        };
-        let sql = match memory_type {
-            Some(_) => format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                 WHERE memory_type = ?1 AND {status_clause}
-                 ORDER BY updated_at DESC"
-            ),
-            None => format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                 WHERE {status_clause}
-                 ORDER BY updated_at DESC"
-            ),
-        };
+        // All four combinations: (type filter, status filter) each parameterized.
+        let filter_status = !matches!(status, Some("all") | None);
+        let active_only = status.is_none();
+
+        let sql = format!("SELECT {MEMORY_COLS} FROM memory WHERE {} ORDER BY updated_at DESC",
+            match (memory_type.is_some(), filter_status, active_only) {
+                (true,  true,  _    ) => "memory_type = ?1 AND status = ?2",
+                (true,  false, false) => "memory_type = ?1",
+                (true,  false, true ) => "memory_type = ?1 AND status = 'active'",
+                (false, true,  _    ) => "status = ?1",
+                (false, false, false) => "1=1",
+                (false, false, true ) => "status = 'active'",
+            }
+        );
+
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = if let Some(t) = memory_type {
-            stmt.query_map(params![t], row_to_memory)?
-        } else {
-            stmt.query_map([], row_to_memory)?
+        let rows = match (memory_type, filter_status, active_only) {
+            (Some(t), true,  _    ) => stmt.query_map(params![t, status.unwrap()], row_to_memory)?,
+            (Some(t), false, _    ) => stmt.query_map(params![t], row_to_memory)?,
+            (None,    true,  _    ) => stmt.query_map(params![status.unwrap()], row_to_memory)?,
+            (None,    false, _    ) => stmt.query_map([], row_to_memory)?,
         };
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -108,21 +108,55 @@ impl Database {
     }
 
     pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
-        let query = fts::sanitize(query);
-        let status_clause = if status == "all" {
-            "1=1".to_string()
+        let fts_query = fts::sanitize(query);
+        let like_pat = format!("%{query}%");
+        let filter_status = status != "all";
+
+        // Tier 1: FTS prefix matches
+        let fts_sql = if filter_status {
+            format!("SELECT {MEMORY_COLS} FROM memory
+                     WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
+                       AND status = ?2
+                     ORDER BY updated_at DESC")
         } else {
-            format!("status = '{status}'")
+            format!("SELECT {MEMORY_COLS} FROM memory
+                     WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
+                     ORDER BY updated_at DESC")
         };
-        let sql = format!(
-            "SELECT {MEMORY_COLS} FROM memory
-             WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
-               AND {status_clause}
-             ORDER BY updated_at DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![query], row_to_memory)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut stmt = self.conn.prepare(&fts_sql)?;
+        let fts_hits: Vec<MemoryEntry> = if filter_status {
+            stmt.query_map(params![fts_query, status], row_to_memory)?
+        } else {
+            stmt.query_map(params![fts_query], row_to_memory)?
+        }
+        .collect::<Result<Vec<_>, _>>()?;
+        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
+
+        // Tier 2: LIKE substring fallback
+        let like_sql = if filter_status {
+            format!("SELECT {MEMORY_COLS} FROM memory
+                     WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
+                       AND status = ?2
+                     ORDER BY updated_at DESC")
+        } else {
+            format!("SELECT {MEMORY_COLS} FROM memory
+                     WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
+                     ORDER BY updated_at DESC")
+        };
+        let mut stmt2 = self.conn.prepare(&like_sql)?;
+        let like_extras: Vec<MemoryEntry> = if filter_status {
+            stmt2.query_map(params![like_pat, status], row_to_memory)?
+        } else {
+            stmt2.query_map(params![like_pat], row_to_memory)?
+        }
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|m| !fts_ids.contains(&m.id))
+        .collect();
+
+        let mut results = fts_hits;
+        results.extend(like_extras);
+        Ok(results)
     }
 
     pub fn memory_delete(&self, key: &str) -> Result<bool> {
