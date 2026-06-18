@@ -599,39 +599,46 @@ ol memory import --agent claude      # import from Claude Code auto-memory
 ol memory import --path <dir>        # import from any directory of .md files
 ol memory people add|remove|list <key> <person_id>
 
-# People
-ol people search "<name or email>"
-ol people add --name "<name>" --email "<email>"
+# People  — ALWAYS use --name flag, never positional: ol people add --name "Alice"
+ol people search "<name or email or identifier>"
+ol people add --name "<name>" [--email "<e>"] [--github "<u>"] [--slack "<id>"] [--atlassian "<e>"]
+ol people get <id>
+ol people update <id> [--name] [--notes]
+ol people identifier add <person_id> <type> <value>   # add any identifier
+ol people types list                                  # see valid identifier types
 
 # Meetings
 ol meeting search "<topic>"
 ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
-ol meeting add --no-embed ...        # skip embedding generation
-
 ol meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"]
 
-# Todos
-ol todo list                         # open todos
+# Todos  — ALWAYS use --title flag, never positional: ol todo add --title "Fix X"
+ol todo list                         # open todos (default)
+ol todo list --status all            # all statuses (NOT --all)
 ol todo add --title "<title>" [--category slack|github|email|meeting|general]
 ol todo update <id> [--title] [--notes] [--deadline] [--category]
 ol todo done <id> [--note "<resolution>"]
-ol todo watch <id>                   # monitor without action
+ol todo watch <id>
 ol todo reopen <id>
-ol todo history [<query>]            # search completed todos
+ol todo history [<query>]
 ol todo search "<query>"
 ol todo people add|remove|list <todo_id> <person_id>
 ol todo projects add|remove|list <todo_id> <project_id>
 
 # Research / Investigations
-ol research list                     # open investigations (default)
+# COMMAND NAMES: start (not create/add/new), get (not show), list --status all (not --all)
+# --name is REQUIRED as a flag, never positional
+ol research list                           # open investigations (default)
+ol research list --status all              # all statuses
 ol research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
-ol research add-source <id> --url "<url>" --label "<label>" [--notes "<notes>"]
-ol research sources <id>             # list evidence sources
+ol research get <id-or-slug>               # NOT 'show' — get
+ol research add-source <id> --url "<url>" [--label "<label>"] [--notes "<notes>"]
+ol research sources <id>
 ol research update <id> [--plan "<text>"] [--findings "<text>"]
 ol research conclude <id> --findings "<findings>"
 ol research reopen <id>
-ol research search "<query>"         # FTS + semantic, combined
-ol research people add|remove|list <id> <person_id>
+ol research search "<query>"
+ol research people add|remove|list <id> <person_id>   # NOT link-person
 ol research projects add|remove|list <id> <project_id>
 
 # Projects
