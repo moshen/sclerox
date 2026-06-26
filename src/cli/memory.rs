@@ -565,10 +565,26 @@ fn distill_with_ai(
 ) -> anyhow::Result<Vec<DistilledMemory>> {
     let prompt = format!("{DISTILL_PROMPT}{text}");
 
+    // Detect binary by basename so /usr/local/bin/claude and claude both match.
+    let basename = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(bin);
+
     let mut cmd = std::process::Command::new(bin);
-    cmd.args(["-p", &prompt]);
-    if let Some(m) = model {
-        cmd.args(["--model", m]);
+    if basename == "opencode" {
+        // opencode run --pure [--model provider/model] "prompt"
+        cmd.arg("run").arg("--pure");
+        if let Some(m) = model {
+            cmd.args(["-m", m]);
+        }
+        cmd.arg(&prompt);
+    } else {
+        // claude (default): -p --safe-mode --no-session-persistence --tools "" "prompt"
+        cmd.args(["-p", "--safe-mode", "--no-session-persistence", "--tools", "", &prompt]);
+        if let Some(m) = model {
+            cmd.args(["--model", m]);
+        }
     }
 
     let output = cmd.output().map_err(|e| {
