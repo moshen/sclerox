@@ -351,10 +351,11 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let boundary = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}...", &s[..boundary])
     }
 }
 

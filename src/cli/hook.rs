@@ -399,6 +399,15 @@ fn run_distill_session(
     if total > 0 {
         log::info!("background: distilled {total} memories from session {session_id}");
     }
+
+    // Write marker so this session isn't re-distilled unnecessarily.
+    if let Some(p) = distill_marker_path(session_id) {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, turns.len().to_string());
+    }
+
     Ok(())
 }
 
