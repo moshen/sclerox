@@ -61,6 +61,11 @@ pub enum SearchResult {
 pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
     let mut results = Vec::new();
 
+    // Initialise embedder once; embed query once. Both are None if unavailable.
+    let query_emb: Option<Vec<f32>> = crate::embed::Embedder::new()
+        .ok()
+        .and_then(|mut emb| emb.embed_one(query).ok());
+
     for m in db.memory_search(query)? {
         results.push(SearchResult::Memory {
             id: m.id,
@@ -76,7 +81,10 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
 
-    for m in db.meeting_search(query)? {
+    let meeting_fts = db.meeting_search(query)?;
+    let meeting_fts_ids: std::collections::HashSet<i64> =
+        meeting_fts.iter().map(|m| m.id).collect();
+    for m in meeting_fts {
         let snippet = m
             .notes
             .as_deref()
@@ -90,6 +98,18 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
             snippet,
         });
     }
+    if let Some(ref qe) = query_emb {
+        for r in db.meeting_similar(qe, 5).unwrap_or_default() {
+            if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= 0.45 {
+                results.push(SearchResult::Meeting {
+                    id: r.meeting.id,
+                    title: r.meeting.title,
+                    date: r.meeting.meeting_date,
+                    snippet: truncate(&r.matched_chunk, 120),
+                });
+            }
+        }
+    }
 
     for p in db.project_search(query)? {
         results.push(SearchResult::Project {
@@ -99,7 +119,6 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
 
-    // FTS+LIKE tier for todos
     let todo_fts: Vec<_> = db.todo_search(query)?;
     let todo_fts_ids: std::collections::HashSet<i64> = todo_fts.iter().map(|t| t.id).collect();
     for t in todo_fts {
@@ -110,23 +129,22 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
             category: t.category,
         });
     }
-    // Semantic tier for todos — always runs, deduped against FTS hits
-    if let Ok(mut emb) = crate::embed::Embedder::new() {
-        if let Ok(query_emb) = emb.embed_one(query) {
-            for r in db.todo_similar(&query_emb, 10).unwrap_or_default() {
-                if !todo_fts_ids.contains(&r.todo.id) && r.score >= 0.45 {
-                    results.push(SearchResult::Todo {
-                        id: r.todo.id,
-                        title: r.todo.title,
-                        status: r.todo.status,
-                        category: r.todo.category,
-                    });
-                }
+    if let Some(ref qe) = query_emb {
+        for r in db.todo_similar(qe, 10).unwrap_or_default() {
+            if !todo_fts_ids.contains(&r.todo.id) && r.score >= 0.45 {
+                results.push(SearchResult::Todo {
+                    id: r.todo.id,
+                    title: r.todo.title,
+                    status: r.todo.status,
+                    category: r.todo.category,
+                });
             }
         }
     }
 
-    for i in db.investigation_search(query)? {
+    let inv_fts = db.investigation_search(query)?;
+    let inv_fts_ids: std::collections::HashSet<i64> = inv_fts.iter().map(|i| i.id).collect();
+    for i in inv_fts {
         let snippet = i
             .findings
             .as_deref()
@@ -141,14 +159,41 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
             snippet,
         });
     }
+    if let Some(ref qe) = query_emb {
+        for r in db.investigation_similar(qe, 5).unwrap_or_default() {
+            if !inv_fts_ids.contains(&r.investigation.id) && r.score >= 0.45 {
+                results.push(SearchResult::Investigation {
+                    id: r.investigation.id,
+                    name: r.investigation.name,
+                    slug: r.investigation.slug,
+                    status: r.investigation.status,
+                    snippet: truncate(&r.matched_chunk, 120),
+                });
+            }
+        }
+    }
 
-    for r in db.repo_search(query)? {
+    let repo_fts = db.repo_search(query)?;
+    let repo_fts_ids: std::collections::HashSet<i64> = repo_fts.iter().map(|r| r.id).collect();
+    for r in repo_fts {
         results.push(SearchResult::Repo {
             id: r.id,
             name: r.name,
             path: r.path,
             description: r.description,
         });
+    }
+    if let Some(ref qe) = query_emb {
+        for r in db.repo_similar(qe, 5).unwrap_or_default() {
+            if !repo_fts_ids.contains(&r.repo.id) && r.score >= 0.45 {
+                results.push(SearchResult::Repo {
+                    id: r.repo.id,
+                    name: r.repo.name,
+                    path: r.repo.path,
+                    description: r.repo.description,
+                });
+            }
+        }
     }
 
     // Fan out to all registered repo DBs and search symbols
