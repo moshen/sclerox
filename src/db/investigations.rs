@@ -162,6 +162,13 @@ impl Database {
         Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
     }
 
+    pub fn investigation_delete(&self, id: i64) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM investigations WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
     pub fn investigation_reopen(&self, id: i64) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE investigations
@@ -547,12 +554,8 @@ mod tests {
         let inv_id = db
             .investigation_start("Auth spike", "auth-spike", None)
             .unwrap();
-        let alice = db
-            .people_add("Alice", None)
-            .unwrap();
-        let bob = db
-            .people_add("Bob", None)
-            .unwrap();
+        let alice = db.people_add("Alice", None).unwrap();
+        let bob = db.people_add("Bob", None).unwrap();
 
         db.investigation_link_person(inv_id, alice).unwrap();
         db.investigation_link_person(inv_id, bob).unwrap();
@@ -568,9 +571,7 @@ mod tests {
     fn test_investigation_unlink_person() {
         let db = db();
         let inv_id = db.investigation_start("Perf", "perf", None).unwrap();
-        let person_id = db
-            .people_add("Carol", None)
-            .unwrap();
+        let person_id = db.people_add("Carol", None).unwrap();
 
         db.investigation_link_person(inv_id, person_id).unwrap();
         assert_eq!(db.investigation_people(inv_id).unwrap().len(), 1);

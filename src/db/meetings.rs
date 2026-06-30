@@ -128,6 +128,42 @@ impl Database {
         Ok(results)
     }
 
+    pub fn meeting_update(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        date: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<bool> {
+        let mut parts = vec!["updated_at = datetime('now')".to_string()];
+        let mut vals: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        let mut idx = 1usize;
+
+        if let Some(v) = title {
+            parts.push(format!("title = ?{idx}"));
+            vals.push(Box::new(v.to_string()));
+            idx += 1;
+        }
+        if let Some(v) = date {
+            parts.push(format!("meeting_date = ?{idx}"));
+            vals.push(Box::new(v.to_string()));
+            idx += 1;
+        }
+        if let Some(v) = notes {
+            parts.push(format!("notes = ?{idx}"));
+            vals.push(Box::new(v.to_string()));
+            idx += 1;
+        }
+
+        if parts.len() == 1 {
+            return Ok(false);
+        }
+        let sql = format!("UPDATE meetings SET {} WHERE id = ?{idx}", parts.join(", "));
+        vals.push(Box::new(id));
+        let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
     pub fn meeting_delete(&self, id: i64) -> Result<bool> {
         let n = self
             .conn
@@ -294,9 +330,7 @@ mod tests {
     #[test]
     fn test_meeting_link_person() {
         let db = Database::open_in_memory().unwrap();
-        let person_id = db
-            .people_add("Alice", None)
-            .unwrap();
+        let person_id = db.people_add("Alice", None).unwrap();
         let meeting_id = db.meeting_add("Planning", None, None, None).unwrap();
 
         db.meeting_link_person(meeting_id, person_id, Some("organizer"))

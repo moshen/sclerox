@@ -38,8 +38,21 @@ pub enum ProjectCommand {
     /// Manage repos on this project
     #[command(subcommand)]
     Repos(ProjectReposCmd),
+    /// Manage links on this project
+    #[command(subcommand)]
+    Links(ProjectLinksCmd),
     /// Delete a project
     Delete { id: i64 },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ProjectLinksCmd {
+    /// Add a link to this project (format: "url" or "url|label")
+    Add { project_id: i64, link: String },
+    /// Remove a link from this project by URL
+    Remove { project_id: i64, url: String },
+    /// List links on this project
+    List { project_id: i64 },
 }
 
 #[derive(clap::Subcommand)]
@@ -251,6 +264,49 @@ pub fn run(db: &Database, cmd: ProjectCommand) -> Result<()> {
                 }
             }
         },
+
+        ProjectCommand::Links(sub) => {
+            let project = match db.project_get(match &sub {
+                ProjectLinksCmd::Add { project_id, .. }
+                | ProjectLinksCmd::Remove { project_id, .. }
+                | ProjectLinksCmd::List { project_id } => *project_id,
+            })? {
+                Some(p) => p,
+                None => {
+                    println!("Project not found");
+                    return Ok(());
+                }
+            };
+            match sub {
+                ProjectLinksCmd::Add { project_id, link } => {
+                    let mut links = project.links.clone();
+                    links.push(parse_link(&link));
+                    db.project_update(project_id, None, None, Some(&links))?;
+                    println!("Added link to project #{project_id}");
+                }
+                ProjectLinksCmd::Remove { project_id, url } => {
+                    let before = project.links.len();
+                    let links: Vec<ProjectLink> =
+                        project.links.into_iter().filter(|l| l.url != url).collect();
+                    if links.len() == before {
+                        println!("Link not found: {url}");
+                    } else {
+                        db.project_update(project_id, None, None, Some(&links))?;
+                        println!("Removed link from project #{project_id}");
+                    }
+                }
+                ProjectLinksCmd::List { project_id } => {
+                    if project.links.is_empty() {
+                        println!("No links on project #{project_id}");
+                    } else {
+                        for l in &project.links {
+                            let label = l.label.as_deref().unwrap_or("link");
+                            println!("[{}] {}", label, l.url);
+                        }
+                    }
+                }
+            }
+        }
 
         ProjectCommand::Delete { id } => {
             if db.project_delete(id)? {

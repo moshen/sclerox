@@ -67,6 +67,8 @@ pub enum ResearchCommand {
     },
     /// List sources for an investigation
     Sources { id: i64 },
+    /// Delete an investigation permanently
+    Delete { id: i64 },
     /// Manage people linked to an investigation
     #[command(subcommand)]
     People(ResearchPeopleCmd),
@@ -282,6 +284,14 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             });
         }
 
+        ResearchCommand::Delete { id } => {
+            if db.investigation_delete(id)? {
+                println!("Deleted investigation #{id}");
+            } else {
+                println!("Investigation #{id} not found");
+            }
+        }
+
         ResearchCommand::People(sub) => match sub {
             ResearchPeopleCmd::Add { id, person_id } => {
                 db.investigation_link_person(id, person_id)?;
@@ -301,7 +311,6 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         println!("No people on investigation #{id}");
                     } else {
                         for p in &people {
-                            
                             println!("#{} {}", p.id, p.name);
                         }
                     }

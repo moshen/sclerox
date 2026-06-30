@@ -95,6 +95,42 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn todo_list_due_within(
+        &self,
+        days: u32,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<Todo>> {
+        let cutoff = format!("+{days} days");
+        let (sql, use_status) = match status_filter {
+            Some("all") | None => (
+                "SELECT id, title, notes, status, source_url, category, originated_date,
+                        deadline_date, completed_at, created_at, updated_at
+                 FROM todos
+                 WHERE deadline_date IS NOT NULL
+                   AND deadline_date <= date('now', ?1)
+                 ORDER BY deadline_date ASC, originated_date ASC",
+                false,
+            ),
+            Some(_) => (
+                "SELECT id, title, notes, status, source_url, category, originated_date,
+                        deadline_date, completed_at, created_at, updated_at
+                 FROM todos
+                 WHERE deadline_date IS NOT NULL
+                   AND deadline_date <= date('now', ?1)
+                   AND status = ?2
+                 ORDER BY deadline_date ASC, originated_date ASC",
+                true,
+            ),
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if use_status {
+            stmt.query_map(params![cutoff, status_filter.unwrap()], row_to_todo)?
+        } else {
+            stmt.query_map(params![cutoff], row_to_todo)?
+        };
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn todo_search(&self, query: &str) -> Result<Vec<Todo>> {
         let fts_query = fts::sanitize(query);
         let like_pat = format!("%{query}%");
@@ -297,8 +333,7 @@ impl Database {
 
         if let Some(q) = query {
             let q = fts::sanitize(q);
-            let sql =
-                "SELECT id, title, notes, status, source_url, category, originated_date,
+            let sql = "SELECT id, title, notes, status, source_url, category, originated_date,
                         deadline_date, completed_at, created_at, updated_at
                  FROM todos
                  WHERE id IN (SELECT rowid FROM todos_fts WHERE todos_fts MATCH ?1)
@@ -324,8 +359,10 @@ impl Database {
         todo_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM todo_chunks WHERE todo_id = ?1", params![todo_id])?;
+        self.conn.execute(
+            "DELETE FROM todo_chunks WHERE todo_id = ?1",
+            params![todo_id],
+        )?;
         for (i, (text, emb)) in chunks.iter().enumerate() {
             let emb_bytes = emb.as_deref().map(crate::db::embedding_to_bytes);
             self.conn.execute(
@@ -386,7 +423,14 @@ impl Database {
             .map(|(chunk_text, emb_bytes, todo)| {
                 let emb = bytes_to_embedding(&emb_bytes);
                 let score = cosine_similarity(query_embedding, &emb);
-                (score, SimilarTodo { todo, score, matched_chunk: chunk_text })
+                (
+                    score,
+                    SimilarTodo {
+                        todo,
+                        score,
+                        matched_chunk: chunk_text,
+                    },
+                )
             })
             .collect();
 
@@ -672,12 +716,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let alice = db
-            .people_add("Alice", None)
-            .unwrap();
-        let bob = db
-            .people_add("Bob", None)
-            .unwrap();
+        let alice = db.people_add("Alice", None).unwrap();
+        let bob = db.people_add("Bob", None).unwrap();
 
         db.todo_link_person(todo_id, alice).unwrap();
         db.todo_link_person(todo_id, bob).unwrap();
@@ -695,9 +735,7 @@ mod tests {
         let todo_id = db
             .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
             .unwrap();
-        let person_id = db
-            .people_add("Carol", None)
-            .unwrap();
+        let person_id = db.people_add("Carol", None).unwrap();
 
         db.todo_link_person(todo_id, person_id).unwrap();
         assert_eq!(db.todo_people(todo_id).unwrap().len(), 1);
@@ -715,9 +753,7 @@ mod tests {
         let todo_id = db
             .todo_add("Task", None, TodoStatus::Open, None, "general", None, None)
             .unwrap();
-        let person_id = db
-            .people_add("Dave", None)
-            .unwrap();
+        let person_id = db.people_add("Dave", None).unwrap();
         db.todo_link_person(todo_id, person_id).unwrap();
 
         db.todo_delete(todo_id).unwrap();

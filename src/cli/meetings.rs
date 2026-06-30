@@ -38,6 +38,16 @@ pub enum MeetingCommand {
     },
     /// Search meetings (FTS + semantic similarity combined)
     Search { query: String },
+    /// Update a meeting's fields
+    Update {
+        id: i64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, help = "ISO date, e.g. 2026-06-08")]
+        date: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+    },
     /// Manage people linked to a meeting
     #[command(subcommand)]
     People(MeetingPeopleCmd),
@@ -181,6 +191,19 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
 
             if fts_hits.is_empty() {
                 println!("No matches for: {query}");
+            }
+        }
+
+        MeetingCommand::Update {
+            id,
+            title,
+            date,
+            notes,
+        } => {
+            if db.meeting_update(id, title.as_deref(), date.as_deref(), notes.as_deref())? {
+                println!("Updated meeting #{id}");
+            } else {
+                println!("Meeting #{id} not found or no changes");
             }
         }
 

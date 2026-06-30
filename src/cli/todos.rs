@@ -43,6 +43,9 @@ pub enum TodoCommand {
         /// Filter by category
         #[arg(long)]
         category: Option<String>,
+        /// Show only items with a deadline within N days
+        #[arg(long)]
+        deadline_within: Option<u32>,
     },
     /// Full-text search todos (includes done items)
     Search { query: String },
@@ -174,8 +177,16 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             None => println!("Todo #{id} not found"),
         },
 
-        TodoCommand::List { status, category } => {
-            let mut todos = db.todo_list(Some(&status))?;
+        TodoCommand::List {
+            status,
+            category,
+            deadline_within,
+        } => {
+            let mut todos = if let Some(days) = deadline_within {
+                db.todo_list_due_within(days, Some(&status))?
+            } else {
+                db.todo_list(Some(&status))?
+            };
             if let Some(cat) = &category {
                 todos.retain(|t| &t.category == cat);
             }
@@ -192,7 +203,6 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
         }
 
         TodoCommand::Search { query } => {
-
             // Tier 1+2: FTS prefix + LIKE substring
             let fts_results = db.todo_search(&query)?;
 
@@ -320,7 +330,6 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                         println!("No people linked to todo #{todo_id}");
                     } else {
                         for p in &people {
-                            
                             println!("#{} {}", p.id, p.name);
                         }
                     }
@@ -375,9 +384,13 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
     };
     if let Ok(mut embedder) = Embedder::new() {
         let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
-        if let Ok(embeddings) = embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
-            let chunks: Vec<(String, Option<Vec<f32>>)> =
-                raw.into_iter().zip(embeddings.into_iter().map(Some)).collect();
+        if let Ok(embeddings) =
+            embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        {
+            let chunks: Vec<(String, Option<Vec<f32>>)> = raw
+                .into_iter()
+                .zip(embeddings.into_iter().map(Some))
+                .collect();
             let _ = db.todo_store_chunks(id, &chunks);
         }
     }
@@ -385,9 +398,15 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
 
 /// Backfill embeddings for todos that have none. Called transparently on search.
 pub fn backfill_todo_embeddings_pub(db: &Database) {
-    let Ok(pending) = db.todos_without_embeddings() else { return };
-    if pending.is_empty() { return; }
-    let Ok(mut embedder) = Embedder::new() else { return };
+    let Ok(pending) = db.todos_without_embeddings() else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let Ok(mut embedder) = Embedder::new() else {
+        return;
+    };
     log::debug!("backfilling embeddings for {} todos", pending.len());
     for t in pending {
         let text = match &t.notes {
@@ -395,16 +414,24 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
             _ => t.title.clone(),
         };
         let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
-        if let Ok(embeddings) = embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
-            let chunks: Vec<(String, Option<Vec<f32>>)> =
-                raw.into_iter().zip(embeddings.into_iter().map(Some)).collect();
+        if let Ok(embeddings) =
+            embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        {
+            let chunks: Vec<(String, Option<Vec<f32>>)> = raw
+                .into_iter()
+                .zip(embeddings.into_iter().map(Some))
+                .collect();
             let _ = db.todo_store_chunks(t.id, &chunks);
         }
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
 }
 
 fn print_todo_detail(t: &crate::db::todos::Todo) {
@@ -429,4 +456,3 @@ fn print_todo_detail(t: &crate::db::todos::Todo) {
         println!("  Done at:    {at}");
     }
 }
-
