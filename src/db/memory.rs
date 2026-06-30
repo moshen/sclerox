@@ -81,23 +81,24 @@ impl Database {
         let filter_status = !matches!(status, Some("all") | None);
         let active_only = status.is_none();
 
-        let sql = format!("SELECT {MEMORY_COLS} FROM memory WHERE {} ORDER BY updated_at DESC",
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory WHERE {} ORDER BY updated_at DESC",
             match (memory_type.is_some(), filter_status, active_only) {
-                (true,  true,  _    ) => "memory_type = ?1 AND status = ?2",
-                (true,  false, false) => "memory_type = ?1",
-                (true,  false, true ) => "memory_type = ?1 AND status = 'active'",
-                (false, true,  _    ) => "status = ?1",
+                (true, true, _) => "memory_type = ?1 AND status = ?2",
+                (true, false, false) => "memory_type = ?1",
+                (true, false, true) => "memory_type = ?1 AND status = 'active'",
+                (false, true, _) => "status = ?1",
                 (false, false, false) => "1=1",
-                (false, false, true ) => "status = 'active'",
+                (false, false, true) => "status = 'active'",
             }
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = match (memory_type, filter_status, active_only) {
-            (Some(t), true,  _    ) => stmt.query_map(params![t, status.unwrap()], row_to_memory)?,
-            (Some(t), false, _    ) => stmt.query_map(params![t], row_to_memory)?,
-            (None,    true,  _    ) => stmt.query_map(params![status.unwrap()], row_to_memory)?,
-            (None,    false, _    ) => stmt.query_map([], row_to_memory)?,
+            (Some(t), true, _) => stmt.query_map(params![t, status.unwrap()], row_to_memory)?,
+            (Some(t), false, _) => stmt.query_map(params![t], row_to_memory)?,
+            (None, true, _) => stmt.query_map(params![status.unwrap()], row_to_memory)?,
+            (None, false, _) => stmt.query_map([], row_to_memory)?,
         };
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -114,14 +115,18 @@ impl Database {
 
         // Tier 1: FTS prefix matches
         let fts_sql = if filter_status {
-            format!("SELECT {MEMORY_COLS} FROM memory
+            format!(
+                "SELECT {MEMORY_COLS} FROM memory
                      WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
                        AND status = ?2
-                     ORDER BY updated_at DESC")
+                     ORDER BY updated_at DESC"
+            )
         } else {
-            format!("SELECT {MEMORY_COLS} FROM memory
+            format!(
+                "SELECT {MEMORY_COLS} FROM memory
                      WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
-                     ORDER BY updated_at DESC")
+                     ORDER BY updated_at DESC"
+            )
         };
         let mut stmt = self.conn.prepare(&fts_sql)?;
         let fts_hits: Vec<MemoryEntry> = if filter_status {
@@ -134,14 +139,18 @@ impl Database {
 
         // Tier 2: LIKE substring fallback
         let like_sql = if filter_status {
-            format!("SELECT {MEMORY_COLS} FROM memory
+            format!(
+                "SELECT {MEMORY_COLS} FROM memory
                      WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
                        AND status = ?2
-                     ORDER BY updated_at DESC")
+                     ORDER BY updated_at DESC"
+            )
         } else {
-            format!("SELECT {MEMORY_COLS} FROM memory
+            format!(
+                "SELECT {MEMORY_COLS} FROM memory
                      WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
-                     ORDER BY updated_at DESC")
+                     ORDER BY updated_at DESC"
+            )
         };
         let mut stmt2 = self.conn.prepare(&like_sql)?;
         let like_extras: Vec<MemoryEntry> = if filter_status {
@@ -404,12 +413,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("auth-pref", "prefer JWT", "project", None)
             .unwrap();
-        let alice = db
-            .people_add("Alice", None)
-            .unwrap();
-        let bob = db
-            .people_add("Bob", None)
-            .unwrap();
+        let alice = db.people_add("Alice", None).unwrap();
+        let bob = db.people_add("Bob", None).unwrap();
 
         assert!(db.memory_link_person("auth-pref", alice).unwrap());
         assert!(db.memory_link_person("auth-pref", bob).unwrap());
@@ -424,9 +429,7 @@ mod tests {
     #[test]
     fn test_memory_link_missing_key_returns_false() {
         let db = Database::open_in_memory().unwrap();
-        let person_id = db
-            .people_add("Carol", None)
-            .unwrap();
+        let person_id = db.people_add("Carol", None).unwrap();
         assert!(!db.memory_link_person("no-such-key", person_id).unwrap());
     }
 
@@ -434,9 +437,7 @@ mod tests {
     fn test_memory_unlink_person() {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("k", "v", "general", None).unwrap();
-        let person_id = db
-            .people_add("Dave", None)
-            .unwrap();
+        let person_id = db.people_add("Dave", None).unwrap();
 
         db.memory_link_person("k", person_id).unwrap();
         assert_eq!(db.memory_people("k").unwrap().len(), 1);

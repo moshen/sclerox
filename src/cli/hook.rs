@@ -806,10 +806,7 @@ mod tests {
     #[test]
     fn test_extract_text_content_strips_private() {
         let val = serde_json::json!("hello <private>secret</private> world");
-        assert_eq!(
-            extract_text_content(&val),
-            Some("hello  world".to_string())
-        );
+        assert_eq!(extract_text_content(&val), Some("hello  world".to_string()));
     }
 
     #[test]

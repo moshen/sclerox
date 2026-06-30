@@ -205,7 +205,10 @@ fn is_symbol_node(kind: &str, language: &str) -> bool {
         "ruby" => matches!(kind, "method" | "singleton_method" | "class" | "module"),
         "kotlin" => matches!(
             kind,
-            "function_declaration" | "class_declaration" | "object_declaration" | "companion_object"
+            "function_declaration"
+                | "class_declaration"
+                | "object_declaration"
+                | "companion_object"
         ),
         "sql" => matches!(
             kind,
@@ -237,8 +240,8 @@ fn collect_symbols_and_edges(
     if is_symbol {
         let start = node.start_position();
         let end = node.end_position();
-        let name = extract_name(node, source, language)
-            .unwrap_or_else(|| "<anonymous>".to_string());
+        let name =
+            extract_name(node, source, language).unwrap_or_else(|| "<anonymous>".to_string());
         let text = &source[node.start_byte()..node.end_byte()];
         let signature = extract_signature(text, language);
 
@@ -267,7 +270,11 @@ fn collect_symbols_and_edges(
         }
 
         // Recurse into the symbol's body to find nested symbols and call edges.
-        let enc = if name == "<anonymous>" { enclosing } else { Some(name.as_str()) };
+        let enc = if name == "<anonymous>" {
+            enclosing
+        } else {
+            Some(name.as_str())
+        };
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             collect_symbols_and_edges(&child, source, language, out, enc);
@@ -652,13 +659,12 @@ fn extract_structural_edges(
 /// Bash built-ins and common external commands that clutter the call graph.
 fn is_shell_builtin(name: &str) -> bool {
     const BUILTINS: &[&str] = &[
-        "echo", "printf", "cd", "export", "source", ".", "return", "exit",
-        "if", "then", "else", "fi", "for", "while", "do", "done", "case", "esac",
-        "local", "readonly", "declare", "typeset", "set", "unset", "shift",
-        "true", "false", "test", "[", "[[",
+        "echo", "printf", "cd", "export", "source", ".", "return", "exit", "if", "then", "else",
+        "fi", "for", "while", "do", "done", "case", "esac", "local", "readonly", "declare",
+        "typeset", "set", "unset", "shift", "true", "false", "test", "[", "[[",
         // common external commands unlikely to be project-defined
-        "grep", "sed", "awk", "cut", "sort", "uniq", "cat", "ls", "cp", "mv",
-        "rm", "mkdir", "touch", "find", "xargs", "curl", "wget",
+        "grep", "sed", "awk", "cut", "sort", "uniq", "cat", "ls", "cp", "mv", "rm", "mkdir",
+        "touch", "find", "xargs", "curl", "wget",
     ];
     BUILTINS.contains(&name)
 }
@@ -670,18 +676,45 @@ fn is_noise_call(name: &str, language: &str) -> bool {
     }
     const UNIVERSAL: &[&str] = &["len", "push", "pop", "get", "set", "fmt"];
     const RUST: &[&str] = &[
-        "unwrap", "expect", "ok", "err", "into", "from", "as_ref", "as_mut",
-        "map", "filter", "collect", "iter", "into_iter", "next", "clone",
-        "to_string", "to_owned", "borrow", "borrow_mut", "deref",
+        "unwrap",
+        "expect",
+        "ok",
+        "err",
+        "into",
+        "from",
+        "as_ref",
+        "as_mut",
+        "map",
+        "filter",
+        "collect",
+        "iter",
+        "into_iter",
+        "next",
+        "clone",
+        "to_string",
+        "to_owned",
+        "borrow",
+        "borrow_mut",
+        "deref",
     ];
-    const PYTHON: &[&str] = &["append", "extend", "items", "keys", "values", "strip", "split"];
+    const PYTHON: &[&str] = &[
+        "append", "extend", "items", "keys", "values", "strip", "split",
+    ];
     const JAVA_KOTLIN: &[&str] = &[
-        "toString", "equals", "hashCode", "compareTo", "size", "isEmpty", "contains",
-        "add", "remove", "put", "println", "print",
+        "toString",
+        "equals",
+        "hashCode",
+        "compareTo",
+        "size",
+        "isEmpty",
+        "contains",
+        "add",
+        "remove",
+        "put",
+        "println",
+        "print",
     ];
-    const RUBY: &[&str] = &[
-        "to_s", "to_i", "to_f", "to_a", "inspect", "puts", "print",
-    ];
+    const RUBY: &[&str] = &["to_s", "to_i", "to_f", "to_a", "inspect", "puts", "print"];
     match language {
         "rust" => UNIVERSAL.contains(&name) || RUST.contains(&name),
         "python" => UNIVERSAL.contains(&name) || PYTHON.contains(&name),
@@ -730,10 +763,11 @@ fn extract_name(node: &Node, source: &str, language: &str) -> Option<String> {
                         )
                     }
                     "dot_index_expression" | "method_index_expression" => {
-                        if let Some(field) = name_node.child_by_field_name("field").or_else(|| name_node.child_by_field_name("method")) {
-                            return Some(
-                                source[field.start_byte()..field.end_byte()].to_string(),
-                            );
+                        if let Some(field) = name_node
+                            .child_by_field_name("field")
+                            .or_else(|| name_node.child_by_field_name("method"))
+                        {
+                            return Some(source[field.start_byte()..field.end_byte()].to_string());
                         }
                     }
                     _ => {}
@@ -1011,9 +1045,18 @@ public class PaymentService {
 "#;
         let (symbols, _chunks, edges) = parse_file(source, "java", 50);
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"PaymentService"), "missing class: {names:?}");
-        assert!(names.contains(&"processPayment"), "missing method: {names:?}");
-        assert!(names.contains(&"validateInput"), "missing method: {names:?}");
+        assert!(
+            names.contains(&"PaymentService"),
+            "missing class: {names:?}"
+        );
+        assert!(
+            names.contains(&"processPayment"),
+            "missing method: {names:?}"
+        );
+        assert!(
+            names.contains(&"validateInput"),
+            "missing method: {names:?}"
+        );
 
         let calls: Vec<(&str, &str)> = edges
             .iter()
@@ -1044,11 +1087,15 @@ public class Dog extends Animal implements Runnable {
             .map(|e| (e.from_name.as_str(), e.kind.as_str(), e.to_name.as_str()))
             .collect();
         assert!(
-            structural.iter().any(|(f, k, t)| *f == "Dog" && *k == "inherits" && *t == "Animal"),
+            structural
+                .iter()
+                .any(|(f, k, t)| *f == "Dog" && *k == "inherits" && *t == "Animal"),
             "expected Dog inherits Animal: {structural:?}"
         );
         assert!(
-            structural.iter().any(|(f, k, t)| *f == "Dog" && *k == "implements" && *t == "Runnable"),
+            structural
+                .iter()
+                .any(|(f, k, t)| *f == "Dog" && *k == "implements" && *t == "Runnable"),
             "expected Dog implements Runnable: {structural:?}"
         );
     }
@@ -1068,7 +1115,10 @@ int validate(int x) {
         let (symbols, _chunks, edges) = parse_file(source, "cpp", 50);
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"process"), "missing fn process: {names:?}");
-        assert!(names.contains(&"validate"), "missing fn validate: {names:?}");
+        assert!(
+            names.contains(&"validate"),
+            "missing fn validate: {names:?}"
+        );
 
         let calls: Vec<(&str, &str)> = edges
             .iter()
@@ -1127,7 +1177,10 @@ class PaymentProcessor {
 "#;
         let (symbols, _chunks, _edges) = parse_file(source, "kotlin", 50);
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"PaymentProcessor"), "missing class: {names:?}");
+        assert!(
+            names.contains(&"PaymentProcessor"),
+            "missing class: {names:?}"
+        );
         assert!(names.contains(&"processPayment"), "missing fn: {names:?}");
         assert!(names.contains(&"validate"), "missing fn: {names:?}");
     }
@@ -1203,7 +1256,10 @@ end
         let (symbols, _chunks, edges) = parse_file(source, "lua", 50);
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"process"), "missing fn process: {names:?}");
-        assert!(names.contains(&"validate"), "missing fn validate: {names:?}");
+        assert!(
+            names.contains(&"validate"),
+            "missing fn validate: {names:?}"
+        );
 
         let calls: Vec<(&str, &str)> = edges
             .iter()

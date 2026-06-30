@@ -285,7 +285,6 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-
     pub fn insert_chunk(
         &self,
         file_id: i64,

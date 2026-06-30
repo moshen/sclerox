@@ -50,7 +50,10 @@ mod tests {
         .unwrap();
         let count: i64 = conn
             .query_row(
-                &format!("SELECT count(*) FROM t WHERE t MATCH '{}'", sanitize("split")),
+                &format!(
+                    "SELECT count(*) FROM t WHERE t MATCH '{}'",
+                    sanitize("split")
+                ),
                 [],
                 |r| r.get(0),
             )

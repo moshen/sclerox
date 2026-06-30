@@ -340,7 +340,6 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         println!("No people linked to memory '{key}'");
                     } else {
                         for p in &people {
-                            
                             println!("#{} {}", p.id, p.name);
                         }
                     }
@@ -581,7 +580,14 @@ fn distill_with_ai(
         cmd.arg(&prompt);
     } else {
         // claude (default): -p --safe-mode --no-session-persistence --tools "" "prompt"
-        cmd.args(["-p", "--safe-mode", "--no-session-persistence", "--tools", "", &prompt]);
+        cmd.args([
+            "-p",
+            "--safe-mode",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            &prompt,
+        ]);
         if let Some(m) = model {
             cmd.args(["--model", m]);
         }

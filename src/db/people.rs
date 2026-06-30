@@ -44,9 +44,9 @@ impl Database {
     }
 
     pub fn people_get(&self, id: i64) -> Result<Option<Person>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, notes, created_at, updated_at FROM people WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, notes, created_at, updated_at FROM people WHERE id = ?1")?;
         match stmt.query_row(params![id], row_to_person) {
             Ok(p) => Ok(Some(p)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -55,9 +55,9 @@ impl Database {
     }
 
     pub fn people_list(&self) -> Result<Vec<Person>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, notes, created_at, updated_at FROM people ORDER BY name",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, notes, created_at, updated_at FROM people ORDER BY name")?;
         let rows = stmt.query_map([], row_to_person)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -153,11 +153,7 @@ impl Database {
     }
 
     #[allow(dead_code)]
-    pub fn people_identifier_get(
-        &self,
-        person_id: i64,
-        type_: &str,
-    ) -> Result<Option<String>> {
+    pub fn people_identifier_get(&self, person_id: i64, type_: &str) -> Result<Option<String>> {
         match self.conn.query_row(
             "SELECT identifier FROM people_identifiers WHERE person_id = ?1 AND type = ?2",
             params![person_id, type_],
@@ -289,9 +285,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let id = db.people_add("Eve", None).unwrap();
         // Unknown type should fail due to FK constraint
-        assert!(db
-            .people_identifier_set(id, "telegram", "eve123")
-            .is_err());
+        assert!(db.people_identifier_set(id, "telegram", "eve123").is_err());
     }
 
     #[test]
@@ -303,9 +297,7 @@ mod tests {
         db.people_identifier_set(id, "telegram", "@frankbot")
             .unwrap();
         assert_eq!(
-            db.people_identifier_get(id, "telegram")
-                .unwrap()
-                .as_deref(),
+            db.people_identifier_get(id, "telegram").unwrap().as_deref(),
             Some("@frankbot")
         );
     }

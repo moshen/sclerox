@@ -121,9 +121,11 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
         PeopleCommand::Get { id } => match db.people_get(id)? {
             Some(p) => {
                 let idents = db.people_identifiers_for(id)?;
-                print_output(format, &serde_json::json!({"person": p, "identifiers": idents}), || {
-                    print_person(&p, &idents)
-                });
+                print_output(
+                    format,
+                    &serde_json::json!({"person": p, "identifiers": idents}),
+                    || print_person(&p, &idents),
+                );
             }
             None => println!("Person #{id} not found"),
         },
@@ -241,10 +243,7 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
     Ok(())
 }
 
-fn print_person(
-    p: &crate::db::people::Person,
-    idents: &[crate::db::people::PersonIdentifier],
-) {
+fn print_person(p: &crate::db::people::Person, idents: &[crate::db::people::PersonIdentifier]) {
     println!("ID:    #{}", p.id);
     println!("Name:  {}", p.name);
     if !idents.is_empty() {

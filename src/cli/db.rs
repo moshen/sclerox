@@ -105,15 +105,13 @@ const OWNED_SUBDIRS: &[&str] = &[
 ];
 
 fn export(db: &Database, dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating export dir {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating export dir {}", dir.display()))?;
 
     // Wipe owned subdirs so deleted records vanish on re-export.
     for sub in OWNED_SUBDIRS {
         let path = dir.join(sub);
         if path.exists() {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("clearing {}", path.display()))?;
+            fs::remove_dir_all(&path).with_context(|| format!("clearing {}", path.display()))?;
         }
     }
 
@@ -231,7 +229,11 @@ fn export_projects(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result
             body.push_str("## People\n\n");
             for p in &project_people {
                 let s = slugify(&p.person_name);
-                let role = p.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                let role = p
+                    .role
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
                 body.push_str(&format!("- [[people/{s}|{}]]{role}\n", p.person_name));
             }
             body.push('\n');
@@ -336,7 +338,11 @@ fn export_meetings(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result
             body.push_str("## Attendees\n\n");
             for p in &people {
                 let s = slugify(&p.person_name);
-                let role = p.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                let role = p
+                    .role
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
                 body.push_str(&format!("- [[people/{s}|{}]]{role}\n", p.person_name));
             }
             body.push('\n');
@@ -496,7 +502,11 @@ fn export_research(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result
             }
         }
 
-        write_md(&out_dir.join(format!("{}.md", inv.slug)), &fm.render(), &body)?;
+        write_md(
+            &out_dir.join(format!("{}.md", inv.slug)),
+            &fm.render(),
+            &body,
+        )?;
         stats.research += 1;
     }
     Ok(())
@@ -602,8 +612,7 @@ fn write_md(path: &Path, frontmatter: &str, body: &str) -> Result<()> {
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    fs::write(path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

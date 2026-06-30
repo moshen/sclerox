@@ -101,7 +101,10 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                         continue;
                     }
                     let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                    println!("{} ({}/{}:{})", sig, entry_name, sym.file_path, sym.start_line);
+                    println!(
+                        "{} ({}/{}:{})",
+                        sig, entry_name, sym.file_path, sym.start_line
+                    );
                     for (to_name, kind, line, confidence) in &callees {
                         let resolved = repo_db
                             .symbol_by_name(to_name)
@@ -226,7 +229,12 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                             );
                         }
                         None => {
-                            println!("{}  {} {} [unresolved]", indent, kind_arrow(&edge_kind), name);
+                            println!(
+                                "{}  {} {} [unresolved]",
+                                indent,
+                                kind_arrow(&edge_kind),
+                                name
+                            );
                             continue; // can't follow edges from unresolved
                         }
                     }
@@ -260,10 +268,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 }
 
 /// Open all repo DBs, optionally filtered by name.
-fn open_matching_repos(
-    db: &Database,
-    repo_filter: Option<&str>,
-) -> Result<Vec<(String, RepoDb)>> {
+fn open_matching_repos(db: &Database, repo_filter: Option<&str>) -> Result<Vec<(String, RepoDb)>> {
     let entries = db.repo_list()?;
     let mut result = Vec::new();
     for entry in entries {

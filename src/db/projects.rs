@@ -299,9 +299,7 @@ mod tests {
     fn test_project_link_person_and_meeting() {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("Proj", None, &[]).unwrap();
-        let person_id = db
-            .people_add("Bob", None)
-            .unwrap();
+        let person_id = db.people_add("Bob", None).unwrap();
         let meeting_id = db.meeting_add("Kickoff", None, None, None).unwrap();
 
         db.project_link_person(project_id, person_id, Some("lead"))
@@ -370,9 +368,7 @@ mod tests {
     fn test_project_delete_cascades() {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("ToDelete", None, &[]).unwrap();
-        let person_id = db
-            .people_add("Alice", None)
-            .unwrap();
+        let person_id = db.people_add("Alice", None).unwrap();
         db.project_link_person(project_id, person_id, None).unwrap();
 
         db.project_delete(project_id).unwrap();

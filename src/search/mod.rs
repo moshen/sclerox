@@ -49,6 +49,7 @@ pub enum SearchResult {
     },
     Symbol {
         repo_name: String,
+        repo_path: String,
         kind: String,
         name: String,
         signature: Option<String>,
@@ -174,6 +175,7 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         for sym in symbols {
             results.push(SearchResult::Symbol {
                 repo_name: repo.name.clone(),
+                repo_path: repo.path.clone(),
                 kind: sym.kind,
                 name: sym.name,
                 signature: sym.signature,
@@ -203,8 +205,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("rust-tip", "Rust lifetimes are key", "feedback", None)
             .unwrap();
-        db.people_add("Rustacean Bob", None)
-            .unwrap();
+        db.people_add("Rustacean Bob", None).unwrap();
         db.meeting_add("Rust Review", None, None, Some("discussed Rust async"))
             .unwrap();
         db.project_add("Rust Migration", Some("Moving to Rust"), &[])

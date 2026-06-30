@@ -81,6 +81,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                 }
                 SearchResult::Symbol {
                     repo_name,
+                    repo_path,
                     kind,
                     name,
                     signature,
@@ -88,7 +89,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     start_line,
                 } => {
                     let sig = signature.as_deref().unwrap_or(name);
-                    println!("[symbol] [{kind}] {sig} ({repo_name}/{file_path}:{start_line})");
+                    println!("[symbol] [{kind}] {sig} ({repo_path}/{file_path}:{start_line})  [{repo_name}]");
                 }
             }
         }

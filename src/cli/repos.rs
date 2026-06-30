@@ -69,11 +69,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let result = indexer.index_repo(db, &canonical, description.as_deref())?;
             println!(
                 "Done: {} files indexed, {} skipped, {} symbols, {} chunks, {} edges",
-                result.files_indexed,
-                result.skipped,
-                result.symbols,
-                result.chunks,
-                result.edges,
+                result.files_indexed, result.skipped, result.symbols, result.chunks, result.edges,
             );
         }
 
