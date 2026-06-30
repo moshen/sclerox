@@ -546,17 +546,31 @@ fn distill_marker_path(session_id: &str) -> Option<std::path::PathBuf> {
 
 fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
+    let filename = format!("{session_id}.jsonl");
+
+    // Fast path: try the hash derived from cwd first.
     let hash = path_to_project_hash(cwd);
-    let transcript = home
+    let candidate = home
         .join(".claude/projects")
         .join(&hash)
-        .join(format!("{session_id}.jsonl"));
-
-    if transcript.exists() {
-        Some(transcript)
-    } else {
-        None
+        .join(&filename);
+    if candidate.exists() {
+        return Some(candidate);
     }
+
+    // Fallback: search all project directories. Required when distill-session
+    // is invoked from a different cwd than the original session (e.g. manually).
+    let projects_dir = home.join(".claude/projects");
+    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path().join(&filename);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 /// Each chunk sent to the AI for distillation.
