@@ -3,6 +3,7 @@ use clap::Subcommand;
 use std::io::Read;
 
 use crate::db::Database;
+use crate::index::find_git_root;
 
 #[derive(Subcommand)]
 pub enum HookCommand {
@@ -103,13 +104,15 @@ fn run_start(db: &Database) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     // Index the repo if we're in one (silent on failure).
-    if cwd.join(".git").exists() {
-        let description = cwd
+    // Walk up from cwd to find the git root so subdirectory sessions index the whole repo.
+    let git_root = find_git_root(&cwd);
+    if git_root.join(".git").exists() {
+        let description = git_root
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| format!("{n} repo"));
         let mut indexer = crate::index::RepoIndexer::new(None);
-        let _ = indexer.index_repo(db, &cwd, description.as_deref());
+        let _ = indexer.index_repo(db, &git_root, description.as_deref());
     }
 
     // Emit compact session context for Claude Code to inject (layer-1 index only).
@@ -245,15 +248,17 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     let hook_data: serde_json::Value =
         serde_json::from_str(&stdin_buf).unwrap_or(serde_json::json!({}));
 
-    // Index the current repo (existing behaviour, silent on failure)
+    // Index the current repo (existing behaviour, silent on failure).
+    // Walk up from cwd to find the git root so subdirectory sessions index the whole repo.
     let cwd = std::env::current_dir()?;
     {
+        let git_root = find_git_root(&cwd);
         let mut indexer = crate::index::RepoIndexer::new(None);
-        let description = cwd
+        let description = git_root
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| format!("{n} repo"));
-        let _ = indexer.index_repo(db, &cwd, description.as_deref());
+        let _ = indexer.index_repo(db, &git_root, description.as_deref());
     }
 
     if no_distill {
@@ -424,19 +429,21 @@ fn run_opencode(
     }
     unsafe { std::env::set_var("OL_HOOK_RUNNING", "1") };
 
-    // Index the repo if directory is a git repo
+    // Index the repo if directory is a git repo.
+    // Walk up to the git root so sessions opened in subdirectories index the whole repo.
     let dir = directory
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
+    let git_root = find_git_root(&dir);
 
-    if dir.join(".git").exists() {
+    if git_root.join(".git").exists() {
         let mut indexer = crate::index::RepoIndexer::new(None);
-        let description = dir
+        let description = git_root
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| format!("{n} repo"));
-        let _ = indexer.index_repo(db, &dir, description.as_deref());
+        let _ = indexer.index_repo(db, &git_root, description.as_deref());
     }
 
     if no_distill {

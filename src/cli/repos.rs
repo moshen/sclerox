@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::db::Database;
 use crate::embed::Embedder;
-use crate::index::{repo_db::RepoDb, RepoIndexer};
+use crate::index::{find_git_root, repo_db::RepoDb, RepoIndexer};
 
 #[derive(Subcommand)]
 pub enum RepoCommand {
@@ -59,6 +59,8 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             no_embed,
         } => {
             let canonical = path.canonicalize().unwrap_or(path);
+            // Walk up to the git root so `ol repo index` from a subdirectory indexes the whole repo.
+            let canonical = find_git_root(&canonical);
             let mut embedder_opt: Option<Embedder> = if no_embed {
                 None
             } else {

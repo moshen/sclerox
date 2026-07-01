@@ -11,6 +11,22 @@ use crate::embed::Embedder;
 use parser::{detect_language, parse_file};
 use repo_db::RepoDb;
 
+/// Walk up from `dir` to find the root of the git repository.
+/// Returns the ancestor directory that contains a `.git` entry (file or dir).
+/// Falls back to `dir` itself if no git root is found.
+pub fn find_git_root(dir: &Path) -> std::path::PathBuf {
+    let mut current = dir.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return current;
+        }
+        match current.parent() {
+            Some(p) => current = p.to_path_buf(),
+            None => return dir.to_path_buf(),
+        }
+    }
+}
+
 // Fallback line count for languages without a tree-sitter grammar.
 // ~15 lines × 50 chars/line ≈ 750 chars, within AllMiniLML6V2's 256-token window.
 pub const CHUNK_SIZE_LINES: usize = 15;
