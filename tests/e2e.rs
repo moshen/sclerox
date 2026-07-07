@@ -75,6 +75,36 @@ fn memory_set_get_delete() {
 }
 
 #[test]
+fn memory_set_warns_but_stores_long_value() {
+    let e = Env::new();
+    let long_value = "x".repeat(900); // over the 800-char recommendation
+
+    let out = e
+        .cmd()
+        .args(["memory", "set", "long-key", &long_value])
+        .output()
+        .unwrap();
+
+    // Warn-and-store: command succeeds, warns on stderr, value is persisted whole.
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning"),
+        "expected a warning, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("900"),
+        "expected the length in the warning: {stderr}"
+    );
+
+    let got = e.run(&["memory", "get", "long-key"]);
+    assert!(
+        got.contains(&long_value),
+        "long value was not stored intact"
+    );
+}
+
+#[test]
 fn memory_list_filters_by_type() {
     let e = Env::new();
     e.run(&["memory", "set", "a", "val", "--type", "user"]);

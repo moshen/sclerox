@@ -134,6 +134,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             let tag_list: Option<Vec<String>> = tags
                 .as_deref()
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+            warn_if_long(&key, &value);
             db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
             println!("Set: {key}");
         }
@@ -217,6 +218,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             new_value,
             r#type,
         } => {
+            warn_if_long(&new_key, &new_value);
             if db.memory_supersede(&old_key, &new_key, &new_value, &r#type)? {
                 println!("Superseded '{old_key}' → '{new_key}'");
             } else {
@@ -299,6 +301,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 println!("\n{} memories (dry-run: nothing written)", memories.len());
             } else {
                 for m in &memories {
+                    warn_if_long(&m.key, &m.value);
                     if let Some(ref old_key) = existing_key {
                         // Compressing a single existing entry: supersede it
                         db.memory_supersede(old_key, &m.key, &m.value, &m.memory_type)?;
@@ -357,6 +360,22 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let boundary = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}...", &s[..boundary])
+    }
+}
+
+/// Warn (to stderr) when a memory value exceeds the recommended length.
+/// The value is still stored — this is an assist, not a hard limit — but over-
+/// long values embed worse (the vector is capped at the model window) and crowd
+/// the session-start context, so we nudge the writer to shorten them.
+fn warn_if_long(key: &str, value: &str) {
+    let len = value.chars().count();
+    if len > crate::db::memory::MAX_MEMORY_VALUE_CHARS {
+        eprintln!(
+            "warning: memory '{key}' is {len} chars (over {} recommended). \
+             Stored anyway, but consider shortening: long values embed worse \
+             and crowd session context.",
+            crate::db::memory::MAX_MEMORY_VALUE_CHARS
+        );
     }
 }
 
@@ -502,6 +521,7 @@ fn import_memories(
                 skipped += 1;
                 continue;
             }
+            warn_if_long(&key, &value);
             db.memory_set_full(&key, &value, &memory_type, None, "imported")?;
             imported += 1;
         }
@@ -530,6 +550,10 @@ const DISTILL_PROMPT: &str = r#"You are extracting structured memory entries fro
 
 Extract 1-8 concise, factual memory entries. Each entry should capture a single
 distinct fact, preference, decision, or piece of context worth remembering.
+
+Keep each "value" concise: 1-3 sentences and UNDER 800 characters. If a fact
+needs more than that, it is really several facts — split it into separate
+entries rather than writing one long value.
 
 Output ONLY a JSON array with no surrounding text or markdown fences:
 [

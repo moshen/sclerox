@@ -25,6 +25,16 @@ pub struct MemoryEntry {
 const MEMORY_COLS: &str =
     "id, key, value, memory_type, tags, created_at, updated_at, status, source, superseded_by, reviewed_at";
 
+/// Recommended maximum length (in chars) for a memory value.
+///
+/// A distinct policy from the embedding window (`index::MAX_EMBED_CHARS`), even
+/// though they currently share the value 800: this governs how long a stored
+/// value should be for readability and context-injection, whereas the embed
+/// constant tracks the model's token limit. Values over this are still stored
+/// (writes must never silently drop a memory), but callers on interactive paths
+/// warn so the writer can shorten them.
+pub const MAX_MEMORY_VALUE_CHARS: usize = 800;
+
 impl Database {
     pub fn memory_set(
         &self,
