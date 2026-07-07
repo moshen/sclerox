@@ -17,6 +17,7 @@ pub enum MemoryCommand {
         tags: Option<String>,
     },
     /// Get a memory entry by key
+    #[command(alias = "show")]
     Get { key: String },
     /// List memory entries (active only by default)
     List {
@@ -542,6 +543,13 @@ Type guide:
   user        - facts about the user's role, context, or goals
   reference   - pointers to external resources
   session     - summary of what happened in a session
+
+Key naming:
+  Use stable, descriptive kebab-case slugs. If a fact updates or corrects an
+  earlier fact, reuse the same key you would have used before rather than
+  inventing a new near-identical slug (e.g. reuse "chunk-size-limit", do not
+  add "chunk-size-fix" then "chunk-size-limit-v2"). Prefer the plainest slug
+  that names the fact.
 
 Text to distill:
 "#;

@@ -168,6 +168,55 @@ impl Database {
         Ok(results)
     }
 
+    /// Find an active memory whose value is a near-duplicate of `value`.
+    ///
+    /// Gathers candidates via an FTS OR-query over the value's most distinctive
+    /// tokens, then scores each by token overlap. Returns the highest-overlap
+    /// match at or above `threshold` (0.0-1.0), if any. Used at distillation
+    /// time to supersede an existing fact instead of creating a drift-key.
+    pub fn memory_find_near_duplicate(
+        &self,
+        value: &str,
+        threshold: f64,
+    ) -> Result<Option<MemoryEntry>> {
+        let tokens = significant_tokens(value);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+
+        // Build an FTS OR-query from the most distinctive (longest) tokens.
+        // sanitize() joins with implicit AND, which is too strict here, so we
+        // construct the OR-query directly with quoted prefix terms.
+        let mut ranked: Vec<&String> = tokens.iter().collect();
+        ranked.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        let fts_query = ranked
+            .iter()
+            .take(8)
+            .map(|t| format!("\"{}\"*", t.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory
+                 WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
+                   AND status = 'active'
+                 ORDER BY updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let candidates: Vec<MemoryEntry> = stmt
+            .query_map(params![fts_query], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut best: Option<(f64, MemoryEntry)> = None;
+        for c in candidates {
+            let score = token_overlap(value, &c.value);
+            if score >= threshold && best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                best = Some((score, c));
+            }
+        }
+        Ok(best.map(|(_, m)| m))
+    }
+
     pub fn memory_delete(&self, key: &str) -> Result<bool> {
         let n = self
             .conn
@@ -322,6 +371,35 @@ impl Database {
     }
 }
 
+/// Significant lowercase tokens of a string: alphanumeric words of 3+ chars,
+/// minus common stopwords. Used for near-duplicate scoring.
+fn significant_tokens(s: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "have", "has",
+        "had", "not", "but", "its", "into", "when", "then", "than", "them", "they", "use", "used",
+        "uses", "via", "per", "can", "will", "should", "must", "which", "each", "any", "all",
+        "one", "now", "how", "why", "what", "who", "our", "out", "off", "get", "set",
+    ];
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Fraction of `proposed`'s significant tokens that also appear in `existing`
+/// (0.0-1.0). Asymmetric on purpose: a short new fact fully contained in a
+/// longer existing one scores 1.0 and is treated as a duplicate.
+pub fn token_overlap(proposed: &str, existing: &str) -> f64 {
+    let a = significant_tokens(proposed);
+    if a.is_empty() {
+        return 0.0;
+    }
+    let b = significant_tokens(existing);
+    let shared = a.iter().filter(|t| b.contains(*t)).count();
+    shared as f64 / a.len() as f64
+}
+
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let tags_json: Option<String> = row.get(4)?;
     let tags = tags_json
@@ -445,6 +523,59 @@ mod tests {
         assert!(db.memory_unlink_person("k", person_id).unwrap());
         assert!(db.memory_people("k").unwrap().is_empty());
         assert!(!db.memory_unlink_person("k", person_id).unwrap());
+    }
+
+    #[test]
+    fn test_token_overlap() {
+        // Same fact, different phrasing -> high overlap.
+        let a = "Chunk size for embeddings capped at 800 chars for AllMiniLM";
+        let b = "Embeddings chunk size limited to 800 chars because AllMiniLM";
+        assert!(
+            token_overlap(a, b) >= 0.6,
+            "overlap was {}",
+            token_overlap(a, b)
+        );
+
+        // Unrelated facts -> low overlap.
+        let c = "Stop hook reads Claude Code JSON from stdin";
+        assert!(token_overlap(a, c) < 0.3);
+
+        // Empty proposed -> zero.
+        assert_eq!(token_overlap("the and for", "anything here"), 0.0);
+    }
+
+    #[test]
+    fn test_find_near_duplicate() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set(
+            "chunk-size-fix",
+            "Embedding chunk size limited to 800 chars because AllMiniLM max is 256 tokens",
+            "project",
+            None,
+        )
+        .unwrap();
+        db.memory_set(
+            "hook-stdin",
+            "Stop hook reads Claude Code JSON from stdin to avoid broken pipe",
+            "project",
+            None,
+        )
+        .unwrap();
+
+        // A near-duplicate of the chunk-size fact should be found.
+        let dup = db
+            .memory_find_near_duplicate(
+                "Chunk size for embeddings capped at 800 chars for the AllMiniLM model",
+                0.6,
+            )
+            .unwrap();
+        assert_eq!(dup.map(|m| m.key), Some("chunk-size-fix".to_string()));
+
+        // An unrelated new fact should not match.
+        let none = db
+            .memory_find_near_duplicate("User prefers dark mode in the terminal editor", 0.6)
+            .unwrap();
+        assert!(none.is_none());
     }
 
     #[test]

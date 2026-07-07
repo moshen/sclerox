@@ -397,6 +397,54 @@ fn research_full_lifecycle() {
 }
 
 #[test]
+fn command_aliases_match_canonical() {
+    let e = Env::new();
+
+    // research create/show/close alias the canonical start/get/conclude
+    let id = e.run_get_id(&[
+        "research",
+        "create",
+        "--name",
+        "Alias probe",
+        "--slug",
+        "alias-probe",
+    ]);
+    let shown = e.run(&["research", "show", "alias-probe"]);
+    assert!(shown.contains("Alias probe"));
+    e.run(&[
+        "research",
+        "close",
+        &id.to_string(),
+        "--findings",
+        "done via alias",
+    ]);
+    let concluded = e.run(&["research", "get", &id.to_string()]);
+    assert!(concluded.contains("concluded"));
+
+    // memory show aliases get
+    e.run(&[
+        "memory",
+        "set",
+        "alias-key",
+        "alias value",
+        "--type",
+        "project",
+    ]);
+    let mem = e.run(&["memory", "show", "alias-key"]);
+    assert!(mem.contains("alias value"));
+
+    // people show aliases get
+    let pid = e.run_get_id(&["people", "add", "--name", "Alias Person"]);
+    let person = e.run(&["people", "show", &pid.to_string()]);
+    assert!(person.contains("Alias Person"));
+
+    // todo show aliases get
+    let tid = e.run_get_id(&["todo", "add", "--title", "Alias todo"]);
+    let todo = e.run(&["todo", "show", &tid.to_string()]);
+    assert!(todo.contains("Alias todo"));
+}
+
+#[test]
 fn research_search_plan_and_findings() {
     let e = Env::new();
     let id = e.run_get_id(&[

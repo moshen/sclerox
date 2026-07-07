@@ -34,6 +34,7 @@ pub enum TodoCommand {
         watch: bool,
     },
     /// Get a todo by ID
+    #[command(alias = "show")]
     Get { id: i64 },
     /// List todos
     List {

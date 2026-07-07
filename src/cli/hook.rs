@@ -106,11 +106,13 @@ fn run_start(db: &Database) -> Result<()> {
     // Index the repo if we're in one (silent on failure).
     // Walk up from cwd to find the git root so subdirectory sessions index the whole repo.
     let git_root = find_git_root(&cwd);
+    let mut repo_name: Option<String> = None;
     if git_root.join(".git").exists() {
-        let description = git_root
+        repo_name = git_root
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| format!("{n} repo"));
+            .map(str::to_string);
+        let description = repo_name.as_ref().map(|n| format!("{n} repo"));
         let mut indexer = crate::index::RepoIndexer::new(None);
         let _ = indexer.index_repo(db, &git_root, description.as_deref());
     }
@@ -118,7 +120,7 @@ fn run_start(db: &Database) -> Result<()> {
     // Emit compact session context for Claude Code to inject (layer-1 index only).
     // Hard-capped at ~750 tokens so the agent knows what's available without
     // loading full content. It then fetches detail via `ol memory get`, etc.
-    if let Ok(ctx) = build_session_context(db) {
+    if let Ok(ctx) = build_session_context(db, repo_name.as_deref()) {
         if !ctx.is_empty() {
             let payload = serde_json::json!({
                 "hookSpecificOutput": {
@@ -139,7 +141,11 @@ const SESSION_CONTEXT_MAX_CHARS: usize = 3000;
 /// Build a compact index of what's in the knowledge base so the agent knows
 /// what's available without loading every memory. The agent fetches detail
 /// on demand with `ol memory get`, `ol todo get`, etc.
-fn build_session_context(db: &Database) -> Result<String> {
+/// Number of full-value memories to surface at session start. Reads, not just
+/// keys: keys alone never earn a follow-up `ol memory get`.
+const RELEVANT_MEMORY_COUNT: usize = 5;
+
+fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<String> {
     let mut out = String::new();
     out.push_str("## ol context (run `ol memory get <key>` etc. for full content)\n\n");
 
@@ -174,7 +180,23 @@ fn build_session_context(db: &Database) -> Result<String> {
         }
     }
 
-    // 3. Recent session memories (last 3) — chronological brief.
+    // 3. Relevant knowledge — FULL values of the top memories, not just keys.
+    // Priority: feedback (user corrections) > project, repo-matched first, then
+    // most-recent as fallback. This is the section that actually gets read.
+    let relevant = relevant_memories(db, repo_name, RELEVANT_MEMORY_COUNT);
+    let shown_keys: std::collections::HashSet<String> =
+        relevant.iter().map(|m| m.key.clone()).collect();
+    if !relevant.is_empty() {
+        let mut section = String::from("### Relevant knowledge\n");
+        for m in &relevant {
+            let val = truncate_for_index(&m.value, 200);
+            section.push_str(&format!("- [{}] {}: {}\n", m.memory_type, m.key, val));
+        }
+        section.push('\n');
+        push_if_fits(&mut out, &section, budget);
+    }
+
+    // 4. Recent session memories (last 3) — chronological brief.
     if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
         if !sessions.is_empty() {
             let mut section = String::from("### Recent sessions\n");
@@ -187,17 +209,34 @@ fn build_session_context(db: &Database) -> Result<String> {
         }
     }
 
-    // 4. Other active memory keys (project/feedback/general) — keys only, no content.
-    // The agent fetches full content via `ol memory get <key>` when relevant.
+    // 5. Remaining active memory keys (excluding session + already-shown) — a
+    // single compact line of keys the agent can `ol memory get` on demand.
     if let Ok(all) = db.memory_list(None, Some("active")) {
-        let others: Vec<_> = all.iter().filter(|m| m.memory_type != "session").collect();
+        let others: Vec<&str> = all
+            .iter()
+            .filter(|m| m.memory_type != "session" && !shown_keys.contains(&m.key))
+            .map(|m| m.key.as_str())
+            .take(30)
+            .collect();
         if !others.is_empty() {
-            let mut section = format!("### Memory keys ({})\n", others.len());
-            for m in others.iter().take(20) {
-                let hint = truncate_for_index(&m.value, 60);
-                section.push_str(&format!("- {} — {}\n", m.key, hint));
-            }
-            section.push('\n');
+            let section = format!(
+                "### More memory keys ({})\n{}\n\n",
+                others.len(),
+                others.join(", ")
+            );
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
+    // 6. Code index reminder — every session should know `ol code` exists and is
+    // the preferred symbol search across indexed repos.
+    if let Ok(repos) = db.repo_list() {
+        if !repos.is_empty() {
+            let section = format!(
+                "### Code index\n{} repo(s) indexed. Prefer `ol code search <symbol>` \
+                 / `ol code refs <symbol>` over Grep for symbol lookup.\n\n",
+                repos.len()
+            );
             push_if_fits(&mut out, &section, budget);
         }
     }
@@ -209,6 +248,90 @@ fn build_session_context(db: &Database) -> Result<String> {
     }
 
     Ok(out)
+}
+
+/// Slots reserved for feedback (user corrections) so they always surface, even
+/// when repo-matched project facts would otherwise fill every slot.
+const FEEDBACK_RESERVED: usize = 1;
+
+/// Collect up to `limit` distinct active memories to surface with full values.
+/// A feedback entry is guaranteed a slot when any feedback exists (user
+/// corrections matter most). Remaining slots go to repo-name matches, then
+/// most-recent feedback, then most-recent project — deduplicated by key.
+fn relevant_memories(
+    db: &Database,
+    repo_name: Option<&str>,
+    limit: usize,
+) -> Vec<crate::db::memory::MemoryEntry> {
+    let mut picked: Vec<crate::db::memory::MemoryEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let add = |m: crate::db::memory::MemoryEntry,
+               picked: &mut Vec<_>,
+               seen: &mut std::collections::HashSet<String>| {
+        if picked.len() < limit && seen.insert(m.key.clone()) {
+            picked.push(m);
+        }
+    };
+
+    // Repo-matched feedback, ranked by recency, for both the repo name and its
+    // whitespace-split form. Collected up front so the reserved slot prefers a
+    // repo-relevant correction over a generic one.
+    let repo_feedback: Vec<crate::db::memory::MemoryEntry> = repo_name
+        .into_iter()
+        .flat_map(|name| [name.to_string(), name.replace(['-', '_'], " ")])
+        .filter_map(|token| db.memory_search(&token).ok())
+        .flatten()
+        .filter(|m| m.memory_type == "feedback")
+        .collect();
+
+    // Reserved feedback slot(s): repo-matched feedback first, else most-recent.
+    for m in repo_feedback.iter().cloned() {
+        if picked.len() >= FEEDBACK_RESERVED {
+            break;
+        }
+        add(m, &mut picked, &mut seen);
+    }
+    if picked.len() < FEEDBACK_RESERVED {
+        if let Ok(list) = db.memory_list(Some("feedback"), Some("active")) {
+            for m in list {
+                if picked.len() >= FEEDBACK_RESERVED {
+                    break;
+                }
+                add(m, &mut picked, &mut seen);
+            }
+        }
+    }
+
+    // Tier 1: repo-name matches. Split on non-alphanumerics so "operating-layer-cli"
+    // also matches memories phrased with the individual words.
+    if let Some(name) = repo_name {
+        for token in [name.to_string(), name.replace(['-', '_'], " ")] {
+            if let Ok(hits) = db.memory_search(&token) {
+                let mut ordered = hits;
+                ordered.sort_by_key(|m| m.memory_type != "feedback"); // feedback first
+                for m in ordered {
+                    if m.memory_type == "feedback" || m.memory_type == "project" {
+                        add(m, &mut picked, &mut seen);
+                    }
+                }
+            }
+        }
+    }
+
+    // Tier 2/3: most-recent feedback, then most-recent project.
+    for ty in ["feedback", "project"] {
+        if picked.len() >= limit {
+            break;
+        }
+        if let Ok(list) = db.memory_list(Some(ty), Some("active")) {
+            for m in list {
+                add(m, &mut picked, &mut seen);
+            }
+        }
+    }
+
+    picked
 }
 
 /// Append `section` to `out` only if doing so keeps `out` under `budget` chars.
@@ -566,10 +689,7 @@ fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path:
 
     // Fast path: try the hash derived from cwd first.
     let hash = path_to_project_hash(cwd);
-    let candidate = home
-        .join(".claude/projects")
-        .join(&hash)
-        .join(&filename);
+    let candidate = home.join(".claude/projects").join(&hash).join(&filename);
     if candidate.exists() {
         return Some(candidate);
     }
@@ -609,8 +729,17 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Overlap fraction (0.0-1.0) at or above which a distilled memory is treated
+/// as a near-duplicate of an existing one and supersedes it instead of adding a
+/// new drift-key. Conservative: a false supersede is worse than a duplicate.
+const DEDUP_THRESHOLD: f64 = 0.7;
+
 /// Distill a full list of turns in chunks, deduplicating by key.
 /// Returns total number of memories stored.
+///
+/// Dedup happens at two levels: exact-key collisions upsert (via
+/// `memory_set_full`'s ON CONFLICT), and near-duplicate values supersede the
+/// existing entry so re-learning a fact under a new slug doesn't create drift.
 fn distill_chunked(
     db: &Database,
     bin: &str,
@@ -626,10 +755,23 @@ fn distill_chunked(
             continue;
         };
         for m in &memories {
-            if seen_keys.insert(m.key.clone()) {
-                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
-                stored += 1;
+            if !seen_keys.insert(m.key.clone()) {
+                continue;
             }
+
+            // If this value closely matches an existing active memory under a
+            // different key, supersede that one rather than adding a near-dup.
+            let near_dup = db
+                .memory_find_near_duplicate(&m.value, DEDUP_THRESHOLD)
+                .unwrap_or(None)
+                .filter(|existing| existing.key != m.key);
+
+            if let Some(existing) = near_dup {
+                let _ = db.memory_supersede(&existing.key, &m.key, &m.value, &m.memory_type);
+            } else {
+                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+            }
+            stored += 1;
         }
     }
 
@@ -874,7 +1016,7 @@ mod tests {
                 None,
             );
         }
-        let ctx = build_session_context(&db).unwrap();
+        let ctx = build_session_context(&db, None).unwrap();
         assert!(
             ctx.len() <= SESSION_CONTEXT_MAX_CHARS,
             "context exceeded budget: {} > {}",
@@ -886,8 +1028,55 @@ mod tests {
     #[test]
     fn test_build_session_context_empty_db_has_header() {
         let db = Database::open_in_memory().unwrap();
-        let ctx = build_session_context(&db).unwrap();
+        let ctx = build_session_context(&db, None).unwrap();
         assert!(ctx.contains("ol context"));
+    }
+
+    #[test]
+    fn test_build_session_context_injects_full_memory_values() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set(
+            "clippy-as-errors",
+            "Fix ALL clippy warnings immediately; zero warnings is the bar",
+            "feedback",
+            None,
+        )
+        .unwrap();
+        let ctx = build_session_context(&db, None).unwrap();
+        // Full value present, not just the key.
+        assert!(ctx.contains("Relevant knowledge"));
+        assert!(ctx.contains("zero warnings is the bar"));
+        assert!(ctx.len() <= SESSION_CONTEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn test_relevant_memories_guarantees_feedback_slot() {
+        let db = Database::open_in_memory().unwrap();
+        // Fill many repo-matched project memories that would otherwise take all slots.
+        for i in 0..10 {
+            db.memory_set(
+                &format!("myrepo-project-{i}"),
+                &format!("myrepo project fact number {i}"),
+                "project",
+                None,
+            )
+            .unwrap();
+        }
+        // A single feedback memory that does NOT mention the repo.
+        db.memory_set(
+            "prefer-tabs",
+            "Always use tabs, never spaces, in this codebase",
+            "feedback",
+            None,
+        )
+        .unwrap();
+
+        let picked = relevant_memories(&db, Some("myrepo"), RELEVANT_MEMORY_COUNT);
+        assert!(
+            picked.iter().any(|m| m.memory_type == "feedback"),
+            "feedback slot not guaranteed: {:?}",
+            picked.iter().map(|m| &m.key).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -905,7 +1094,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let ctx = build_session_context(&db).unwrap();
+        let ctx = build_session_context(&db, None).unwrap();
         assert!(ctx.contains("Open todos"));
         assert!(ctx.contains("fix login bug"));
     }

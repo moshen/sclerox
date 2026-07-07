@@ -9,7 +9,35 @@ Use when the user asks about people, meetings, projects, todos, past decisions, 
 - Past decision referenced: search memory and investigations
 - After learning something: save to memory for future sessions
 - When a memory is wrong or outdated: mark it stale or supersede it
-- Looking for code: search symbols across all indexed repos
+- Looking for code: use `ol code` (see below) BEFORE Grep/Glob
+
+## Code search — prefer this over Grep/Glob
+
+When searching for symbols, functions, types, or callers in ANY indexed repo,
+use `ol code` BEFORE reaching for Grep or Glob. It is pre-indexed (no directory
+walk), cross-repo (finds callers in OTHER repos Grep can't see), structural
+(matches symbols, not raw strings), and call-graph aware. Fall back to Grep
+only when the repo is not indexed (`ol repo list`) or the query is free text
+rather than a symbol.
+
+```bash
+# "Where is X defined?"                    → find the symbol
+ol code search "X"
+ol code search --repo "<name>" "X"         # scope to one repo
+# "What calls X? / what breaks if I change X?" → impact analysis across repos
+ol code refs X
+# "What does X depend on?"                 → outgoing calls
+ol code calls X
+# "Trace the flow from X"                  → BFS call graph
+ol code graph X --depth 4
+
+# Compose with ast-grep for structural matching: ol finds the files, ast-grep
+# matches the pattern. NOTE the flag is --output json (not --format).
+ol code search "<symbol>" --output json \
+  | jq -r '.[] | select(.type=="Symbol") | "\(.repo_path)/\(.file_path)"' \
+  | sort -u \
+  | xargs ast-grep --pattern '<pattern>' --lang <lang>
+```
 
 ## Commands
 
@@ -60,12 +88,12 @@ ol todo people add|remove|list <todo_id> <person_id>
 ol todo projects add|remove|list <todo_id> <project_id>
 
 # Research / Investigations
-# COMMAND NAMES: start (not create/add/new), get (not show), list --status all (not --all)
-# --name is REQUIRED as a flag, never positional
+# --name is REQUIRED as a flag, never positional. Use --status all (not --all).
+# Aliases: start=create/add/new, get=show, conclude=close/finish.
 ol research list                           # open investigations (default)
 ol research list --status all              # all statuses
 ol research start --name "<name>" --slug "<slug>" [--plan "<scope>"]
-ol research get <id-or-slug>               # NOT 'show' — get
+ol research get <id-or-slug>
 ol research add-source <id> --url "<url>" [--label "<label>"] [--notes "<notes>"]
 ol research sources <id>
 ol research update <id> [--plan "<text>"] [--findings "<text>"]
@@ -91,31 +119,17 @@ ol repo index --no-embed [path]      # index without generating embeddings
 ol repo show [path] [--symbols "<query>"]
 ol repo sync                         # heal registry: remove stale, reindex missing
 
-# Code search and navigation (call graph across indexed repos)
-ol code search "<query>"                        # find symbols by name
-ol code search --repo "<name>" "<query>"        # scoped to one repo
-ol code calls <symbol>                          # what does this symbol call?
-ol code calls --repo "<name>" <symbol>          # scoped
-ol code refs <symbol>                           # what calls/uses this symbol?
-ol code refs --repo "<name>" <symbol>           # scoped
-ol code graph <symbol>                          # BFS call graph (depth 3)
-ol code graph --depth 5 <symbol>               # deeper traversal
-
-# Advanced code search patterns
-# Find files containing a symbol then pipe to ast-grep for structural matching:
-ol code search "<symbol>" --format json \
-  | jq -r '.[] | select(.type=="Symbol") | "\(.repo_path)/\(.file_path)"' \
-  | sort -u \
-  | xargs ast-grep --pattern '<pattern>' --lang <lang>
+# Code search and navigation — see the "Code search" section above (prefer over Grep)
+ol code search "<query>"                         # find symbols by name
+ol code refs <symbol>                            # what calls/uses this symbol?
+ol code calls <symbol>                           # what does this symbol call?
+ol code graph <symbol> --depth 4                 # BFS call graph
 ```
 
 ## Patterns
 
 **Before any task:** `ol search "<topic>"`
-**Finding code:** `ol code search "<function or type name>"` or `ol code search --repo <name> "<query>"`
-**Understanding a function's dependencies:** `ol code calls <symbol_name>`
-**Finding what uses a function (impact of changes):** `ol code refs <symbol_name>`
-**Exploring call chains:** `ol code graph <symbol_name> --depth 4`
+**Finding code (prefer over Grep):** `ol code search "<symbol>"` / `ol code refs <symbol>`
 **After a decision:** `ol memory set "<key>" "<decision>" --type project`
 **When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
 **When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`

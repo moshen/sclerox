@@ -11,6 +11,7 @@ const CHUNK_OVERLAP: usize = 200;
 #[derive(Subcommand)]
 pub enum ResearchCommand {
     /// Start a new investigation
+    #[command(alias = "create", alias = "add", alias = "new")]
     Start {
         #[arg(long)]
         name: String,
@@ -22,6 +23,7 @@ pub enum ResearchCommand {
         plan: Option<String>,
     },
     /// Get an investigation by ID or slug
+    #[command(alias = "show")]
     Get {
         /// ID or slug
         id_or_slug: String,
@@ -47,6 +49,7 @@ pub enum ResearchCommand {
     /// Reopen a concluded investigation
     Reopen { id: i64 },
     /// Conclude an investigation with final findings
+    #[command(alias = "close", alias = "finish")]
     Conclude {
         id: i64,
         /// Final findings (required - every conclusion must be recorded)

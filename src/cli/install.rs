@@ -573,6 +573,10 @@ ol search \"<topic>\"           # all tables\n\
 ol todo list                  # open todos\n\
 ol research list              # open investigations\n\
 ol meeting search \"<topic>\"   # past decisions\n\
+```\n\n\
+Finding code: prefer `ol code` over Grep/Glob for symbols in indexed repos:\n\n```bash\n\
+ol code search \"<symbol>\"      # where is it defined (cross-repo, pre-indexed)\n\
+ol code refs <symbol>         # what calls it (impact of a change)\n\
 ```\n\nRecord outcomes:\n\n```bash\n\
 ol todo done <id> --note \"<resolution>\"\n\
 ol research conclude <id> --findings \"<findings>\"\n\

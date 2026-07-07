@@ -26,6 +26,7 @@ pub enum PeopleCommand {
         identifiers: Vec<String>,
     },
     /// Get a person by ID
+    #[command(alias = "show")]
     Get { id: i64 },
     /// List all people
     List,
