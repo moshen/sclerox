@@ -66,12 +66,25 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         .ok()
         .and_then(|mut emb| emb.embed_one(query).ok());
 
-    for m in db.memory_search(query)? {
+    let memory_fts = db.memory_search(query)?;
+    let memory_fts_ids: std::collections::HashSet<i64> = memory_fts.iter().map(|m| m.id).collect();
+    for m in memory_fts {
         results.push(SearchResult::Memory {
             id: m.id,
             key: m.key,
             snippet: truncate(&m.value, 120),
         });
+    }
+    if let Some(ref qe) = query_emb {
+        for r in db.memory_similar(qe, 5).unwrap_or_default() {
+            if !memory_fts_ids.contains(&r.entry.id) && r.score >= 0.45 {
+                results.push(SearchResult::Memory {
+                    id: r.entry.id,
+                    key: r.entry.key,
+                    snippet: truncate(&r.entry.value, 120),
+                });
+            }
+        }
     }
 
     for p in db.people_search(query)? {

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::db::Database;
+use crate::embed::Embedder;
 use crate::output::{print_output, OutputFormat};
 
 #[derive(Subcommand)]
@@ -15,6 +16,9 @@ pub enum MemoryCommand {
         /// Comma-separated tags
         #[arg(long)]
         tags: Option<String>,
+        /// Skip computing the semantic embedding for this entry
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Get a memory entry by key
     #[command(alias = "show")]
@@ -52,6 +56,12 @@ pub enum MemoryCommand {
         new_value: String,
         #[arg(long, default_value = "project", value_parser = ["general","user","feedback","project","reference","session"])]
         r#type: String,
+    },
+    /// Backfill semantic embeddings for memories that don't have one yet
+    Reembed {
+        /// Re-embed ALL active memories, not just those missing an embedding
+        #[arg(long)]
+        force: bool,
     },
     /// Mark a memory as reviewed (you've confirmed it's still accurate)
     Review { key: String },
@@ -130,12 +140,18 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             value,
             r#type,
             tags,
+            no_embed,
         } => {
             let tag_list: Option<Vec<String>> = tags
                 .as_deref()
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
             warn_if_long(&key, &value);
             db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
+            if !no_embed {
+                if let Ok(mut embedder) = Embedder::new() {
+                    embed_and_store(db, &mut embedder, &key, &value);
+                }
+            }
             println!("Set: {key}");
         }
 
@@ -179,11 +195,25 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         }
 
         MemoryCommand::Search { query, all } => {
-            let results = if all {
+            let mut results = if all {
                 db.memory_search_filtered(&query, "all")?
             } else {
                 db.memory_search(&query)?
             };
+            // Add a semantic tier for active search: embeddings live only on
+            // active rows, so this is skipped for --all (which includes stale).
+            if !all {
+                let seen: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
+                if let Ok(mut embedder) = Embedder::new() {
+                    if let Ok(qe) = embedder.embed_one(&query) {
+                        for r in db.memory_similar(&qe, 5).unwrap_or_default() {
+                            if !seen.contains(&r.entry.id) && r.score >= 0.45 {
+                                results.push(r.entry);
+                            }
+                        }
+                    }
+                }
+            }
             print_output(format, &results, || {
                 if results.is_empty() {
                     println!("No matches for: {query}");
@@ -220,10 +250,33 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         } => {
             warn_if_long(&new_key, &new_value);
             if db.memory_supersede(&old_key, &new_key, &new_value, &r#type)? {
+                if let Ok(mut embedder) = Embedder::new() {
+                    embed_and_store(db, &mut embedder, &new_key, &new_value);
+                }
                 println!("Superseded '{old_key}' → '{new_key}'");
             } else {
                 println!("Not found: {old_key}");
             }
+        }
+
+        MemoryCommand::Reembed { force } => {
+            let targets = if force {
+                db.memory_list(None, Some("active"))?
+            } else {
+                db.memory_needing_embedding()?
+            };
+            if targets.is_empty() {
+                println!("All active memories already embedded.");
+                return Ok(());
+            }
+            let mut embedder = Embedder::new()?;
+            let mut done = 0usize;
+            for m in &targets {
+                if embed_and_store(db, &mut embedder, &m.key, &m.value) {
+                    done += 1;
+                }
+            }
+            println!("Embedded {done} of {} memories.", targets.len());
         }
 
         MemoryCommand::Review { key } => {
@@ -300,6 +353,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             if dry_run {
                 println!("\n{} memories (dry-run: nothing written)", memories.len());
             } else {
+                let mut embedder = Embedder::new().ok();
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
                     if let Some(ref old_key) = existing_key {
@@ -307,6 +361,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         db.memory_supersede(old_key, &m.key, &m.value, &m.memory_type)?;
                     } else {
                         db.memory_set_full(&m.key, &m.value, &m.memory_type, None, "distilled")?;
+                    }
+                    if let Some(e) = embedder.as_mut() {
+                        embed_and_store(db, e, &m.key, &m.value);
                     }
                 }
                 println!("\nSaved {} memories.", memories.len());
@@ -376,6 +433,23 @@ fn warn_if_long(key: &str, value: &str) {
              and crowd session context.",
             crate::db::memory::MAX_MEMORY_VALUE_CHARS
         );
+    }
+}
+
+/// Embed a memory value and store the vector on its row. Best-effort: the
+/// value is truncated to the model window first, and any embedding failure is
+/// swallowed so a memory write is never blocked by embedding. Returns whether a
+/// vector was stored. Shared by the CLI write paths and the background hook.
+pub(crate) fn embed_and_store(
+    db: &Database,
+    embedder: &mut Embedder,
+    key: &str,
+    value: &str,
+) -> bool {
+    let capped: String = value.chars().take(crate::index::MAX_EMBED_CHARS).collect();
+    match embedder.embed_one(&capped) {
+        Ok(emb) => db.memory_set_embedding(key, &emb).unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -506,6 +580,7 @@ fn import_memories(
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
+    let mut embedder = if dry_run { None } else { Embedder::new().ok() };
 
     for path in &files {
         let Some((key, value, memory_type)) = parse_memory_file(path) else {
@@ -523,6 +598,9 @@ fn import_memories(
             }
             warn_if_long(&key, &value);
             db.memory_set_full(&key, &value, &memory_type, None, "imported")?;
+            if let Some(e) = embedder.as_mut() {
+                embed_and_store(db, e, &key, &value);
+            }
             imported += 1;
         }
     }

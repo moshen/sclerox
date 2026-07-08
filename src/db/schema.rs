@@ -404,6 +404,13 @@ CREATE TABLE IF NOT EXISTS todo_chunks (
 );
 ";
 
+/// Migration v10: add embedding to memory for semantic search + dedup.
+/// Memory values are single short statements (1-3 sentences), so one vector
+/// per row is stored directly on the table rather than in a chunks table.
+pub const MIGRATION_V10: &str = "
+ALTER TABLE memory ADD COLUMN embedding BLOB;
+";
+
 /// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
 pub const MIGRATION_V8: &str = "
 DELETE FROM identifier_types WHERE name = 'jira';

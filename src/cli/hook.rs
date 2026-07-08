@@ -734,6 +734,11 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// new drift-key. Conservative: a false supersede is worse than a duplicate.
 const DEDUP_THRESHOLD: f64 = 0.7;
 
+/// Cosine threshold for semantic dedup (used when an embedding is available).
+/// Higher than the lexical bar: embeddings catch paraphrase, so require strong
+/// agreement before superseding.
+const DEDUP_COSINE_THRESHOLD: f32 = 0.85;
+
 /// Distill a full list of turns in chunks, deduplicating by key.
 /// Returns total number of memories stored.
 ///
@@ -749,6 +754,9 @@ fn distill_chunked(
 ) -> Result<usize> {
     let mut stored = 0usize;
     let mut seen_keys = std::collections::HashSet::new();
+    // Best-effort embedder, reused across all chunks. None if the model is
+    // unavailable — dedup then falls back to lexical and no vectors are stored.
+    let mut embedder = crate::embed::Embedder::new().ok();
 
     for chunk in chunk_turns(turns, CHUNK_CHARS) {
         let Ok(memories) = crate::cli::memory::distill_with_ai_pub(bin, model, &chunk) else {
@@ -759,17 +767,35 @@ fn distill_chunked(
                 continue;
             }
 
+            // Embed the value once (if possible); reused for dedup and storage.
+            let capped: String = m
+                .value
+                .chars()
+                .take(crate::index::MAX_EMBED_CHARS)
+                .collect();
+            let emb = embedder.as_mut().and_then(|e| e.embed_one(&capped).ok());
+
             // If this value closely matches an existing active memory under a
             // different key, supersede that one rather than adding a near-dup.
-            let near_dup = db
-                .memory_find_near_duplicate(&m.value, DEDUP_THRESHOLD)
-                .unwrap_or(None)
-                .filter(|existing| existing.key != m.key);
+            // Prefer semantic (cosine) matching; fall back to lexical overlap.
+            let near_dup = match &emb {
+                Some(v) => db
+                    .memory_find_near_duplicate_semantic(v, DEDUP_COSINE_THRESHOLD)
+                    .unwrap_or(None),
+                None => db
+                    .memory_find_near_duplicate(&m.value, DEDUP_THRESHOLD)
+                    .unwrap_or(None),
+            }
+            .filter(|existing| existing.key != m.key);
 
             if let Some(existing) = near_dup {
                 let _ = db.memory_supersede(&existing.key, &m.key, &m.value, &m.memory_type);
             } else {
                 let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+            }
+            // Persist the embedding for the (possibly new) key.
+            if let Some(v) = &emb {
+                let _ = db.memory_set_embedding(&m.key, v);
             }
             stored += 1;
         }

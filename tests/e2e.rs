@@ -105,6 +105,21 @@ fn memory_set_warns_but_stores_long_value() {
 }
 
 #[test]
+fn memory_reembed_backfills_missing() {
+    let e = Env::new();
+    // Stored without an embedding via --no-embed.
+    e.run(&["memory", "set", "k1", "some value", "--no-embed"]);
+
+    // Backfill embeds exactly the one missing entry.
+    let out = e.run(&["memory", "reembed"]);
+    assert!(out.contains("Embedded 1"), "got: {out}");
+
+    // Nothing left to embed on a second pass (set auto-embeds by default too).
+    let out2 = e.run(&["memory", "reembed"]);
+    assert!(out2.contains("already embedded"), "got: {out2}");
+}
+
+#[test]
 fn memory_list_filters_by_type() {
     let e = Env::new();
     e.run(&["memory", "set", "a", "val", "--type", "user"]);

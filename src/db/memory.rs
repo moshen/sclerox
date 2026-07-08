@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{fts, Database};
+use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -24,6 +24,13 @@ pub struct MemoryEntry {
 
 const MEMORY_COLS: &str =
     "id, key, value, memory_type, tags, created_at, updated_at, status, source, superseded_by, reviewed_at";
+
+/// An active memory ranked by cosine similarity to a query embedding.
+#[derive(Debug, Clone)]
+pub struct SimilarMemory {
+    pub entry: MemoryEntry,
+    pub score: f32,
+}
 
 /// Recommended maximum length (in chars) for a memory value.
 ///
@@ -225,6 +232,78 @@ impl Database {
             }
         }
         Ok(best.map(|(_, m)| m))
+    }
+
+    /// Store (or replace) the embedding vector for a memory. Returns false if
+    /// the key doesn't exist.
+    pub fn memory_set_embedding(&self, key: &str, embedding: &[f32]) -> Result<bool> {
+        let bytes = embedding_to_bytes(embedding);
+        let n = self.conn.execute(
+            "UPDATE memory SET embedding = ?1 WHERE key = ?2",
+            params![bytes, key],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Active memories with no embedding yet — the backfill work list.
+    pub fn memory_needing_embedding(&self) -> Result<Vec<MemoryEntry>> {
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory
+             WHERE embedding IS NULL AND status = 'active'
+             ORDER BY updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Active memories ranked by cosine similarity to `query_embedding`.
+    /// Only rows with a stored embedding participate.
+    pub fn memory_similar(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SimilarMemory>> {
+        let sql = format!(
+            "SELECT {MEMORY_COLS}, embedding FROM memory
+             WHERE embedding IS NOT NULL AND status = 'active'"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut scored: Vec<SimilarMemory> = stmt
+            .query_map([], |row| {
+                let entry = row_to_memory(row)?;
+                let emb_bytes: Vec<u8> = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
+                Ok((entry, emb_bytes))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(entry, emb_bytes)| {
+                let emb = bytes_to_embedding(&emb_bytes);
+                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
+                SimilarMemory { entry, score }
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    /// Semantic counterpart to `memory_find_near_duplicate`: returns the single
+    /// most-similar active memory if its cosine score is at or above `threshold`.
+    pub fn memory_find_near_duplicate_semantic(
+        &self,
+        query_embedding: &[f32],
+        threshold: f32,
+    ) -> Result<Option<MemoryEntry>> {
+        Ok(self
+            .memory_similar(query_embedding, 1)?
+            .into_iter()
+            .next()
+            .filter(|sm| sm.score >= threshold)
+            .map(|sm| sm.entry))
     }
 
     pub fn memory_delete(&self, key: &str) -> Result<bool> {
@@ -586,6 +665,42 @@ mod tests {
             .memory_find_near_duplicate("User prefers dark mode in the terminal editor", 0.6)
             .unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_memory_similar_and_embedding_backfill() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("a", "alpha", "project", None).unwrap();
+        db.memory_set("b", "beta", "project", None).unwrap();
+        db.memory_set("c", "gamma", "project", None).unwrap();
+
+        // Before embedding: all three need backfill.
+        assert_eq!(db.memory_needing_embedding().unwrap().len(), 3);
+
+        // Mock embeddings (unit vectors); 'c' is close to 'a', 'b' is orthogonal.
+        db.memory_set_embedding("a", &[1.0, 0.0, 0.0]).unwrap();
+        db.memory_set_embedding("b", &[0.0, 1.0, 0.0]).unwrap();
+        db.memory_set_embedding("c", &[0.9, 0.1, 0.0]).unwrap();
+        assert!(db.memory_needing_embedding().unwrap().is_empty());
+
+        // Ranking: exact match first, then the near neighbour.
+        let res = db.memory_similar(&[1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].entry.key, "a");
+        assert_eq!(res[1].entry.key, "c");
+
+        // Semantic near-dup honours the threshold.
+        let hit = db
+            .memory_find_near_duplicate_semantic(&[1.0, 0.0, 0.0], 0.95)
+            .unwrap();
+        assert_eq!(hit.map(|m| m.key), Some("a".to_string()));
+        let miss = db
+            .memory_find_near_duplicate_semantic(&[0.0, 0.0, 1.0], 0.95)
+            .unwrap();
+        assert!(miss.is_none());
+
+        // Setting a key that doesn't exist returns false.
+        assert!(!db.memory_set_embedding("nope", &[1.0, 0.0, 0.0]).unwrap());
     }
 
     #[test]
