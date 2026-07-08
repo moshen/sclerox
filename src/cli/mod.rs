@@ -1,5 +1,6 @@
 pub mod code;
 pub mod completions;
+pub mod config_cmd;
 pub mod db;
 pub mod format;
 pub mod hook;
@@ -16,7 +17,7 @@ pub mod todos;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::config::Config;
+use crate::config::settings;
 use crate::db::Database;
 use crate::output::OutputFormat;
 
@@ -78,6 +79,10 @@ pub enum Commands {
     #[command(subcommand)]
     Code(code::CodeCommand),
 
+    /// View and manage ol configuration (~/.ol/config.toml)
+    #[command(subcommand)]
+    Config(config_cmd::ConfigCommand),
+
     /// Database utilities: schema migration status, plaintext export
     #[command(subcommand)]
     Db(db::DbCommand),
@@ -106,14 +111,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => install::run_install(args),
         Commands::Uninstall(args) => install::run_uninstall(args),
         Commands::Completions(args) => completions::run(args),
+        Commands::Config(cmd) => config_cmd::run(cmd, format),
         Commands::Hook(cmd) => {
-            let config = Config::from_env();
-            let db = Database::open(&config.db_path)?;
+            let db = Database::open(&settings().db_path)?;
             hook::run(&db, cmd)
         }
         cmd => {
-            let config = Config::from_env();
-            let db = Database::open(&config.db_path)?;
+            let db = Database::open(&settings().db_path)?;
             // Run any pending embedding backfills once, right after the DB opens.
             // This is the Rust-level equivalent of what a schema migration can't do
             // (migrations are pure SQL; fastembed is Rust). Runs once after upgrade,
@@ -133,6 +137,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Install(_)
                 | Commands::Uninstall(_)
                 | Commands::Completions(_)
+                | Commands::Config(_)
                 | Commands::Hook(_) => unreachable!(),
             }
         }

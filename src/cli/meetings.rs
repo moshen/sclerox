@@ -1,14 +1,9 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::config::settings;
 use crate::db::Database;
 use crate::embed::{chunk_text, Embedder};
-
-// AllMiniLML6V2 has a 256-token context window (~4 chars/token = ~1024 chars).
-// 800 chars gives ~200 tokens with a safety margin for subword tokenization.
-// Overlap of 200 chars (~50 words) keeps context across chunk boundaries.
-const CHUNK_SIZE: usize = 800;
-const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]
 pub enum MeetingCommand {
@@ -95,7 +90,9 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             let text_to_chunk = transcript.as_deref().or(notes.as_deref()).unwrap_or("");
 
             if !text_to_chunk.is_empty() {
-                let raw_chunks = chunk_text(text_to_chunk, CHUNK_SIZE, CHUNK_OVERLAP);
+                let emb_cfg = &settings().embed;
+                let raw_chunks =
+                    chunk_text(text_to_chunk, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
                 let chunks: Vec<(String, Option<Vec<f32>>)> = if !no_embed {
                     let mut embedder = Embedder::new()?;
                     let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();

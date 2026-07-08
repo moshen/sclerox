@@ -58,7 +58,16 @@ pub enum SearchResult {
     },
 }
 
-pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
+/// Search every table for `query`. FTS/LIKE always runs; semantic (cosine)
+/// tiers run when an embedder is available, keeping hits at/above
+/// `semantic_threshold` and capping each entity type at `semantic_limit`.
+/// Both tunables are passed in so this library function stays config-free.
+pub fn global_search(
+    db: &Database,
+    query: &str,
+    semantic_threshold: f32,
+    semantic_limit: usize,
+) -> Result<Vec<SearchResult>> {
     let mut results = Vec::new();
 
     // Initialise embedder once; embed query once. Both are None if unavailable.
@@ -76,8 +85,8 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.memory_similar(qe, 5).unwrap_or_default() {
-            if !memory_fts_ids.contains(&r.entry.id) && r.score >= 0.45 {
+        for r in db.memory_similar(qe, semantic_limit).unwrap_or_default() {
+            if !memory_fts_ids.contains(&r.entry.id) && r.score >= semantic_threshold {
                 results.push(SearchResult::Memory {
                     id: r.entry.id,
                     key: r.entry.key,
@@ -112,8 +121,8 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.meeting_similar(qe, 5).unwrap_or_default() {
-            if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= 0.45 {
+        for r in db.meeting_similar(qe, semantic_limit).unwrap_or_default() {
+            if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= semantic_threshold {
                 results.push(SearchResult::Meeting {
                     id: r.meeting.id,
                     title: r.meeting.title,
@@ -143,8 +152,8 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.todo_similar(qe, 10).unwrap_or_default() {
-            if !todo_fts_ids.contains(&r.todo.id) && r.score >= 0.45 {
+        for r in db.todo_similar(qe, semantic_limit).unwrap_or_default() {
+            if !todo_fts_ids.contains(&r.todo.id) && r.score >= semantic_threshold {
                 results.push(SearchResult::Todo {
                     id: r.todo.id,
                     title: r.todo.title,
@@ -173,8 +182,11 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.investigation_similar(qe, 5).unwrap_or_default() {
-            if !inv_fts_ids.contains(&r.investigation.id) && r.score >= 0.45 {
+        for r in db
+            .investigation_similar(qe, semantic_limit)
+            .unwrap_or_default()
+        {
+            if !inv_fts_ids.contains(&r.investigation.id) && r.score >= semantic_threshold {
                 results.push(SearchResult::Investigation {
                     id: r.investigation.id,
                     name: r.investigation.name,
@@ -197,8 +209,8 @@ pub fn global_search(db: &Database, query: &str) -> Result<Vec<SearchResult>> {
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.repo_similar(qe, 5).unwrap_or_default() {
-            if !repo_fts_ids.contains(&r.repo.id) && r.score >= 0.45 {
+        for r in db.repo_similar(qe, semantic_limit).unwrap_or_default() {
+            if !repo_fts_ids.contains(&r.repo.id) && r.score >= semantic_threshold {
                 results.push(SearchResult::Repo {
                     id: r.repo.id,
                     name: r.repo.name,
@@ -285,7 +297,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = global_search(&db, "Rust").unwrap();
+        let results = global_search(&db, "Rust", 0.45, 5).unwrap();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",

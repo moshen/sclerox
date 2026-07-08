@@ -117,8 +117,25 @@ ol people search "alice"
 
 ## Configuration
 
+Tunables live in `~/.ol/config.toml` (created, all-commented, by `ol install`).
+Precedence, highest first: **CLI flag > env var > config file > built-in default**.
+
+```bash
+ol config show          # effective settings (file + env + defaults, merged)
+ol config init          # write a commented config.toml (--force to overwrite)
+ol config path          # where the file lives
+```
+
+Configurable sections include `[ai]` (distillation binary/model), `[search]`
+(`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds,
+`[session_context]` sizes, `[distill]` chunking, `[embed]` chunk size, and
+`[index] max_file_bytes`. Run `ol config init` to see every key with its default.
+
+Environment variables still work and override the file:
+
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `OL_CONFIG` | `~/.ol/config.toml` | Config file path |
 | `OL_DB` | `~/.ol/ol.db` | Primary database path |
 | `OL_LOG` | off | Log level: `error\|warn\|info\|debug` → `~/.ol/logs/ol-YYYY-MM-DD.log` |
 | `OL_AI_BIN` | `claude` | AI binary for `ol memory distill` |

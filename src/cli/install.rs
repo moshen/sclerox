@@ -43,6 +43,10 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     }
     install_shell_completions(args.dry_run)?;
     install_global_gitignore(args.dry_run)?;
+    // Create a commented ~/.ol/config.toml so the tunables are discoverable.
+    // Never overwrites an existing file; every key ships commented, so this
+    // changes no behaviour.
+    super::config_cmd::install_default_config(args.dry_run)?;
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
@@ -55,6 +59,14 @@ pub fn run_uninstall(args: InstallArgs) -> Result<()> {
     for target in resolve_targets(args.target) {
         println!("Uninstalling for {}...", target_name(target));
         uninstall_for_target(target, &args)?;
+    }
+    // Deliberately keep ~/.ol/config.toml — it holds user edits.
+    let cfg = crate::config::config_path();
+    if cfg.exists() {
+        println!(
+            "config: kept {} (remove it manually if desired)",
+            cfg.display()
+        );
     }
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");

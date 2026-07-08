@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::config::settings;
 use crate::db::Database;
 use crate::embed::Embedder;
 use crate::output::{print_output, OutputFormat};
@@ -206,8 +207,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 let seen: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
                 if let Ok(mut embedder) = Embedder::new() {
                     if let Ok(qe) = embedder.embed_one(&query) {
-                        for r in db.memory_similar(&qe, 5).unwrap_or_default() {
-                            if !seen.contains(&r.entry.id) && r.score >= 0.45 {
+                        let sem = &settings().search;
+                        let floor = sem.semantic_threshold as f32;
+                        for r in db
+                            .memory_similar(&qe, sem.semantic_limit)
+                            .unwrap_or_default()
+                        {
+                            if !seen.contains(&r.entry.id) && r.score >= floor {
                                 results.push(r.entry);
                             }
                         }
@@ -310,22 +316,11 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             model,
             dry_run,
         } => {
-            let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
-            let bin = via
-                .as_deref()
-                .or(if env_bin.is_empty() {
-                    None
-                } else {
-                    Some(env_bin.as_str())
-                })
-                .unwrap_or("claude");
-
-            let env_model = std::env::var("OL_AI_MODEL").unwrap_or_default();
-            let resolved_model = model.as_deref().or(if env_model.is_empty() {
-                None
-            } else {
-                Some(env_model.as_str())
-            });
+            // Precedence: --via/--model flag > settings.ai (which already folds
+            // in the OL_AI_BIN / OL_AI_MODEL env vars) > built-in default.
+            let cfg_ai = &settings().ai;
+            let bin = via.as_deref().unwrap_or(cfg_ai.bin.as_str());
+            let resolved_model = model.as_deref().or(cfg_ai.model.as_deref());
 
             let (text, existing_key) = match (&key, &from) {
                 (Some(k), None) => {
@@ -426,12 +421,12 @@ fn truncate(s: &str, max: usize) -> String {
 /// the session-start context, so we nudge the writer to shorten them.
 fn warn_if_long(key: &str, value: &str) {
     let len = value.chars().count();
-    if len > crate::db::memory::MAX_MEMORY_VALUE_CHARS {
+    if len > settings().memory.max_value_chars {
         eprintln!(
             "warning: memory '{key}' is {len} chars (over {} recommended). \
              Stored anyway, but consider shortening: long values embed worse \
              and crowd session context.",
-            crate::db::memory::MAX_MEMORY_VALUE_CHARS
+            settings().memory.max_value_chars
         );
     }
 }

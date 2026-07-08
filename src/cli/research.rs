@@ -1,12 +1,10 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::config::settings;
 use crate::db::Database;
 use crate::embed::{chunk_text, Embedder};
 use crate::output::{print_output, OutputFormat};
-
-const CHUNK_SIZE: usize = 800;
-const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]
 pub enum ResearchCommand {
@@ -388,7 +386,8 @@ fn embed_investigation(
     if text.trim().is_empty() {
         return Ok(());
     }
-    let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+    let emb_cfg = &settings().embed;
+    let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
     let mut embedder = Embedder::new()?;
     let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
     let embeddings = embedder.embed_batch(&texts)?;

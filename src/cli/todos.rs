@@ -1,12 +1,10 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::config::settings;
 use crate::db::{todos::TodoStatus, Database};
 use crate::embed::{chunk_text, Embedder};
 use crate::output::{print_output, OutputFormat};
-
-const CHUNK_SIZE: usize = 800;
-const CHUNK_OVERLAP: usize = 200;
 
 #[derive(Subcommand)]
 pub enum TodoCommand {
@@ -210,16 +208,16 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             // Tier 3: semantic similarity — always runs alongside FTS+LIKE.
             // Results are deduped against FTS hits and filtered by a minimum score.
             // Model load costs ~1s; acceptable for a search that already has context.
-            const MIN_SEMANTIC_SCORE: f32 = 0.45;
+            let sem = &settings().search;
+            let floor = sem.semantic_threshold as f32;
             let fts_ids: std::collections::HashSet<i64> =
                 fts_results.iter().map(|t| t.id).collect();
             let semantic: Vec<_> = if let Ok(mut emb) = Embedder::new() {
                 if let Ok(query_emb) = emb.embed_one(&query) {
-                    db.todo_similar(&query_emb, 10)
+                    db.todo_similar(&query_emb, sem.semantic_limit)
                         .unwrap_or_default()
                         .into_iter()
-                        .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= MIN_SEMANTIC_SCORE)
-                        .take(5)
+                        .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= floor)
                         .collect()
                 } else {
                     vec![]
@@ -384,7 +382,8 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
         _ => title.to_string(),
     };
     if let Ok(mut embedder) = Embedder::new() {
-        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+        let emb_cfg = &settings().embed;
+        let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
         if let Ok(embeddings) =
             embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {
@@ -414,7 +413,8 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
             Some(n) if !n.trim().is_empty() => format!("{}\n\n{n}", t.title),
             _ => t.title.clone(),
         };
-        let raw = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+        let emb_cfg = &settings().embed;
+        let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
         if let Ok(embeddings) =
             embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {

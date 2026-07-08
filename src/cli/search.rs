@@ -11,7 +11,13 @@ pub struct SearchArgs {
 }
 
 pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> {
-    let results = global_search(db, &args.query)?;
+    let s = crate::config::settings();
+    let results = global_search(
+        db,
+        &args.query,
+        s.search.semantic_threshold as f32,
+        s.search.semantic_limit,
+    )?;
     print_output(format, &results, || {
         if results.is_empty() {
             println!("No matches for: {}", args.query);

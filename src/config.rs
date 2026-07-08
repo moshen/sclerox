@@ -1,17 +1,453 @@
-use std::path::PathBuf;
+//! Configuration: typed settings loaded from `~/.ol/config.toml`.
+//!
+//! Precedence (highest first): CLI flag > env var > config file > built-in
+//! default. Every key is optional; a missing or malformed file falls back to
+//! defaults with a warning rather than failing (the session hooks run this on
+//! every session start and must never be bricked by a bad file).
+//!
+//! `config.rs` is binary-only. Library modules (search, index, db) stay
+//! settings-free: `global_search` takes thresholds as parameters, the indexer
+//! reads its limit from an env var (bridged from config in `init`), and the db
+//! layer takes thresholds as call arguments. Only `cli/*` reads `settings()`.
 
-pub struct Config {
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Path to the primary SQLite database. Env: `OL_DB`.
     pub db_path: PathBuf,
+    pub ai: AiSettings,
+    pub search: SearchSettings,
+    pub dedup: DedupSettings,
+    pub memory: MemorySettings,
+    pub session_context: SessionContextSettings,
+    pub distill: DistillSettings,
+    pub embed: EmbedSettings,
+    pub index: IndexSettings,
 }
 
-impl Config {
-    pub fn from_env() -> Self {
-        let db_path = if let Ok(p) = std::env::var("OL_DB") {
-            PathBuf::from(p)
-        } else {
-            let home = dirs::home_dir().expect("could not find home directory");
-            home.join(".ol").join("ol.db")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// CLI binary used for distillation. Env: `OL_AI_BIN`.
+    pub bin: String,
+    /// Model passed to the AI binary; None/empty = the agent's default.
+    /// Env: `OL_AI_MODEL`.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchSettings {
+    /// Cosine floor for a semantic hit to be shown. Stored as f64 for clean
+    /// TOML round-tripping; cast to f32 at the (f32) score comparison sites.
+    pub semantic_threshold: f64,
+    /// Max semantic hits per entity type.
+    pub semantic_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DedupSettings {
+    /// Cosine score at/above which a distilled memory supersedes an existing one.
+    pub cosine_threshold: f64,
+    /// Lexical token-overlap fallback threshold (used when no embedder).
+    pub lexical_threshold: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Values longer than this warn on write (never rejected).
+    pub max_value_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionContextSettings {
+    /// Hard cap on injected session-start context (~4 chars/token).
+    pub max_chars: usize,
+    /// Full-value memories surfaced at session start.
+    pub relevant_memories: usize,
+    /// Slots reserved for feedback-type memories.
+    pub feedback_reserved: usize,
+    pub todos_shown: usize,
+    pub research_shown: usize,
+    pub sessions_shown: usize,
+    pub memory_keys_shown: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistillSettings {
+    /// Transcript chars per AI call.
+    pub chunk_chars: usize,
+    /// Sessions shorter than this many turns are not distilled.
+    pub min_turns: usize,
+    /// Re-distill only after the session grows by this many turns.
+    pub min_new_turns: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbedSettings {
+    /// Entity-text chunk size for embeddings.
+    pub chunk_size: usize,
+    /// Overlap between adjacent chunks.
+    pub chunk_overlap: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexSettings {
+    /// Files larger than this skip tree-sitter symbol extraction (still indexed
+    /// via line chunks). Env: `OL_MAX_INDEX_FILE_BYTES`.
+    pub max_file_bytes: usize,
+}
+
+// ── Defaults ────────────────────────────────────────────────────────────────
+// These are the single source of truth for built-in values; the previously
+// scattered `const`s now live here.
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            db_path: default_db_path(),
+            ai: AiSettings::default(),
+            search: SearchSettings::default(),
+            dedup: DedupSettings::default(),
+            memory: MemorySettings::default(),
+            session_context: SessionContextSettings::default(),
+            distill: DistillSettings::default(),
+            embed: EmbedSettings::default(),
+            index: IndexSettings::default(),
+        }
+    }
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            bin: "claude".to_string(),
+            model: None,
+        }
+    }
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            semantic_threshold: 0.45_f64,
+            semantic_limit: 5,
+        }
+    }
+}
+
+impl Default for DedupSettings {
+    fn default() -> Self {
+        Self {
+            cosine_threshold: 0.85_f64,
+            lexical_threshold: 0.7_f64,
+        }
+    }
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            max_value_chars: 800,
+        }
+    }
+}
+
+impl Default for SessionContextSettings {
+    fn default() -> Self {
+        Self {
+            max_chars: 3000,
+            relevant_memories: 5,
+            feedback_reserved: 1,
+            todos_shown: 5,
+            research_shown: 3,
+            sessions_shown: 3,
+            memory_keys_shown: 30,
+        }
+    }
+}
+
+impl Default for DistillSettings {
+    fn default() -> Self {
+        Self {
+            chunk_chars: 20_000,
+            min_turns: 5,
+            min_new_turns: 50,
+        }
+    }
+}
+
+impl Default for EmbedSettings {
+    fn default() -> Self {
+        Self {
+            chunk_size: 800,
+            chunk_overlap: 200,
+        }
+    }
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1_000_000,
+        }
+    }
+}
+
+fn default_db_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".ol").join("ol.db"))
+        .unwrap_or_else(|| PathBuf::from("ol.db"))
+}
+
+// ── Loading ─────────────────────────────────────────────────────────────────
+
+/// Resolved config file path: `$OL_CONFIG` if set, else `~/.ol/config.toml`.
+pub fn config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("OL_CONFIG") {
+        return PathBuf::from(p);
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".ol").join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("config.toml"))
+}
+
+impl Settings {
+    /// Parse settings from TOML text. Errors are surfaced so `load` can warn.
+    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    /// Load effective settings: file (or defaults) + env overrides + validation.
+    pub fn load() -> Self {
+        let path = config_path();
+        let mut settings = match std::fs::read_to_string(&path) {
+            Ok(contents) => Self::from_toml_str(&contents).unwrap_or_else(|e| {
+                eprintln!(
+                    "warning: could not parse {}: {e}\n         using built-in defaults",
+                    path.display()
+                );
+                Self::default()
+            }),
+            // Missing file is normal, not an error.
+            Err(_) => Self::default(),
         };
-        Self { db_path }
+        settings.expand_db_path();
+        settings.apply_env_overrides();
+        settings.validate();
+        settings
+    }
+
+    /// Expand a leading `~/` in db_path to the home directory.
+    fn expand_db_path(&mut self) {
+        if let Ok(rest) = self.db_path.strip_prefix("~") {
+            if let Some(home) = dirs::home_dir() {
+                self.db_path = home.join(rest);
+            }
+        }
+    }
+
+    /// Env vars beat the file (but not CLI flags, which win at their call sites).
+    fn apply_env_overrides(&mut self) {
+        if let Ok(p) = std::env::var("OL_DB") {
+            if !p.is_empty() {
+                self.db_path = PathBuf::from(p);
+            }
+        }
+        if let Ok(b) = std::env::var("OL_AI_BIN") {
+            if !b.is_empty() {
+                self.ai.bin = b;
+            }
+        }
+        if let Ok(m) = std::env::var("OL_AI_MODEL") {
+            if !m.is_empty() {
+                self.ai.model = Some(m);
+            }
+        }
+        if let Ok(v) = std::env::var("OL_MAX_INDEX_FILE_BYTES") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.index.max_file_bytes = n;
+            }
+        }
+    }
+
+    /// Clamp/repair out-of-range values, warning once per bad key. Never aborts.
+    fn validate(&mut self) {
+        clamp_unit(
+            "search.semantic_threshold",
+            &mut self.search.semantic_threshold,
+        );
+        clamp_unit("dedup.cosine_threshold", &mut self.dedup.cosine_threshold);
+        clamp_unit("dedup.lexical_threshold", &mut self.dedup.lexical_threshold);
+
+        require_positive("search.semantic_limit", &mut self.search.semantic_limit, 5);
+        require_positive(
+            "memory.max_value_chars",
+            &mut self.memory.max_value_chars,
+            800,
+        );
+        require_positive(
+            "session_context.max_chars",
+            &mut self.session_context.max_chars,
+            3000,
+        );
+        require_positive(
+            "session_context.relevant_memories",
+            &mut self.session_context.relevant_memories,
+            5,
+        );
+        // feedback_reserved may legitimately be 0 (no reserved slot) — don't force > 0.
+        require_positive(
+            "session_context.todos_shown",
+            &mut self.session_context.todos_shown,
+            5,
+        );
+        require_positive(
+            "session_context.research_shown",
+            &mut self.session_context.research_shown,
+            3,
+        );
+        require_positive(
+            "session_context.sessions_shown",
+            &mut self.session_context.sessions_shown,
+            3,
+        );
+        require_positive(
+            "session_context.memory_keys_shown",
+            &mut self.session_context.memory_keys_shown,
+            30,
+        );
+        require_positive("distill.chunk_chars", &mut self.distill.chunk_chars, 20_000);
+        require_positive("distill.min_turns", &mut self.distill.min_turns, 5);
+        require_positive("distill.min_new_turns", &mut self.distill.min_new_turns, 50);
+        require_positive("embed.chunk_size", &mut self.embed.chunk_size, 800);
+        require_positive(
+            "index.max_file_bytes",
+            &mut self.index.max_file_bytes,
+            1_000_000,
+        );
+
+        // Normalise an empty model to None so consumers can treat it uniformly.
+        if self.ai.model.as_deref() == Some("") {
+            self.ai.model = None;
+        }
+    }
+}
+
+fn clamp_unit(name: &str, v: &mut f64) {
+    if !(0.0..=1.0).contains(v) {
+        eprintln!("warning: {name} = {v} out of range [0.0, 1.0]; clamping");
+        *v = v.clamp(0.0, 1.0);
+    }
+}
+
+fn require_positive(name: &str, v: &mut usize, default: usize) {
+    if *v == 0 {
+        eprintln!("warning: {name} must be > 0; using default {default}");
+        *v = default;
+    }
+}
+
+// ── Global accessor ───────────────────────────────────────────────────────────
+
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+
+/// The process-wide effective settings, loaded once on first access.
+pub fn settings() -> &'static Settings {
+    SETTINGS.get_or_init(Settings::load)
+}
+
+/// Eagerly load settings and bridge config-only values into the mechanisms that
+/// can't read `settings()` directly (the library indexer reads an env var).
+/// Call once at startup. Bridging respects precedence: it only sets the env var
+/// when the user hasn't already set it AND has actually customized the value
+/// (setting it unconditionally would make `config show` report a phantom env
+/// override, and is unnecessary since the indexer's own default matches ours).
+pub fn init() {
+    let s = settings();
+    let is_default = s.index.max_file_bytes == IndexSettings::default().max_file_bytes;
+    if !is_default && std::env::var("OL_MAX_INDEX_FILE_BYTES").is_err() {
+        // SAFETY: single-threaded startup, before any indexing thread is spawned.
+        unsafe {
+            std::env::set_var(
+                "OL_MAX_INDEX_FILE_BYTES",
+                s.index.max_file_bytes.to_string(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_when_empty() {
+        let s = Settings::from_toml_str("").unwrap();
+        assert_eq!(s.search.semantic_threshold, 0.45);
+        assert_eq!(s.search.semantic_limit, 5);
+        assert_eq!(s.dedup.cosine_threshold, 0.85);
+        assert_eq!(s.memory.max_value_chars, 800);
+        assert_eq!(s.session_context.max_chars, 3000);
+        assert_eq!(s.embed.chunk_size, 800);
+        assert_eq!(s.ai.bin, "claude");
+        assert!(s.ai.model.is_none());
+    }
+
+    #[test]
+    fn partial_file_keeps_other_defaults() {
+        let toml = r#"
+[search]
+semantic_threshold = 0.7
+"#;
+        let s = Settings::from_toml_str(toml).unwrap();
+        assert_eq!(s.search.semantic_threshold, 0.7);
+        // untouched keys keep defaults
+        assert_eq!(s.search.semantic_limit, 5);
+        assert_eq!(s.dedup.cosine_threshold, 0.85);
+    }
+
+    #[test]
+    fn unknown_section_absent_uses_defaults() {
+        // A file setting only db_path leaves every section at defaults.
+        let s = Settings::from_toml_str("db_path = \"/tmp/x.db\"").unwrap();
+        assert_eq!(s.db_path, PathBuf::from("/tmp/x.db"));
+        assert_eq!(s.distill.chunk_chars, 20_000);
+    }
+
+    #[test]
+    fn validate_clamps_out_of_range() {
+        let mut s = Settings::from_toml_str("[search]\nsemantic_threshold = 5.0\n").unwrap();
+        s.validate();
+        assert_eq!(s.search.semantic_threshold, 1.0);
+    }
+
+    #[test]
+    fn validate_repairs_zero_counts() {
+        let mut s = Settings::from_toml_str("[search]\nsemantic_limit = 0\n").unwrap();
+        s.validate();
+        assert_eq!(s.search.semantic_limit, 5);
+    }
+
+    #[test]
+    fn validate_normalises_empty_model() {
+        let mut s = Settings::from_toml_str("[ai]\nmodel = \"\"\n").unwrap();
+        s.validate();
+        assert!(s.ai.model.is_none());
+    }
+
+    #[test]
+    fn malformed_toml_errors() {
+        assert!(Settings::from_toml_str("this is = = not toml").is_err());
     }
 }

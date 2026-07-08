@@ -10,18 +10,27 @@ use tempfile::TempDir;
 struct Env {
     _dir: TempDir,
     db: PathBuf,
+    config: PathBuf,
 }
 
 impl Env {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("ol.db");
-        Self { _dir: dir, db }
+        let config = dir.path().join("config.toml");
+        Self {
+            _dir: dir,
+            db,
+            config,
+        }
     }
 
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("ol").unwrap();
         c.env("OL_DB", &self.db);
+        // Isolate from the developer's real ~/.ol/config.toml. The path starts
+        // out nonexistent (pure defaults); `ol config init` can create it here.
+        c.env("OL_CONFIG", &self.config);
         c
     }
 
@@ -102,6 +111,44 @@ fn memory_set_warns_but_stores_long_value() {
         got.contains(&long_value),
         "long value was not stored intact"
     );
+}
+
+#[test]
+fn config_show_reflects_defaults_and_edits() {
+    let e = Env::new();
+
+    // No file yet → show reports defaults.
+    let out = e.run(&["config", "show"]);
+    assert!(out.contains("semantic_threshold = 0.45"), "got: {out}");
+    assert!(
+        out.contains("using defaults") || out.contains("no file"),
+        "got: {out}"
+    );
+
+    // path reports the isolated temp location, not created yet.
+    let path = e.run(&["config", "path"]);
+    assert!(path.contains("config.toml"));
+
+    // init writes the template; a second init refuses without --force.
+    let init = e.run(&["config", "init"]);
+    assert!(init.contains("wrote"), "got: {init}");
+    let reinit = e.cmd().args(["config", "init"]).output().unwrap();
+    assert!(
+        !reinit.status.success() || {
+            // init without --force on an existing file should error or report skip
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&reinit.stdout),
+                String::from_utf8_lossy(&reinit.stderr)
+            );
+            combined.contains("already exists")
+        }
+    );
+
+    // Edit a key and confirm `show` echoes the new value.
+    std::fs::write(&e.config, "[search]\nsemantic_threshold = 0.9\n").unwrap();
+    let edited = e.run(&["config", "show"]);
+    assert!(edited.contains("semantic_threshold = 0.9"), "got: {edited}");
 }
 
 #[test]

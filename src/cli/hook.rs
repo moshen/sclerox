@@ -135,27 +135,22 @@ fn run_start(db: &Database) -> Result<()> {
     Ok(())
 }
 
-/// Maximum characters in the injected session context. ~3000 chars ≈ 750 tokens.
-const SESSION_CONTEXT_MAX_CHARS: usize = 3000;
-
 /// Build a compact index of what's in the knowledge base so the agent knows
 /// what's available without loading every memory. The agent fetches detail
-/// on demand with `ol memory get`, `ol todo get`, etc.
-/// Number of full-value memories to surface at session start. Reads, not just
-/// keys: keys alone never earn a follow-up `ol memory get`.
-const RELEVANT_MEMORY_COUNT: usize = 5;
-
+/// on demand with `ol memory get`, `ol todo get`, etc. Section sizes and the
+/// overall budget come from `[session_context]` in config.
 fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<String> {
+    let cfg = &crate::config::settings().session_context;
     let mut out = String::new();
     out.push_str("## ol context (run `ol memory get <key>` etc. for full content)\n\n");
 
-    let budget = SESSION_CONTEXT_MAX_CHARS;
+    let budget = cfg.max_chars;
 
-    // 1. Open todos (deadline-sorted, top 5). Highest priority — actionable now.
+    // 1. Open todos (deadline-sorted). Highest priority — actionable now.
     if let Ok(todos) = db.todo_list(Some("open")) {
         if !todos.is_empty() {
             let mut section = format!("### Open todos ({})\n", todos.len());
-            for t in todos.iter().take(5) {
+            for t in todos.iter().take(cfg.todos_shown) {
                 let due = t
                     .deadline_date
                     .as_deref()
@@ -172,7 +167,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     if let Ok(invs) = db.investigation_list(Some("open")) {
         if !invs.is_empty() {
             let mut section = format!("### Open research ({})\n", invs.len());
-            for inv in invs.iter().take(3) {
+            for inv in invs.iter().take(cfg.research_shown) {
                 section.push_str(&format!("- #{} {} [{}]\n", inv.id, inv.name, inv.slug));
             }
             section.push('\n');
@@ -183,7 +178,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     // 3. Relevant knowledge — FULL values of the top memories, not just keys.
     // Priority: feedback (user corrections) > project, repo-matched first, then
     // most-recent as fallback. This is the section that actually gets read.
-    let relevant = relevant_memories(db, repo_name, RELEVANT_MEMORY_COUNT);
+    let relevant = relevant_memories(db, repo_name, cfg.relevant_memories);
     let shown_keys: std::collections::HashSet<String> =
         relevant.iter().map(|m| m.key.clone()).collect();
     if !relevant.is_empty() {
@@ -200,7 +195,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
         if !sessions.is_empty() {
             let mut section = String::from("### Recent sessions\n");
-            for m in sessions.iter().take(3) {
+            for m in sessions.iter().take(cfg.sessions_shown) {
                 let summary = truncate_for_index(&m.value, 100);
                 section.push_str(&format!("- {}: {}\n", m.key, summary));
             }
@@ -216,7 +211,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
             .iter()
             .filter(|m| m.memory_type != "session" && !shown_keys.contains(&m.key))
             .map(|m| m.key.as_str())
-            .take(30)
+            .take(cfg.memory_keys_shown)
             .collect();
         if !others.is_empty() {
             let section = format!(
@@ -250,19 +245,18 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     Ok(out)
 }
 
-/// Slots reserved for feedback (user corrections) so they always surface, even
-/// when repo-matched project facts would otherwise fill every slot.
-const FEEDBACK_RESERVED: usize = 1;
-
 /// Collect up to `limit` distinct active memories to surface with full values.
-/// A feedback entry is guaranteed a slot when any feedback exists (user
-/// corrections matter most). Remaining slots go to repo-name matches, then
+/// A configurable number of feedback slots (user corrections) are guaranteed
+/// when feedback exists. Remaining slots go to repo-name matches, then
 /// most-recent feedback, then most-recent project — deduplicated by key.
 fn relevant_memories(
     db: &Database,
     repo_name: Option<&str>,
     limit: usize,
 ) -> Vec<crate::db::memory::MemoryEntry> {
+    // Slots reserved for feedback so corrections surface even when repo-matched
+    // project facts would otherwise fill every slot.
+    let feedback_reserved = crate::config::settings().session_context.feedback_reserved;
     let mut picked: Vec<crate::db::memory::MemoryEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -287,15 +281,15 @@ fn relevant_memories(
 
     // Reserved feedback slot(s): repo-matched feedback first, else most-recent.
     for m in repo_feedback.iter().cloned() {
-        if picked.len() >= FEEDBACK_RESERVED {
+        if picked.len() >= feedback_reserved {
             break;
         }
         add(m, &mut picked, &mut seen);
     }
-    if picked.len() < FEEDBACK_RESERVED {
+    if picked.len() < feedback_reserved {
         if let Ok(list) = db.memory_list(Some("feedback"), Some("active")) {
             for m in list {
-                if picked.len() >= FEEDBACK_RESERVED {
+                if picked.len() >= feedback_reserved {
                     break;
                 }
                 add(m, &mut picked, &mut seen);
@@ -401,24 +395,23 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     let Some(transcript_path) = transcript else {
         return Ok(());
     };
+    let distill_cfg = &crate::config::settings().distill;
     let turn_count = count_turns(&transcript_path).unwrap_or(0);
-    if turn_count < 5 {
+    if turn_count < distill_cfg.min_turns {
         return Ok(());
     }
 
     // Skip if we've already distilled this session at this turn count.
     // Prevents repeated distillation when claude -p sub-sessions fire
     // their own Stop hooks, and avoids redundant work on re-runs.
-    // Re-distills only if the session has grown by at least 50 turns
-    // since last time (picking up genuinely new content).
+    // Re-distills only after the session grows by distill.min_new_turns turns.
     let marker = distill_marker_path(session_id);
     let last_distilled = marker
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    const MIN_NEW_TURNS: usize = 50;
-    if turn_count <= last_distilled + MIN_NEW_TURNS {
+    if turn_count <= last_distilled + distill_cfg.min_new_turns {
         log::debug!(
             "session {} already distilled at {} turns (now {}), skipping",
             session_id,
@@ -498,25 +491,14 @@ fn run_distill_session(
         Err(_) => return Ok(()),
     };
 
-    if turns.len() < 5 {
+    let cfg = crate::config::settings();
+    if turns.len() < cfg.distill.min_turns {
         return Ok(());
     }
 
-    let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
-    let bin = via
-        .or(if env_bin.is_empty() {
-            None
-        } else {
-            Some(env_bin.as_str())
-        })
-        .unwrap_or("claude");
-
-    let env_model = std::env::var("OL_AI_MODEL").unwrap_or_default();
-    let resolved_model = model.or(if env_model.is_empty() {
-        None
-    } else {
-        Some(env_model.as_str())
-    });
+    // Precedence: --via/--model flag > settings.ai (folds OL_AI_BIN/OL_AI_MODEL).
+    let bin = via.unwrap_or(cfg.ai.bin.as_str());
+    let resolved_model = model.or(cfg.ai.model.as_deref());
 
     log::debug!(
         "background: distilling {} turns from {}",
@@ -579,10 +561,13 @@ fn run_opencode(
         Err(_) => return Ok(()),
     };
 
-    if turns.len() < 5 {
+    if turns.len() < crate::config::settings().distill.min_turns {
         return Ok(());
     }
 
+    // OpenCode distillation defaults to the `opencode` binary (not `claude`),
+    // so this path resolves via flag > OL_AI_BIN env > "opencode" rather than
+    // routing through [ai].bin (whose default is claude).
     let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
     let bin = via
         .or(if env_bin.is_empty() {
@@ -709,10 +694,6 @@ fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path:
     None
 }
 
-/// Each chunk sent to the AI for distillation.
-/// Keeping chunks small prevents memory spikes from large prompts.
-const CHUNK_CHARS: usize = 20_000;
-
 /// Count the number of user/assistant turns in a transcript without reading it fully.
 /// Used for a quick gate before spawning the background distillation process.
 fn count_turns(path: &std::path::Path) -> Result<usize> {
@@ -729,16 +710,6 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
     Ok(count)
 }
 
-/// Overlap fraction (0.0-1.0) at or above which a distilled memory is treated
-/// as a near-duplicate of an existing one and supersedes it instead of adding a
-/// new drift-key. Conservative: a false supersede is worse than a duplicate.
-const DEDUP_THRESHOLD: f64 = 0.7;
-
-/// Cosine threshold for semantic dedup (used when an embedding is available).
-/// Higher than the lexical bar: embeddings catch paraphrase, so require strong
-/// agreement before superseding.
-const DEDUP_COSINE_THRESHOLD: f32 = 0.85;
-
 /// Distill a full list of turns in chunks, deduplicating by key.
 /// Returns total number of memories stored.
 ///
@@ -752,13 +723,15 @@ fn distill_chunked(
     turns: &[String],
     source: &str,
 ) -> Result<usize> {
+    let dedup = &crate::config::settings().dedup;
+    let chunk_chars = crate::config::settings().distill.chunk_chars;
     let mut stored = 0usize;
     let mut seen_keys = std::collections::HashSet::new();
     // Best-effort embedder, reused across all chunks. None if the model is
     // unavailable — dedup then falls back to lexical and no vectors are stored.
     let mut embedder = crate::embed::Embedder::new().ok();
 
-    for chunk in chunk_turns(turns, CHUNK_CHARS) {
+    for chunk in chunk_turns(turns, chunk_chars) {
         let Ok(memories) = crate::cli::memory::distill_with_ai_pub(bin, model, &chunk) else {
             continue;
         };
@@ -780,10 +753,10 @@ fn distill_chunked(
             // Prefer semantic (cosine) matching; fall back to lexical overlap.
             let near_dup = match &emb {
                 Some(v) => db
-                    .memory_find_near_duplicate_semantic(v, DEDUP_COSINE_THRESHOLD)
+                    .memory_find_near_duplicate_semantic(v, dedup.cosine_threshold as f32)
                     .unwrap_or(None),
                 None => db
-                    .memory_find_near_duplicate(&m.value, DEDUP_THRESHOLD)
+                    .memory_find_near_duplicate(&m.value, dedup.lexical_threshold)
                     .unwrap_or(None),
             }
             .filter(|existing| existing.key != m.key);
@@ -918,6 +891,16 @@ fn truncate_content(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Point OL_CONFIG at a nonexistent path so `settings()` yields built-in
+    /// defaults regardless of the developer's real ~/.ol/config.toml. All
+    /// settings()-using tests call this; since settings() is a process-wide
+    /// OnceLock, the first caller locks in defaults for the whole test binary.
+    fn isolate_config() {
+        // SAFETY: test-only; every caller writes the same value before the
+        // OnceLock is first read.
+        unsafe { std::env::set_var("OL_CONFIG", "/nonexistent/ol-test-config.toml") };
+    }
+
     #[test]
     fn test_path_to_project_hash() {
         // Plain path
@@ -960,7 +943,7 @@ mod tests {
             .map(|i| "x".repeat(6_000) + &format!(" turn{i}\n"))
             .collect();
         let chunks = chunk_turns(&turns, 20_000);
-        // Each chunk should be at most CHUNK_CHARS
+        // Each chunk should be at most the configured chunk size
         for chunk in &chunks {
             assert!(chunk.len() <= 25_000, "chunk too large: {}", chunk.len());
         }
@@ -1032,6 +1015,7 @@ mod tests {
 
     #[test]
     fn test_build_session_context_caps_at_budget() {
+        isolate_config();
         let db = Database::open_in_memory().unwrap();
         // Add way more memory than the budget allows
         for i in 0..200 {
@@ -1043,16 +1027,18 @@ mod tests {
             );
         }
         let ctx = build_session_context(&db, None).unwrap();
+        let budget = crate::config::settings().session_context.max_chars;
         assert!(
-            ctx.len() <= SESSION_CONTEXT_MAX_CHARS,
+            ctx.len() <= budget,
             "context exceeded budget: {} > {}",
             ctx.len(),
-            SESSION_CONTEXT_MAX_CHARS
+            budget
         );
     }
 
     #[test]
     fn test_build_session_context_empty_db_has_header() {
+        isolate_config();
         let db = Database::open_in_memory().unwrap();
         let ctx = build_session_context(&db, None).unwrap();
         assert!(ctx.contains("ol context"));
@@ -1060,6 +1046,7 @@ mod tests {
 
     #[test]
     fn test_build_session_context_injects_full_memory_values() {
+        isolate_config();
         let db = Database::open_in_memory().unwrap();
         db.memory_set(
             "clippy-as-errors",
@@ -1072,11 +1059,12 @@ mod tests {
         // Full value present, not just the key.
         assert!(ctx.contains("Relevant knowledge"));
         assert!(ctx.contains("zero warnings is the bar"));
-        assert!(ctx.len() <= SESSION_CONTEXT_MAX_CHARS);
+        assert!(ctx.len() <= crate::config::settings().session_context.max_chars);
     }
 
     #[test]
     fn test_relevant_memories_guarantees_feedback_slot() {
+        isolate_config();
         let db = Database::open_in_memory().unwrap();
         // Fill many repo-matched project memories that would otherwise take all slots.
         for i in 0..10 {
@@ -1097,7 +1085,7 @@ mod tests {
         )
         .unwrap();
 
-        let picked = relevant_memories(&db, Some("myrepo"), RELEVANT_MEMORY_COUNT);
+        let picked = relevant_memories(&db, Some("myrepo"), 5);
         assert!(
             picked.iter().any(|m| m.memory_type == "feedback"),
             "feedback slot not guaranteed: {:?}",
@@ -1107,6 +1095,7 @@ mod tests {
 
     #[test]
     fn test_build_session_context_includes_open_todos() {
+        isolate_config();
         use crate::db::todos::TodoStatus;
         let db = Database::open_in_memory().unwrap();
         let _ = db
