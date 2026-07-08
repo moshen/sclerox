@@ -75,28 +75,27 @@ pub enum MemoryCommand {
     /// Distill text into structured memories using an AI CLI
     ///
     /// Compresses a verbose memory entry OR extracts multiple memories from a
-    /// transcript/document file. Shells out to any AI CLI that accepts a
-    /// prompt via its -p / --print flag.
+    /// transcript/document file. Shells out to an AI CLI; the prompt is
+    /// appended as the final argument of the command.
     ///
-    /// Binary resolution order:
-    ///   1. --via <bin>
-    ///   2. $OL_AI_BIN environment variable
-    ///   3. claude (default)
+    /// Command resolution order:
+    ///   1. --via "<full command>"
+    ///   2. [ai].command / $OL_AI_COMMAND
+    ///   3. built-in default (claude with headless flags)
     ///
-    /// Model resolution order:
-    ///   1. --model <model>
-    ///   2. $OL_AI_MODEL environment variable
-    ///   3. agent default (no --model flag passed)
+    /// Model (applies to the DEFAULT command only): --model > [ai].model /
+    /// $OL_AI_MODEL > agent default. Bake the model into a custom --via command.
     Distill {
         /// Compress an existing memory entry (supersedes it with the distilled version)
         key: Option<String>,
         /// Extract memories from a transcript or document file
         #[arg(long)]
         from: Option<String>,
-        /// AI CLI binary to use (default: claude, or $OL_AI_BIN)
+        /// Full AI command to run, e.g. "claude -p --safe-mode --tools ''"
+        /// (default: built-in claude command, or [ai].command / $OL_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
-        /// Model to pass to the AI binary via --model (optional, uses agent default if omitted)
+        /// Model for the default command (ignored when --via is a custom command)
         #[arg(long)]
         model: Option<String>,
         /// Show extracted memories without writing to the database
@@ -316,11 +315,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             model,
             dry_run,
         } => {
-            // Precedence: --via/--model flag > settings.ai (which already folds
-            // in the OL_AI_BIN / OL_AI_MODEL env vars) > built-in default.
+            // Precedence: --via/--model flag > settings.ai (which folds in the
+            // OL_AI_COMMAND / OL_AI_MODEL env vars) > built-in default. Manual
+            // `ol memory distill` defaults to the claude command.
             let cfg_ai = &settings().ai;
-            let bin = via.as_deref().unwrap_or(cfg_ai.bin.as_str());
+            let command = via.as_deref().or(cfg_ai.command.as_deref());
             let resolved_model = model.as_deref().or(cfg_ai.model.as_deref());
+            let argv = resolve_distill_command(command, "claude", resolved_model)?;
 
             let (text, existing_key) = match (&key, &from) {
                 (Some(k), None) => {
@@ -334,7 +335,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 (None, None) => anyhow::bail!("provide a memory key or --from <file>"),
             };
 
-            let memories = distill_with_ai(bin, resolved_model, &text)?;
+            let memories = distill_with_ai(&argv, &text)?;
 
             if memories.is_empty() {
                 println!("No memories extracted.");
@@ -651,68 +652,90 @@ Key naming:
 Text to distill:
 "#;
 
-/// Call an AI CLI subprocess with the distillation prompt and parse the JSON response.
-///
-/// The binary must support: `<bin> -p "<prompt>"` → prints response to stdout.
-/// If model is provided, it is forwarded as `--model <model>`.
-pub fn distill_with_ai_pub(
-    bin: &str,
-    model: Option<&str>,
-    text: &str,
-) -> anyhow::Result<Vec<DistilledMemory>> {
-    distill_with_ai(bin, model, text)
-}
-
-fn distill_with_ai(
-    bin: &str,
-    model: Option<&str>,
-    text: &str,
-) -> anyhow::Result<Vec<DistilledMemory>> {
-    let prompt = format!("{DISTILL_PROMPT}{text}");
-
-    // Detect binary by basename so /usr/local/bin/claude and claude both match.
-    let basename = std::path::Path::new(bin)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(bin);
-
-    let mut cmd = std::process::Command::new(bin);
-    if basename == "opencode" {
-        // opencode run --pure [--model provider/model] "prompt"
-        cmd.arg("run").arg("--pure");
-        if let Some(m) = model {
-            cmd.args(["-m", m]);
-        }
-        cmd.arg(&prompt);
-    } else {
-        // claude (default): -p --safe-mode --no-session-persistence --tools "" "prompt"
-        cmd.args([
+/// Built-in default distillation command (argv, WITHOUT the prompt) for a known
+/// agent. The prompt is appended as the final argument by `distill_with_ai`.
+fn default_command(agent: &str) -> Vec<String> {
+    let parts: &[&str] = match agent {
+        // opencode run --pure "prompt"
+        "opencode" => &["opencode", "run", "--pure"],
+        // claude (default): headless flags that skip hooks/skills/persistence.
+        _ => &[
+            "claude",
             "-p",
             "--safe-mode",
             "--no-session-persistence",
             "--tools",
             "",
-            &prompt,
-        ]);
-        if let Some(m) = model {
-            cmd.args(["--model", m]);
+        ],
+    };
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// Resolve the distillation command into argv (program + args, WITHOUT the prompt).
+///
+/// - `command`: an explicit full command (from `--via`, `[ai].command`, or
+///   `OL_AI_COMMAND`). Parsed shell-style and used verbatim; `model` is ignored
+///   (bake the model flag into a custom command yourself).
+/// - `default_agent`: which built-in default to use when `command` is `None` —
+///   `"claude"` for the Claude paths, `"opencode"` for the OpenCode hook.
+/// - `model`: appended to the DEFAULT command only, per the agent's flag
+///   convention (`--model` for claude, `-m` for opencode).
+pub fn resolve_distill_command(
+    command: Option<&str>,
+    default_agent: &str,
+    model: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(cmd) = command {
+        let argv = shlex::split(cmd).ok_or_else(|| {
+            anyhow::anyhow!("could not parse AI command (unbalanced quotes?): {cmd}")
+        })?;
+        if argv.is_empty() {
+            anyhow::bail!("AI command is empty");
         }
+        return Ok(argv);
     }
+    let mut argv = default_command(default_agent);
+    if let Some(m) = model {
+        if default_agent == "opencode" {
+            argv.push("-m".to_string());
+        } else {
+            argv.push("--model".to_string());
+        }
+        argv.push(m.to_string());
+    }
+    Ok(argv)
+}
+
+/// Run the resolved AI command (argv) with the distillation prompt appended as
+/// the final argument, and parse the JSON response.
+pub fn distill_with_ai_pub(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledMemory>> {
+    distill_with_ai(argv, text)
+}
+
+fn distill_with_ai(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledMemory>> {
+    let prompt = format!("{DISTILL_PROMPT}{text}");
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("AI command is empty"))?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.arg(&prompt);
 
     let output = cmd.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
-                "AI binary '{bin}' not found in PATH. \
-                     Install it or set OL_AI_BIN to the binary name."
+                "AI command '{program}' not found in PATH. \
+                 Set [ai].command in ~/.ol/config.toml (or $OL_AI_COMMAND)."
             )
         } else {
-            anyhow::anyhow!("failed to run '{bin}': {e}")
+            anyhow::anyhow!("failed to run '{program}': {e}")
         }
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("'{bin}' exited with error:\n{stderr}");
+        anyhow::bail!("'{program}' exited with error:\n{stderr}");
     }
 
     let response = String::from_utf8_lossy(&output.stdout);
@@ -755,4 +778,49 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
     }
 
     Ok(memories)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_claude_command_with_flags() {
+        let argv = resolve_distill_command(None, "claude", None).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "-p",
+                "--safe-mode",
+                "--no-session-persistence",
+                "--tools",
+                ""
+            ]
+        );
+    }
+
+    #[test]
+    fn default_command_appends_model_per_agent() {
+        let claude = resolve_distill_command(None, "claude", Some("sonnet")).unwrap();
+        assert_eq!(&claude[claude.len() - 2..], &["--model", "sonnet"]);
+
+        let oc = resolve_distill_command(None, "opencode", Some("x/y")).unwrap();
+        assert_eq!(oc[0], "opencode");
+        assert_eq!(&oc[oc.len() - 2..], &["-m", "x/y"]);
+    }
+
+    #[test]
+    fn custom_command_is_parsed_and_ignores_model() {
+        // Quoted empty arg must survive parsing.
+        let argv = resolve_distill_command(Some("claude -p --tools ''"), "claude", Some("ignored"))
+            .unwrap();
+        assert_eq!(argv, vec!["claude", "-p", "--tools", ""]);
+    }
+
+    #[test]
+    fn empty_or_unparseable_command_errors() {
+        assert!(resolve_distill_command(Some("   "), "claude", None).is_err());
+        assert!(resolve_distill_command(Some("claude 'unbalanced"), "claude", None).is_err());
+    }
 }

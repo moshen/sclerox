@@ -67,7 +67,7 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `ol memory stale <key>` | Mark as stale (preserved for history) |
 | `ol memory supersede <old> <new> <value>` | Replace with traceable back-link |
 | `ol memory needs-review [--days 30]` | List memories not reviewed recently |
-| `ol memory distill [<key>\|--from <file>]` | AI-compress via `claude -p` (or `$OL_AI_BIN`) |
+| `ol memory distill [<key>\|--from <file>]` | AI-compress via the `[ai].command` (default `claude -p …`) |
 | `ol memory import --agent claude` | Import from Claude Code auto-memory |
 
 ### `ol todo`
@@ -126,10 +126,15 @@ ol config init          # write a commented config.toml (--force to overwrite)
 ol config path          # where the file lives
 ```
 
-Configurable sections include `[ai]` (distillation binary/model), `[search]`
+Configurable sections include `[ai]` (distillation command/model), `[search]`
 (`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds,
 `[session_context]` sizes, `[distill]` chunking, `[embed]` chunk size, and
 `[index] max_file_bytes`. Run `ol config init` to see every key with its default.
+
+`[ai].command` is the full distillation command (the transcript prompt is
+appended as the last argument). If unset, ol uses the built-in default for the
+agent that invoked it — `claude -p --safe-mode --no-session-persistence --tools ''`
+or `opencode run --pure`.
 
 Environment variables still work and override the file:
 
@@ -138,8 +143,8 @@ Environment variables still work and override the file:
 | `OL_CONFIG` | `~/.ol/config.toml` | Config file path |
 | `OL_DB` | `~/.ol/ol.db` | Primary database path |
 | `OL_LOG` | off | Log level: `error\|warn\|info\|debug` → `~/.ol/logs/ol-YYYY-MM-DD.log` |
-| `OL_AI_BIN` | `claude` | AI binary for `ol memory distill` |
-| `OL_AI_MODEL` | agent default | Model flag forwarded to AI binary |
+| `OL_AI_COMMAND` | agent default | Full distillation command (prompt appended last) |
+| `OL_AI_MODEL` | agent default | Model appended to the default command |
 | `OL_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
 
 ## How hooks work

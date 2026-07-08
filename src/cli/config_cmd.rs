@@ -65,7 +65,7 @@ fn show(format: OutputFormat) -> Result<()> {
 fn active_env_overrides() -> Vec<&'static str> {
     [
         "OL_DB",
-        "OL_AI_BIN",
+        "OL_AI_COMMAND",
         "OL_AI_MODEL",
         "OL_MAX_INDEX_FILE_BYTES",
         "OL_CONFIG",
@@ -87,8 +87,12 @@ pub fn config_template() -> String {
          # db_path = \"~/.ol/ol.db\"            # env: OL_DB\n\
          \n\
          [ai]\n\
-         # bin = \"{ai_bin}\"                     # env: OL_AI_BIN — CLI used for distillation\n\
-         # model = \"\"                         # env: OL_AI_MODEL — empty = agent default\n\
+         # Full distillation command; the transcript prompt is appended as the\n\
+         # final argument. If unset, ol uses the default for the invoking agent.\n\
+         # Uncomment and edit ONE of these defaults to override (env: OL_AI_COMMAND):\n\
+         #   command = \"claude -p --safe-mode --no-session-persistence --tools ''\"\n\
+         #   command = \"opencode run --pure\"\n\
+         # model = \"\"   # appended to the DEFAULT command only; bake into a custom command. env: OL_AI_MODEL\n\
          \n\
          [search]\n\
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
@@ -121,7 +125,6 @@ pub fn config_template() -> String {
          \n\
          [index]\n\
          # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n",
-        ai_bin = d.ai.bin,
         sem_thr = d.search.semantic_threshold,
         sem_lim = d.search.semantic_limit,
         cos_thr = d.dedup.cosine_threshold,

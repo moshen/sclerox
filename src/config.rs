@@ -29,13 +29,15 @@ pub struct Settings {
     pub index: IndexSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
-    /// CLI binary used for distillation. Env: `OL_AI_BIN`.
-    pub bin: String,
-    /// Model passed to the AI binary; None/empty = the agent's default.
-    /// Env: `OL_AI_MODEL`.
+    /// Full distillation command (binary + flags), parsed shell-style; the
+    /// transcript prompt is appended as the final argument. `None` = use the
+    /// built-in default for whichever agent invoked ol. Env: `OL_AI_COMMAND`.
+    pub command: Option<String>,
+    /// Model for the DEFAULT command only (ignored when `command` is set — bake
+    /// the model flag into a custom command yourself). Env: `OL_AI_MODEL`.
     pub model: Option<String>,
 }
 
@@ -124,15 +126,6 @@ impl Default for Settings {
             distill: DistillSettings::default(),
             embed: EmbedSettings::default(),
             index: IndexSettings::default(),
-        }
-    }
-}
-
-impl Default for AiSettings {
-    fn default() -> Self {
-        Self {
-            bin: "claude".to_string(),
-            model: None,
         }
     }
 }
@@ -264,9 +257,9 @@ impl Settings {
                 self.db_path = PathBuf::from(p);
             }
         }
-        if let Ok(b) = std::env::var("OL_AI_BIN") {
-            if !b.is_empty() {
-                self.ai.bin = b;
+        if let Ok(c) = std::env::var("OL_AI_COMMAND") {
+            if !c.is_empty() {
+                self.ai.command = Some(c);
             }
         }
         if let Ok(m) = std::env::var("OL_AI_MODEL") {
@@ -337,7 +330,10 @@ impl Settings {
             1_000_000,
         );
 
-        // Normalise an empty model to None so consumers can treat it uniformly.
+        // Normalise empty strings to None so consumers can treat them uniformly.
+        if self.ai.command.as_deref() == Some("") {
+            self.ai.command = None;
+        }
         if self.ai.model.as_deref() == Some("") {
             self.ai.model = None;
         }
@@ -400,7 +396,7 @@ mod tests {
         assert_eq!(s.memory.max_value_chars, 800);
         assert_eq!(s.session_context.max_chars, 3000);
         assert_eq!(s.embed.chunk_size, 800);
-        assert_eq!(s.ai.bin, "claude");
+        assert!(s.ai.command.is_none());
         assert!(s.ai.model.is_none());
     }
 

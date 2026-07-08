@@ -18,7 +18,7 @@ pub enum HookCommand {
     /// Reads the hook JSON from stdin (Claude Code passes session metadata this way).
     /// Safe to call even outside a hook context - missing transcript is a no-op.
     Stop {
-        /// AI CLI binary to use for memory distillation (default: claude, or $OL_AI_BIN)
+        /// Full AI command for distillation (default: built-in claude, or [ai].command / $OL_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary (optional, uses agent default if omitted)
@@ -37,7 +37,7 @@ pub enum HookCommand {
         /// Claude Code session ID
         #[arg(long)]
         session_id: String,
-        /// AI CLI binary (default: claude or $OL_AI_BIN)
+        /// Full AI command for distillation (default: built-in claude, or [ai].command / $OL_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary
@@ -54,7 +54,7 @@ pub enum HookCommand {
         session_id: String,
         /// Project directory (passed by the plugin via ctx.directory)
         directory: Option<String>,
-        /// AI CLI binary to use for memory distillation (default: opencode, or $OL_AI_BIN)
+        /// Full AI command for distillation (default: built-in opencode, or [ai].command / $OL_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary (optional, uses agent default if omitted)
@@ -496,16 +496,18 @@ fn run_distill_session(
         return Ok(());
     }
 
-    // Precedence: --via/--model flag > settings.ai (folds OL_AI_BIN/OL_AI_MODEL).
-    let bin = via.unwrap_or(cfg.ai.bin.as_str());
+    // Precedence: --via/--model flag > [ai] (folds OL_AI_COMMAND/OL_AI_MODEL).
+    // This is a Claude Stop-hook path, so the default command is claude's.
+    let command = via.or(cfg.ai.command.as_deref());
     let resolved_model = model.or(cfg.ai.model.as_deref());
+    let argv = crate::cli::memory::resolve_distill_command(command, "claude", resolved_model)?;
 
     log::debug!(
         "background: distilling {} turns from {}",
         turns.len(),
         session_id
     );
-    let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
+    let total = distill_chunked(db, &argv, &turns, "session")?;
     if total > 0 {
         log::info!("background: distilled {total} memories from session {session_id}");
     }
@@ -561,30 +563,19 @@ fn run_opencode(
         Err(_) => return Ok(()),
     };
 
-    if turns.len() < crate::config::settings().distill.min_turns {
+    let cfg = crate::config::settings();
+    if turns.len() < cfg.distill.min_turns {
         return Ok(());
     }
 
-    // OpenCode distillation defaults to the `opencode` binary (not `claude`),
-    // so this path resolves via flag > OL_AI_BIN env > "opencode" rather than
-    // routing through [ai].bin (whose default is claude).
-    let env_bin = std::env::var("OL_AI_BIN").unwrap_or_default();
-    let bin = via
-        .or(if env_bin.is_empty() {
-            None
-        } else {
-            Some(env_bin.as_str())
-        })
-        .unwrap_or("opencode");
+    // Precedence: --via/--model flag > [ai] (folds OL_AI_COMMAND/OL_AI_MODEL).
+    // This is the OpenCode hook, so the default command is opencode's — a bare
+    // [ai].command (if the user set one) still overrides it.
+    let command = via.or(cfg.ai.command.as_deref());
+    let resolved_model = model.or(cfg.ai.model.as_deref());
+    let argv = crate::cli::memory::resolve_distill_command(command, "opencode", resolved_model)?;
 
-    let env_model = std::env::var("OL_AI_MODEL").unwrap_or_default();
-    let resolved_model = model.or(if env_model.is_empty() {
-        None
-    } else {
-        Some(env_model.as_str())
-    });
-
-    let total = distill_chunked(db, bin, resolved_model, &turns, "session")?;
+    let total = distill_chunked(db, &argv, &turns, "session")?;
     if total > 0 {
         eprintln!("[ol] distilled {total} memories from opencode session");
     }
@@ -718,8 +709,7 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// existing entry so re-learning a fact under a new slug doesn't create drift.
 fn distill_chunked(
     db: &Database,
-    bin: &str,
-    model: Option<&str>,
+    argv: &[String],
     turns: &[String],
     source: &str,
 ) -> Result<usize> {
@@ -732,7 +722,7 @@ fn distill_chunked(
     let mut embedder = crate::embed::Embedder::new().ok();
 
     for chunk in chunk_turns(turns, chunk_chars) {
-        let Ok(memories) = crate::cli::memory::distill_with_ai_pub(bin, model, &chunk) else {
+        let Ok(memories) = crate::cli::memory::distill_with_ai_pub(argv, &chunk) else {
             continue;
         };
         for m in &memories {
