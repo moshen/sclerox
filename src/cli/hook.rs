@@ -502,6 +502,18 @@ fn run_distill_session(
     let resolved_model = model.or(cfg.ai.model.as_deref());
     let argv = crate::cli::memory::resolve_distill_command(command, "claude", resolved_model)?;
 
+    // Hold a per-session lock so a manual `distill-session` can't race the
+    // hook-spawned worker (or another manual run) and pay for the same
+    // distillation twice. Held until this function returns.
+    let _lock = match try_lock_session(session_id) {
+        LockOutcome::Contended => {
+            log::info!("session {session_id} is already being distilled, skipping");
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => Some(guard),
+        LockOutcome::NoLock => None,
+    };
+
     log::debug!(
         "background: distilling {} turns from {}",
         turns.len(),
@@ -574,6 +586,16 @@ fn run_opencode(
     let command = via.or(cfg.ai.command.as_deref());
     let resolved_model = model.or(cfg.ai.model.as_deref());
     let argv = crate::cli::memory::resolve_distill_command(command, "opencode", resolved_model)?;
+
+    // Per-session lock: don't distill the same session concurrently.
+    let _lock = match try_lock_session(session_id) {
+        LockOutcome::Contended => {
+            log::info!("session {session_id} is already being distilled, skipping");
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => Some(guard),
+        LockOutcome::NoLock => None,
+    };
 
     let total = distill_chunked(db, &argv, &turns, "session")?;
     if total > 0 {
@@ -658,6 +680,82 @@ fn distill_marker_path(session_id: &str) -> Option<std::path::PathBuf> {
             .join("distilled")
             .join(session_id),
     )
+}
+
+/// Locks older than this are treated as abandoned by a crashed process and
+/// stolen — a distiller that died must not block the session forever. Set well
+/// above any real distillation time (minutes).
+const LOCK_STALE_SECS: u64 = 30 * 60;
+
+/// RAII guard for a per-session distillation lock; removes the lockfile on drop.
+struct SessionLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Outcome of trying to acquire the per-session distillation lock.
+enum LockOutcome {
+    /// Acquired — hold the guard for the duration of distillation.
+    Acquired(SessionLock),
+    /// Another live process is already distilling this session — skip.
+    Contended,
+    /// Locking infrastructure is unavailable — proceed WITHOUT a lock rather
+    /// than skip (a broken lock dir must never stop distillation entirely).
+    NoLock,
+}
+
+/// Acquire the per-session lock under `~/.ol/distilled/<id>.lock`.
+fn try_lock_session(session_id: &str) -> LockOutcome {
+    match distill_marker_path(session_id).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        Some(dir) => try_lock_session_in(&dir, session_id, LOCK_STALE_SECS),
+        None => LockOutcome::NoLock,
+    }
+}
+
+/// Testable core: create an exclusive lockfile in `dir`. An existing lock older
+/// than `stale_secs` is stolen.
+fn try_lock_session_in(dir: &std::path::Path, session_id: &str, stale_secs: u64) -> LockOutcome {
+    if std::fs::create_dir_all(dir).is_err() {
+        return LockOutcome::NoLock;
+    }
+    let path = dir.join(format!("{session_id}.lock"));
+    loop {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                // PID is informational — the lock is the file's existence.
+                let _ = write!(f, "{}", std::process::id());
+                return LockOutcome::Acquired(SessionLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&path, stale_secs) {
+                    let _ = std::fs::remove_file(&path);
+                    continue; // retry the create
+                }
+                return LockOutcome::Contended;
+            }
+            // Any other error: don't block distillation on lock trouble.
+            Err(_) => return LockOutcome::NoLock,
+        }
+    }
+}
+
+fn lock_is_stale(path: &std::path::Path, stale_secs: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age.as_secs() >= stale_secs)
+        .unwrap_or(false)
 }
 
 fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
@@ -896,6 +994,51 @@ mod tests {
         // SAFETY: test-only; every caller writes the same value before the
         // OnceLock is first read.
         unsafe { std::env::set_var("OL_CONFIG", "/nonexistent/ol-test-config.toml") };
+    }
+
+    #[test]
+    fn session_lock_is_exclusive_then_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let held = match try_lock_session_in(dir.path(), "sess", LOCK_STALE_SECS) {
+            LockOutcome::Acquired(g) => g,
+            _ => panic!("expected to acquire the lock"),
+        };
+        // A second attempt on the same session while held is contended.
+        assert!(matches!(
+            try_lock_session_in(dir.path(), "sess", LOCK_STALE_SECS),
+            LockOutcome::Contended
+        ));
+        // A different session is independent.
+        assert!(matches!(
+            try_lock_session_in(dir.path(), "other", LOCK_STALE_SECS),
+            LockOutcome::Acquired(_)
+        ));
+        // Releasing the guard frees the lock.
+        drop(held);
+        assert!(matches!(
+            try_lock_session_in(dir.path(), "sess", LOCK_STALE_SECS),
+            LockOutcome::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn stale_session_lock_is_stolen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Simulate a crashed distiller: leak the guard so the lockfile persists.
+        match try_lock_session_in(dir.path(), "sess", LOCK_STALE_SECS) {
+            LockOutcome::Acquired(g) => std::mem::forget(g),
+            _ => panic!("expected to acquire the lock"),
+        };
+        // A live process still sees it as contended...
+        assert!(matches!(
+            try_lock_session_in(dir.path(), "sess", LOCK_STALE_SECS),
+            LockOutcome::Contended
+        ));
+        // ...but once older than the staleness window it is stolen.
+        assert!(matches!(
+            try_lock_session_in(dir.path(), "sess", 0),
+            LockOutcome::Acquired(_)
+        ));
     }
 
     #[test]
