@@ -27,6 +27,7 @@ pub struct Settings {
     pub distill: DistillSettings,
     pub embed: EmbedSettings,
     pub index: IndexSettings,
+    pub log: LogSettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +111,15 @@ pub struct IndexSettings {
     pub max_file_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogSettings {
+    /// Log level: off|error|warn|info|debug|trace. Logs go to
+    /// `~/.ol/logs/ol-YYYY-MM-DD.log`. Env: `OL_LOG`; the `--log-level` flag
+    /// overrides both.
+    pub level: String,
+}
+
 // ── Defaults ────────────────────────────────────────────────────────────────
 // These are the single source of truth for built-in values; the previously
 // scattered `const`s now live here.
@@ -126,6 +136,7 @@ impl Default for Settings {
             distill: DistillSettings::default(),
             embed: EmbedSettings::default(),
             index: IndexSettings::default(),
+            log: LogSettings::default(),
         }
     }
 }
@@ -193,6 +204,14 @@ impl Default for IndexSettings {
     fn default() -> Self {
         Self {
             max_file_bytes: 1_000_000,
+        }
+    }
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            level: "off".to_string(),
         }
     }
 }
@@ -272,6 +291,11 @@ impl Settings {
                 self.index.max_file_bytes = n;
             }
         }
+        if let Ok(l) = std::env::var("OL_LOG") {
+            if !l.is_empty() {
+                self.log.level = l;
+            }
+        }
     }
 
     /// Clamp/repair out-of-range values, warning once per bad key. Never aborts.
@@ -336,6 +360,16 @@ impl Settings {
         }
         if self.ai.model.as_deref() == Some("") {
             self.ai.model = None;
+        }
+
+        // Log level must be a recognised filter; otherwise warn and disable.
+        if self.log.level.parse::<log::LevelFilter>().is_err() {
+            eprintln!(
+                "warning: log.level = \"{}\" is not a valid level \
+                 (off|error|warn|info|debug|trace); using off",
+                self.log.level
+            );
+            self.log.level = "off".to_string();
         }
     }
 }
@@ -433,6 +467,20 @@ semantic_threshold = 0.7
         let mut s = Settings::from_toml_str("[search]\nsemantic_limit = 0\n").unwrap();
         s.validate();
         assert_eq!(s.search.semantic_limit, 5);
+    }
+
+    #[test]
+    fn log_level_defaults_off_and_validates() {
+        let s = Settings::from_toml_str("").unwrap();
+        assert_eq!(s.log.level, "off");
+
+        let mut good = Settings::from_toml_str("[log]\nlevel = \"debug\"\n").unwrap();
+        good.validate();
+        assert_eq!(good.log.level, "debug");
+
+        let mut bad = Settings::from_toml_str("[log]\nlevel = \"loud\"\n").unwrap();
+        bad.validate();
+        assert_eq!(bad.log.level, "off");
     }
 
     #[test]

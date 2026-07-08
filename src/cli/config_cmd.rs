@@ -68,6 +68,7 @@ fn active_env_overrides() -> Vec<&'static str> {
         "OL_AI_COMMAND",
         "OL_AI_MODEL",
         "OL_MAX_INDEX_FILE_BYTES",
+        "OL_LOG",
         "OL_CONFIG",
     ]
     .into_iter()
@@ -126,7 +127,10 @@ pub fn config_template() -> String {
          # chunk_overlap = {embed_overlap}\n\
          \n\
          [index]\n\
-         # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n",
+         # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n\
+         \n\
+         [log]\n\
+         # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n",
         sem_thr = d.search.semantic_threshold,
         sem_lim = d.search.semantic_limit,
         cos_thr = d.dedup.cosine_threshold,
@@ -145,6 +149,7 @@ pub fn config_template() -> String {
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
         max_bytes = d.index.max_file_bytes,
+        log_level = d.log.level,
     )
 }
 
@@ -339,6 +344,7 @@ mod tests {
             "[distill]",
             "[embed]",
             "[index]",
+            "[log]",
         ] {
             assert!(t.contains(section), "template missing {section}");
         }

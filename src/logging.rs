@@ -67,10 +67,11 @@ fn rss_mb() -> u64 {
 }
 
 /// Initialise the logger. Call once at startup.
-/// Level is resolved in order: explicit arg → OL_LOG env var → default.
+/// Level is resolved in order: `--log-level` arg → `[log].level` (which folds
+/// in the `OL_LOG` env var) → default off.
 pub fn init(level: Option<LevelFilter>) {
     let level = level
-        .or_else(|| std::env::var("OL_LOG").ok().and_then(|v| v.parse().ok()))
+        .or_else(|| crate::config::settings().log.level.parse().ok())
         .unwrap_or(LevelFilter::Off);
 
     if level == LevelFilter::Off {

@@ -128,8 +128,9 @@ ol config path          # where the file lives
 
 Configurable sections include `[ai]` (distillation command/model), `[search]`
 (`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds,
-`[session_context]` sizes, `[distill]` chunking, `[embed]` chunk size, and
-`[index] max_file_bytes`. Run `ol config init` to see every key with its default.
+`[session_context]` sizes, `[distill]` chunking, `[embed]` chunk size,
+`[index] max_file_bytes`, and `[log] level`. Run `ol config init` to see every
+key with its default.
 
 `[ai].command` is the full distillation command (the transcript prompt is
 appended as the last argument). If unset, ol uses the built-in default for the
