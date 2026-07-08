@@ -91,7 +91,7 @@ pub enum MemoryCommand {
         /// Extract memories from a transcript or document file
         #[arg(long)]
         from: Option<String>,
-        /// Full AI command to run, e.g. "claude -p --safe-mode --tools ''"
+        /// Full AI command to run, e.g. "claude -p --safe-mode --tools="
         /// (default: built-in claude command, or [ai].command / $OL_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
@@ -659,13 +659,15 @@ fn default_command(agent: &str) -> Vec<String> {
         // opencode run --pure "prompt"
         "opencode" => &["opencode", "run", "--pure"],
         // claude (default): headless flags that skip hooks/skills/persistence.
+        // NOTE: --tools= must be the single-token equals form. The space form
+        // (`--tools ""`) broke when the claude CLI made --tools variadic — it
+        // swallowed the prompt argument and every distillation failed.
         _ => &[
             "claude",
             "-p",
             "--safe-mode",
             "--no-session-persistence",
-            "--tools",
-            "",
+            "--tools=",
         ],
     };
     parts.iter().map(|s| s.to_string()).collect()
@@ -794,10 +796,13 @@ mod tests {
                 "-p",
                 "--safe-mode",
                 "--no-session-persistence",
-                "--tools",
-                ""
+                "--tools=",
             ]
         );
+        // Regression guard: --tools must be the single-token equals form. The
+        // claude CLI treats a bare `--tools ""` as variadic and swallows the
+        // prompt argument.
+        assert!(!argv.contains(&"--tools".to_string()));
     }
 
     #[test]

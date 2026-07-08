@@ -92,7 +92,7 @@ pub fn config_template() -> String {
          # Full distillation command; the transcript prompt is appended as the\n\
          # final argument. If unset, ol uses the built-in default for the agent\n\
          # that invoked it:\n\
-         #   claude -p --safe-mode --no-session-persistence --tools ''\n\
+         #   claude -p --safe-mode --no-session-persistence --tools=\n\
          #   opencode run --pure\n\
          # command = \"\"   # full command incl. flags; env: OL_AI_COMMAND\n\
          # model = \"\"     # appended to the DEFAULT command only; env: OL_AI_MODEL\n\
@@ -130,7 +130,8 @@ pub fn config_template() -> String {
          # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n\
          \n\
          [log]\n\
-         # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n",
+         # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n\
+         # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n",
         sem_thr = d.search.semantic_threshold,
         sem_lim = d.search.semantic_limit,
         cos_thr = d.dedup.cosine_threshold,
@@ -150,6 +151,7 @@ pub fn config_template() -> String {
         embed_overlap = d.embed.chunk_overlap,
         max_bytes = d.index.max_file_bytes,
         log_level = d.log.level,
+        retain_days = d.log.retain_days,
     )
 }
 

@@ -31,6 +31,9 @@ impl Env {
         // Isolate from the developer's real ~/.ol/config.toml. The path starts
         // out nonexistent (pure defaults); `ol config init` can create it here.
         c.env("OL_CONFIG", &self.config);
+        // Never write test noise into the developer's real ~/.ol/logs/ (an
+        // exported OL_LOG=debug once made a day's log 100x normal size).
+        c.env("OL_LOG", "off");
         c
     }
 

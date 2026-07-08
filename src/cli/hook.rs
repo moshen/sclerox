@@ -508,9 +508,9 @@ fn run_distill_session(
         session_id
     );
     let total = distill_chunked(db, &argv, &turns, "session")?;
-    if total > 0 {
-        log::info!("background: distilled {total} memories from session {session_id}");
-    }
+    // Always log the outcome — a run of zero-memory sessions is the signal
+    // that distillation is broken, so it must be visible.
+    log::info!("background: distilled {total} memories from session {session_id}");
 
     // Write marker so this session isn't re-distilled unnecessarily.
     if let Some(p) = distill_marker_path(session_id) {
@@ -579,6 +579,7 @@ fn run_opencode(
     if total > 0 {
         eprintln!("[ol] distilled {total} memories from opencode session");
     }
+    log::info!("opencode: distilled {total} memories from session {session_id}");
 
     Ok(())
 }
@@ -722,8 +723,14 @@ fn distill_chunked(
     let mut embedder = crate::embed::Embedder::new().ok();
 
     for chunk in chunk_turns(turns, chunk_chars) {
-        let Ok(memories) = crate::cli::memory::distill_with_ai_pub(argv, &chunk) else {
-            continue;
+        // A failed chunk must be LOUD in the logs: swallowing it silently hid a
+        // broken claude flag for 8 days of zero distillations.
+        let memories = match crate::cli::memory::distill_with_ai_pub(argv, &chunk) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("distill chunk failed (command: {}): {e:#}", argv.join(" "));
+                continue;
+            }
         };
         for m in &memories {
             if !seen_keys.insert(m.key.clone()) {

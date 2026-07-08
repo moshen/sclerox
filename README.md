@@ -134,7 +134,7 @@ key with its default.
 
 `[ai].command` is the full distillation command (the transcript prompt is
 appended as the last argument). If unset, ol uses the built-in default for the
-agent that invoked it — `claude -p --safe-mode --no-session-persistence --tools ''`
+agent that invoked it — `claude -p --safe-mode --no-session-persistence --tools=`
 or `opencode run --pure`.
 
 Environment variables still work and override the file:

@@ -29,7 +29,14 @@ impl OlLogger {
 
 impl log::Log for OlLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= self.level
+        if meta.level() > self.level {
+            return false;
+        }
+        // Dependency crates (globset, ignore, ort, ...) are noisy at debug —
+        // they were ~5% of a debug-level day. Keep them to warn and stronger;
+        // our own ol::* targets log at the configured level.
+        let t = meta.target();
+        t == "ol" || t.starts_with("ol::") || meta.level() <= log::Level::Warn
     }
 
     fn log(&self, record: &log::Record) {
@@ -83,6 +90,8 @@ pub fn init(level: Option<LevelFilter>) {
         .join(".ol")
         .join("logs");
 
+    prune_old_logs(&log_dir, crate::config::settings().log.retain_days);
+
     match OlLogger::new(level, &log_dir) {
         Ok(logger) => {
             if log::set_boxed_logger(Box::new(logger)).is_ok() {
@@ -91,6 +100,33 @@ pub fn init(level: Option<LevelFilter>) {
         }
         Err(e) => {
             eprintln!("[ol] could not open log file: {e}");
+        }
+    }
+}
+
+/// Delete `ol-YYYY-MM-DD.log` files older than `retain_days` (0 = keep all).
+/// Best-effort: any error is ignored — retention must never break startup.
+fn prune_old_logs(log_dir: &Path, retain_days: u32) {
+    if retain_days == 0 {
+        return;
+    }
+    let cutoff = chrono::Local::now().date_naive() - chrono::Days::new(u64::from(retain_days));
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(date_part) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("ol-"))
+            .and_then(|n| n.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
+            if date < cutoff {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }

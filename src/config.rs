@@ -118,6 +118,8 @@ pub struct LogSettings {
     /// `~/.ol/logs/ol-YYYY-MM-DD.log`. Env: `OL_LOG`; the `--log-level` flag
     /// overrides both.
     pub level: String,
+    /// Delete daily log files older than this many days (0 = keep forever).
+    pub retain_days: u32,
 }
 
 // ── Defaults ────────────────────────────────────────────────────────────────
@@ -212,6 +214,7 @@ impl Default for LogSettings {
     fn default() -> Self {
         Self {
             level: "off".to_string(),
+            retain_days: 30,
         }
     }
 }
