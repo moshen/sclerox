@@ -82,17 +82,19 @@ pub fn config_template() -> String {
     format!(
         "# ol configuration — all keys optional; defaults shown.\n\
          # Precedence: CLI flag > env var > this file > built-in default.\n\
-         # Uncomment a line to change it.\n\
+         # Uncomment a line to change it. `ol install` refreshes this file and\n\
+         # preserves any values you've set.\n\
          \n\
          # db_path = \"~/.ol/ol.db\"            # env: OL_DB\n\
          \n\
          [ai]\n\
          # Full distillation command; the transcript prompt is appended as the\n\
-         # final argument. If unset, ol uses the default for the invoking agent.\n\
-         # Uncomment and edit ONE of these defaults to override (env: OL_AI_COMMAND):\n\
-         #   command = \"claude -p --safe-mode --no-session-persistence --tools ''\"\n\
-         #   command = \"opencode run --pure\"\n\
-         # model = \"\"   # appended to the DEFAULT command only; bake into a custom command. env: OL_AI_MODEL\n\
+         # final argument. If unset, ol uses the built-in default for the agent\n\
+         # that invoked it:\n\
+         #   claude -p --safe-mode --no-session-persistence --tools ''\n\
+         #   opencode run --pure\n\
+         # command = \"\"   # full command incl. flags; env: OL_AI_COMMAND\n\
+         # model = \"\"     # appended to the DEFAULT command only; env: OL_AI_MODEL\n\
          \n\
          [search]\n\
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
@@ -147,11 +149,11 @@ pub fn config_template() -> String {
 }
 
 /// Write the template to `path`. If the file exists and `overwrite` is false,
-/// leaves it untouched. Shared by `ol config init` and `ol install`.
+/// leaves it untouched. Used by `ol config init`.
 pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
     if path.exists() && !overwrite {
         println!(
-            "config: {} already exists, leaving it untouched",
+            "config: {} already exists, leaving it untouched (run `ol install` to upgrade it)",
             path.display()
         );
         return Ok(());
@@ -160,20 +162,156 @@ pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Res
         println!("  would create: {}", path.display());
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, config_template())
-        .with_context(|| format!("writing {}", path.display()))?;
+    write(path, &config_template())?;
     println!("config: wrote {}", path.display());
     Ok(())
 }
 
-/// Install-time helper: create the config file only if it doesn't exist yet.
-/// Never overwrites (install must be safe to re-run).
+/// Install-time helper: create the config if missing, or UPGRADE it in place —
+/// regenerate the commented template (refreshed docs + any new keys) while
+/// preserving every value the user has set. Like the CLAUDE.md / skill refresh,
+/// this keeps the file current across ol versions. Never loses user settings; a
+/// file that can't be parsed is left untouched.
 pub fn install_default_config(dry_run: bool) -> Result<()> {
-    write_config_template(&config_path(), false, dry_run)
+    let path = config_path();
+
+    if !path.exists() {
+        if dry_run {
+            println!("  would create: {}", path.display());
+        } else {
+            write(&path, &config_template())?;
+            println!("config: wrote {}", path.display());
+        }
+        return Ok(());
+    }
+
+    let existing =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let Some(values) = flatten_user_values(&existing) else {
+        println!(
+            "config: {} could not be parsed, leaving it untouched \
+             (fix it or run `ol config init --force`)",
+            path.display()
+        );
+        return Ok(());
+    };
+
+    let upgraded = render_with_overrides(&values);
+    if upgraded == existing {
+        println!("config: {} is up to date", path.display());
+    } else if dry_run {
+        println!(
+            "  would upgrade: {} (preserving your settings)",
+            path.display()
+        );
+    } else {
+        write(&path, &upgraded)?;
+        println!("config: upgraded {} (kept your settings)", path.display());
+    }
+    Ok(())
+}
+
+fn write(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Parse a config file into a map of (section, key) -> value for every key the
+/// user has actually set (uncommented). Section is "" for top-level keys.
+/// Returns None if the file isn't valid TOML (so callers avoid clobbering it).
+fn flatten_user_values(
+    contents: &str,
+) -> Option<std::collections::HashMap<(String, String), toml::Value>> {
+    let table: toml::Table = toml::from_str(contents).ok()?;
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in table {
+        match v {
+            toml::Value::Table(sub) => {
+                for (k2, v2) in sub {
+                    out.insert((k.clone(), k2), v2);
+                }
+            }
+            scalar => {
+                out.insert((String::new(), k), scalar);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Render the template, but uncomment each key the user had set and substitute
+/// their value. Keys are matched section-aware; unset keys stay commented so
+/// future default changes still reach the user.
+fn render_with_overrides(
+    values: &std::collections::HashMap<(String, String), toml::Value>,
+) -> String {
+    let mut section = String::new();
+    let mut out = String::new();
+    for line in config_template().lines() {
+        // Track the current [section] header.
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed[1..trimmed.len() - 1].to_string();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some((key, comment)) = commented_key_line(line) {
+            if let Some(val) = values.get(&(section.clone(), key.to_string())) {
+                let rendered = render_toml_value(val);
+                match comment {
+                    Some(c) => out.push_str(&format!("{key} = {rendered}   {c}\n")),
+                    None => out.push_str(&format!("{key} = {rendered}\n")),
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// If `line` is a commented key line (`# key = default   # comment`), return the
+/// key and any trailing `# comment`. Indented example lines and prose are
+/// rejected so only real keys are matched.
+fn commented_key_line(line: &str) -> Option<(&str, Option<&str>)> {
+    let rest = line.strip_prefix("# ")?;
+    // Reject indented example lines like "#   claude ...".
+    if rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let eq = rest.find(" = ")?;
+    let key = &rest[..eq];
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let after = &rest[eq + 3..];
+    // The value never contains '#', so the first '#' begins a trailing comment.
+    let comment = after.find('#').map(|i| after[i..].trim_end());
+    Some((key, comment))
+}
+
+fn render_toml_value(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => {
+            let s = f.to_string();
+            // TOML floats need a decimal point; keep 5.0 from becoming int-like "5".
+            if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("nan") {
+                s
+            } else {
+                format!("{s}.0")
+            }
+        }
+        toml::Value::Boolean(b) => b.to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +342,50 @@ mod tests {
         ] {
             assert!(t.contains(section), "template missing {section}");
         }
+    }
+
+    #[test]
+    fn upgrade_preserves_user_values_and_refreshes_docs() {
+        // Simulate an "old" config: a couple of set keys, terse/no docs, and
+        // missing newer keys entirely.
+        let old = "[search]\nsemantic_threshold = 0.9\n\n[ai]\ncommand = \"opencode run --pure\"\n";
+        let values = flatten_user_values(old).unwrap();
+        let upgraded = render_with_overrides(&values);
+
+        // User's values are carried over, uncommented.
+        assert!(upgraded.contains("semantic_threshold = 0.9"));
+        assert!(upgraded.contains("command = \"opencode run --pure\""));
+        // Untouched keys remain commented at their defaults (docs refreshed).
+        assert!(upgraded.contains("# semantic_limit = 5"));
+        assert!(upgraded.contains("# cosine_threshold = 0.85"));
+        // A newer key absent from the old file now appears (commented).
+        assert!(upgraded.contains("# max_file_bytes ="));
+
+        // The result is valid TOML and round-trips to the user's values.
+        let s = Settings::from_toml_str(&upgraded).unwrap();
+        assert_eq!(s.search.semantic_threshold, 0.9);
+        assert_eq!(s.ai.command.as_deref(), Some("opencode run --pure"));
+        assert_eq!(s.search.semantic_limit, 5); // still default
+    }
+
+    #[test]
+    fn upgrade_is_idempotent() {
+        // Rendering with the values parsed from a rendered file reproduces it.
+        let values = flatten_user_values("[dedup]\ncosine_threshold = 0.7\n").unwrap();
+        let once = render_with_overrides(&values);
+        let twice = render_with_overrides(&flatten_user_values(&once).unwrap());
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn example_command_lines_are_not_treated_as_keys() {
+        // The `#   claude ...` example lines must not be mistaken for a
+        // `command` key (which would corrupt the [ai] block on upgrade).
+        let values = flatten_user_values("[ai]\ncommand = \"custom cmd\"\n").unwrap();
+        let out = render_with_overrides(&values);
+        // Exactly one active command line; examples stay commented.
+        assert_eq!(out.matches("\ncommand = ").count(), 1);
+        assert!(out.contains("#   claude -p"));
+        assert!(out.contains("#   opencode run --pure"));
     }
 }
