@@ -309,6 +309,33 @@ impl RepoDb {
         Ok(())
     }
 
+    /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
+    /// list for `ol repo reembed` — hook-indexed repos have chunks but no
+    /// embeddings, since the auto-indexer runs without an embedder.
+    pub fn chunks_without_embedding(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, chunk_text FROM chunks WHERE embedding IS NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// All chunks: (chunk_id, chunk_text). Used by `reembed --force`.
+    pub fn all_chunks(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, chunk_text FROM chunks")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Set (or replace) a chunk's embedding.
+    pub fn set_chunk_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chunks SET embedding = ?1 WHERE id = ?2",
+            params![embedding_to_bytes(embedding), chunk_id],
+        )?;
+        Ok(())
+    }
+
     pub fn search_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
         // Use LIKE for substring matching so "Sumo" finds "SumoClient" and
         // "SearchJob" finds "CreateSearchJobRequest". Symbol tables are small
@@ -477,6 +504,28 @@ mod tests {
         let results = db.similar_chunks(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].chunk_text.contains("foo"));
+    }
+
+    #[test]
+    fn test_reembed_backfill() {
+        let db = RepoDb::open_in_memory().unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
+        // One embedded chunk, one without.
+        db.insert_chunk(file_id, 0, "embedded", None, None, Some(&[1.0, 0.0, 0.0]))
+            .unwrap();
+        db.insert_chunk(file_id, 1, "needs embedding", None, None, None)
+            .unwrap();
+
+        let missing = db.chunks_without_embedding().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].1, "needs embedding");
+
+        // Backfill it.
+        db.set_chunk_embedding(missing[0].0, &[0.0, 1.0, 0.0]).unwrap();
+        assert!(db.chunks_without_embedding().unwrap().is_empty());
+
+        // --force sees all chunks regardless of embedding state.
+        assert_eq!(db.all_chunks().unwrap().len(), 2);
     }
 
     #[test]

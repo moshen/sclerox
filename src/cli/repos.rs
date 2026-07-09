@@ -49,6 +49,19 @@ pub enum RepoCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Backfill embeddings for indexed code chunks that don't have one
+    ///
+    /// The auto-index hooks index without an embedder, so hook-indexed repos
+    /// have code chunks but no embeddings (semantic code search skips them).
+    /// This embeds the stored chunk text in place — no re-parsing.
+    Reembed {
+        /// Restrict to repos whose name contains this string
+        #[arg(long)]
+        repo: Option<String>,
+        /// Re-embed ALL chunks, not just those missing an embedding
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
@@ -229,6 +242,73 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         RepoCommand::Sync { force } => {
             heal_repos(db, force)?;
         }
+
+        RepoCommand::Reembed { repo, force } => {
+            reembed_repos(db, repo.as_deref(), force)?;
+        }
+    }
+    Ok(())
+}
+
+/// Backfill (or force-recompute) embeddings for indexed code chunks across
+/// registered repos, embedding the stored chunk text in place.
+fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Result<()> {
+    let repos = db.repo_list()?;
+    if repos.is_empty() {
+        println!("No repos indexed. Run `ol repo index [path]` first.");
+        return Ok(());
+    }
+
+    let mut embedder = Embedder::new()?;
+    let mut total_embedded = 0usize;
+    let mut touched_repos = 0usize;
+
+    for entry in &repos {
+        if let Some(f) = repo_filter {
+            if !entry.name.to_lowercase().contains(&f.to_lowercase()) {
+                continue;
+            }
+        }
+        let db_path = PathBuf::from(&entry.db_path);
+        if !db_path.exists() {
+            continue;
+        }
+        let repo_db = match RepoDb::open(&db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {}: could not open ({e})", entry.name);
+                continue;
+            }
+        };
+
+        let targets = if force {
+            repo_db.all_chunks()?
+        } else {
+            repo_db.chunks_without_embedding()?
+        };
+        if targets.is_empty() {
+            continue;
+        }
+
+        // Embed in batches to bound memory.
+        let mut embedded = 0usize;
+        for batch in targets.chunks(64) {
+            let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
+            let vectors = embedder.embed_batch(&texts)?;
+            for ((chunk_id, _), vec) in batch.iter().zip(vectors) {
+                repo_db.set_chunk_embedding(*chunk_id, &vec)?;
+                embedded += 1;
+            }
+        }
+        println!("  {}: embedded {embedded} chunks", entry.name);
+        total_embedded += embedded;
+        touched_repos += 1;
+    }
+
+    if total_embedded == 0 {
+        println!("All indexed chunks already have embeddings.");
+    } else {
+        println!("Embedded {total_embedded} chunks across {touched_repos} repos.");
     }
     Ok(())
 }
