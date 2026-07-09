@@ -97,6 +97,16 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     let sig = signature.as_deref().unwrap_or(name);
                     println!("[symbol] [{kind}] {sig} ({repo_path}/{file_path}:{start_line})  [{repo_name}]");
                 }
+                SearchResult::CodeChunk {
+                    repo_name,
+                    file_path,
+                    start_line,
+                    snippet,
+                } => {
+                    let line = start_line.map(|l| format!(":{l}")).unwrap_or_default();
+                    println!("[code] {file_path}{line}  [{repo_name}]");
+                    println!("       {snippet}");
+                }
             }
         }
         println!("\n{} results", results.len());

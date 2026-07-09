@@ -337,7 +337,6 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    #[allow(dead_code)]
     pub fn similar_chunks(
         &self,
         query_embedding: &[f32],

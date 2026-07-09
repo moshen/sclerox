@@ -48,7 +48,16 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 return Ok(());
             }
 
+            // Embed the query once for the semantic tier (best-effort — skipped
+            // if the model is unavailable). FTS symbol search always runs.
+            let query_emb = crate::embed::Embedder::new()
+                .ok()
+                .and_then(|mut e| e.embed_one(&needle).ok());
+            let sem = &crate::config::settings().search;
+            let floor = sem.semantic_threshold as f32;
+
             let mut any = false;
+            let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> = Vec::new();
             for entry in &repos {
                 if let Some(filter) = &repo {
                     if !entry.name.to_lowercase().contains(&filter.to_lowercase()) {
@@ -73,6 +82,28 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                     );
                     any = true;
                 }
+
+                if let Some(ref qe) = query_emb {
+                    for c in repo_db.similar_chunks(qe, sem.semantic_limit).unwrap_or_default() {
+                        if c.score >= floor {
+                            code_chunks.push((c.score, entry.name.clone(), c));
+                        }
+                    }
+                }
+            }
+
+            // Rank semantic code-chunk matches across all repos; keep top N.
+            code_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            code_chunks.truncate(sem.semantic_limit);
+            if !code_chunks.is_empty() {
+                println!("\nSemantic matches:");
+                for (score, rname, c) in code_chunks {
+                    let line = c.start_line.map(|l| format!(":{l}")).unwrap_or_default();
+                    let snippet: String = c.chunk_text.trim().chars().take(100).collect();
+                    println!("  ({score:.2}) {}/{}{}", rname, c.file_path, line);
+                    println!("        {snippet}");
+                    any = true;
+                }
             }
 
             if !any {
@@ -80,7 +111,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                     .as_deref()
                     .map(|r| format!(" in repos matching '{r}'"))
                     .unwrap_or_default();
-                println!("No symbols match '{needle}'{scope}");
+                println!("No matches for '{needle}'{scope}");
             }
         }
 

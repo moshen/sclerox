@@ -56,6 +56,15 @@ pub enum SearchResult {
         file_path: String,
         start_line: i64,
     },
+    /// A semantically-matched code chunk (not a named symbol) from a repo's
+    /// indexed content — catches comments, strings, and logic FTS symbol search
+    /// misses.
+    CodeChunk {
+        repo_name: String,
+        file_path: String,
+        start_line: Option<i64>,
+        snippet: String,
+    },
 }
 
 /// Search every table for `query`. FTS/LIKE always runs; semantic (cosine)
@@ -221,7 +230,10 @@ pub fn global_search(
         }
     }
 
-    // Fan out to all registered repo DBs and search symbols
+    // Fan out to all registered repo DBs: FTS symbol search always, plus a
+    // semantic code-chunk pass (ranked globally across repos) when embeddings
+    // are available.
+    let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> = Vec::new();
     for repo in db.repo_list()? {
         let db_path = std::path::Path::new(&repo.db_path);
         if !db_path.exists() {
@@ -253,6 +265,24 @@ pub fn global_search(
                 start_line: sym.start_line,
             });
         }
+        if let Some(ref qe) = query_emb {
+            for c in repo_db.similar_chunks(qe, semantic_limit).unwrap_or_default() {
+                if c.score >= semantic_threshold {
+                    code_chunks.push((c.score, repo.name.clone(), c));
+                }
+            }
+        }
+    }
+    // Rank code chunks across all repos and keep the global top N.
+    code_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    code_chunks.truncate(semantic_limit);
+    for (_, repo_name, c) in code_chunks {
+        results.push(SearchResult::CodeChunk {
+            repo_name,
+            file_path: c.file_path,
+            start_line: c.start_line,
+            snippet: truncate(c.chunk_text.trim(), 120),
+        });
     }
 
     Ok(results)
@@ -315,6 +345,7 @@ mod tests {
                 SearchResult::Investigation { .. } => "investigation",
                 SearchResult::Repo { .. } => "repo",
                 SearchResult::Symbol { .. } => "symbol",
+                SearchResult::CodeChunk { .. } => "code",
             })
             .collect();
         assert!(types.contains(&"todo"), "missing todo results");
