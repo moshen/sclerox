@@ -134,8 +134,10 @@ impl Database {
         title: Option<&str>,
         date: Option<&str>,
         notes: Option<&str>,
+        transcript: Option<&str>,
     ) -> Result<bool> {
-        let mut parts = vec!["updated_at = datetime('now')".to_string()];
+        // NB: the meetings table has no updated_at column, so don't touch one.
+        let mut parts: Vec<String> = vec![];
         let mut vals: Vec<Box<dyn rusqlite::ToSql>> = vec![];
         let mut idx = 1usize;
 
@@ -154,8 +156,13 @@ impl Database {
             vals.push(Box::new(v.to_string()));
             idx += 1;
         }
+        if let Some(v) = transcript {
+            parts.push(format!("transcript = ?{idx}"));
+            vals.push(Box::new(v.to_string()));
+            idx += 1;
+        }
 
-        if parts.len() == 1 {
+        if parts.is_empty() {
             return Ok(false);
         }
         let sql = format!("UPDATE meetings SET {} WHERE id = ?{idx}", parts.join(", "));

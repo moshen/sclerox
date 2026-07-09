@@ -42,6 +42,13 @@ pub enum MeetingCommand {
         date: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+        /// Path to a transcript text file (replaces the stored transcript and
+        /// its embeddings)
+        #[arg(long)]
+        transcript_file: Option<String>,
+        /// Skip embedding generation (embeddings are on by default)
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Manage people linked to a meeting
     #[command(subcommand)]
@@ -86,26 +93,9 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                 notes.as_deref(),
             )?;
 
-            // Chunk and optionally embed the combined text
+            // Chunk and optionally embed the combined text (transcript preferred).
             let text_to_chunk = transcript.as_deref().or(notes.as_deref()).unwrap_or("");
-
-            if !text_to_chunk.is_empty() {
-                let emb_cfg = &settings().embed;
-                let raw_chunks =
-                    chunk_text(text_to_chunk, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
-                let chunks: Vec<(String, Option<Vec<f32>>)> = if !no_embed {
-                    let mut embedder = Embedder::new()?;
-                    let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();
-                    let embeddings = embedder.embed_batch(&texts)?;
-                    raw_chunks
-                        .into_iter()
-                        .zip(embeddings.into_iter().map(Some))
-                        .collect()
-                } else {
-                    raw_chunks.into_iter().map(|c| (c, None)).collect()
-                };
-                db.meeting_store_chunks(id, &chunks)?;
-            }
+            store_chunks(db, id, text_to_chunk, no_embed)?;
 
             println!("Added meeting #{id}: {title}");
         }
@@ -196,12 +186,29 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             title,
             date,
             notes,
+            transcript_file,
+            no_embed,
         } => {
-            if db.meeting_update(id, title.as_deref(), date.as_deref(), notes.as_deref())? {
-                println!("Updated meeting #{id}");
-            } else {
+            let transcript = transcript_file
+                .as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()?;
+            let changed = db.meeting_update(
+                id,
+                title.as_deref(),
+                date.as_deref(),
+                notes.as_deref(),
+                transcript.as_deref(),
+            )?;
+            if !changed {
                 println!("Meeting #{id} not found or no changes");
+                return Ok(());
             }
+            // A new transcript replaces the stored chunks + embeddings.
+            if let Some(t) = transcript.as_deref() {
+                store_chunks(db, id, t, no_embed)?;
+            }
+            println!("Updated meeting #{id}");
         }
 
         MeetingCommand::People(sub) => match sub {
@@ -244,6 +251,29 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Chunk `text` and store it as the meeting's embedding chunks, replacing any
+/// existing ones. No-op for empty text. Shared by `add` and `update`.
+fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let emb_cfg = &settings().embed;
+    let raw_chunks = chunk_text(text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
+    let chunks: Vec<(String, Option<Vec<f32>>)> = if no_embed {
+        raw_chunks.into_iter().map(|c| (c, None)).collect()
+    } else {
+        let mut embedder = Embedder::new()?;
+        let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();
+        let embeddings = embedder.embed_batch(&texts)?;
+        raw_chunks
+            .into_iter()
+            .zip(embeddings.into_iter().map(Some))
+            .collect()
+    };
+    db.meeting_store_chunks(meeting_id, &chunks)?;
     Ok(())
 }
 

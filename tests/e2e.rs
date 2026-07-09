@@ -320,6 +320,34 @@ fn meeting_lifecycle() {
     assert!(list.contains("Sprint Planning"));
 }
 
+#[test]
+fn meeting_update_attaches_transcript() {
+    let e = Env::new();
+    let id = e.run_get_id(&[
+        "meeting", "add", "--title", "Weekly Sync", "--date", "2026-07-01", "--notes", "short recap",
+    ]);
+
+    // Initially no transcript shown.
+    let before = e.run(&["meeting", "get", &id.to_string()]);
+    assert!(!before.contains("full transcript body"));
+
+    // Attach a transcript from a file via update.
+    let tx = e._dir.path().join("transcript.txt");
+    std::fs::write(&tx, "Alice: the full transcript body goes here\nBob: agreed").unwrap();
+    e.run(&[
+        "meeting", "update", &id.to_string(), "--transcript-file", tx.to_str().unwrap(),
+    ]);
+
+    // get now shows the transcript, and the notes summary is preserved.
+    let after = e.run(&["meeting", "get", &id.to_string()]);
+    assert!(after.contains("full transcript body"), "transcript not stored: {after}");
+    assert!(after.contains("short recap"), "notes were clobbered: {after}");
+
+    // The transcript text is searchable (it was chunked/indexed).
+    let hit = e.run(&["meeting", "search", "transcript body"]);
+    assert!(hit.contains("Weekly Sync"));
+}
+
 // ─── Todos ───────────────────────────────────────────────────────────────────
 
 #[test]
