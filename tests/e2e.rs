@@ -637,6 +637,35 @@ fn research_json_output() {
     assert_eq!(parsed[0]["status"], "open");
 }
 
+// ─── Repos ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn repo_index_respects_ol_config_opt_out() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".ol")).unwrap();
+    std::fs::write(dir.path().join(".ol/config.toml"), "index = false\n").unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let out = e.run(&["repo", "index", dir.path().to_str().unwrap()]);
+    assert!(
+        out.contains("Skipping"),
+        "expected opt-out skip, got: {out}"
+    );
+
+    // The folder must not have been registered.
+    let list = e.run(&["repo", "list"]);
+    assert!(
+        !list.contains(dir.path().to_str().unwrap()),
+        "opted-out folder was registered: {list}"
+    );
+    // The index db must not have been created (only our config.toml is in .ol/).
+    assert!(
+        !dir.path().join(".ol/repo.db").exists(),
+        "repo.db created despite opt-out"
+    );
+}
+
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
 #[test]

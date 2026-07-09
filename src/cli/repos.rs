@@ -74,6 +74,14 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let canonical = path.canonicalize().unwrap_or(path);
             // Walk up to the git root so `ol repo index` from a subdirectory indexes the whole repo.
             let canonical = find_git_root(&canonical);
+            // Respect a per-folder opt-out before loading the (expensive) model.
+            if !crate::index::repo_config(&canonical).index {
+                println!(
+                    "Skipping {}: indexing disabled in .ol/config.toml",
+                    canonical.display()
+                );
+                return Ok(());
+            }
             let mut embedder_opt: Option<Embedder> = if no_embed {
                 None
             } else {

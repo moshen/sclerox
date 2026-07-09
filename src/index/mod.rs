@@ -88,6 +88,13 @@ impl<'a> RepoIndexer<'a> {
             .unwrap_or("unknown")
             .to_string();
 
+        // Honor a per-folder opt-out before touching anything (no .ol/ dir, no
+        // registration) so hooks silently skip excluded folders.
+        if !repo_config(repo_root).index {
+            log::info!("skipping '{name}' — indexing disabled in .ol/config.toml");
+            return Ok(IndexResult::default());
+        }
+
         log::info!("indexing repo '{}' at {}", name, repo_root.display());
         let db_path = repo_root.join(".ol").join("repo.db");
         let repo_db = RepoDb::open(&db_path)?;
@@ -273,6 +280,42 @@ pub struct IndexResult {
     pub chunks: usize,
     pub edges: usize,
     pub skipped: usize,
+}
+
+/// Per-repo ol config, read from `<root>/.ol/config.toml` (the per-repo analog
+/// of `~/.ol/config.toml`, alongside the repo's index db). Controls whether a
+/// folder is indexed. A missing or malformed file means "index by default".
+#[derive(Debug, Clone)]
+pub struct RepoConfig {
+    pub index: bool,
+}
+
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self { index: true }
+    }
+}
+
+/// Read `<root>/.ol/config.toml`. Tolerant: any read/parse error yields
+/// defaults so a stray file never breaks indexing.
+pub fn repo_config(root: &Path) -> RepoConfig {
+    let path = root.join(".ol").join("config.toml");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return RepoConfig::default();
+    };
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        index: Option<bool>,
+    }
+    match toml::from_str::<Raw>(&contents) {
+        Ok(r) => RepoConfig {
+            index: r.index.unwrap_or(true),
+        },
+        Err(e) => {
+            log::warn!("ignoring malformed {}: {e}", path.display());
+            RepoConfig::default()
+        }
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {

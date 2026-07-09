@@ -124,6 +124,9 @@ ol repo index [path]                 # index a repo (embeddings on by default)
 ol repo index --no-embed [path]      # index without generating embeddings
 ol repo show [path] [--symbols "<query>"]
 ol repo sync                         # heal registry: remove stale, reindex missing
+ol repo reembed [--repo <name>] [--force]  # backfill embeddings for indexed chunks
+# Opt a folder OUT of indexing: create <repo-root>/.ol/config.toml with
+# `index = false`. The SessionStart hook and `ol repo index` both skip it.
 
 # Code search and navigation — see the "Code search" section above (prefer over Grep)
 ol code search "<query>"                         # find symbols by name
@@ -196,6 +199,15 @@ list` at session start — they're already visible. Use `ol memory get <key>`,
 `ol todo get <id>`, etc. to fetch full content for items that look relevant.
 
 ## Workflows
+
+### When entering a repo/folder not yet indexed
+
+The SessionStart hook auto-indexes the git repo you start in. If you're about to
+work in a folder that is NOT already indexed (check `ol repo list`) — especially
+a large monorepo or a catch-all working directory — ASK the user whether to index
+it before running `ol repo index`. Indexing large trees adds many embedded chunks
+and slows search. If they decline, create `<repo-root>/.ol/config.toml` with
+`index = false` so the hook and future `ol repo index` calls skip it permanently.
 
 ### When working on a repo
 
