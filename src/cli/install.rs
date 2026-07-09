@@ -528,30 +528,72 @@ export default function(ctx) {{
 }
 
 const SECTION_MARKER: &str = "<!-- ol-kb -->";
+const SECTION_END_MARKER: &str = "<!-- /ol-kb -->";
 
-fn append_or_create_section(path: &Path, content: &str, dry_run: bool) -> Result<()> {
-    if path.exists() {
-        let existing = std::fs::read_to_string(path)?;
-        if existing.contains(SECTION_MARKER) {
-            println!("  {}: already has ol-kb section", path.display());
-            return Ok(());
-        }
-        if dry_run {
-            println!("  would append to: {}", path.display());
-        } else {
-            std::fs::write(path, format!("{}\n{content}", existing.trim_end()))?;
-            println!("  appended to: {}", path.display());
-        }
-    } else if dry_run {
-        println!("  would create: {}", path.display());
+/// Create the ol-kb section, or UPDATE it in place if already present, so a
+/// re-install refreshes stale instructions (like the skill file). The section
+/// is bounded by start/end markers; content outside the markers is preserved.
+fn append_or_create_section(path: &Path, block: &str, dry_run: bool) -> Result<()> {
+    let existed = path.exists();
+    let existing = if existed {
+        std::fs::read_to_string(path)?
     } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)?;
-        println!("  created: {}", path.display());
+        String::new()
+    };
+    let updated = rebuild_section(&existing, block);
+
+    if existed && updated == existing {
+        println!("  {}: ol-kb section up to date", path.display());
+        return Ok(());
     }
+    let verb = if existed { "update" } else { "create" };
+    if dry_run {
+        println!("  would {verb} ol-kb section in: {}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &updated)?;
+    println!("  {verb}d ol-kb section in: {}", path.display());
     Ok(())
+}
+
+/// Insert or replace the ol-kb block within `existing`, preserving everything
+/// outside the markers. Handles the legacy format (start marker, no end marker,
+/// section ran to EOF) by upgrading it to the bounded form.
+fn rebuild_section(existing: &str, block: &str) -> String {
+    let Some(start) = existing.find(SECTION_MARKER) else {
+        // No section yet: append after existing content (or create fresh).
+        return if existing.trim().is_empty() {
+            format!("{block}\n")
+        } else {
+            format!("{}\n\n{block}\n", existing.trim_end())
+        };
+    };
+
+    let before = existing[..start].trim_end();
+    let rest = &existing[start..];
+    // New format: content after the end marker is user's and must survive.
+    // Legacy format (no end marker): the section ran to EOF, so nothing after.
+    let after = match rest.find(SECTION_END_MARKER) {
+        Some(rel) => existing[start + rel + SECTION_END_MARKER.len()..].trim(),
+        None => "",
+    };
+
+    let mut out = String::new();
+    if !before.is_empty() {
+        out.push_str(before);
+        out.push_str("\n\n");
+    }
+    out.push_str(block);
+    out.push('\n');
+    if !after.is_empty() {
+        out.push('\n');
+        out.push_str(after);
+        out.push('\n');
+    }
+    out
 }
 
 fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
@@ -561,16 +603,30 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let content = std::fs::read_to_string(&path)?;
-    if let Some(start) = content.find(SECTION_MARKER) {
-        if dry_run {
-            println!("  would remove ol-kb section from {filename}");
-        } else {
-            std::fs::write(&path, format!("{}\n", content[..start].trim_end()))?;
-            println!("  removed ol-kb section from {filename}");
-        }
-    } else {
+    let Some(start) = content.find(SECTION_MARKER) else {
         println!("  {filename}: no ol-kb section");
+        return Ok(());
+    };
+    if dry_run {
+        println!("  would remove ol-kb section from {filename}");
+        return Ok(());
     }
+    // Remove start..end-marker (new format) or start..EOF (legacy), keeping the
+    // text before and any user content after the section.
+    let before = content[..start].trim_end();
+    let rest = &content[start..];
+    let after = match rest.find(SECTION_END_MARKER) {
+        Some(rel) => content[start + rel + SECTION_END_MARKER.len()..].trim(),
+        None => "",
+    };
+    let rebuilt = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{after}\n"),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n\n{after}\n"),
+    };
+    std::fs::write(&path, rebuilt)?;
+    println!("  removed ol-kb section from {filename}");
     Ok(())
 }
 
@@ -580,7 +636,7 @@ fn skill_file_content() -> String {
 
 fn project_md_section() -> String {
     format!(
-        "\n{SECTION_MARKER}\n# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
+        "{SECTION_MARKER}\n# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
 ol search \"<topic>\"           # all tables\n\
 ol todo list                  # open todos\n\
 ol research list              # open investigations\n\
@@ -593,7 +649,7 @@ ol code refs <symbol>         # what calls it (impact of a change)\n\
 ol todo done <id> --note \"<resolution>\"\n\
 ol research conclude <id> --findings \"<findings>\"\n\
 ol memory set \"<key>\" \"<value>\" --type project\n\
-```\n"
+```\n\n{SECTION_END_MARKER}"
     )
 }
 
@@ -647,4 +703,57 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
         serde_json::to_string_pretty(value).context("failed to serialize")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: &str = "<!-- ol-kb -->\nBODY\n<!-- /ol-kb -->";
+
+    #[test]
+    fn creates_in_empty_file() {
+        assert_eq!(rebuild_section("", BLOCK), format!("{BLOCK}\n"));
+    }
+
+    #[test]
+    fn appends_after_existing_content() {
+        assert_eq!(
+            rebuild_section("# My notes\n", BLOCK),
+            format!("# My notes\n\n{BLOCK}\n")
+        );
+    }
+
+    #[test]
+    fn replaces_legacy_section_running_to_eof() {
+        // Legacy format: start marker, no end marker, section was the file tail.
+        let existing = "# Notes\n\n<!-- ol-kb -->\nOLD CONTENT\nmore old\n";
+        let out = rebuild_section(existing, BLOCK);
+        assert_eq!(out, format!("# Notes\n\n{BLOCK}\n"));
+        assert!(!out.contains("OLD CONTENT"));
+    }
+
+    #[test]
+    fn replaces_bounded_section_preserving_trailing_user_content() {
+        let existing = "# Notes\n\n<!-- ol-kb -->\nOLD\n<!-- /ol-kb -->\n\n# After the section\n";
+        let out = rebuild_section(existing, BLOCK);
+        assert!(out.contains("BODY") && !out.contains("OLD"));
+        assert!(out.contains("# Notes"));
+        assert!(out.contains("# After the section"));
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let block = project_md_section();
+        let once = rebuild_section("# Notes\n", &block);
+        let twice = rebuild_section(&once, &block);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn real_section_has_both_markers() {
+        let s = project_md_section();
+        assert!(s.starts_with(SECTION_MARKER));
+        assert!(s.trim_end().ends_with(SECTION_END_MARKER));
+    }
 }

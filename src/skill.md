@@ -70,8 +70,14 @@ ol people identifier add <person_id> <type> <value>   # add any identifier
 ol people types list                                  # see valid identifier types
 
 # Meetings
+# ALWAYS store the FULL transcript when you have one, not just a summary.
+# --notes is a short summary; --transcript-file is the complete text (chunked
+# and embedded for semantic search). Write the transcript to a temp file and
+# pass its path. Only fall back to notes-only when no transcript exists.
 ol meeting search "<topic>"
-ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"
+ol meeting add --title "<title>" --date <YYYY-MM-DD> \
+  --transcript-file <path> [--notes "<summary>"]
+ol meeting add --title "<title>" --date <YYYY-MM-DD> --notes "<notes>"   # no transcript available
 ol meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"]
 
 # Todos  — ALWAYS use --title flag, never positional: ol todo add --title "Fix X"
@@ -218,8 +224,12 @@ After `ol research start`:
 2. Find or confirm the project: `ol project search "<area>"`
 3. Link it: `ol todo projects add <todo_id> <project_id>`
 
-### When meeting notes mention a project
+### When recording a meeting
 
-After `ol meeting add`:
-1. Search for the project: `ol project search "<project name from notes>"`
-2. Link the meeting: `ol project meetings add <project_id> <meeting_id>`
+1. If you have the full transcript (e.g. Gemini/Zoom notes, a pasted log),
+   store ALL of it — write it to a temp file and pass `--transcript-file`.
+   The transcript is chunked and embedded, so semantic search can later find
+   what was actually said, not just a summary. Add `--notes` for a short recap
+   on top. Do NOT collapse a real transcript into a notes summary.
+2. If a project is mentioned: `ol project search "<name>"`, then link with
+   `ol project meetings add <project_id> <meeting_id>`.
