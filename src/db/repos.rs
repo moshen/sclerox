@@ -57,19 +57,6 @@ impl Database {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn repo_get(&self, id: i64) -> Result<Option<RepoEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, description, db_path, last_indexed, created_at
-             FROM repos WHERE id = ?1",
-        )?;
-        match stmt.query_row(params![id], row_to_repo) {
-            Ok(r) => Ok(Some(r)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     pub fn repo_list(&self) -> Result<Vec<RepoEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, name, description, db_path, last_indexed, created_at

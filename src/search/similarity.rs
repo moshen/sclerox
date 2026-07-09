@@ -15,18 +15,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Return indices of the top-k most similar vectors to `query` from `candidates`.
-#[allow(dead_code)]
-pub fn top_k_similar(query: &[f32], candidates: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
-    let mut scored: Vec<(usize, f32)> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, emb)| (i, cosine_similarity(query, emb)))
-        .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(k);
-    scored
-}
 
 #[cfg(test)]
 mod tests {
@@ -57,20 +45,6 @@ mod tests {
         let a = vec![0.0f32, 0.0, 0.0];
         let b = vec![1.0f32, 2.0, 3.0];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
-    }
-
-    #[test]
-    fn test_top_k_similar() {
-        let query = vec![1.0f32, 0.0, 0.0];
-        let candidates = vec![
-            vec![1.0f32, 0.0, 0.0], // identical
-            vec![0.0f32, 1.0, 0.0], // orthogonal
-            vec![0.8f32, 0.6, 0.0], // close
-        ];
-        let results = top_k_similar(&query, &candidates, 2);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 0); // identical is best
-        assert_eq!(results[1].0, 2); // close is second
     }
 
     #[test]

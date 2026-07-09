@@ -37,7 +37,6 @@ pub struct Symbol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct SimilarChunk {
     pub file_path: String,
     pub chunk_text: String,

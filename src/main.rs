@@ -2,7 +2,6 @@ mod cli;
 mod config;
 mod db;
 mod embed;
-mod error;
 mod index;
 mod logging;
 mod output;
