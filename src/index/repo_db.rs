@@ -4,12 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::db::{
-    bytes_to_embedding, embedding_to_bytes,
+    embedding_to_bytes,
     migrations::{REPO_MIGRATIONS, REPO_VERSION},
     run_migrations,
     schema::REPO_SCHEMA,
 };
-use crate::search::similarity::cosine_similarity;
 
 pub struct RepoDb {
     pub conn: Connection,
@@ -50,6 +49,7 @@ impl RepoDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        crate::db::register_vec_extension();
         let conn = Connection::open(path)?;
         let db = Self { conn };
         db.init()?;
@@ -58,6 +58,7 @@ impl RepoDb {
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
+        crate::db::register_vec_extension();
         let conn = Connection::open_in_memory()?;
         let db = Self { conn };
         db.init()?;
@@ -363,47 +364,39 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Top-`limit` code chunks nearest to `query_embedding`, via the sqlite-vec
+    /// KNN index (`chunks_vec`, cosine). The index does the distance work in C,
+    /// so this is O(log n)-ish instead of a full Rust scan. `score` is cosine
+    /// similarity (1 - cosine distance), matching the previous semantics.
     pub fn similar_chunks(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarChunk>> {
+        let query = embedding_to_bytes(query_embedding);
         let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_text, c.start_line, c.end_line, c.embedding, f.path
-             FROM chunks c
+            "SELECT c.chunk_text, c.start_line, c.end_line, f.path, v.distance
+             FROM chunks_vec v
+             JOIN chunks c ON c.id = v.rowid
              JOIN files f ON c.file_id = f.id
-             WHERE c.embedding IS NOT NULL",
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
         )?;
-
-        let mut scored: Vec<(f32, SimilarChunk)> = stmt
-            .query_map([], |row| {
-                let chunk_text: String = row.get(0)?;
-                let start_line: Option<i64> = row.get(1)?;
-                let end_line: Option<i64> = row.get(2)?;
-                let emb_bytes: Vec<u8> = row.get(3)?;
-                let file_path: String = row.get(4)?;
-                Ok((chunk_text, start_line, end_line, emb_bytes, file_path))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(chunk_text, start_line, end_line, emb_bytes, file_path)| {
-                let emb = bytes_to_embedding(&emb_bytes);
-                let score = cosine_similarity(query_embedding, &emb);
-                (
-                    score,
-                    SimilarChunk {
-                        file_path,
-                        chunk_text,
-                        start_line,
-                        end_line,
-                        score,
-                    },
-                )
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let chunk_text: String = row.get(0)?;
+            let start_line: Option<i64> = row.get(1)?;
+            let end_line: Option<i64> = row.get(2)?;
+            let file_path: String = row.get(3)?;
+            let distance: f64 = row.get(4)?;
+            Ok(SimilarChunk {
+                file_path,
+                chunk_text,
+                start_line,
+                end_line,
+                score: 1.0 - distance as f32, // cosine distance -> similarity
             })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored.into_iter().map(|(_, c)| c).collect())
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_files(&self) -> Result<Vec<IndexedFile>> {
@@ -489,18 +482,27 @@ mod tests {
         assert_eq!(by_mid[0].name, "ConfigBuilder");
     }
 
+    /// A 384-dim unit vector with 1.0 at index `i` (matches the AllMiniLM
+    /// dimension the vec0 index enforces).
+    #[cfg(test)]
+    fn v384(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 384];
+        v[i] = 1.0;
+        v
+    }
+
     #[test]
     fn test_chunks_similarity() {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
-        let v1: Vec<f32> = vec![1.0, 0.0, 0.0];
-        let v2: Vec<f32> = vec![0.0, 1.0, 0.0];
-        db.insert_chunk(file_id, 0, "fn foo() { ... }", Some(1), Some(5), Some(&v1))
+        db.insert_chunk(file_id, 0, "fn foo() { ... }", Some(1), Some(5), Some(&v384(0)))
             .unwrap();
-        db.insert_chunk(file_id, 1, "fn bar() { ... }", Some(6), Some(10), Some(&v2))
+        db.insert_chunk(file_id, 1, "fn bar() { ... }", Some(6), Some(10), Some(&v384(1)))
             .unwrap();
 
-        let query = vec![0.9f32, 0.1, 0.0];
+        // Query closest to v384(0) → the "foo" chunk ranks first.
+        let mut query = v384(0);
+        query[1] = 0.1;
         let results = db.similar_chunks(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].chunk_text.contains("foo"));
@@ -511,7 +513,7 @@ mod tests {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
         // One embedded chunk, one without.
-        db.insert_chunk(file_id, 0, "embedded", None, None, Some(&[1.0, 0.0, 0.0]))
+        db.insert_chunk(file_id, 0, "embedded", None, None, Some(&v384(0)))
             .unwrap();
         db.insert_chunk(file_id, 1, "needs embedding", None, None, None)
             .unwrap();
@@ -521,7 +523,7 @@ mod tests {
         assert_eq!(missing[0].1, "needs embedding");
 
         // Backfill it.
-        db.set_chunk_embedding(missing[0].0, &[0.0, 1.0, 0.0]).unwrap();
+        db.set_chunk_embedding(missing[0].0, &v384(1)).unwrap();
         assert!(db.chunks_without_embedding().unwrap().is_empty());
 
         // --force sees all chunks regardless of embedding state.

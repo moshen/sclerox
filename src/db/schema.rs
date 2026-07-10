@@ -438,6 +438,40 @@ CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
 pub const REPO_MIGRATION_V3: &str =
     "ALTER TABLE symbol_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'extracted';";
 
+/// Migration v4: sqlite-vec KNN index over code chunk embeddings.
+///
+/// `chunks.embedding` (LE-f32 BLOB) stays the source of truth; `chunks_vec` is
+/// a vec0 index keyed by chunk id, kept in sync by triggers, and backfilled
+/// from existing embeddings. Requires the sqlite-vec extension to be registered
+/// on the connection (RepoDb::open does this before migrating). 384 dims =
+/// AllMiniLM-L6-v2; cosine distance to match the previous cosine_similarity.
+pub const REPO_MIGRATION_V4: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+    embedding float[384] distance_metric=cosine
+);
+
+INSERT INTO chunks_vec(rowid, embedding)
+    SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS chunks_vec_ai AFTER INSERT ON chunks
+    WHEN new.embedding IS NOT NULL
+BEGIN
+    INSERT INTO chunks_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_vec_au AFTER UPDATE OF embedding ON chunks
+BEGIN
+    DELETE FROM chunks_vec WHERE rowid = old.id;
+    INSERT INTO chunks_vec(rowid, embedding)
+        SELECT new.id, new.embedding WHERE new.embedding IS NOT NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_vec_ad AFTER DELETE ON chunks
+BEGIN
+    DELETE FROM chunks_vec WHERE rowid = old.id;
+END;
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -492,6 +526,28 @@ CREATE TABLE IF NOT EXISTS chunks (
     end_line INTEGER,
     embedding BLOB
 );
+
+-- sqlite-vec KNN index over chunk embeddings (chunks.embedding stays source of
+-- truth; triggers keep this in sync). Requires the sqlite-vec extension to be
+-- registered on the connection before this schema runs (RepoDb::open does so).
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+    embedding float[384] distance_metric=cosine
+);
+CREATE TRIGGER IF NOT EXISTS chunks_vec_ai AFTER INSERT ON chunks
+    WHEN new.embedding IS NOT NULL
+BEGIN
+    INSERT INTO chunks_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_vec_au AFTER UPDATE OF embedding ON chunks
+BEGIN
+    DELETE FROM chunks_vec WHERE rowid = old.id;
+    INSERT INTO chunks_vec(rowid, embedding)
+        SELECT new.id, new.embedding WHERE new.embedding IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_vec_ad AFTER DELETE ON chunks
+BEGIN
+    DELETE FROM chunks_vec WHERE rowid = old.id;
+END;
 
 -- Call graph edges: records calls, inherits, implements relationships between symbols.
 -- from_symbol_id is the caller/child; to_name is the callee/parent as written in source.

@@ -12,8 +12,29 @@ pub mod todos;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::Once;
 
 use migrations::{Migration, PRIMARY_MIGRATIONS, PRIMARY_VERSION};
+
+static VEC_INIT: Once = Once::new();
+
+/// Register the sqlite-vec extension so `vec0` virtual tables are available on
+/// every connection opened AFTER this call. Idempotent — call before each
+/// `Connection::open` (primary and per-repo). Must run before any migration
+/// that creates a vec0 table.
+pub fn register_vec_extension() {
+    VEC_INIT.call_once(|| {
+        // SAFETY: sqlite3_vec_init matches the C entry-point signature that
+        // sqlite3_auto_extension expects; registration is process-global and
+        // one-time.
+        #[allow(clippy::missing_transmute_annotations)]
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 pub struct Database {
     pub conn: Connection,
@@ -25,6 +46,7 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        register_vec_extension();
         let conn = Connection::open(path)?;
         let db = Self { conn };
         db.init()?;
@@ -37,6 +59,7 @@ impl Database {
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
+        register_vec_extension();
         let conn = Connection::open_in_memory()?;
         let db = Self { conn };
         db.init()?;
