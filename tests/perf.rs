@@ -164,95 +164,60 @@ fn per_table_search_500_research() {
 
 // ─── Similarity search performance ───────────────────────────────────────────
 
-/// Test similarity search at scale using mock (pre-computed) embeddings
-/// injected directly via the DB. This avoids needing the fastembed model.
-#[test]
-fn similarity_search_1000_chunks_unit_level() {
-    use ol::search::similarity::cosine_similarity;
+/// Benchmark the real production KNN path: store N mock-embedded chunks so the
+/// vec0 triggers populate `meeting_chunks_vec`, then time `meeting_similar`.
+/// This exercises the sqlite-vec index end-to-end without the fastembed model.
+fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
+    use ol::db::Database;
 
-    // Simulate what happens inside `db.meeting_similar()` with 1000 chunks
     let dims = 384usize;
-    let n_chunks = 1000usize;
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(&dir.path().join("ol.db")).unwrap();
+    let meeting_id = db.meeting_add("Perf", None, None, None).unwrap();
 
-    // Build fake embeddings: random-ish using deterministic values
-    let chunks: Vec<Vec<f32>> = (0..n_chunks)
+    // Deterministic mock embeddings; each chunk points along a rotating basis.
+    let chunks: Vec<(String, Option<Vec<f32>>)> = (0..n_chunks)
         .map(|i| {
-            (0..dims)
+            let emb: Vec<f32> = (0..dims)
                 .map(|j| ((i * dims + j) as f32 * 0.001).sin())
-                .collect()
+                .collect();
+            (format!("chunk {i}"), Some(emb))
         })
         .collect();
+    db.meeting_store_chunks(meeting_id, &chunks).unwrap();
 
     let query: Vec<f32> = (0..dims).map(|j| ((j as f32) * 0.002).cos()).collect();
 
+    // Warm up, then measure a single KNN query (the actual hot path).
+    let _ = db.meeting_similar(&query, 10).unwrap();
     let start = Instant::now();
-    let mut scored: Vec<(f32, usize)> = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, emb)| (cosine_similarity(&query, emb), i))
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    let results = db.meeting_similar(&query, 10).unwrap();
     let elapsed = start.elapsed();
 
-    println!(
-        "\n[perf] cosine similarity scan ({n_chunks} x {dims}d): {:?}",
-        elapsed
-    );
-    assert_eq!(scored.len(), n_chunks);
-
-    // Release: ~1ms. Debug: ~20ms (no LLVM vectorisation).
-    let budget = if cfg!(debug_assertions) {
-        Duration::from_millis(200)
-    } else {
-        Duration::from_millis(10)
-    };
+    println!("\n[perf] vec0 KNN over {n_chunks} chunks ({dims}d): {elapsed:?}");
+    assert_eq!(results.len(), 10);
     assert!(
         elapsed < budget,
-        "cosine scan of {n_chunks} chunks took {:?} (budget {budget:?})",
-        elapsed
+        "vec0 KNN over {n_chunks} chunks took {elapsed:?} (budget {budget:?})",
     );
 }
 
 #[test]
-fn similarity_search_10k_chunks_unit_level() {
-    use ol::search::similarity::cosine_similarity;
-
-    let dims = 384usize;
-    let n_chunks = 10_000usize;
-
-    let chunks: Vec<Vec<f32>> = (0..n_chunks)
-        .map(|i| {
-            (0..dims)
-                .map(|j| ((i * dims + j) as f32 * 0.0001).sin())
-                .collect()
-        })
-        .collect();
-
-    let query: Vec<f32> = (0..dims).map(|j| ((j as f32) * 0.0002).cos()).collect();
-
-    let start = Instant::now();
-    let mut scored: Vec<(f32, usize)> = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, emb)| (cosine_similarity(&query, emb), i))
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    let elapsed = start.elapsed();
-
-    println!(
-        "\n[perf] cosine similarity scan ({n_chunks} x {dims}d): {:?}",
-        elapsed
-    );
-
-    // Release: ~10ms. Debug: ~150ms.
+fn similarity_search_1000_chunks_knn() {
     let budget = if cfg!(debug_assertions) {
-        Duration::from_millis(2000)
+        Duration::from_millis(200)
+    } else {
+        Duration::from_millis(50)
+    };
+    bench_meeting_knn(1000, budget);
+}
+
+#[test]
+fn similarity_search_10k_chunks_knn() {
+    let budget = if cfg!(debug_assertions) {
+        Duration::from_millis(500)
     } else {
         Duration::from_millis(100)
     };
-    assert!(
-        elapsed < budget,
-        "cosine scan of {n_chunks} chunks took {:?} (budget {budget:?})",
-        elapsed
-    );
+    bench_meeting_knn(10_000, budget);
 }
