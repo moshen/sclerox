@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
+use super::{embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -249,36 +249,32 @@ impl Database {
 
     /// Active memories ranked by cosine similarity to `query_embedding`.
     /// Only rows with a stored embedding participate.
+    /// Active memories nearest to `query_embedding`, via the sqlite-vec KNN index
+    /// (`memory_vec`, cosine). The index is maintained active-only by triggers,
+    /// so this is a plain KNN join. `score` = 1 - cosine distance.
     pub fn memory_similar(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarMemory>> {
+        let query = embedding_to_bytes(query_embedding);
         let sql = format!(
-            "SELECT {MEMORY_COLS}, embedding FROM memory
-             WHERE embedding IS NOT NULL AND status = 'active'"
+            "SELECT {MEMORY_COLS}, v.distance
+             FROM memory_vec v
+             JOIN memory m ON m.id = v.rowid
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut scored: Vec<SimilarMemory> = stmt
-            .query_map([], |row| {
-                let entry = row_to_memory(row)?;
-                let emb_bytes: Vec<u8> = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
-                Ok((entry, emb_bytes))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(entry, emb_bytes)| {
-                let emb = bytes_to_embedding(&emb_bytes);
-                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
-                SimilarMemory { entry, score }
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let entry = row_to_memory(row)?;
+            let distance: f64 = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
+            Ok(SimilarMemory {
+                entry,
+                score: 1.0 - distance as f32,
             })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(limit);
-        Ok(scored)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Semantic counterpart to `memory_find_near_duplicate`: returns the single
@@ -667,30 +663,39 @@ mod tests {
         // Before embedding: all three need backfill.
         assert_eq!(db.memory_needing_embedding().unwrap().len(), 3);
 
-        // Mock embeddings (unit vectors); 'c' is close to 'a', 'b' is orthogonal.
-        db.memory_set_embedding("a", &[1.0, 0.0, 0.0]).unwrap();
-        db.memory_set_embedding("b", &[0.0, 1.0, 0.0]).unwrap();
-        db.memory_set_embedding("c", &[0.9, 0.1, 0.0]).unwrap();
+        // 384-dim mock embeddings (the vec0 index enforces the AllMiniLM dim).
+        // 'c' is close to 'a', 'b' is orthogonal.
+        let unit = |i: usize| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = 1.0;
+            v
+        };
+        let mut mix = vec![0.0f32; 384];
+        mix[0] = 0.9;
+        mix[1] = 0.1;
+        db.memory_set_embedding("a", &unit(0)).unwrap();
+        db.memory_set_embedding("b", &unit(1)).unwrap();
+        db.memory_set_embedding("c", &mix).unwrap();
         assert!(db.memory_needing_embedding().unwrap().is_empty());
 
         // Ranking: exact match first, then the near neighbour.
-        let res = db.memory_similar(&[1.0, 0.0, 0.0], 2).unwrap();
+        let res = db.memory_similar(&unit(0), 2).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].entry.key, "a");
         assert_eq!(res[1].entry.key, "c");
 
         // Semantic near-dup honours the threshold.
         let hit = db
-            .memory_find_near_duplicate_semantic(&[1.0, 0.0, 0.0], 0.95)
+            .memory_find_near_duplicate_semantic(&unit(0), 0.95)
             .unwrap();
         assert_eq!(hit.map(|m| m.key), Some("a".to_string()));
         let miss = db
-            .memory_find_near_duplicate_semantic(&[0.0, 0.0, 1.0], 0.95)
+            .memory_find_near_duplicate_semantic(&unit(2), 0.95)
             .unwrap();
         assert!(miss.is_none());
 
         // Setting a key that doesn't exist returns false.
-        assert!(!db.memory_set_embedding("nope", &[1.0, 0.0, 0.0]).unwrap());
+        assert!(!db.memory_set_embedding("nope", &unit(0)).unwrap());
     }
 
     #[test]

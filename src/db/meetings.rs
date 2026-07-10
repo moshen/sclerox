@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
+use super::{embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meeting {
@@ -239,53 +239,43 @@ impl Database {
         Ok(())
     }
 
+    /// Meetings whose chunks are nearest to `query_embedding`, via the
+    /// sqlite-vec KNN index (`meeting_chunks_vec`, cosine). Returns up to
+    /// `limit` chunk hits (a meeting may appear more than once); callers dedupe.
+    /// `score` = 1 - cosine distance.
     pub fn meeting_similar(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarMeeting>> {
-        // Load all chunks with embeddings
+        let query = embedding_to_bytes(query_embedding);
         let mut stmt = self.conn.prepare(
-            "SELECT mc.meeting_id, mc.chunk_text, mc.embedding,
-                    m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at
-             FROM meeting_chunks mc
+            "SELECT m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at,
+                    mc.chunk_text, v.distance
+             FROM meeting_chunks_vec v
+             JOIN meeting_chunks mc ON mc.id = v.rowid
              JOIN meetings m ON mc.meeting_id = m.id
-             WHERE mc.embedding IS NOT NULL",
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
         )?;
-
-        let mut scored: Vec<(f32, String, Meeting)> = stmt
-            .query_map([], |row| {
-                let emb_bytes: Vec<u8> = row.get(2)?;
-                let chunk_text: String = row.get(1)?;
-                let meeting = Meeting {
-                    id: row.get(3)?,
-                    title: row.get(4)?,
-                    meeting_date: row.get(5)?,
-                    transcript: row.get(6)?,
-                    notes: row.get(7)?,
-                    created_at: row.get(8)?,
-                };
-                Ok((emb_bytes, chunk_text, meeting))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(emb_bytes, chunk, meeting)| {
-                let emb = bytes_to_embedding(&emb_bytes);
-                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
-                (score, chunk, meeting)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        Ok(scored
-            .into_iter()
-            .map(|(score, matched_chunk, meeting)| SimilarMeeting {
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let meeting = Meeting {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                meeting_date: row.get(2)?,
+                transcript: row.get(3)?,
+                notes: row.get(4)?,
+                created_at: row.get(5)?,
+            };
+            let matched_chunk: String = row.get(6)?;
+            let distance: f64 = row.get(7)?;
+            Ok(SimilarMeeting {
                 meeting,
-                score,
+                score: 1.0 - distance as f32,
                 matched_chunk,
             })
-            .collect())
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 
@@ -356,20 +346,25 @@ mod tests {
             .meeting_add("Tech Talk", None, Some("Rust is great for systems"), None)
             .unwrap();
 
-        // Store chunks with mock embeddings
-        let v1: Vec<f32> = vec![1.0, 0.0, 0.0];
-        let v2: Vec<f32> = vec![0.0, 1.0, 0.0];
+        // Store chunks with 384-dim mock embeddings (vec0 enforces the dim).
+        let unit = |i: usize| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = 1.0;
+            v
+        };
         db.meeting_store_chunks(
             id,
             &[
-                ("Rust is great for systems".to_string(), Some(v1.clone())),
-                ("Python is great for scripting".to_string(), Some(v2)),
+                ("Rust is great for systems".to_string(), Some(unit(0))),
+                ("Python is great for scripting".to_string(), Some(unit(1))),
             ],
         )
         .unwrap();
 
-        // Query with a vector close to v1
-        let query = vec![0.9, 0.1, 0.0];
+        // Query with a vector close to unit(0)
+        let mut query = vec![0.0f32; 384];
+        query[0] = 0.9;
+        query[1] = 0.1;
         let results = db.meeting_similar(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
         // First result should be the one matching [1,0,0]

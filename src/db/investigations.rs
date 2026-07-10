@@ -340,58 +340,46 @@ impl Database {
     }
 
     /// Find investigations semantically similar to a query embedding.
+    /// Investigations whose chunks are nearest to `query_embedding`, via the
+    /// sqlite-vec KNN index (`investigation_chunks_vec`, cosine). `score` =
+    /// 1 - cosine distance.
     pub fn investigation_similar(
         &self,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarInvestigation>> {
+        let query = crate::db::embedding_to_bytes(query_embedding);
         let mut stmt = self.conn.prepare(
-            "SELECT ic.investigation_id, ic.chunk_text, ic.embedding,
-                    i.id, i.name, i.slug, i.status, i.plan, i.findings,
-                    i.created_at, i.concluded_at, i.updated_at
-             FROM investigation_chunks ic
+            "SELECT i.id, i.name, i.slug, i.status, i.plan, i.findings,
+                    i.created_at, i.concluded_at, i.updated_at,
+                    ic.chunk_text, v.distance
+             FROM investigation_chunks_vec v
+             JOIN investigation_chunks ic ON ic.id = v.rowid
              JOIN investigations i ON ic.investigation_id = i.id
-             WHERE ic.embedding IS NOT NULL",
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
         )?;
-
-        let mut scored: Vec<(f32, String, Investigation)> = stmt
-            .query_map([], |row| {
-                let emb_bytes: Vec<u8> = row.get(2)?;
-                let chunk_text: String = row.get(1)?;
-                let inv = Investigation {
-                    id: row.get(3)?,
-                    name: row.get(4)?,
-                    slug: row.get(5)?,
-                    status: row.get(6)?,
-                    plan: row.get(7)?,
-                    findings: row.get(8)?,
-                    created_at: row.get(9)?,
-                    concluded_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                };
-                Ok((emb_bytes, chunk_text, inv))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(emb_bytes, chunk, inv)| {
-                let emb = crate::db::bytes_to_embedding(&emb_bytes);
-                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
-                (score, chunk, inv)
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+            let inv = Investigation {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                slug: row.get(2)?,
+                status: row.get(3)?,
+                plan: row.get(4)?,
+                findings: row.get(5)?,
+                created_at: row.get(6)?,
+                concluded_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            };
+            let matched_chunk: String = row.get(9)?;
+            let distance: f64 = row.get(10)?;
+            Ok(SimilarInvestigation {
+                investigation: inv,
+                score: 1.0 - distance as f32,
+                matched_chunk,
             })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        Ok(scored
-            .into_iter()
-            .map(
-                |(score, matched_chunk, investigation)| SimilarInvestigation {
-                    investigation,
-                    score,
-                    matched_chunk,
-                },
-            )
-            .collect())
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

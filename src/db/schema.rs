@@ -411,6 +411,125 @@ pub const MIGRATION_V10: &str = "
 ALTER TABLE memory ADD COLUMN embedding BLOB;
 ";
 
+/// Migration v11: sqlite-vec KNN indexes for every embedded primary-DB table
+/// (memory, meeting/todo/investigation chunks, repo descriptions), mirroring
+/// what REPO_MIGRATION_V4 did for code chunks. The base `embedding` columns stay
+/// the source of truth; each `*_vec` vec0 table is kept in sync by triggers and
+/// backfilled from existing rows. 384 dims = AllMiniLM-L6-v2; cosine distance to
+/// match the previous cosine_similarity ranking. Requires the sqlite-vec
+/// extension (registered in Database::open before migrating).
+pub const MIGRATION_V11: &str = "
+-- memory (embedding on the row itself, keyed by memory.id). memory_similar
+-- only ever wants ACTIVE memories, so keep the index active-only: maintain it
+-- on both embedding and status changes, and backfill active rows only.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(embedding float[384] distance_metric=cosine);
+INSERT INTO memory_vec(rowid, embedding)
+    SELECT id, embedding FROM memory WHERE embedding IS NOT NULL AND status = 'active';
+CREATE TRIGGER IF NOT EXISTS memory_vec_ai AFTER INSERT ON memory
+    WHEN new.embedding IS NOT NULL AND new.status = 'active'
+BEGIN
+    INSERT INTO memory_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_vec_au AFTER UPDATE OF embedding ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+    INSERT INTO memory_vec(rowid, embedding)
+        SELECT new.id, new.embedding
+        WHERE new.embedding IS NOT NULL AND new.status = 'active';
+END;
+CREATE TRIGGER IF NOT EXISTS memory_vec_status AFTER UPDATE OF status ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+    INSERT INTO memory_vec(rowid, embedding)
+        SELECT new.id, new.embedding
+        WHERE new.embedding IS NOT NULL AND new.status = 'active';
+END;
+CREATE TRIGGER IF NOT EXISTS memory_vec_ad AFTER DELETE ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+END;
+
+-- meeting_chunks
+CREATE VIRTUAL TABLE IF NOT EXISTS meeting_chunks_vec USING vec0(embedding float[384] distance_metric=cosine);
+INSERT INTO meeting_chunks_vec(rowid, embedding)
+    SELECT id, embedding FROM meeting_chunks WHERE embedding IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS meeting_chunks_vec_ai AFTER INSERT ON meeting_chunks
+    WHEN new.embedding IS NOT NULL
+BEGIN
+    INSERT INTO meeting_chunks_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS meeting_chunks_vec_au AFTER UPDATE OF embedding ON meeting_chunks
+BEGIN
+    DELETE FROM meeting_chunks_vec WHERE rowid = old.id;
+    INSERT INTO meeting_chunks_vec(rowid, embedding)
+        SELECT new.id, new.embedding WHERE new.embedding IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS meeting_chunks_vec_ad AFTER DELETE ON meeting_chunks
+BEGIN
+    DELETE FROM meeting_chunks_vec WHERE rowid = old.id;
+END;
+
+-- todo_chunks
+CREATE VIRTUAL TABLE IF NOT EXISTS todo_chunks_vec USING vec0(embedding float[384] distance_metric=cosine);
+INSERT INTO todo_chunks_vec(rowid, embedding)
+    SELECT id, embedding FROM todo_chunks WHERE embedding IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS todo_chunks_vec_ai AFTER INSERT ON todo_chunks
+    WHEN new.embedding IS NOT NULL
+BEGIN
+    INSERT INTO todo_chunks_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS todo_chunks_vec_au AFTER UPDATE OF embedding ON todo_chunks
+BEGIN
+    DELETE FROM todo_chunks_vec WHERE rowid = old.id;
+    INSERT INTO todo_chunks_vec(rowid, embedding)
+        SELECT new.id, new.embedding WHERE new.embedding IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS todo_chunks_vec_ad AFTER DELETE ON todo_chunks
+BEGIN
+    DELETE FROM todo_chunks_vec WHERE rowid = old.id;
+END;
+
+-- investigation_chunks
+CREATE VIRTUAL TABLE IF NOT EXISTS investigation_chunks_vec USING vec0(embedding float[384] distance_metric=cosine);
+INSERT INTO investigation_chunks_vec(rowid, embedding)
+    SELECT id, embedding FROM investigation_chunks WHERE embedding IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS investigation_chunks_vec_ai AFTER INSERT ON investigation_chunks
+    WHEN new.embedding IS NOT NULL
+BEGIN
+    INSERT INTO investigation_chunks_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS investigation_chunks_vec_au AFTER UPDATE OF embedding ON investigation_chunks
+BEGIN
+    DELETE FROM investigation_chunks_vec WHERE rowid = old.id;
+    INSERT INTO investigation_chunks_vec(rowid, embedding)
+        SELECT new.id, new.embedding WHERE new.embedding IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS investigation_chunks_vec_ad AFTER DELETE ON investigation_chunks
+BEGIN
+    DELETE FROM investigation_chunks_vec WHERE rowid = old.id;
+END;
+
+-- repos (description_embedding, keyed by repos.id)
+CREATE VIRTUAL TABLE IF NOT EXISTS repos_vec USING vec0(embedding float[384] distance_metric=cosine);
+INSERT INTO repos_vec(rowid, embedding)
+    SELECT id, description_embedding FROM repos WHERE description_embedding IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS repos_vec_ai AFTER INSERT ON repos
+    WHEN new.description_embedding IS NOT NULL
+BEGIN
+    INSERT INTO repos_vec(rowid, embedding) VALUES (new.id, new.description_embedding);
+END;
+CREATE TRIGGER IF NOT EXISTS repos_vec_au AFTER UPDATE OF description_embedding ON repos
+BEGIN
+    DELETE FROM repos_vec WHERE rowid = old.id;
+    INSERT INTO repos_vec(rowid, embedding)
+        SELECT new.id, new.description_embedding WHERE new.description_embedding IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS repos_vec_ad AFTER DELETE ON repos
+BEGIN
+    DELETE FROM repos_vec WHERE rowid = old.id;
+END;
+";
+
 /// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
 pub const MIGRATION_V8: &str = "
 DELETE FROM identifier_types WHERE name = 'jira';

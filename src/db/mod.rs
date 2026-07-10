@@ -128,17 +128,11 @@ pub fn run_migrations(
     Ok(())
 }
 
-/// Serialize a float vector to little-endian bytes for BLOB storage.
+/// Serialize a float vector to little-endian bytes for BLOB storage. This is
+/// exactly the layout sqlite-vec's `float[N]` columns consume, so the stored
+/// BLOB doubles as the vec0 index input with no conversion.
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-/// Deserialize BLOB bytes back to a float vector.
-pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -261,12 +255,14 @@ mod tests {
     }
 
     #[test]
-    fn test_embedding_roundtrip() {
-        let original = vec![1.0f32, -0.5, 0.123456, f32::MAX, f32::MIN_POSITIVE];
-        let bytes = embedding_to_bytes(&original);
-        let recovered = bytes_to_embedding(&bytes);
-        for (a, b) in original.iter().zip(recovered.iter()) {
-            assert!((a - b).abs() < f32::EPSILON);
-        }
+    fn test_embedding_to_bytes_le_layout() {
+        // sqlite-vec float[N] consumes a contiguous little-endian f32 array;
+        // verify our serialization matches that exact layout.
+        let v = vec![1.0f32, -0.5, 0.25];
+        let bytes = embedding_to_bytes(&v);
+        assert_eq!(bytes.len(), v.len() * 4);
+        assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &(-0.5f32).to_le_bytes());
+        assert_eq!(&bytes[8..12], &0.25f32.to_le_bytes());
     }
 }

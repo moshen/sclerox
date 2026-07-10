@@ -387,56 +387,43 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Todos whose chunks are nearest to `query_embedding`, via the sqlite-vec
+    /// KNN index (`todo_chunks_vec`, cosine). `score` = 1 - cosine distance.
     pub fn todo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarTodo>> {
-        use crate::db::bytes_to_embedding;
-        use crate::search::similarity::cosine_similarity;
-
+        let query = crate::db::embedding_to_bytes(query_embedding);
         let mut stmt = self.conn.prepare(
-            "SELECT tc.chunk_text, tc.embedding,
-                    t.id, t.title, t.notes, t.status, t.source_url, t.category,
-                    t.originated_date, t.deadline_date, t.completed_at, t.created_at, t.updated_at
-             FROM todo_chunks tc
+            "SELECT t.id, t.title, t.notes, t.status, t.source_url, t.category,
+                    t.originated_date, t.deadline_date, t.completed_at, t.created_at, t.updated_at,
+                    tc.chunk_text, v.distance
+             FROM todo_chunks_vec v
+             JOIN todo_chunks tc ON tc.id = v.rowid
              JOIN todos t ON t.id = tc.todo_id
-             WHERE tc.embedding IS NOT NULL",
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
         )?;
-
-        let mut scored: Vec<(f32, SimilarTodo)> = stmt
-            .query_map([], |r| {
-                let chunk_text: String = r.get(0)?;
-                let emb_bytes: Vec<u8> = r.get(1)?;
-                let todo = Todo {
-                    id: r.get(2)?,
-                    title: r.get(3)?,
-                    notes: r.get(4)?,
-                    status: r.get(5)?,
-                    source_url: r.get(6)?,
-                    category: r.get(7)?,
-                    originated_date: r.get(8)?,
-                    deadline_date: r.get(9)?,
-                    completed_at: r.get(10)?,
-                    created_at: r.get(11)?,
-                    updated_at: r.get(12)?,
-                };
-                Ok((chunk_text, emb_bytes, todo))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(chunk_text, emb_bytes, todo)| {
-                let emb = bytes_to_embedding(&emb_bytes);
-                let score = cosine_similarity(query_embedding, &emb);
-                (
-                    score,
-                    SimilarTodo {
-                        todo,
-                        score,
-                        matched_chunk: chunk_text,
-                    },
-                )
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |r| {
+            let todo = Todo {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                notes: r.get(2)?,
+                status: r.get(3)?,
+                source_url: r.get(4)?,
+                category: r.get(5)?,
+                originated_date: r.get(6)?,
+                deadline_date: r.get(7)?,
+                completed_at: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+            };
+            let matched_chunk: String = r.get(11)?;
+            let distance: f64 = r.get(12)?;
+            Ok(SimilarTodo {
+                todo,
+                score: 1.0 - distance as f32,
+                matched_chunk,
             })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored.into_iter().map(|(_, t)| t).collect())
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

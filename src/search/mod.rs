@@ -1,5 +1,3 @@
-pub mod similarity;
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -266,7 +264,10 @@ pub fn global_search(
             });
         }
         if let Some(ref qe) = query_emb {
-            for c in repo_db.similar_chunks(qe, semantic_limit).unwrap_or_default() {
+            for c in repo_db
+                .similar_chunks(qe, semantic_limit)
+                .unwrap_or_default()
+            {
                 if c.score >= semantic_threshold {
                     code_chunks.push((c.score, repo.name.clone(), c));
                 }

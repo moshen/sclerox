@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::{bytes_to_embedding, embedding_to_bytes, fts, Database};
+use super::{embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoEntry {
@@ -78,41 +78,35 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Repos whose description is nearest to `query_embedding`, via the
+    /// sqlite-vec KNN index (`repos_vec`, cosine). `score` = 1 - cosine distance.
     pub fn repo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarRepo>> {
+        let query = crate::db::embedding_to_bytes(query_embedding);
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, description, db_path, last_indexed, created_at, description_embedding
-             FROM repos WHERE description_embedding IS NOT NULL",
+            "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at,
+                    v.distance
+             FROM repos_vec v
+             JOIN repos r ON r.id = v.rowid
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance",
         )?;
-
-        let mut scored: Vec<(f32, RepoEntry)> = stmt
-            .query_map([], |row| {
-                let emb_bytes: Vec<u8> = row.get(7)?;
-                let repo = RepoEntry {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                    db_path: row.get(4)?,
-                    last_indexed: row.get(5)?,
-                    created_at: row.get(6)?,
-                };
-                Ok((emb_bytes, repo))
-            })?
-            .filter_map(|r| r.ok())
-            .map(|(emb_bytes, repo)| {
-                let emb = bytes_to_embedding(&emb_bytes);
-                let score = crate::search::similarity::cosine_similarity(query_embedding, &emb);
-                (score, repo)
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let repo = RepoEntry {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                db_path: row.get(4)?,
+                last_indexed: row.get(5)?,
+                created_at: row.get(6)?,
+            };
+            let distance: f64 = row.get(7)?;
+            Ok(SimilarRepo {
+                repo,
+                score: 1.0 - distance as f32,
             })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        Ok(scored
-            .into_iter()
-            .map(|(score, repo)| SimilarRepo { repo, score })
-            .collect())
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn repo_remove(&self, path: &str) -> Result<bool> {
@@ -264,15 +258,18 @@ mod tests {
     #[test]
     fn test_repo_similar() {
         let db = Database::open_in_memory().unwrap();
-        let v1: Vec<f32> = vec![1.0, 0.0, 0.0];
-        let v2: Vec<f32> = vec![0.0, 1.0, 0.0];
+        let unit = |i: usize| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = 1.0;
+            v
+        };
 
         db.repo_register(
             "/a",
             "repo-a",
             Some("systems code"),
             "/a/.ol/repo.db",
-            Some(&v1),
+            Some(&unit(0)),
         )
         .unwrap();
         db.repo_register(
@@ -280,11 +277,13 @@ mod tests {
             "repo-b",
             Some("web frontend"),
             "/b/.ol/repo.db",
-            Some(&v2),
+            Some(&unit(1)),
         )
         .unwrap();
 
-        let query = vec![0.95f32, 0.05, 0.0];
+        let mut query = vec![0.0f32; 384];
+        query[0] = 0.95;
+        query[1] = 0.05;
         let results = db.repo_similar(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].repo.name, "repo-a");
