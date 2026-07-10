@@ -57,7 +57,8 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             let floor = sem.semantic_threshold as f32;
 
             let mut any = false;
-            let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> = Vec::new();
+            let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> =
+                Vec::new();
             for entry in &repos {
                 if let Some(filter) = &repo {
                     if !entry.name.to_lowercase().contains(&filter.to_lowercase()) {
@@ -84,7 +85,10 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 }
 
                 if let Some(ref qe) = query_emb {
-                    for c in repo_db.similar_chunks(qe, sem.semantic_limit).unwrap_or_default() {
+                    for c in repo_db
+                        .similar_chunks(qe, sem.semantic_limit)
+                        .unwrap_or_default()
+                    {
                         if c.score >= floor {
                             code_chunks.push((c.score, entry.name.clone(), c));
                         }

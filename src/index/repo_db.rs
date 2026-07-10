@@ -495,10 +495,24 @@ mod tests {
     fn test_chunks_similarity() {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
-        db.insert_chunk(file_id, 0, "fn foo() { ... }", Some(1), Some(5), Some(&v384(0)))
-            .unwrap();
-        db.insert_chunk(file_id, 1, "fn bar() { ... }", Some(6), Some(10), Some(&v384(1)))
-            .unwrap();
+        db.insert_chunk(
+            file_id,
+            0,
+            "fn foo() { ... }",
+            Some(1),
+            Some(5),
+            Some(&v384(0)),
+        )
+        .unwrap();
+        db.insert_chunk(
+            file_id,
+            1,
+            "fn bar() { ... }",
+            Some(6),
+            Some(10),
+            Some(&v384(1)),
+        )
+        .unwrap();
 
         // Query closest to v384(0) → the "foo" chunk ranks first.
         let mut query = v384(0);
