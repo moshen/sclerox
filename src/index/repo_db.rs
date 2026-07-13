@@ -51,6 +51,9 @@ impl RepoDb {
         }
         crate::db::register_vec_extension();
         let conn = Connection::open(path)?;
+        // Enforce FOREIGN KEY / ON DELETE CASCADE (per-connection, OFF by
+        // default; must be set outside a transaction, so set it before init).
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
@@ -60,6 +63,7 @@ impl RepoDb {
     pub fn open_in_memory() -> Result<Self> {
         crate::db::register_vec_extension();
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.init()?;
         Ok(db)

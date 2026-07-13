@@ -48,6 +48,10 @@ impl Database {
         }
         register_vec_extension();
         let conn = Connection::open(path)?;
+        // Enforce the schema's FOREIGN KEY / ON DELETE CASCADE constraints.
+        // This pragma is per-connection and OFF by default; it must be set
+        // outside a transaction (open is), so set it before init/migrations.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.init()?;
         log::debug!(
@@ -61,6 +65,7 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         register_vec_extension();
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.init()?;
         Ok(db)

@@ -373,6 +373,46 @@ mod tests {
     }
 
     #[test]
+    fn test_meeting_delete_cascades_chunks_and_vec_index() {
+        // Deleting a meeting must ON DELETE CASCADE to meeting_chunks, and the
+        // chunk delete must fire the vec0 AFTER DELETE trigger so no orphaned
+        // KNN index rows survive. This only holds with PRAGMA foreign_keys=ON.
+        let db = Database::open_in_memory().unwrap();
+        let mut unit = vec![0.0f32; 384];
+        unit[0] = 1.0;
+
+        let id = db.meeting_add("Doomed", None, Some("body"), None).unwrap();
+        db.meeting_store_chunks(id, &[("c0".to_string(), Some(unit))])
+            .unwrap();
+
+        let chunks: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM meeting_chunks", [], |r| r.get(0))
+            .unwrap();
+        let vec_rows: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM meeting_chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((chunks, vec_rows), (1, 1), "chunk + vec index seeded");
+
+        assert!(db.meeting_delete(id).unwrap());
+
+        let chunks: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM meeting_chunks", [], |r| r.get(0))
+            .unwrap();
+        let vec_rows: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM meeting_chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (chunks, vec_rows),
+            (0, 0),
+            "cascade removed chunks and their vec0 index rows"
+        );
+    }
+
+    #[test]
     fn test_meeting_list_date_filter() {
         let db = Database::open_in_memory().unwrap();
         db.meeting_add("M1", Some("2026-01-01"), None, None)
