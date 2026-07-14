@@ -88,10 +88,30 @@ impl<'a> RepoIndexer<'a> {
             .unwrap_or("unknown")
             .to_string();
 
-        // Honor a per-folder opt-out before touching anything (no .ol/ dir, no
-        // registration) so hooks silently skip excluded folders.
+        // Honor a per-folder opt-out before touching anything so hooks silently
+        // skip excluded folders. Also self-heal: if this folder was indexed
+        // before being opted out, retract the now-stale index (repo.db + its
+        // WAL/SHM sidecars) and the primary registry entry. Keep .ol/config.toml
+        // — it is the opt-out marker itself.
         if !repo_config(repo_root).index {
             log::info!("skipping '{name}' — indexing disabled in .ol/config.toml");
+            let ol_dir = repo_root.join(".ol");
+            let mut retracted = false;
+            for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
+                let p = ol_dir.join(fname);
+                if p.exists() {
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => retracted = true,
+                        Err(e) => log::warn!("failed to remove stale {}: {e}", p.display()),
+                    }
+                }
+            }
+            if db.repo_remove(&repo_root.to_string_lossy())? {
+                retracted = true;
+            }
+            if retracted {
+                log::info!("retracted stale index for opted-out '{name}'");
+            }
             return Ok(IndexResult::default());
         }
 
@@ -371,6 +391,37 @@ class Handler:
         let repos = primary_db.repo_list().unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].description.as_deref(), Some("Test repo"));
+    }
+
+    #[test]
+    fn test_opt_out_retracts_stale_index() {
+        // Index a repo, then opt it out and re-run: the stale repo.db and the
+        // registry entry must be retracted, while .ol/config.toml survives.
+        let repo_dir = make_test_repo();
+        let primary_db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+
+        indexer
+            .index_repo(&primary_db, repo_dir.path(), None)
+            .unwrap();
+        let db_path = repo_dir.path().join(".ol").join("repo.db");
+        assert!(db_path.exists(), "index built");
+        assert_eq!(primary_db.repo_list().unwrap().len(), 1, "registered");
+
+        // Opt out and re-run (as a hook would).
+        let cfg = repo_dir.path().join(".ol").join("config.toml");
+        std::fs::write(&cfg, "index = false\n").unwrap();
+        let result = indexer
+            .index_repo(&primary_db, repo_dir.path(), None)
+            .unwrap();
+
+        assert_eq!(result.files_indexed, 0, "opted-out: nothing indexed");
+        assert!(!db_path.exists(), "stale repo.db retracted");
+        assert!(cfg.exists(), "opt-out marker config.toml preserved");
+        assert!(
+            primary_db.repo_list().unwrap().is_empty(),
+            "registry entry deregistered"
+        );
     }
 
     #[test]
