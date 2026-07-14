@@ -254,7 +254,18 @@ fn detect_shell() -> Option<&'static str> {
         "zsh" => Some("zsh"),
         "bash" => Some("bash"),
         "fish" => Some("fish"),
-        _ => None,
+        // On Windows, $SHELL is normally unset (Git Bash sets it to "bash",
+        // handled above). Default the native case to PowerShell.
+        _ => {
+            #[cfg(windows)]
+            {
+                Some("powershell")
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        }
     }
 }
 
@@ -342,6 +353,26 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
                 std::fs::write(&comp_file, &content)?;
                 println!("Completions (fish): {}", comp_file.display());
                 println!("  completions active in new fish sessions automatically");
+            }
+        }
+        "powershell" => {
+            // $PROFILE varies by PowerShell version/host and Documents may be
+            // OneDrive-redirected, so write to a stable path and print the line
+            // to add rather than guess-editing the profile.
+            let comp_dir = home.join(".ol").join("completions");
+            let comp_file = comp_dir.join("ol.ps1");
+            if dry_run {
+                println!(
+                    "Completions (powershell): would write {}",
+                    comp_file.display()
+                );
+                println!("  then dot-source it from $PROFILE");
+            } else {
+                std::fs::create_dir_all(&comp_dir)?;
+                std::fs::write(&comp_file, &content)?;
+                println!("Completions (powershell): {}", comp_file.display());
+                println!("  add this line to your $PROFILE, then restart PowerShell:");
+                println!("    . \"{}\"", comp_file.display());
             }
         }
         _ => {}

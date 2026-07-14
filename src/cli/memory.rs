@@ -728,7 +728,9 @@ fn distill_with_ai(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledM
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
                 "AI command '{program}' not found in PATH. \
-                 Set [ai].command in ~/.ol/config.toml (or $OL_AI_COMMAND)."
+                 Set [ai].command in ~/.ol/config.toml (or $OL_AI_COMMAND). \
+                 On Windows an npm CLI is a .cmd shim the bare name can't \
+                 resolve — point it at e.g. '{program}.cmd'."
             )
         } else {
             anyhow::anyhow!("failed to run '{program}': {e}")

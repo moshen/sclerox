@@ -145,8 +145,17 @@ impl<'a> RepoIndexer<'a> {
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
             let path = entry.path();
+            // Store repo-relative paths with forward slashes on every platform
+            // (git's convention) so stored paths, search output, and the
+            // `/`-based ignore checks stay consistent on Windows too. Building
+            // from components avoids the native separator that to_string_lossy
+            // would emit (backslashes on Windows).
             let rel_path = match path.strip_prefix(repo_root) {
-                Ok(p) => p.to_string_lossy().to_string(),
+                Ok(p) => p
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
                 Err(_) => continue,
             };
 

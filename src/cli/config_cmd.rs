@@ -94,6 +94,9 @@ pub fn config_template() -> String {
          # that invoked it:\n\
          #   claude -p --safe-mode --no-session-persistence --tools=\n\
          #   opencode run --pure\n\
+         # Windows: an npm-installed CLI is a .cmd shim, which the bare name\n\
+         # won't resolve. Point command at the shim explicitly, e.g.\n\
+         #   command = \"claude.cmd -p --safe-mode --no-session-persistence --tools=\"\n\
          # command = \"\"   # full command incl. flags; env: OL_AI_COMMAND\n\
          # model = \"\"     # appended to the DEFAULT command only; env: OL_AI_MODEL\n\
          \n\
