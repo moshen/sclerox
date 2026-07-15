@@ -714,13 +714,64 @@ pub fn distill_with_ai_pub(argv: &[String], text: &str) -> anyhow::Result<Vec<Di
     distill_with_ai(argv, text)
 }
 
+/// Search `path_var` × `pathext` for `program`, returning the first candidate
+/// for which `exists` is true. Pure so it is testable without a real PATH; the
+/// Windows resolver below supplies the real env values and a filesystem check.
+#[cfg(any(windows, test))]
+fn resolve_via_pathext(
+    program: &str,
+    path_var: &str,
+    pathext: &str,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    for dir in std::env::split_paths(path_var) {
+        for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+            let cand = dir.join(format!("{program}{ext}"));
+            if exists(&cand) {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the AI command's program token to a concrete path.
+///
+/// `Command::new` on Windows only auto-appends `.exe`, so a bare name like
+/// `claude` or `opencode` never finds the `.cmd`/`.bat` shims npm installs.
+/// Resolve bare names against PATH + PATHEXT ourselves; std then routes a
+/// resolved `.cmd`/`.bat` through cmd.exe with hardened arg escaping. A name
+/// that already has an extension or a path separator is trusted as given, and
+/// Unix needs nothing (Command::new already searches PATH and honors shebangs).
+fn resolve_program(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        let bare = std::path::Path::new(program).extension().is_none()
+            && !program.contains(['/', '\\']);
+        if bare {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            if let Ok(path) = std::env::var("PATH") {
+                if let Some(found) =
+                    resolve_via_pathext(program, &path, &pathext, |p| p.is_file())
+                {
+                    return found;
+                }
+            }
+        }
+    }
+    program.to_string()
+}
+
 fn distill_with_ai(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledMemory>> {
     let prompt = format!("{DISTILL_PROMPT}{text}");
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("AI command is empty"))?;
 
-    let mut cmd = std::process::Command::new(program);
+    // On Windows this finds claude.cmd/opencode.cmd; elsewhere it's a no-op.
+    let resolved = resolve_program(program);
+    let mut cmd = std::process::Command::new(&resolved);
     cmd.args(args);
     cmd.arg(&prompt);
 
@@ -787,6 +838,38 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_via_pathext_finds_shim_and_respects_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Only a .cmd shim exists (the npm-on-Windows shape).
+        std::fs::write(dir.path().join("claude.cmd"), "").unwrap();
+        let path_var = dir.path().to_string_lossy().into_owned();
+
+        let found =
+            resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
+        assert!(found.ends_with("claude.cmd"), "resolved to the .cmd shim");
+
+        // A bare name with no matching file resolves to nothing.
+        assert!(
+            resolve_via_pathext("opencode", &path_var, ".exe;.cmd", |p| p.is_file()).is_none()
+        );
+
+        // .exe wins when both exist (PATHEXT order honored).
+        std::fs::write(dir.path().join("claude.exe"), "").unwrap();
+        let found =
+            resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
+        assert!(found.ends_with("claude.exe"), "earlier PATHEXT entry wins");
+    }
+
+    #[test]
+    fn resolve_program_is_identity_for_explicit_names() {
+        // Names with an extension or path separator are trusted as-is on every
+        // platform (and the whole thing is a no-op on non-Windows).
+        assert_eq!(resolve_program("claude.cmd"), "claude.cmd");
+        #[cfg(not(windows))]
+        assert_eq!(resolve_program("claude"), "claude");
+    }
 
     #[test]
     fn default_claude_command_with_flags() {
