@@ -7,9 +7,34 @@ Use when the user asks about people, meetings, projects, todos, past decisions, 
 - Starting work: search for related meetings, todos, investigations, project context
 - Colleague mentioned: look them up for contact details
 - Past decision referenced: search memory and investigations
+- A decision is made: record it as a memory IMMEDIATELY, unprompted (see below)
 - After learning something: save to memory for future sessions
 - When a memory is wrong or outdated: mark it stale or supersede it
 - Looking for code: use `ol code` (see below) BEFORE Grep/Glob
+
+## Decisions — record automatically, don't wait to be asked
+
+Whenever a decision is encountered in conversation, write it to memory at that
+moment. Do not ask permission and do not defer to session distillation — the
+decision and its WHY should survive even if the session is never distilled.
+
+Triggers (any of these = a decision):
+
+- The user picks an approach, option, or tool ("let's go with X", "do it that way")
+- The user accepts or rejects a recommendation you made
+- A convention, threshold, or default is settled ("always X", "keep it as-is")
+- Something is deliberately deferred or descoped ("not now", "revisit when Y")
+- A meeting note or document you're processing states a decision
+
+```bash
+ol memory set "<area>-<decision-slug>" \
+  "<what was decided>. Why: <reasoning>. Rejected: <alternatives, if any>" \
+  --type project
+```
+
+Include the why and the rejected alternatives — future sessions need the
+reasoning, not just the verdict. If the decision reverses an earlier one, use
+`ol memory supersede <old_key> <new_key> "<new value>"` instead of a bare set.
 
 ## Code search — prefer this over Grep/Glob
 
@@ -147,7 +172,7 @@ ol config path                       # where the config file lives
 
 **Before any task:** `ol search "<topic>"`
 **Finding code (prefer over Grep):** `ol code search "<symbol>"` / `ol code refs <symbol>`
-**After a decision:** `ol memory set "<key>" "<decision>" --type project`
+**After a decision:** record immediately, unprompted (see "Decisions" above)
 **When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
 **When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`
 **After research:** `ol research conclude <id> --findings "<findings>"`
