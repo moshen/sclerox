@@ -478,10 +478,16 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path
             if HARDCODED_IGNORED.contains(&name) {
                 return false;
             }
-            // Prune any subfolder that explicitly opted out of indexing, so the
-            // parent index never absorbs a folder the user excluded. depth() > 0
-            // skips re-checking the root (already known to be opted in).
+            // Directory rules below apply only to *sub*directories; depth() > 0
+            // skips re-checking the root itself.
             if e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                // A nested git repo is its own index target — treat its .git as
+                // a boundary and don't absorb its files into this parent index.
+                // Each .git level gets its own .ol.
+                if is_git_repo(e.path()) {
+                    return false;
+                }
+                // Prune a subfolder that explicitly opted out of indexing.
                 return repo_config(e.path()).index;
             }
             true
@@ -507,25 +513,28 @@ fn is_git_repo(p: &Path) -> bool {
     p.join(".git").exists()
 }
 
-/// Which entry of a nested (ancestor, descendant) pair is redundant.
+/// How to resolve a nested (ancestor, descendant) pair of registered folders.
 #[derive(Debug, PartialEq, Eq)]
-enum NestedLoser {
-    Ancestor,
-    Descendant,
+enum NestedResolution {
+    /// Both are real repos (nested git) — each keeps its own index.
+    KeepBoth,
+    /// Drop the ancestor (a spurious non-git "workspace" holding a real repo).
+    DropAncestor,
+    /// Drop the descendant (a plain subdir already covered by the ancestor).
+    DropDescendant,
 }
 
-/// Decide which entry to drop when one registered folder sits inside another.
-/// A git repo owns its whole subtree, so a git ancestor always wins (drop the
-/// descendant). A non-git ancestor holding a git descendant is a spurious
-/// "workspace" folder (indexed by an over-eager hook) and loses to its real
-/// repo child. When neither is a git repo, the broader ancestor is kept.
-fn nested_loser(ancestor_is_git: bool, descendant_is_git: bool) -> NestedLoser {
-    if ancestor_is_git {
-        NestedLoser::Descendant
-    } else if descendant_is_git {
-        NestedLoser::Ancestor
-    } else {
-        NestedLoser::Descendant
+/// Decide what to do when one registered folder sits inside another.
+/// Two git repos nested one inside the other are independent — the parent's
+/// walk stops at the inner .git boundary, so each keeps its own index. A non-git
+/// ancestor holding a git descendant is a spurious "workspace" folder (indexed
+/// by an over-eager hook) and loses to its real repo child. Otherwise the
+/// broader ancestor covers a plain descendant, so the descendant is dropped.
+fn nested_resolution(ancestor_is_git: bool, descendant_is_git: bool) -> NestedResolution {
+    match (ancestor_is_git, descendant_is_git) {
+        (true, true) => NestedResolution::KeepBoth,
+        (false, true) => NestedResolution::DropAncestor,
+        (true, false) | (false, false) => NestedResolution::DropDescendant,
     }
 }
 
@@ -552,14 +561,15 @@ pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
             if i == j || ci == cj || !cj.starts_with(ci) {
                 continue;
             }
-            match nested_loser(is_git_repo(ci), is_git_repo(cj)) {
-                NestedLoser::Descendant => {
+            match nested_resolution(is_git_repo(ci), is_git_repo(cj)) {
+                NestedResolution::KeepBoth => {}
+                NestedResolution::DropDescendant => {
                     // Keep a descendant that deliberately opted out.
                     if repo_config(cj).index {
                         to_remove.insert(canon[j].0.clone());
                     }
                 }
-                NestedLoser::Ancestor => {
+                NestedResolution::DropAncestor => {
                     to_remove.insert(canon[i].0.clone());
                 }
             }
@@ -608,6 +618,9 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
         if child == repo_root || !child.starts_with(&repo_root) {
             continue;
         }
+        if is_git_repo(&child) {
+            continue; // a nested git repo is its own index, not covered here
+        }
         if !repo_config(child_raw).index {
             continue; // explicit opt-out: leave the independent child index be
         }
@@ -643,6 +656,13 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
 /// Used to skip indexing a subfolder that a parent index already covers.
 /// Returns the ancestor's (stored) path if one is registered, else `None`.
 fn parent_indexed_repo(db: &Database, repo_root: &Path) -> Result<Option<String>> {
+    // A git repo is its own index even when nested inside another repo — each
+    // .git level gets its own .ol, and the parent's walk stops at the boundary
+    // so it never covered this repo anyway. Only a non-git folder is deemed
+    // covered by a parent index.
+    if is_git_repo(repo_root) {
+        return Ok(None);
+    }
     let repo_root = canonical_or_self(repo_root);
     for r in db.repo_list()? {
         // Canonicalize both sides so differing path forms still match. A
@@ -1012,14 +1032,24 @@ class Handler:
     }
 
     #[test]
-    fn test_nested_loser_rule() {
-        // git ancestor owns the subtree → drop descendant.
-        assert_eq!(nested_loser(true, true), NestedLoser::Descendant);
-        assert_eq!(nested_loser(true, false), NestedLoser::Descendant);
+    fn test_nested_resolution_rule() {
+        // Two nested git repos are independent → keep both.
+        assert_eq!(nested_resolution(true, true), NestedResolution::KeepBoth);
+        // git ancestor with a plain (non-git) subdir → drop the subdir.
+        assert_eq!(
+            nested_resolution(true, false),
+            NestedResolution::DropDescendant
+        );
         // non-git workspace parent with a real repo child → drop the parent.
-        assert_eq!(nested_loser(false, true), NestedLoser::Ancestor);
+        assert_eq!(
+            nested_resolution(false, true),
+            NestedResolution::DropAncestor
+        );
         // neither is a repo → keep the broader ancestor.
-        assert_eq!(nested_loser(false, false), NestedLoser::Descendant);
+        assert_eq!(
+            nested_resolution(false, false),
+            NestedResolution::DropDescendant
+        );
     }
 
     /// Register `path` with a stub `.ol/repo.db` so pruning has something to
@@ -1070,9 +1100,9 @@ class Handler:
     }
 
     #[test]
-    fn test_prune_drops_child_under_git_parent() {
-        // A git repo containing a nested registered folder: the git root owns
-        // the subtree, so the nested child entry is dropped.
+    fn test_prune_keeps_nested_git_repos() {
+        // Two git repos nested one inside the other are independent: the parent
+        // walk stops at the inner .git boundary, so both keep their own index.
         let parent = TempDir::new().unwrap();
         std::fs::create_dir_all(parent.path().join(".git")).unwrap();
         let child = parent.path().join("sub");
@@ -1083,14 +1113,28 @@ class Handler:
         register_with_index(&db, &child, true); // nested git child
 
         let removed = prune_nested_repos(&db).unwrap();
+        assert!(removed.is_empty(), "nested git repos are both kept");
+        assert_eq!(db.repo_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_prune_drops_plain_subdir_under_git_parent() {
+        // A git repo with a plain (non-git) subdir spuriously registered: the
+        // subdir is covered by the parent, so its entry is dropped.
+        let parent = TempDir::new().unwrap();
+        std::fs::create_dir_all(parent.path().join(".git")).unwrap();
+        let child = parent.path().join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        register_with_index(&db, parent.path(), true); // git parent
+        register_with_index(&db, &child, false); // plain subdir
+
+        let removed = prune_nested_repos(&db).unwrap();
         assert_eq!(removed, vec![child.to_string_lossy().to_string()]);
         let remaining = db.repo_list().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].path, parent.path().to_string_lossy());
-        assert!(
-            parent.path().join(".ol").join("repo.db").exists(),
-            "git parent index kept"
-        );
     }
 
     #[test]
@@ -1112,6 +1156,48 @@ class Handler:
             removed.is_empty(),
             "opted-out descendant must not be pruned"
         );
+        assert_eq!(db.repo_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_nested_git_repos_index_separately() {
+        // A git repo containing a nested git repo: the outer index must stop at
+        // the inner .git boundary (not absorb inner files), and the inner repo
+        // must get its own index — one .ol per .git level.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir_all(outer.path().join(".git")).unwrap();
+        std::fs::write(outer.path().join("outer.rs"), "fn outer() {}").unwrap();
+        let inner = outer.path().join("inner");
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        std::fs::write(inner.join("inner.rs"), "fn inner() {}").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+
+        // Index the outer repo: its index must NOT contain inner/inner.rs.
+        RepoIndexer::new(None)
+            .index_repo(&db, outer.path(), None)
+            .unwrap();
+        let outer_db = RepoDb::open(&outer.path().join(".ol").join("repo.db")).unwrap();
+        let outer_files = outer_db.list_files().unwrap();
+        assert!(
+            outer_files.iter().any(|f| f.path == "outer.rs"),
+            "outer indexes its own file"
+        );
+        assert!(
+            !outer_files.iter().any(|f| f.path.starts_with("inner/")),
+            "outer must not absorb the nested repo's files"
+        );
+
+        // Index the inner repo: it is NOT skipped and gets its own .ol.
+        let result = RepoIndexer::new(None)
+            .index_repo(&db, &inner, None)
+            .unwrap();
+        assert!(result.files_indexed > 0, "nested repo indexed on its own");
+        assert!(
+            inner.join(".ol").join("repo.db").exists(),
+            "inner repo has its own index"
+        );
+        // Both levels registered.
         assert_eq!(db.repo_list().unwrap().len(), 2);
     }
 
