@@ -105,6 +105,12 @@ impl<'a> RepoIndexer<'a> {
         repo_root: &Path,
         description: Option<&str>,
     ) -> Result<IndexResult> {
+        // Canonicalize up front so the registry, the index db path, and every
+        // ancestry check use one normalized form regardless of caller (hooks
+        // pass a logical cwd; `ol repo index` canonicalizes). This keeps the
+        // same directory from being registered twice under different spellings.
+        let repo_root = canonical_or_self(repo_root);
+        let repo_root = repo_root.as_path();
         let name = repo_root
             .file_name()
             .and_then(|n| n.to_str())
@@ -497,6 +503,86 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path
     (files, over_cap)
 }
 
+fn is_git_repo(p: &Path) -> bool {
+    p.join(".git").exists()
+}
+
+/// Which entry of a nested (ancestor, descendant) pair is redundant.
+#[derive(Debug, PartialEq, Eq)]
+enum NestedLoser {
+    Ancestor,
+    Descendant,
+}
+
+/// Decide which entry to drop when one registered folder sits inside another.
+/// A git repo owns its whole subtree, so a git ancestor always wins (drop the
+/// descendant). A non-git ancestor holding a git descendant is a spurious
+/// "workspace" folder (indexed by an over-eager hook) and loses to its real
+/// repo child. When neither is a git repo, the broader ancestor is kept.
+fn nested_loser(ancestor_is_git: bool, descendant_is_git: bool) -> NestedLoser {
+    if ancestor_is_git {
+        NestedLoser::Descendant
+    } else if descendant_is_git {
+        NestedLoser::Ancestor
+    } else {
+        NestedLoser::Descendant
+    }
+}
+
+/// Consolidate registry entries made redundant by nesting: when one registered
+/// folder sits inside another, only one should own the overlapping code (see
+/// `nested_loser`). Retracts each loser's `.ol` index and deregisters it. A
+/// descendant that explicitly opted out keeps its independent index. Returns the
+/// stored paths that were removed. Used by `ol repo sync` to heal registries
+/// polluted by the old hook that indexed non-git folders.
+pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
+    let repos = db.repo_list()?;
+    // (stored path, canonical path) for each entry.
+    let canon: Vec<(String, std::path::PathBuf)> = repos
+        .iter()
+        .map(|r| (r.path.clone(), canonical_or_self(Path::new(&r.path))))
+        .collect();
+
+    let mut to_remove: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (i, (_, ci)) in canon.iter().enumerate() {
+        for (j, (_, cj)) in canon.iter().enumerate() {
+            // Only consider ci as a *proper* ancestor of cj. `starts_with` is
+            // component-wise. `ci == cj` (two rows for the same real dir) is
+            // left alone here — canonical registration prevents new ones.
+            if i == j || ci == cj || !cj.starts_with(ci) {
+                continue;
+            }
+            match nested_loser(is_git_repo(ci), is_git_repo(cj)) {
+                NestedLoser::Descendant => {
+                    // Keep a descendant that deliberately opted out.
+                    if repo_config(cj).index {
+                        to_remove.insert(canon[j].0.clone());
+                    }
+                }
+                NestedLoser::Ancestor => {
+                    to_remove.insert(canon[i].0.clone());
+                }
+            }
+        }
+    }
+
+    let removed: Vec<String> = to_remove.into_iter().collect();
+    for path in &removed {
+        let ol_dir = Path::new(path).join(".ol");
+        for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
+            let p = ol_dir.join(fname);
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    log::warn!("failed to remove redundant index {}: {e}", p.display());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&ol_dir);
+        let _ = db.repo_remove(path);
+    }
+    Ok(removed)
+}
+
 /// Canonicalize `p`, falling back to `p` as-is if it can't be resolved.
 /// Ancestry checks between a live `repo_root` and registry paths must compare
 /// the same normalized form: the hooks index the session's *logical* cwd
@@ -844,7 +930,11 @@ class Handler:
         );
         let repos = db.repo_list().unwrap();
         assert_eq!(repos.len(), 1, "only the parent remains registered");
-        assert_eq!(repos[0].path, parent.path().to_string_lossy());
+        // index_repo canonicalizes before registering, so compare canonical.
+        assert_eq!(
+            repos[0].path,
+            parent.path().canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[test]
@@ -919,6 +1009,110 @@ class Handler:
             parent_indexed_repo(&db, &child).unwrap().is_some(),
             "parent must be detected despite differing path forms"
         );
+    }
+
+    #[test]
+    fn test_nested_loser_rule() {
+        // git ancestor owns the subtree → drop descendant.
+        assert_eq!(nested_loser(true, true), NestedLoser::Descendant);
+        assert_eq!(nested_loser(true, false), NestedLoser::Descendant);
+        // non-git workspace parent with a real repo child → drop the parent.
+        assert_eq!(nested_loser(false, true), NestedLoser::Ancestor);
+        // neither is a repo → keep the broader ancestor.
+        assert_eq!(nested_loser(false, false), NestedLoser::Descendant);
+    }
+
+    /// Register `path` with a stub `.ol/repo.db` so pruning has something to
+    /// retract. Optionally mark it a git repo.
+    fn register_with_index(db: &Database, path: &Path, git: bool) {
+        std::fs::create_dir_all(path.join(".ol")).unwrap();
+        std::fs::write(path.join(".ol").join("repo.db"), b"stub").unwrap();
+        if git {
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+        }
+        db.repo_register(
+            &path.to_string_lossy(),
+            path.file_name().unwrap().to_str().unwrap(),
+            None,
+            &path.join(".ol").join("repo.db").to_string_lossy(),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_prune_drops_spurious_non_git_parent() {
+        // A non-git workspace folder holding a git-repo child: the parent is
+        // the over-eager-hook artifact and must be dropped, the child kept.
+        let ws = TempDir::new().unwrap();
+        let child = ws.path().join("repo-a");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        register_with_index(&db, ws.path(), false); // non-git parent
+        register_with_index(&db, &child, true); // git child
+
+        let removed = prune_nested_repos(&db).unwrap();
+        assert_eq!(removed.len(), 1, "only the parent removed");
+        assert_eq!(removed[0], ws.path().to_string_lossy());
+
+        let remaining = db.repo_list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, child.to_string_lossy());
+        assert!(
+            !ws.path().join(".ol").join("repo.db").exists(),
+            "spurious parent index retracted"
+        );
+        assert!(
+            child.join(".ol").join("repo.db").exists(),
+            "child index preserved"
+        );
+    }
+
+    #[test]
+    fn test_prune_drops_child_under_git_parent() {
+        // A git repo containing a nested registered folder: the git root owns
+        // the subtree, so the nested child entry is dropped.
+        let parent = TempDir::new().unwrap();
+        std::fs::create_dir_all(parent.path().join(".git")).unwrap();
+        let child = parent.path().join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        register_with_index(&db, parent.path(), true); // git parent
+        register_with_index(&db, &child, true); // nested git child
+
+        let removed = prune_nested_repos(&db).unwrap();
+        assert_eq!(removed, vec![child.to_string_lossy().to_string()]);
+        let remaining = db.repo_list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, parent.path().to_string_lossy());
+        assert!(
+            parent.path().join(".ol").join("repo.db").exists(),
+            "git parent index kept"
+        );
+    }
+
+    #[test]
+    fn test_prune_keeps_opted_out_descendant() {
+        // A git parent with a child that explicitly opted out: the child is an
+        // intentional independent index and must survive consolidation.
+        let parent = TempDir::new().unwrap();
+        std::fs::create_dir_all(parent.path().join(".git")).unwrap();
+        let child = parent.path().join("vendored");
+        std::fs::create_dir_all(child.join(".ol")).unwrap();
+        std::fs::write(child.join(".ol").join("config.toml"), "index = false\n").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        register_with_index(&db, parent.path(), true);
+        register_with_index(&db, &child, false);
+
+        let removed = prune_nested_repos(&db).unwrap();
+        assert!(
+            removed.is_empty(),
+            "opted-out descendant must not be pruned"
+        );
+        assert_eq!(db.repo_list().unwrap().len(), 2);
     }
 
     #[test]

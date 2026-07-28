@@ -330,6 +330,12 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
 fn heal_repos(db: &Database, force: bool) -> anyhow::Result<()> {
     use crate::db::repos::RepoHealthStatus;
 
+    // First consolidate nested registrations: a folder indexed inside another
+    // indexed folder is redundant (or a spurious non-git workspace parent).
+    for removed in crate::index::prune_nested_repos(db)? {
+        println!("Removing nested/redundant entry: {removed}");
+    }
+
     let health = db.repo_health_check()?;
     if health.is_empty() {
         return Ok(());
