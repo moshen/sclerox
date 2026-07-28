@@ -17,6 +17,9 @@ pub enum RepoCommand {
         /// Skip embedding generation (embeddings are on by default)
         #[arg(long)]
         no_embed: bool,
+        /// Index even when the folder exceeds the max-files cap
+        #[arg(long)]
+        force: bool,
     },
     /// List all indexed repositories
     List,
@@ -70,6 +73,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             path,
             description,
             no_embed,
+            force,
         } => {
             let canonical = path.canonicalize().unwrap_or(path);
             // Walk up to the git root so `ol repo index` from a subdirectory indexes the whole repo.
@@ -87,7 +91,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             } else {
                 Some(Embedder::new()?)
             };
-            let mut indexer = RepoIndexer::new(embedder_opt.as_mut());
+            let mut indexer = RepoIndexer::new(embedder_opt.as_mut()).with_force(force);
             println!("Indexing {}...", canonical.display());
             let result = indexer.index_repo(db, &canonical, description.as_deref())?;
             println!(
@@ -349,7 +353,9 @@ fn heal_repos(db: &Database, force: bool) -> anyhow::Result<()> {
                 };
                 println!("{action}: {}", h.repo.name);
                 let path = std::path::Path::new(&h.repo.path);
-                let mut indexer = crate::index::RepoIndexer::new(None);
+                // Re-indexing a known repo: don't let the cap drop one that was
+                // previously indexed fine.
+                let mut indexer = crate::index::RepoIndexer::new(None).with_force(true);
                 match indexer.index_repo(db, path, h.repo.description.as_deref()) {
                     Ok(r) => println!("  {} files indexed, {} symbols", r.files_indexed, r.symbols),
                     Err(e) => println!("  failed: {e}"),

@@ -112,9 +112,12 @@ fn run_start(db: &Database) -> Result<()> {
             .file_name()
             .and_then(|n| n.to_str())
             .map(str::to_string);
-        let description = repo_name.as_ref().map(|n| format!("{n} repo"));
-        let mut indexer = crate::index::RepoIndexer::new(None);
-        let _ = indexer.index_repo(db, &git_root, description.as_deref());
+        // Auto-index policy: "off" disables session-hook indexing entirely.
+        if crate::config::settings().index.auto != "off" {
+            let description = repo_name.as_ref().map(|n| format!("{n} repo"));
+            let mut indexer = crate::index::RepoIndexer::new(None);
+            let _ = indexer.index_repo(db, &git_root, description.as_deref());
+        }
     }
 
     // Emit compact session context for Claude Code to inject (layer-1 index only).
@@ -369,13 +372,17 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     // Walk up from cwd to find the git root so subdirectory sessions index the whole repo.
     let cwd = std::env::current_dir()?;
     {
+        // Auto-index policy: only the session's git repo root, and only when
+        // "off" hasn't disabled it. Matches the SessionStart hook.
         let git_root = find_git_root(&cwd);
-        let mut indexer = crate::index::RepoIndexer::new(None);
-        let description = git_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| format!("{n} repo"));
-        let _ = indexer.index_repo(db, &git_root, description.as_deref());
+        if git_root.join(".git").exists() && crate::config::settings().index.auto != "off" {
+            let mut indexer = crate::index::RepoIndexer::new(None);
+            let description = git_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| format!("{n} repo"));
+            let _ = indexer.index_repo(db, &git_root, description.as_deref());
+        }
     }
 
     if no_distill {
@@ -556,7 +563,7 @@ fn run_opencode(
         .unwrap_or_default();
     let git_root = find_git_root(&dir);
 
-    if git_root.join(".git").exists() {
+    if git_root.join(".git").exists() && crate::config::settings().index.auto != "off" {
         let mut indexer = crate::index::RepoIndexer::new(None);
         let description = git_root
             .file_name()

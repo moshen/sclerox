@@ -746,14 +746,13 @@ fn resolve_via_pathext(
 fn resolve_program(program: &str) -> String {
     #[cfg(windows)]
     {
-        let bare = std::path::Path::new(program).extension().is_none()
-            && !program.contains(['/', '\\']);
+        let bare =
+            std::path::Path::new(program).extension().is_none() && !program.contains(['/', '\\']);
         if bare {
             let pathext =
                 std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
             if let Ok(path) = std::env::var("PATH") {
-                if let Some(found) =
-                    resolve_via_pathext(program, &path, &pathext, |p| p.is_file())
+                if let Some(found) = resolve_via_pathext(program, &path, &pathext, |p| p.is_file())
                 {
                     return found;
                 }
@@ -846,19 +845,15 @@ mod tests {
         std::fs::write(dir.path().join("claude.cmd"), "").unwrap();
         let path_var = dir.path().to_string_lossy().into_owned();
 
-        let found =
-            resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
+        let found = resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
         assert!(found.ends_with("claude.cmd"), "resolved to the .cmd shim");
 
         // A bare name with no matching file resolves to nothing.
-        assert!(
-            resolve_via_pathext("opencode", &path_var, ".exe;.cmd", |p| p.is_file()).is_none()
-        );
+        assert!(resolve_via_pathext("opencode", &path_var, ".exe;.cmd", |p| p.is_file()).is_none());
 
         // .exe wins when both exist (PATHEXT order honored).
         std::fs::write(dir.path().join("claude.exe"), "").unwrap();
-        let found =
-            resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
+        let found = resolve_via_pathext("claude", &path_var, ".exe;.cmd", |p| p.is_file()).unwrap();
         assert!(found.ends_with("claude.exe"), "earlier PATHEXT entry wins");
     }
 

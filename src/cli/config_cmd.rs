@@ -131,6 +131,8 @@ pub fn config_template() -> String {
          \n\
          [index]\n\
          # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n\
+         # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
+         # max_files = {max_files}                    # reject folders over this many files (--force to override); env: OL_MAX_INDEX_FILES\n\
          \n\
          [log]\n\
          # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n\
@@ -153,6 +155,8 @@ pub fn config_template() -> String {
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
         max_bytes = d.index.max_file_bytes,
+        auto = d.index.auto,
+        max_files = d.index.max_files,
         log_level = d.log.level,
         retain_days = d.log.retain_days,
     )

@@ -109,6 +109,14 @@ pub struct IndexSettings {
     /// Files larger than this skip tree-sitter symbol extraction (still indexed
     /// via line chunks). Env: `OL_MAX_INDEX_FILE_BYTES`.
     pub max_file_bytes: usize,
+    /// Automatic (session-hook) indexing policy: `"git"` indexes the session's
+    /// git repo root only; `"off"` disables auto-indexing entirely. Explicit
+    /// `ol repo index` is unaffected. Unknown values fall back to `"git"`.
+    pub auto: String,
+    /// Reject indexing a folder with more than this many indexable files (unless
+    /// `ol repo index --force`). Guards against indexing a giant tree. Env:
+    /// `OL_MAX_INDEX_FILES`.
+    pub max_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +214,8 @@ impl Default for IndexSettings {
     fn default() -> Self {
         Self {
             max_file_bytes: 1_000_000,
+            auto: "git".to_string(),
+            max_files: 50_000,
         }
     }
 }
@@ -294,6 +304,11 @@ impl Settings {
                 self.index.max_file_bytes = n;
             }
         }
+        if let Ok(v) = std::env::var("OL_MAX_INDEX_FILES") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.index.max_files = n;
+            }
+        }
         if let Ok(l) = std::env::var("OL_LOG") {
             if !l.is_empty() {
                 self.log.level = l;
@@ -356,6 +371,16 @@ impl Settings {
             &mut self.index.max_file_bytes,
             1_000_000,
         );
+        require_positive("index.max_files", &mut self.index.max_files, 50_000);
+
+        // Auto-index policy must be a recognised value; otherwise warn and use "git".
+        if !matches!(self.index.auto.as_str(), "git" | "off") {
+            eprintln!(
+                "warning: index.auto = \"{}\" is not valid (git|off); using git",
+                self.index.auto
+            );
+            self.index.auto = "git".to_string();
+        }
 
         // Normalise empty strings to None so consumers can treat them uniformly.
         if self.ai.command.as_deref() == Some("") {
@@ -416,6 +441,15 @@ pub fn init() {
                 "OL_MAX_INDEX_FILE_BYTES",
                 s.index.max_file_bytes.to_string(),
             );
+        }
+    }
+    // Same bridge for the max-files cap: the library indexer reads it from the
+    // env var, so surface a customized config value there.
+    let files_is_default = s.index.max_files == IndexSettings::default().max_files;
+    if !files_is_default && std::env::var("OL_MAX_INDEX_FILES").is_err() {
+        // SAFETY: single-threaded startup, before any indexing thread is spawned.
+        unsafe {
+            std::env::set_var("OL_MAX_INDEX_FILES", s.index.max_files.to_string());
         }
     }
 }
@@ -496,5 +530,26 @@ semantic_threshold = 0.7
     #[test]
     fn malformed_toml_errors() {
         assert!(Settings::from_toml_str("this is = = not toml").is_err());
+    }
+
+    #[test]
+    fn index_defaults_and_validation() {
+        // Defaults.
+        let s = Settings::from_toml_str("").unwrap();
+        assert_eq!(s.index.auto, "git");
+        assert_eq!(s.index.max_files, 50_000);
+
+        // Valid override kept.
+        let mut ok = Settings::from_toml_str("[index]\nauto = \"off\"\nmax_files = 10\n").unwrap();
+        ok.validate();
+        assert_eq!(ok.index.auto, "off");
+        assert_eq!(ok.index.max_files, 10);
+
+        // Unknown auto value falls back to git; zero max_files repaired.
+        let mut bad =
+            Settings::from_toml_str("[index]\nauto = \"everything\"\nmax_files = 0\n").unwrap();
+        bad.validate();
+        assert_eq!(bad.index.auto, "git");
+        assert_eq!(bad.index.max_files, 50_000);
     }
 }
