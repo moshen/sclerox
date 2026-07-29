@@ -170,7 +170,11 @@ impl<'a> RepoIndexer<'a> {
         // as soon as the cap is exceeded, so a giant tree can't run the walk
         // away before we bail.
         let max_files = self.max_files.unwrap_or_else(max_index_files);
-        let (files, over_cap) = collect_indexable_files(repo_root, max_files);
+        let WalkOutcome {
+            files,
+            nested_repos,
+            over_cap,
+        } = collect_indexable_files(repo_root, max_files);
         if over_cap && !self.force {
             log::warn!(
                 "refusing to index '{name}' — more than {max_files} indexable files. \
@@ -330,6 +334,17 @@ impl<'a> RepoIndexer<'a> {
             result.edges,
         );
 
+        // Index each nested git repo hit at a boundary so a single index of the
+        // parent yields a separate entry (and .ol) per .git level. Recurse via
+        // self so nested repos deeper still are handled too; best-effort, so one
+        // failing nested repo never fails the parent. Done before the empty
+        // check so a parent whose only content is submodules still indexes them.
+        for nested in &nested_repos {
+            if let Err(e) = self.index_repo(db, nested, None) {
+                log::warn!("failed to index nested repo {}: {e:#}", nested.display());
+            }
+        }
+
         // Nothing to index: a fresh run over a folder with no indexable source
         // files. Don't leave a stub repo.db or a registry entry behind — drop
         // the handle, remove the db (and its WAL/SHM sidecars), and skip
@@ -458,11 +473,27 @@ fn is_unsafe_index_root(root: &Path) -> bool {
     false
 }
 
+/// Files to index plus the nested git repos discovered at boundaries.
+struct WalkOutcome {
+    files: Vec<std::path::PathBuf>,
+    /// Nested git repo roots pruned at their `.git` boundary — each is indexed
+    /// on its own so a parent index produces a separate entry per `.git` level.
+    nested_repos: Vec<std::path::PathBuf>,
+    /// The file count exceeded `max_files`; the caller rejects or forces.
+    over_cap: bool,
+}
+
 /// Walk `repo_root` (respecting .gitignore + hardcoded excludes + per-folder
 /// opt-outs) and collect the indexable files, stopping as soon as the count
-/// exceeds `max_files`. Returns the collected paths and whether the cap was
-/// exceeded (in which case the caller decides to reject or force through).
-fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path::PathBuf>, bool) {
+/// exceeds `max_files`. Also records nested git repos hit at their boundary.
+fn collect_indexable_files(repo_root: &Path, max_files: usize) -> WalkOutcome {
+    use std::sync::{Arc, Mutex};
+    // filter_entry must be Fn + Send + Sync + 'static, so it can't borrow a
+    // local Vec — collect nested repo roots through shared interior mutability.
+    // The walker is single-threaded, so there's no real contention.
+    let nested: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+    let nested_filter = Arc::clone(&nested);
+
     // Use the `ignore` crate (same engine as ripgrep) so .gitignore, .ignore,
     // and global gitignore are all automatically respected.
     let walker = ignore::WalkBuilder::new(repo_root)
@@ -472,7 +503,7 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path
         .git_global(true) // respect ~/.config/git/ignore
         .git_exclude(true) // respect .git/info/exclude
         .require_git(false) // respect .gitignore even outside a git repo
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             // Exclude our own .ol dir and other universal build/cache noise.
             let name = e.file_name().to_str().unwrap_or("");
             if HARDCODED_IGNORED.contains(&name) {
@@ -482,9 +513,12 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path
             // skips re-checking the root itself.
             if e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 // A nested git repo is its own index target — treat its .git as
-                // a boundary and don't absorb its files into this parent index.
-                // Each .git level gets its own .ol.
+                // a boundary (don't absorb its files) and remember it so the
+                // caller can index it separately: one .ol per .git level.
                 if is_git_repo(e.path()) {
+                    if let Ok(mut v) = nested_filter.lock() {
+                        v.push(e.path().to_path_buf());
+                    }
                     return false;
                 }
                 // Prune a subfolder that explicitly opted out of indexing.
@@ -506,7 +540,15 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> (Vec<std::path
             break;
         }
     }
-    (files, over_cap)
+    let nested_repos = Arc::try_unwrap(nested)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_default();
+    WalkOutcome {
+        files,
+        nested_repos,
+        over_cap,
+    }
 }
 
 fn is_git_repo(p: &Path) -> bool {
@@ -891,13 +933,13 @@ class Handler:
             std::fs::write(dir.path().join(format!("f{i}.rs")), "fn a() {}").unwrap();
         }
         // Over the cap: collection stops just past it and flags over_cap.
-        let (files, over) = collect_indexable_files(dir.path(), 3);
-        assert!(over, "5 files should exceed a cap of 3");
-        assert!(files.len() <= 4, "collection stops right after the cap");
+        let out = collect_indexable_files(dir.path(), 3);
+        assert!(out.over_cap, "5 files should exceed a cap of 3");
+        assert!(out.files.len() <= 4, "collection stops right after the cap");
         // Under the cap: everything collected, no flag.
-        let (files, over) = collect_indexable_files(dir.path(), 100);
-        assert!(!over);
-        assert_eq!(files.len(), 5);
+        let out = collect_indexable_files(dir.path(), 100);
+        assert!(!out.over_cap);
+        assert_eq!(out.files.len(), 5);
     }
 
     #[test]
@@ -1172,11 +1214,12 @@ class Handler:
         std::fs::write(inner.join("inner.rs"), "fn inner() {}").unwrap();
 
         let db = Database::open_in_memory().unwrap();
-
-        // Index the outer repo: its index must NOT contain inner/inner.rs.
+        // Index ONLY the outer repo.
         RepoIndexer::new(None)
             .index_repo(&db, outer.path(), None)
             .unwrap();
+
+        // Outer index holds only its own file, not the nested repo's.
         let outer_db = RepoDb::open(&outer.path().join(".ol").join("repo.db")).unwrap();
         let outer_files = outer_db.list_files().unwrap();
         assert!(
@@ -1188,17 +1231,53 @@ class Handler:
             "outer must not absorb the nested repo's files"
         );
 
-        // Index the inner repo: it is NOT skipped and gets its own .ol.
-        let result = RepoIndexer::new(None)
-            .index_repo(&db, &inner, None)
+        // The nested repo was indexed automatically — its own .ol with its file.
+        let inner_db = RepoDb::open(&inner.join(".ol").join("repo.db")).unwrap();
+        assert!(
+            inner_db
+                .list_files()
+                .unwrap()
+                .iter()
+                .any(|f| f.path == "inner.rs"),
+            "nested repo indexed on its own"
+        );
+
+        // Two registry entries — one per .git level, from a single index call.
+        let repos = db.repo_list().unwrap();
+        assert_eq!(repos.len(), 2, "two repo entries from one index");
+        // Both are stored canonicalized (index_repo canonicalizes before register).
+        let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+        let outer_c = outer.path().canonicalize().unwrap();
+        let inner_c = inner.canonicalize().unwrap();
+        assert!(paths.contains(&outer_c.to_string_lossy().as_ref()));
+        assert!(paths.contains(&inner_c.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn test_parent_with_only_nested_repo_still_indexes_it() {
+        // A git repo whose only content is a nested repo: the parent has nothing
+        // of its own to index (so no entry), but the nested repo is still indexed.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir_all(outer.path().join(".git")).unwrap();
+        let inner = outer.path().join("inner");
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        std::fs::write(inner.join("inner.rs"), "fn inner() {}").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        RepoIndexer::new(None)
+            .index_repo(&db, outer.path(), None)
             .unwrap();
-        assert!(result.files_indexed > 0, "nested repo indexed on its own");
+
         assert!(
             inner.join(".ol").join("repo.db").exists(),
-            "inner repo has its own index"
+            "nested repo indexed even when parent has nothing of its own"
         );
-        // Both levels registered.
-        assert_eq!(db.repo_list().unwrap().len(), 2);
+        let repos = db.repo_list().unwrap();
+        assert_eq!(repos.len(), 1, "only the nested repo is registered");
+        assert_eq!(
+            repos[0].path,
+            inner.canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[test]
