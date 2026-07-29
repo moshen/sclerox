@@ -112,7 +112,8 @@ pub fn config_template() -> String {
          # max_value_chars = {max_val}              # warn (not reject) above this length\n\
          \n\
          [session_context]\n\
-         # max_chars = {ctx_max}                   # ~750 tokens injected at session start\n\
+         # max_tokens = {ctx_tokens}                 # token budget (real MiniLM tokenizer) injected at session start\n\
+         # max_chars = {ctx_max}                   # hard byte backstop on that payload\n\
          # relevant_memories = {rel_mem}              # full-value memories shown\n\
          # feedback_reserved = {fb_res}              # slots guaranteed for feedback type\n\
          # todos_shown = {todos}\n\
@@ -142,6 +143,7 @@ pub fn config_template() -> String {
         cos_thr = d.dedup.cosine_threshold,
         lex_thr = d.dedup.lexical_threshold,
         max_val = d.memory.max_value_chars,
+        ctx_tokens = d.session_context.max_tokens,
         ctx_max = d.session_context.max_chars,
         rel_mem = d.session_context.relevant_memories,
         fb_res = d.session_context.feedback_reserved,

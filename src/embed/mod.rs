@@ -1,5 +1,8 @@
 use anyhow::Result;
 
+pub mod tokens;
+pub use tokens::count_tokens;
+
 /// Path to the pre-downloaded model cache, baked in at compile time.
 /// Only set when the model was downloaded during `cargo build`.
 #[cfg(bundled_model)]

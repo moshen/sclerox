@@ -147,7 +147,9 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     let mut out = String::new();
     out.push_str("## ol context (run `ol memory get <key>` etc. for full content)\n\n");
 
-    let budget = cfg.max_chars;
+    // Budget is enforced in real tokens (MiniLM tokenizer); max_chars is only a
+    // final byte backstop applied at the end.
+    let budget = cfg.max_tokens;
 
     // 1. Open todos (deadline-sorted). Highest priority — actionable now.
     if let Ok(todos) = db.todo_list(Some("open")) {
@@ -239,10 +241,16 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // Final safety cap — should already fit but guard against runaway growth.
-    if out.len() > budget {
-        out.truncate(budget);
-        out.push_str("\n…[truncated]");
+    // Final byte backstop — the token budget should already keep us well under
+    // this, but guard against runaway growth. Leave room for the marker and cut
+    // on a char boundary so the result stays within max_chars and a multibyte
+    // sequence at the limit can't panic the session-start hook.
+    const TRUNC_MARKER: &str = "\n…[truncated]";
+    if out.len() > cfg.max_chars {
+        let limit = cfg.max_chars.saturating_sub(TRUNC_MARKER.len());
+        let cut = floor_char_boundary(&out, limit);
+        out.truncate(cut);
+        out.push_str(TRUNC_MARKER);
     }
 
     Ok(out)
@@ -331,11 +339,26 @@ fn relevant_memories(
     picked
 }
 
-/// Append `section` to `out` only if doing so keeps `out` under `budget` chars.
-fn push_if_fits(out: &mut String, section: &str, budget: usize) {
-    if out.len() + section.len() <= budget {
+/// Append `section` to `out` only if doing so keeps the payload within
+/// `budget_tokens` real tokens. Counts are additive across the join (a slight,
+/// safe over-count); with only a handful of sections the re-count is cheap.
+fn push_if_fits(out: &mut String, section: &str, budget_tokens: usize) {
+    if crate::embed::count_tokens(out) + crate::embed::count_tokens(section) <= budget_tokens {
         out.push_str(section);
     }
+}
+
+/// Largest byte index `<= max` that lands on a UTF-8 char boundary (stable-Rust
+/// stand-in for the unstable `str::floor_char_boundary`).
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Truncate a value string to a single short line for use in the index.

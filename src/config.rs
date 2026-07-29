@@ -71,7 +71,12 @@ pub struct MemorySettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionContextSettings {
-    /// Hard cap on injected session-start context (~4 chars/token).
+    /// Token budget for injected session-start context, enforced with the real
+    /// MiniLM tokenizer (`embed::count_tokens`).
+    pub max_tokens: usize,
+    /// Hard byte backstop on the injected context — a coarse final guard so a
+    /// tokenizer hiccup can never emit a runaway payload. Keep it comfortably
+    /// above `max_tokens` × ~4 bytes/token.
     pub max_chars: usize,
     /// Full-value memories surfaced at session start.
     pub relevant_memories: usize,
@@ -180,6 +185,7 @@ impl Default for MemorySettings {
 impl Default for SessionContextSettings {
     fn default() -> Self {
         Self {
+            max_tokens: 750,
             max_chars: 3000,
             relevant_memories: 5,
             feedback_reserved: 1,
@@ -330,6 +336,11 @@ impl Settings {
             "memory.max_value_chars",
             &mut self.memory.max_value_chars,
             800,
+        );
+        require_positive(
+            "session_context.max_tokens",
+            &mut self.session_context.max_tokens,
+            750,
         );
         require_positive(
             "session_context.max_chars",
