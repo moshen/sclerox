@@ -12,13 +12,18 @@ command handlers; call the shared function instead.
 
 # When adding or changing CLI commands
 
-The skill file is `src/skill.md` (embedded via `skill_file_content()` in
-`src/cli/install.rs`, which just `include_str!`s it). Update `src/skill.md`:
+The skill is a progressive-disclosure directory under `src/skill/`, embedded
+via `skill_files()` in `src/cli/install.rs`:
 
-- Every new subcommand or flag must appear in the Commands section
-- Every new pattern or workflow must appear in the Patterns section
-- The skill file is what Claude reads to know how to use `ol` — if it's
-  not there, Claude won't use it
+- `src/skill/SKILL.md` — the always-loaded behavioral core (when to use,
+  recording decisions, the code-search rule, privacy, patterns). Keep it lean.
+- `src/skill/reference/<domain>.md` — per-domain commands plus that domain's
+  workflow, read on demand (e.g. `todos.md`, `repos-and-code.md`).
+
+When adding or changing a command or flag, update the matching
+`reference/<domain>.md`; add a new behavioral rule or a new domain link to
+`SKILL.md`. The skill is what the agent reads to use `ol` — if it's not there,
+the agent won't use it.
 
 Check that `ol <command> --help` output matches what the skill describes.
 

@@ -94,12 +94,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Claude => {
             let dir = claude_dir()?;
             if !args.no_skill {
-                install_skill(
-                    &dir.join("skills"),
-                    "ol-kb.md",
-                    policy.overwrite_skill,
-                    args.dry_run,
-                )?;
+                install_skill(&dir.join("skills"), policy.overwrite_skill, args.dry_run)?;
             }
             if !args.no_hooks {
                 // Hook uses full path - runs without the user's shell profile.
@@ -118,12 +113,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Opencode => {
             let dir = opencode_dir()?;
             if !args.no_skill {
-                install_skill(
-                    &dir.join("skills"),
-                    "ol-kb.md",
-                    policy.overwrite_skill,
-                    args.dry_run,
-                )?;
+                install_skill(&dir.join("skills"), policy.overwrite_skill, args.dry_run)?;
             }
             if !args.no_hooks {
                 install_opencode_plugin(&dir, ol_bin, policy.overwrite_hooks, args.dry_run)?;
@@ -159,7 +149,7 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
         InstallTarget::Claude => {
             let dir = claude_dir()?;
             if !args.no_skill {
-                remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
+                remove_skill(&dir.join("skills"), args.dry_run)?;
             }
             if !args.no_hooks {
                 uninstall_claude_hook(&dir, args.dry_run)?;
@@ -171,7 +161,7 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
         InstallTarget::Opencode => {
             let dir = opencode_dir()?;
             if !args.no_skill {
-                remove_if_exists(&dir.join("skills").join("ol-kb.md"), args.dry_run)?;
+                remove_skill(&dir.join("skills"), args.dry_run)?;
             }
             if !args.no_hooks {
                 remove_if_exists(&dir.join("plugins").join("ol-session.js"), args.dry_run)?;
@@ -398,23 +388,73 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_skill(dir: &Path, filename: &str, overwrite: bool, dry_run: bool) -> Result<()> {
-    let path = dir.join(filename);
-    if !overwrite && path.exists() {
+fn install_skill(skills_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
+    let skill_root = skills_dir.join(SKILL_DIR_NAME);
+    let legacy = skills_dir.join(LEGACY_SKILL_FILE);
+
+    // Protect a customized skill: if the current dir or the legacy flat file is
+    // present and overwrite is off, leave everything as-is.
+    if !overwrite && (skill_root.exists() || legacy.exists()) {
         println!(
-            "  skill: kept existing {} (install.overwrite_skill = false)",
-            path.display()
+            "  skill: kept existing {}/ (install.overwrite_skill = false)",
+            skill_root.display()
         );
         return Ok(());
     }
+
     if dry_run {
-        println!("  would write: {}", path.display());
-    } else {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        std::fs::write(&path, skill_file_content())
+        println!(
+            "  would write skill: {}/ (SKILL.md + reference/)",
+            skill_root.display()
+        );
+        if legacy.exists() {
+            println!("  would remove legacy skill file: {}", legacy.display());
+        }
+        return Ok(());
+    }
+
+    // Migrate away from the pre-directory flat file so it can't shadow the skill.
+    if legacy.exists() {
+        std::fs::remove_file(&legacy)
+            .with_context(|| format!("failed to remove {}", legacy.display()))?;
+        println!("  removed legacy skill file: {}", legacy.display());
+    }
+
+    for (rel, content) in skill_files() {
+        let path = skill_root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&path, content)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("  wrote skill: {}", path.display());
+    }
+    println!("  wrote skill: {}/", skill_root.display());
+    Ok(())
+}
+
+/// Remove the installed skill: the `ol-kb/` directory (current layout) plus the
+/// legacy flat `ol-kb.md` if an older install left one.
+fn remove_skill(skills_dir: &Path, dry_run: bool) -> Result<()> {
+    let skill_root = skills_dir.join(SKILL_DIR_NAME);
+    let legacy = skills_dir.join(LEGACY_SKILL_FILE);
+    let mut found = false;
+    if skill_root.exists() {
+        found = true;
+        if dry_run {
+            println!("  would remove: {}/", skill_root.display());
+        } else {
+            std::fs::remove_dir_all(&skill_root)
+                .with_context(|| format!("failed to remove {}", skill_root.display()))?;
+            println!("  removed: {}/", skill_root.display());
+        }
+    }
+    if legacy.exists() {
+        found = true;
+        remove_if_exists(&legacy, dry_run)?;
+    }
+    if !found {
+        println!("  skill: nothing to remove in {}", skills_dir.display());
     }
     Ok(())
 }
@@ -753,8 +793,48 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn skill_file_content() -> String {
-    include_str!("../skill.md").to_string()
+const SKILL_DIR_NAME: &str = "ol-kb";
+const LEGACY_SKILL_FILE: &str = "ol-kb.md";
+
+/// The skill as (path-relative-to-the-skill-dir, contents) pairs, baked into the
+/// binary. SKILL.md is the always-available core (its frontmatter description is
+/// what the agent sees at startup); reference/*.md are read on demand.
+fn skill_files() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("SKILL.md", include_str!("../skill/SKILL.md")),
+        (
+            "reference/memory.md",
+            include_str!("../skill/reference/memory.md"),
+        ),
+        (
+            "reference/people.md",
+            include_str!("../skill/reference/people.md"),
+        ),
+        (
+            "reference/meetings.md",
+            include_str!("../skill/reference/meetings.md"),
+        ),
+        (
+            "reference/todos.md",
+            include_str!("../skill/reference/todos.md"),
+        ),
+        (
+            "reference/research.md",
+            include_str!("../skill/reference/research.md"),
+        ),
+        (
+            "reference/projects.md",
+            include_str!("../skill/reference/projects.md"),
+        ),
+        (
+            "reference/repos-and-code.md",
+            include_str!("../skill/reference/repos-and-code.md"),
+        ),
+        (
+            "reference/config.md",
+            include_str!("../skill/reference/config.md"),
+        ),
+    ]
 }
 
 fn project_md_section() -> String {
@@ -935,19 +1015,66 @@ mod tests {
     }
 
     #[test]
-    fn install_skill_overwrite_false_keeps_file() {
+    fn install_skill_writes_dir_and_respects_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skills = dir.path().join("skills");
+        let skill_md = skills.join(SKILL_DIR_NAME).join("SKILL.md");
+
+        // Fresh install lays down SKILL.md + the reference tree.
+        install_skill(&skills, true, false).unwrap();
+        assert!(skill_md.exists(), "SKILL.md written");
+        assert!(
+            skills
+                .join(SKILL_DIR_NAME)
+                .join("reference/memory.md")
+                .exists(),
+            "reference files written"
+        );
+
+        // overwrite = false keeps a customized SKILL.md.
+        std::fs::write(&skill_md, "MY CUSTOM SKILL").unwrap();
+        install_skill(&skills, false, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&skill_md).unwrap(),
+            "MY CUSTOM SKILL"
+        );
+
+        // overwrite = true refreshes it.
+        install_skill(&skills, true, false).unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&skill_md).unwrap(),
+            "MY CUSTOM SKILL"
+        );
+    }
+
+    #[test]
+    fn install_skill_migrates_legacy_flat_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let skills = dir.path().join("skills");
         std::fs::create_dir_all(&skills).unwrap();
-        let path = skills.join("ol-kb.md");
-        std::fs::write(&path, "MY CUSTOM SKILL").unwrap();
+        let legacy = skills.join(LEGACY_SKILL_FILE);
+        std::fs::write(&legacy, "old flat skill").unwrap();
 
-        install_skill(&skills, "ol-kb.md", false, false).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "MY CUSTOM SKILL");
+        install_skill(&skills, true, false).unwrap();
+        assert!(!legacy.exists(), "legacy flat file removed on migration");
+        assert!(skills.join(SKILL_DIR_NAME).join("SKILL.md").exists());
+    }
 
-        // overwrite = true replaces it with the shipped skill.
-        install_skill(&skills, "ol-kb.md", true, false).unwrap();
-        assert_ne!(std::fs::read_to_string(&path).unwrap(), "MY CUSTOM SKILL");
+    #[test]
+    fn overwrite_false_protects_legacy_flat_file() {
+        // A user who customized the old flat file and set overwrite_skill=false
+        // must not have it migrated out from under them.
+        let dir = tempfile::TempDir::new().unwrap();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let legacy = skills.join(LEGACY_SKILL_FILE);
+        std::fs::write(&legacy, "old flat skill").unwrap();
+
+        install_skill(&skills, false, false).unwrap();
+        assert!(
+            legacy.exists(),
+            "legacy file preserved when overwrite disabled"
+        );
     }
 
     #[test]
