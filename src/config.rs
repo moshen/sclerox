@@ -27,6 +27,7 @@ pub struct Settings {
     pub distill: DistillSettings,
     pub embed: EmbedSettings,
     pub index: IndexSettings,
+    pub install: InstallSettings,
     pub log: LogSettings,
 }
 
@@ -126,6 +127,19 @@ pub struct IndexSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct InstallSettings {
+    /// Refresh `skills/ol-kb.md` on re-install. Set false to keep a customized
+    /// skill file across upgrades (a fresh install still creates it if missing).
+    pub overwrite_skill: bool,
+    /// Refresh the SessionStart/Stop hooks and the OpenCode plugin on re-install.
+    pub overwrite_hooks: bool,
+    /// Refresh the `<!-- ol-kb -->` section body in the global instructions file.
+    /// Content outside the markers is always preserved regardless.
+    pub overwrite_instructions: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogSettings {
     /// Log level: off|error|warn|info|debug|trace. Logs go to
     /// `~/.ol/logs/ol-YYYY-MM-DD.log`. Env: `OL_LOG`; the `--log-level` flag
@@ -151,6 +165,7 @@ impl Default for Settings {
             distill: DistillSettings::default(),
             embed: EmbedSettings::default(),
             index: IndexSettings::default(),
+            install: InstallSettings::default(),
             log: LogSettings::default(),
         }
     }
@@ -222,6 +237,18 @@ impl Default for IndexSettings {
             max_file_bytes: 1_000_000,
             auto: "git".to_string(),
             max_files: 50_000,
+        }
+    }
+}
+
+impl Default for InstallSettings {
+    fn default() -> Self {
+        // Default true preserves the historical always-refresh behavior; users
+        // opt out per-artifact to protect their customizations on upgrade.
+        Self {
+            overwrite_skill: true,
+            overwrite_hooks: true,
+            overwrite_instructions: true,
         }
     }
 }
@@ -541,6 +568,21 @@ semantic_threshold = 0.7
     #[test]
     fn malformed_toml_errors() {
         assert!(Settings::from_toml_str("this is = = not toml").is_err());
+    }
+
+    #[test]
+    fn install_defaults_and_override() {
+        // Default: everything refreshes on install.
+        let s = Settings::from_toml_str("").unwrap();
+        assert!(s.install.overwrite_skill);
+        assert!(s.install.overwrite_hooks);
+        assert!(s.install.overwrite_instructions);
+
+        // A partial override keeps the other keys at their defaults.
+        let s = Settings::from_toml_str("[install]\noverwrite_skill = false\n").unwrap();
+        assert!(!s.install.overwrite_skill);
+        assert!(s.install.overwrite_hooks);
+        assert!(s.install.overwrite_instructions);
     }
 
     #[test]

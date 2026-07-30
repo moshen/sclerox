@@ -86,21 +86,31 @@ fn resolve_targets(target: InstallTarget) -> Vec<InstallTarget> {
 }
 
 fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -> Result<()> {
+    // Persistent per-artifact overwrite policy. A `--no-*` flag skips outright;
+    // an `overwrite_* = false` protects an artifact that already exists (a fresh
+    // install still creates it). See `[install]` in ~/.ol/config.toml.
+    let policy = &crate::config::settings().install;
     match target {
         InstallTarget::Claude => {
             let dir = claude_dir()?;
             if !args.no_skill {
-                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
+                install_skill(
+                    &dir.join("skills"),
+                    "ol-kb.md",
+                    policy.overwrite_skill,
+                    args.dry_run,
+                )?;
             }
             if !args.no_hooks {
                 // Hook uses full path - runs without the user's shell profile.
-                install_claude_hook(&dir, ol_bin, args.dry_run)?;
+                install_claude_hook(&dir, ol_bin, policy.overwrite_hooks, args.dry_run)?;
             }
             if !args.no_instructions {
                 // Write to the global user CLAUDE.md, never to a per-repo file.
                 append_or_create_section(
                     &dir.join("CLAUDE.md"),
                     &project_md_section(),
+                    policy.overwrite_instructions,
                     args.dry_run,
                 )?;
             }
@@ -108,16 +118,22 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
         InstallTarget::Opencode => {
             let dir = opencode_dir()?;
             if !args.no_skill {
-                install_skill(&dir.join("skills"), "ol-kb.md", args.dry_run)?;
+                install_skill(
+                    &dir.join("skills"),
+                    "ol-kb.md",
+                    policy.overwrite_skill,
+                    args.dry_run,
+                )?;
             }
             if !args.no_hooks {
-                install_opencode_plugin(&dir, ol_bin, args.dry_run)?;
+                install_opencode_plugin(&dir, ol_bin, policy.overwrite_hooks, args.dry_run)?;
             }
             if !args.no_instructions {
                 // Global OpenCode instructions file, not a per-repo AGENTS.md.
                 append_or_create_section(
                     &dir.join("AGENTS.md"),
                     &project_md_section(),
+                    policy.overwrite_instructions,
                     args.dry_run,
                 )?;
             }
@@ -128,6 +144,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
                 append_or_create_section(
                     &codex_dir()?.join("instructions.md"),
                     &project_md_section(),
+                    policy.overwrite_instructions,
                     args.dry_run,
                 )?;
             }
@@ -381,8 +398,15 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_skill(dir: &Path, filename: &str, dry_run: bool) -> Result<()> {
+fn install_skill(dir: &Path, filename: &str, overwrite: bool, dry_run: bool) -> Result<()> {
     let path = dir.join(filename);
+    if !overwrite && path.exists() {
+        println!(
+            "  skill: kept existing {} (install.overwrite_skill = false)",
+            path.display()
+        );
+        return Ok(());
+    }
     if dry_run {
         println!("  would write: {}", path.display());
     } else {
@@ -411,9 +435,22 @@ fn remove_if_exists(path: &Path, dry_run: bool) -> Result<()> {
 
 const HOOK_MARKER: &str = "# ol-kb-hook";
 
-fn install_claude_hook(claude_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
+fn install_claude_hook(
+    claude_dir: &Path,
+    ol_bin: &str,
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<()> {
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json(&settings_path)?;
+
+    if !overwrite && ol_hook_present(&settings) {
+        println!(
+            "  hooks: kept existing in {} (install.overwrite_hooks = false)",
+            settings_path.display()
+        );
+        return Ok(());
+    }
 
     let hooks_obj = settings
         .as_object_mut()
@@ -496,6 +533,34 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// True if any SessionStart/Stop entry is an ol-installed hook (matched by the
+/// HOOK_MARKER embedded in its command). Used to protect a customized hook set
+/// when `install.overwrite_hooks = false`.
+fn ol_hook_present(settings: &Value) -> bool {
+    ["SessionStart", "Stop"].iter().any(|event| {
+        settings
+            .pointer(&format!("/hooks/{event}"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|hooks| {
+                            hooks.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| c.contains(HOOK_MARKER))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn strip_ol_hooks(arr: &mut Vec<Value>) {
     arr.retain(|entry| {
         !entry
@@ -515,10 +580,23 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
 
 const OPENCODE_PLUGIN_MARKER: &str = "// ol-kb-plugin";
 
-fn install_opencode_plugin(opencode_dir: &Path, ol_bin: &str, dry_run: bool) -> Result<()> {
+fn install_opencode_plugin(
+    opencode_dir: &Path,
+    ol_bin: &str,
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<()> {
     let plugins_dir = opencode_dir.join("plugins");
     let plugin_path = plugins_dir.join("ol-session.js");
     let content = opencode_plugin_content(ol_bin);
+
+    if !overwrite && plugin_path.exists() {
+        println!(
+            "  plugin: kept existing {} (install.overwrite_hooks = false)",
+            plugin_path.display()
+        );
+        return Ok(());
+    }
 
     if dry_run {
         println!("  would write OpenCode plugin: {}", plugin_path.display());
@@ -564,13 +642,27 @@ const SECTION_END_MARKER: &str = "<!-- /ol-kb -->";
 /// Create the ol-kb section, or UPDATE it in place if already present, so a
 /// re-install refreshes stale instructions (like the skill file). The section
 /// is bounded by start/end markers; content outside the markers is preserved.
-fn append_or_create_section(path: &Path, block: &str, dry_run: bool) -> Result<()> {
+fn append_or_create_section(
+    path: &Path,
+    block: &str,
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<()> {
     let existed = path.exists();
     let existing = if existed {
         std::fs::read_to_string(path)?
     } else {
         String::new()
     };
+    // Protect a customized section when asked. A fresh file (no marker yet) is
+    // still created — the policy only guards an existing ol-kb section.
+    if !overwrite && existing.contains(SECTION_MARKER) {
+        println!(
+            "  {}: kept existing ol-kb section (install.overwrite_instructions = false)",
+            path.display()
+        );
+        return Ok(());
+    }
     let updated = rebuild_section(&existing, block);
 
     if existed && updated == existing {
@@ -667,7 +759,11 @@ fn skill_file_content() -> String {
 
 fn project_md_section() -> String {
     format!(
-        "{SECTION_MARKER}\n# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
+        "{SECTION_MARKER}\n\
+<!-- Managed by `ol install`: this section is regenerated on upgrade; edits\n\
+between these markers are overwritten. To keep changes, edit outside the\n\
+markers, or set install.overwrite_instructions = false in ~/.ol/config.toml. -->\n\
+# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
 ol search \"<topic>\"           # all tables\n\
 ol todo list                  # open todos\n\
 ol research list              # open investigations\n\
@@ -786,5 +882,84 @@ mod tests {
         let s = project_md_section();
         assert!(s.starts_with(SECTION_MARKER));
         assert!(s.trim_end().ends_with(SECTION_END_MARKER));
+    }
+
+    #[test]
+    fn section_documents_upgrade_behavior() {
+        // The delimiter comment must mention the config key so users can find it.
+        let s = project_md_section();
+        assert!(s.contains("install.overwrite_instructions"));
+        assert!(s.contains("regenerated on upgrade"));
+    }
+
+    #[test]
+    fn overwrite_false_keeps_existing_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let original = format!("# Mine\n\n{SECTION_MARKER}\nCUSTOM\n{SECTION_END_MARKER}\n");
+        std::fs::write(&path, &original).unwrap();
+
+        append_or_create_section(&path, &project_md_section(), false, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "an existing section must be left byte-for-byte untouched"
+        );
+    }
+
+    #[test]
+    fn overwrite_false_still_creates_missing_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md"); // absent
+        append_or_create_section(&path, &project_md_section(), false, false).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains(SECTION_MARKER),
+            "a fresh file is still created even with overwrite disabled"
+        );
+    }
+
+    #[test]
+    fn overwrite_true_refreshes_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &path,
+            format!("{SECTION_MARKER}\nOLD\n{SECTION_END_MARKER}\n"),
+        )
+        .unwrap();
+        append_or_create_section(&path, &project_md_section(), true, false).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("OLD"), "section refreshed");
+        assert!(out.contains("Knowledge Base (ol)"));
+    }
+
+    #[test]
+    fn install_skill_overwrite_false_keeps_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let path = skills.join("ol-kb.md");
+        std::fs::write(&path, "MY CUSTOM SKILL").unwrap();
+
+        install_skill(&skills, "ol-kb.md", false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "MY CUSTOM SKILL");
+
+        // overwrite = true replaces it with the shipped skill.
+        install_skill(&skills, "ol-kb.md", true, false).unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), "MY CUSTOM SKILL");
+    }
+
+    #[test]
+    fn ol_hook_present_detects_marker() {
+        assert!(!ol_hook_present(
+            &serde_json::json!({ "hooks": { "Stop": [] } })
+        ));
+
+        let cmd = format!("{HOOK_MARKER}\nol hook stop");
+        let with_hook = serde_json::json!({
+            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }] }
+        });
+        assert!(ol_hook_present(&with_hook));
     }
 }

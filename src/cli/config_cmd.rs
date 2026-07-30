@@ -135,6 +135,13 @@ pub fn config_template() -> String {
          # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
          # max_files = {max_files}                    # reject folders over this many files (--force to override); env: OL_MAX_INDEX_FILES\n\
          \n\
+         [install]\n\
+         # Refresh each managed artifact on a re-install/upgrade. Set false to keep\n\
+         # your customizations; a fresh install still creates a missing artifact.\n\
+         # overwrite_skill = {ow_skill}               # skills/ol-kb.md\n\
+         # overwrite_hooks = {ow_hooks}               # SessionStart/Stop hooks + opencode plugin\n\
+         # overwrite_instructions = {ow_instr}        # the <!-- ol-kb --> section body\n\
+         \n\
          [log]\n\
          # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n\
          # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n",
@@ -159,6 +166,9 @@ pub fn config_template() -> String {
         max_bytes = d.index.max_file_bytes,
         auto = d.index.auto,
         max_files = d.index.max_files,
+        ow_skill = d.install.overwrite_skill,
+        ow_hooks = d.install.overwrite_hooks,
+        ow_instr = d.install.overwrite_instructions,
         log_level = d.log.level,
         retain_days = d.log.retain_days,
     )
