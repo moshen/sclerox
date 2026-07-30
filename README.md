@@ -2,7 +2,7 @@
 
 A SQLite-backed personal knowledge base for AI-augmented engineering. Indexes your code repos, meeting notes, todos, research investigations, and memories — all searchable from one place.
 
-Inspired by [Claude as an Operating Layer](https://github.com/example-ai).
+Inspired by "Claude as an Operating Layer".
 
 ## Install
 

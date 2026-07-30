@@ -271,11 +271,11 @@ mod tests {
     fn test_people_search_by_identifier() {
         let db = Database::open_in_memory().unwrap();
         let id = make_person(&db, "Dave");
-        db.people_identifier_set(id, "email", "dave@example.com")
+        db.people_identifier_set(id, "email", "abc@example.com")
             .unwrap();
 
         // Search by email value finds the person
-        let results = db.people_search("dave@example.com").unwrap();
+        let results = db.people_search("abc@example.com").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Dave");
     }

@@ -460,7 +460,7 @@ mod tests {
         .unwrap();
         db.investigation_add_source(
             id,
-            "https://github.com/example/api/pull/456",
+            "https://github.com/linux/kernel/pull/456",
             Some("PR that caused it"),
             None,
         )
