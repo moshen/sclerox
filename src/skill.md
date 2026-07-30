@@ -147,9 +147,13 @@ ol repo list                         # all indexed repos
 ol repo search "<query>"             # find repos by name/description
 ol repo index [path]                 # index a repo (embeddings on by default)
 ol repo index --no-embed [path]      # index without generating embeddings
+ol repo index --force [path]         # index even if over the max-files cap
 ol repo show [path] [--symbols "<query>"]
-ol repo sync                         # heal registry: remove stale, reindex missing
+ol repo sync                         # heal registry: remove stale/nested, reindex missing
 ol repo reembed [--repo <name>] [--force]  # backfill embeddings for indexed chunks
+# Only git repos are auto-indexed (a folder needs a .git). Indexing happens at
+# the git root; nested git repos each get their own index (one per .git level),
+# and indexing a parent also indexes the nested repos it contains.
 # Opt a folder OUT of indexing: create <repo-root>/.ol/config.toml with
 # `index = false`. The SessionStart hook and `ol repo index` both skip it.
 
@@ -165,7 +169,9 @@ ol config init [--force]             # write a commented config.toml
 ol config path                       # where the config file lives
 # Precedence: CLI flag > env var > ~/.ol/config.toml > built-in default.
 # Tunables include search.semantic_threshold, dedup thresholds,
-# session_context sizes, distill chunking, embed chunk size.
+# session_context.max_tokens (real MiniLM-token budget for injected context),
+# index.auto (git|off) and index.max_files (reject folders over this; --force
+# overrides), distill chunking, embed chunk size.
 ```
 
 ## Patterns
