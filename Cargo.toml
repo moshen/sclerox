@@ -50,6 +50,9 @@ tree-sitter-sequel = "0.3.11"
 tree-sitter-lua = "0.5.0"
 sqlite-vec = "0.1.9"
 
+[patch.crates-io]
+esaxx-rs = { path = "vendor/esaxx-rs" }
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
