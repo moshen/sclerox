@@ -116,7 +116,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
                 install_skill(&dir.join("skills"), policy.overwrite_skill, args.dry_run)?;
             }
             if !args.no_hooks {
-                install_opencode_plugin(&dir, ol_bin, policy.overwrite_hooks, args.dry_run)?;
+                install_opencode_plugin(&dir, policy.overwrite_hooks, args.dry_run)?;
             }
             if !args.no_instructions {
                 // Global OpenCode instructions file, not a per-repo AGENTS.md.
@@ -620,15 +620,10 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
 
 const OPENCODE_PLUGIN_MARKER: &str = "// ol-kb-plugin";
 
-fn install_opencode_plugin(
-    opencode_dir: &Path,
-    ol_bin: &str,
-    overwrite: bool,
-    dry_run: bool,
-) -> Result<()> {
+fn install_opencode_plugin(opencode_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
     let plugins_dir = opencode_dir.join("plugins");
     let plugin_path = plugins_dir.join("ol-session.js");
-    let content = opencode_plugin_content(ol_bin);
+    let content = opencode_plugin_content();
 
     if !overwrite && plugin_path.exists() {
         println!(
@@ -650,29 +645,42 @@ fn install_opencode_plugin(
     Ok(())
 }
 
-fn opencode_plugin_content(ol_bin: &str) -> String {
+fn opencode_plugin_content() -> String {
     format!(
         r#"{OPENCODE_PLUGIN_MARKER}
 // ol Operating Layer - session hook for OpenCode
 // Indexes the current repo and distills session memories on idle.
 // Installed by: ol install --target opencode
+//
+// OpenCode plugins default-export an object with a `server(input)` function
+// returning a Hooks map. The only event hook is the catch-all `event`; there
+// is no per-event-type key, so we filter on `event.type === "session.idle"`.
+// The session.idle payload carries `properties.sessionID`.
+//
+// The `ol` binary is resolved at runtime: $OL_BIN if set, else `ol` from PATH
+// (Bun's `$` shell looks it up). This keeps the plugin portable across
+// machines/users instead of baking in an absolute path at install time.
 
-const OL_BIN = "{ol_bin}";
+const OL_BIN = process.env.OL_BIN || "ol";
 
-export default function(ctx) {{
-  return {{
-    "session.idle": async ({{ session }}) => {{
+export default {{
+  id: "ol-session",
+  server: async ({{ $, directory }}) => ({{
+    event: async ({{ event }}) => {{
+      if (event.type !== "session.idle") return;
       try {{
         // Guard against recursion if opencode is the distillation binary
         if (process.env.OL_HOOK_RUNNING) return;
-        await ctx.$`${{OL_BIN}} hook opencode ${{session.id}} ${{ctx.directory}}`.quiet();
+        const sessionID = event.properties?.sessionID;
+        if (!sessionID) return;
+        await $`${{OL_BIN}} hook opencode ${{sessionID}} ${{directory}}`.quiet();
       }} catch (_) {{
         // Never block session exit
       }}
     }},
-  }};
-}}
-"#
+  }}),
+}};
+"#,
     )
 }
 
