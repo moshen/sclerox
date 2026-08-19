@@ -530,6 +530,121 @@ BEGIN
 END;
 ";
 
+/// Migration v12: memory keys unique among ACTIVE rows only; superseded_by by id.
+///
+/// The old table-level UNIQUE(key) made superseded rows squat the keyspace:
+/// when a later write reused a retired key, the upsert resurrected the dead row
+/// (status flipped back to 'active') while its stale superseded_by pointer was
+/// kept, producing supersession cycles and duplicate active facts. Rebuilding
+/// the table drops that constraint; a partial unique index enforces one ACTIVE
+/// row per key while history rows keep the key as a label. superseded_by now
+/// stores the successor's row id (keys are ambiguous across history, ids are
+/// not); active rows carry no pointer by invariant, so any pointer left on an
+/// active row by the old resurrection bug is cleared during the copy.
+///
+/// memory_people references memory(id), so with foreign_keys=ON its rows are
+/// parked in a plain backup table first — otherwise DROP TABLE memory's
+/// implicit DELETE would cascade into it. The FTS and vec sync triggers die
+/// with the old table and are recreated verbatim; both indexes are rebuilt
+/// (row ids are preserved, but a rebuild makes consistency unconditional).
+///
+/// memory_conflicts records near-duplicate clusters that distillation refused
+/// to auto-supersede (multiple matches, or a manually written memory). Rows
+/// are hints, not state: the listing prunes pairs whose sides are no longer
+/// both active, so merging or staling either side resolves a conflict.
+pub const MIGRATION_V12: &str = "
+CREATE TABLE memory_people_backup AS SELECT * FROM memory_people;
+DROP TABLE memory_people;
+
+CREATE TABLE memory_new (
+    id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    memory_type TEXT NOT NULL DEFAULT 'general',
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    status TEXT NOT NULL DEFAULT 'active',
+    source TEXT NOT NULL DEFAULT 'manual',
+    superseded_by INTEGER,
+    reviewed_at TEXT,
+    embedding BLOB
+);
+INSERT INTO memory_new (id, key, value, memory_type, tags, created_at, updated_at,
+                        status, source, superseded_by, reviewed_at, embedding)
+SELECT m.id, m.key, m.value, m.memory_type, m.tags, m.created_at, m.updated_at,
+       m.status, m.source,
+       CASE WHEN m.status = 'active' THEN NULL
+            ELSE (SELECT t.id FROM memory t WHERE t.key = m.superseded_by) END,
+       m.reviewed_at, m.embedding
+FROM memory m;
+DROP TABLE memory;
+ALTER TABLE memory_new RENAME TO memory;
+
+CREATE UNIQUE INDEX memory_key_active ON memory(key) WHERE status = 'active';
+CREATE INDEX memory_key_all ON memory(key);
+
+CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN
+    INSERT INTO memory_fts(rowid, key, value, memory_type, tags)
+    VALUES (new.id, new.key, new.value, new.memory_type, new.tags);
+END;
+CREATE TRIGGER memory_au AFTER UPDATE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, key, value, memory_type, tags)
+    VALUES ('delete', old.id, old.key, old.value, old.memory_type, old.tags);
+    INSERT INTO memory_fts(rowid, key, value, memory_type, tags)
+    VALUES (new.id, new.key, new.value, new.memory_type, new.tags);
+END;
+CREATE TRIGGER memory_ad AFTER DELETE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, key, value, memory_type, tags)
+    VALUES ('delete', old.id, old.key, old.value, old.memory_type, old.tags);
+END;
+INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
+
+CREATE TRIGGER memory_vec_ai AFTER INSERT ON memory
+    WHEN new.embedding IS NOT NULL AND new.status = 'active'
+BEGIN
+    INSERT INTO memory_vec(rowid, embedding) VALUES (new.id, new.embedding);
+END;
+CREATE TRIGGER memory_vec_au AFTER UPDATE OF embedding ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+    INSERT INTO memory_vec(rowid, embedding)
+        SELECT new.id, new.embedding
+        WHERE new.embedding IS NOT NULL AND new.status = 'active';
+END;
+CREATE TRIGGER memory_vec_status AFTER UPDATE OF status ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+    INSERT INTO memory_vec(rowid, embedding)
+        SELECT new.id, new.embedding
+        WHERE new.embedding IS NOT NULL AND new.status = 'active';
+END;
+CREATE TRIGGER memory_vec_ad AFTER DELETE ON memory
+BEGIN
+    DELETE FROM memory_vec WHERE rowid = old.id;
+END;
+DELETE FROM memory_vec;
+INSERT INTO memory_vec(rowid, embedding)
+    SELECT id, embedding FROM memory WHERE embedding IS NOT NULL AND status = 'active';
+
+CREATE TABLE memory_people (
+    memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    PRIMARY KEY (memory_id, person_id)
+);
+INSERT INTO memory_people SELECT * FROM memory_people_backup;
+DROP TABLE memory_people_backup;
+
+CREATE TABLE memory_conflicts (
+    id INTEGER PRIMARY KEY,
+    memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    matched_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    score REAL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (memory_id, matched_id)
+);
+";
+
 /// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
 pub const MIGRATION_V8: &str = "
 DELETE FROM identifier_types WHERE name = 'jira';

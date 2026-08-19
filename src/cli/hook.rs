@@ -180,6 +180,23 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
+    // 2b. Unresolved memory conflicts — near-duplicate clusters distillation
+    // refused to auto-merge. One line each; they need a content-aware human
+    // (or agent) decision, which is exactly what a session can provide.
+    if let Ok(conflicts) = db.memory_conflicts() {
+        if !conflicts.is_empty() {
+            let mut section = format!(
+                "### Memory conflicts ({}) — resolve with `ol memory conflicts`\n",
+                conflicts.len()
+            );
+            for c in conflicts.iter().take(5) {
+                section.push_str(&format!("- '{}' vs '{}'\n", c.memory.key, c.matched.key));
+            }
+            section.push('\n');
+            push_if_fits(&mut out, &section, budget);
+        }
+    }
+
     // 3. Relevant knowledge — FULL values of the top memories, not just keys.
     // Priority: feedback (user corrections) > project, repo-matched first, then
     // most-recent as fallback. This is the section that actually gets read.
@@ -833,9 +850,15 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// Distill a full list of turns in chunks, deduplicating by key.
 /// Returns total number of memories stored.
 ///
-/// Dedup happens at two levels: exact-key collisions upsert (via
-/// `memory_set_full`'s ON CONFLICT), and near-duplicate values supersede the
-/// existing entry so re-learning a fact under a new slug doesn't create drift.
+/// Dedup happens at two levels: exact-key collisions upsert the ACTIVE row
+/// (via `memory_set_full`'s partial-index ON CONFLICT), and near-duplicate
+/// values supersede the existing entry so re-learning a fact under a new slug
+/// doesn't create drift. Superseding is only automatic when it is safe:
+/// exactly one match, and not a manually written memory (a human wrote it, so
+/// a background job must not silently replace it). Several matches mean a
+/// similarity score can't tell restated-same-fact from similar-distinct-facts
+/// — the new memory is stored and the cluster is flagged in memory_conflicts
+/// for content-aware review (`ol memory conflicts`).
 fn distill_chunked(
     db: &Database,
     argv: &[String],
@@ -873,23 +896,57 @@ fn distill_chunked(
                 .collect();
             let emb = embedder.as_mut().and_then(|e| e.embed_one(&capped).ok());
 
-            // If this value closely matches an existing active memory under a
-            // different key, supersede that one rather than adding a near-dup.
-            // Prefer semantic (cosine) matching; fall back to lexical overlap.
-            let near_dup = match &emb {
+            // Existing active memories this value closely matches, under other
+            // keys. Prefer semantic (cosine) matching; fall back to lexical.
+            const NEAR_DUP_LIMIT: usize = 8;
+            let near_dups: Vec<_> = match &emb {
                 Some(v) => db
-                    .memory_find_near_duplicate_semantic(v, dedup.cosine_threshold as f32)
-                    .unwrap_or(None),
+                    .memory_find_near_duplicates_semantic(
+                        v,
+                        dedup.cosine_threshold as f32,
+                        NEAR_DUP_LIMIT,
+                    )
+                    .unwrap_or_default(),
                 None => db
-                    .memory_find_near_duplicate(&m.value, dedup.lexical_threshold)
-                    .unwrap_or(None),
+                    .memory_find_near_duplicates(&m.value, dedup.lexical_threshold)
+                    .unwrap_or_default(),
             }
-            .filter(|existing| existing.key != m.key);
+            .into_iter()
+            .filter(|sm| sm.entry.key != m.key)
+            .collect();
 
-            if let Some(existing) = near_dup {
-                let _ = db.memory_supersede(&existing.key, &m.key, &m.value, &m.memory_type);
-            } else {
-                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+            match near_dups.as_slice() {
+                [] => {
+                    let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+                }
+                [single] if single.entry.source != "manual" => {
+                    let _ = db.memory_supersede(
+                        &single.entry.key,
+                        &m.key,
+                        &m.value,
+                        &m.memory_type,
+                        source,
+                    );
+                }
+                matches => {
+                    // Ambiguous cluster, or a human-written memory: store the
+                    // new fact and flag the pair(s) for review instead of
+                    // guessing which side should win.
+                    if let Ok(new_id) =
+                        db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source)
+                    {
+                        for sm in matches {
+                            let _ =
+                                db.memory_conflict_add(new_id, sm.entry.id, Some(sm.score as f64));
+                        }
+                        log::info!(
+                            "memory '{}' near-duplicates {} existing entries; flagged in \
+                             memory_conflicts for review",
+                            m.key,
+                            matches.len()
+                        );
+                    }
+                }
             }
             // Persist the embedding for the (possibly new) key.
             if let Some(v) = &emb {

@@ -260,6 +260,57 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_v12_converts_supersession_and_relaxes_key_uniqueness() {
+        register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(schema::PRIMARY_SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        run_migrations(&conn, 1, PRIMARY_MIGRATIONS, 11).unwrap();
+
+        // Legacy shape: key-based pointers, plus one resurrected row (active
+        // but still carrying a stale pointer — the corruption v12 fixes).
+        conn.execute_batch(
+            "INSERT INTO memory (key, value, status, superseded_by) VALUES
+                 ('old', 'v1', 'superseded', 'new'),
+                 ('new', 'v2', 'active', NULL),
+                 ('zombie', 'v3', 'active', 'new'),
+                 ('dangling', 'v4', 'superseded', 'deleted-key');
+             INSERT INTO people (name) VALUES ('Alice');
+             INSERT INTO memory_people (memory_id, person_id)
+                 SELECT m.id, 1 FROM memory m WHERE m.key = 'new';",
+        )
+        .unwrap();
+
+        run_migrations(&conn, 11, PRIMARY_MIGRATIONS, 12).unwrap();
+        let db = Database { conn };
+
+        // Key pointer became an id pointer.
+        let new = db.memory_get("new").unwrap().unwrap();
+        let old = db.memory_get("old").unwrap().unwrap();
+        assert_eq!(old.superseded_by, Some(new.id));
+        // Active rows never carry a pointer.
+        let zombie = db.memory_get("zombie").unwrap().unwrap();
+        assert_eq!(zombie.superseded_by, None);
+        // A pointer at a since-deleted key becomes NULL rather than garbage.
+        let dangling = db.memory_get("dangling").unwrap().unwrap();
+        assert_eq!(dangling.superseded_by, None);
+        // memory_people rows survive the rebuild.
+        assert_eq!(db.memory_people("new").unwrap().len(), 1);
+        // Key uniqueness is active-only: a second ACTIVE row under an active
+        // key is rejected, but reusing a retired key inserts a fresh row.
+        assert!(db
+            .conn
+            .execute("INSERT INTO memory (key, value) VALUES ('new', 'x')", [])
+            .is_err());
+        db.conn
+            .execute("INSERT INTO memory (key, value) VALUES ('old', 'x')", [])
+            .unwrap();
+        // FTS stayed consistent through the rebuild.
+        assert_eq!(db.memory_search("v2").unwrap().len(), 1);
+    }
+
+    #[test]
     fn test_embedding_to_bytes_le_layout() {
         // sqlite-vec float[N] consumes a contiguous little-endian f32 array;
         // verify our serialization matches that exact layout.

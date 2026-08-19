@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 11;
+pub const PRIMARY_VERSION: u32 = 12;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 4;
@@ -75,6 +75,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 11,
         description: "add sqlite-vec KNN indexes for all embedded primary tables",
         sql: crate::db::schema::MIGRATION_V11,
+    },
+    Migration {
+        version: 12,
+        description: "memory: active-only key uniqueness, id-based supersession, conflicts table",
+        sql: crate::db::schema::MIGRATION_V12,
     },
 ];
 

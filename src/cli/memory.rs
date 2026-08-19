@@ -23,7 +23,12 @@ pub enum MemoryCommand {
     },
     /// Get a memory entry by key
     #[command(alias = "show")]
-    Get { key: String },
+    Get {
+        key: String,
+        /// Show every row that ever bore this key plus its supersession chain
+        #[arg(long)]
+        history: bool,
+    },
     /// List memory entries (active only by default)
     List {
         #[arg(long, value_parser = ["general","user","feedback","project","reference","session"])]
@@ -66,6 +71,14 @@ pub enum MemoryCommand {
     },
     /// Mark a memory as reviewed (you've confirmed it's still accurate)
     Review { key: String },
+    /// List unresolved near-duplicate conflicts flagged at distillation time
+    ///
+    /// A conflict means distillation found a new fact too similar to one or
+    /// more existing memories to insert silently, but too ambiguous (several
+    /// matches, or a manually written memory) to supersede automatically.
+    /// Resolve one by merging (ol memory supersede) or staling a side; the
+    /// pair disappears from this list as soon as either side is not active.
+    Conflicts,
     /// List memories that haven't been reviewed recently
     NeedsReview {
         /// Flag memories not reviewed in this many days (default: 30)
@@ -155,18 +168,69 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             println!("Set: {key}");
         }
 
-        MemoryCommand::Get { key } => match db.memory_get(&key)? {
-            Some(entry) => print_output(format, &entry, || {
-                println!("Key:     {}", entry.key);
-                println!("Value:   {}", entry.value);
-                println!("Type:    {}", entry.memory_type);
-                if let Some(tags) = &entry.tags {
-                    println!("Tags:    {}", tags.join(", "));
+        MemoryCommand::Get { key, history } => {
+            if history {
+                let entries = db.memory_history(&key)?;
+                // Resolve successor ids to keys up front; print_output's text
+                // closure can't run fallible db lookups.
+                let successors: Vec<Option<String>> = entries
+                    .iter()
+                    .map(|e| {
+                        e.superseded_by.and_then(|id| {
+                            db.memory_get_by_id(id)
+                                .ok()
+                                .flatten()
+                                .map(|s| format!("{} (#{id})", s.key))
+                        })
+                    })
+                    .collect();
+                print_output(format, &entries, || {
+                    if entries.is_empty() {
+                        println!("Not found: {key}");
+                        return;
+                    }
+                    for (e, successor) in entries.iter().zip(&successors) {
+                        let arrow = successor
+                            .as_deref()
+                            .map(|s| format!(" -> superseded by {s}"))
+                            .unwrap_or_default();
+                        println!(
+                            "#{} [{}] {} ({}){arrow}",
+                            e.id, e.status, e.key, e.created_at
+                        );
+                        println!("  {}", truncate(&e.value, 100));
+                    }
+                    println!("\n{} rows in history", entries.len());
+                });
+            } else {
+                match db.memory_get(&key)? {
+                    Some(entry) => {
+                        let successor = entry.superseded_by.and_then(|id| {
+                            db.memory_get_by_id(id)
+                                .ok()
+                                .flatten()
+                                .map(|s| format!("{} (#{id})", s.key))
+                        });
+                        print_output(format, &entry, || {
+                            println!("Key:     {}", entry.key);
+                            println!("Value:   {}", entry.value);
+                            println!("Type:    {}", entry.memory_type);
+                            if let Some(tags) = &entry.tags {
+                                println!("Tags:    {}", tags.join(", "));
+                            }
+                            if entry.status != "active" {
+                                println!("Status:  {}", entry.status);
+                            }
+                            if let Some(s) = &successor {
+                                println!("Superseded by: {s}");
+                            }
+                            println!("Updated: {}", entry.updated_at);
+                        });
+                    }
+                    None => println!("Not found: {key}"),
                 }
-                println!("Updated: {}", entry.updated_at);
-            }),
-            None => println!("Not found: {key}"),
-        },
+            }
+        }
 
         MemoryCommand::List { r#type, all } => {
             let status = if all { Some("all") } else { None };
@@ -254,13 +318,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             r#type,
         } => {
             warn_if_long(&new_key, &new_value);
-            if db.memory_supersede(&old_key, &new_key, &new_value, &r#type)? {
+            if db.memory_supersede(&old_key, &new_key, &new_value, &r#type, "manual")? {
                 if let Ok(mut embedder) = Embedder::new() {
                     embed_and_store(db, &mut embedder, &new_key, &new_value);
                 }
                 println!("Superseded '{old_key}' → '{new_key}'");
             } else {
-                println!("Not found: {old_key}");
+                println!("No active memory found: {old_key}");
             }
         }
 
@@ -290,6 +354,40 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             } else {
                 println!("Not found: {key}");
             }
+        }
+
+        MemoryCommand::Conflicts => {
+            let conflicts = db.memory_conflicts()?;
+            print_output(format, &conflicts, || {
+                if conflicts.is_empty() {
+                    println!("No unresolved memory conflicts.");
+                } else {
+                    for c in &conflicts {
+                        let score = c
+                            .score
+                            .map(|s| format!(" (score {s:.2})"))
+                            .unwrap_or_default();
+                        println!("#{} detected {}{}", c.id, c.created_at, score);
+                        println!(
+                            "  new:   [{}] {} - {}",
+                            c.memory.memory_type,
+                            c.memory.key,
+                            truncate(&c.memory.value, 80)
+                        );
+                        println!(
+                            "  match: [{}] {} - {}",
+                            c.matched.memory_type,
+                            c.matched.key,
+                            truncate(&c.matched.value, 80)
+                        );
+                    }
+                    println!(
+                        "\n{} conflicts. Resolve by merging (ol memory supersede) or \
+                         staling one side; resolved pairs disappear automatically.",
+                        conflicts.len()
+                    );
+                }
+            });
         }
 
         MemoryCommand::NeedsReview { days } => {
@@ -352,11 +450,27 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 let mut embedder = Embedder::new().ok();
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
-                    if let Some(ref old_key) = existing_key {
-                        // Compressing a single existing entry: supersede it
-                        db.memory_supersede(old_key, &m.key, &m.value, &m.memory_type)?;
-                    } else {
-                        db.memory_set_full(&m.key, &m.value, &m.memory_type, None, "distilled")?;
+                    match &existing_key {
+                        // Compressing a single existing entry: supersede it,
+                        // or update in place when the AI kept the same key.
+                        Some(old_key) if old_key != &m.key => {
+                            db.memory_supersede(
+                                old_key,
+                                &m.key,
+                                &m.value,
+                                &m.memory_type,
+                                "distilled",
+                            )?;
+                        }
+                        _ => {
+                            db.memory_set_full(
+                                &m.key,
+                                &m.value,
+                                &m.memory_type,
+                                None,
+                                "distilled",
+                            )?;
+                        }
                     }
                     if let Some(e) = embedder.as_mut() {
                         embed_and_store(db, e, &m.key, &m.value);

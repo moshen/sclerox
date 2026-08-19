@@ -272,8 +272,8 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
         fm.kv("type", &m.memory_type);
         fm.kv("status", &m.status);
         fm.kv("source", &m.source);
-        if let Some(sb) = &m.superseded_by {
-            fm.kv("superseded_by", sb);
+        if let Some(sb) = m.superseded_by {
+            fm.kv("superseded_by", &sb.to_string());
         }
         if let Some(r) = &m.reviewed_at {
             fm.kv("reviewed", r);

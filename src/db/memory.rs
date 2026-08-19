@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::{embedding_to_bytes, fts, Database};
@@ -17,9 +17,23 @@ pub struct MemoryEntry {
     pub status: String,
     /// manual | claude-auto | session
     pub source: String,
-    /// key of the memory that replaced this one
-    pub superseded_by: Option<String>,
+    /// row id of the memory that replaced this one. Only non-active rows carry
+    /// a pointer: keys repeat across history, so ids are the only stable link.
+    pub superseded_by: Option<i64>,
     pub reviewed_at: Option<String>,
+}
+
+/// A near-duplicate cluster flagged at distillation time instead of being
+/// auto-superseded (multiple matches, or the match was manually written).
+/// Rows are hints: a pair whose sides are no longer both active is pruned on
+/// listing, so merging or staling either side resolves the conflict.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryConflict {
+    pub id: i64,
+    pub score: Option<f64>,
+    pub created_at: String,
+    pub memory: MemoryEntry,
+    pub matched: MemoryEntry,
 }
 
 const MEMORY_COLS: &str =
@@ -44,6 +58,11 @@ impl Database {
     }
 
     /// Insert or update a memory entry with explicit source tracking.
+    ///
+    /// The upsert targets the active-only partial unique index: an existing
+    /// ACTIVE row with this key is updated in place, while retired (superseded
+    /// or stale) rows never conflict — reusing their key creates a fresh row
+    /// instead of resurrecting history. Returns the active row's id.
     pub fn memory_set_full(
         &self,
         key: &str,
@@ -56,25 +75,74 @@ impl Database {
         self.conn.execute(
             "INSERT INTO memory (key, value, memory_type, tags, source)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(key) DO UPDATE SET
+             ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                value      = excluded.value,
                memory_type = excluded.memory_type,
                tags       = excluded.tags,
-               status     = 'active',
                updated_at = datetime('now')",
             params![key, value, memory_type, tags_json, source],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        // last_insert_rowid is stale on the DO UPDATE path; look the row up.
+        Ok(self.conn.query_row(
+            "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+            params![key],
+            |r| r.get(0),
+        )?)
     }
 
+    /// Fetch by key: the active row if one exists, else the newest historical
+    /// row bearing the key (so retired keys stay inspectable).
     pub fn memory_get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let sql = format!("SELECT {MEMORY_COLS} FROM memory WHERE key = ?1");
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory WHERE key = ?1
+             ORDER BY (status = 'active') DESC, updated_at DESC, id DESC
+             LIMIT 1"
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         match stmt.query_row(params![key], row_to_memory) {
             Ok(e) => Ok(Some(e)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn memory_get_by_id(&self, id: i64) -> Result<Option<MemoryEntry>> {
+        let sql = format!("SELECT {MEMORY_COLS} FROM memory WHERE id = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        match stmt.query_row(params![id], row_to_memory) {
+            Ok(e) => Ok(Some(e)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Full history for a key: every row that ever bore it (any status) plus
+    /// the forward supersession chain those rows point into, newest first.
+    pub fn memory_history(&self, key: &str) -> Result<Vec<MemoryEntry>> {
+        let sql = format!(
+            "SELECT {MEMORY_COLS} FROM memory WHERE key = ?1
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut entries: Vec<MemoryEntry> = stmt
+            .query_map(params![key], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut seen: std::collections::HashSet<i64> = entries.iter().map(|e| e.id).collect();
+        let mut queue: Vec<i64> = entries.iter().filter_map(|e| e.superseded_by).collect();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(e) = self.memory_get_by_id(id)? {
+                if let Some(next) = e.superseded_by {
+                    queue.push(next);
+                }
+                entries.push(e);
+            }
+        }
+        entries.sort_by(|a, b| (&b.created_at, b.id).cmp(&(&a.created_at, a.id)));
+        Ok(entries)
     }
 
     /// List memories. Defaults to active only; pass status="all" to include stale/superseded.
@@ -175,20 +243,21 @@ impl Database {
         Ok(results)
     }
 
-    /// Find an active memory whose value is a near-duplicate of `value`.
+    /// Active memories whose values are near-duplicates of `value`, best first.
     ///
     /// Gathers candidates via an FTS OR-query over the value's most distinctive
-    /// tokens, then scores each by token overlap. Returns the highest-overlap
-    /// match at or above `threshold` (0.0-1.0), if any. Used at distillation
-    /// time to supersede an existing fact instead of creating a drift-key.
-    pub fn memory_find_near_duplicate(
+    /// tokens, then scores each by token overlap and keeps those at or above
+    /// `threshold` (0.0-1.0). Used at distillation time: a single match can be
+    /// superseded in place, while several matches mean the cluster is too
+    /// ambiguous to merge automatically and must be flagged for review.
+    pub fn memory_find_near_duplicates(
         &self,
         value: &str,
         threshold: f64,
-    ) -> Result<Option<MemoryEntry>> {
+    ) -> Result<Vec<SimilarMemory>> {
         let tokens = significant_tokens(value);
         if tokens.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // Build an FTS OR-query from the most distinctive (longest) tokens.
@@ -214,22 +283,30 @@ impl Database {
             .query_map(params![fts_query], row_to_memory)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut best: Option<(f64, MemoryEntry)> = None;
-        for c in candidates {
-            let score = token_overlap(value, &c.value);
-            if score >= threshold && best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-                best = Some((score, c));
-            }
-        }
-        Ok(best.map(|(_, m)| m))
+        let mut hits: Vec<SimilarMemory> = candidates
+            .into_iter()
+            .filter_map(|c| {
+                let score = token_overlap(value, &c.value);
+                (score >= threshold).then_some(SimilarMemory {
+                    entry: c,
+                    score: score as f32,
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(hits)
     }
 
-    /// Store (or replace) the embedding vector for a memory. Returns false if
-    /// the key doesn't exist.
+    /// Store (or replace) the embedding vector for a memory's ACTIVE row.
+    /// Returns false if the key has no active row.
     pub fn memory_set_embedding(&self, key: &str, embedding: &[f32]) -> Result<bool> {
         let bytes = embedding_to_bytes(embedding);
         let n = self.conn.execute(
-            "UPDATE memory SET embedding = ?1 WHERE key = ?2",
+            "UPDATE memory SET embedding = ?1 WHERE key = ?2 AND status = 'active'",
             params![bytes, key],
         )?;
         Ok(n > 0)
@@ -277,19 +354,20 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Semantic counterpart to `memory_find_near_duplicate`: returns the single
-    /// most-similar active memory if its cosine score is at or above `threshold`.
-    pub fn memory_find_near_duplicate_semantic(
+    /// Semantic counterpart to `memory_find_near_duplicates`: the up-to-`limit`
+    /// most-similar active memories whose cosine score is at or above
+    /// `threshold`, best first.
+    pub fn memory_find_near_duplicates_semantic(
         &self,
         query_embedding: &[f32],
         threshold: f32,
-    ) -> Result<Option<MemoryEntry>> {
+        limit: usize,
+    ) -> Result<Vec<SimilarMemory>> {
         Ok(self
-            .memory_similar(query_embedding, 1)?
+            .memory_similar(query_embedding, limit)?
             .into_iter()
-            .next()
             .filter(|sm| sm.score >= threshold)
-            .map(|sm| sm.entry))
+            .collect())
     }
 
     pub fn memory_delete(&self, key: &str) -> Result<bool> {
@@ -317,56 +395,129 @@ impl Database {
     }
 
     /// Replace an old memory with a new one in a single atomic operation.
-    /// The old entry is marked superseded and its superseded_by field points to the new key.
+    ///
+    /// Requires an ACTIVE row under `old_key` (returns false otherwise); that
+    /// row is marked superseded with its pointer set to the new row's id. The
+    /// new entry upserts against the active-only key index, so repeated
+    /// supersedes can converge on one canonical key without ever resurrecting
+    /// a retired row. Errors when old and new keys are the same — that is an
+    /// in-place update, not a supersession.
     pub fn memory_supersede(
         &self,
         old_key: &str,
         new_key: &str,
         new_value: &str,
         memory_type: &str,
+        source: &str,
     ) -> Result<bool> {
-        // Check old key exists
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT count(*) > 0 FROM memory WHERE key = ?1",
-                params![old_key],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if !exists {
-            return Ok(false);
+        if old_key == new_key {
+            anyhow::bail!(
+                "old and new keys are both '{old_key}'; use `ol memory set` to update in place"
+            );
         }
 
         let tx = self.conn.unchecked_transaction()?;
-        // Create new entry
+        let old_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+                params![old_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(old_id) = old_id else {
+            return Ok(false);
+        };
+
         tx.execute(
             "INSERT INTO memory (key, value, memory_type, source)
-             VALUES (?1, ?2, ?3, 'manual')
-             ON CONFLICT(key) DO UPDATE SET
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                value = excluded.value,
                memory_type = excluded.memory_type,
-               status = 'active',
                updated_at = datetime('now')",
-            params![new_key, new_value, memory_type],
+            params![new_key, new_value, memory_type, source],
         )?;
-        // Mark old as superseded
+        let new_id: i64 = tx.query_row(
+            "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+            params![new_key],
+            |r| r.get(0),
+        )?;
         tx.execute(
             "UPDATE memory
              SET status = 'superseded',
                  superseded_by = ?1,
                  updated_at = datetime('now')
-             WHERE key = ?2",
-            params![new_key, old_key],
+             WHERE id = ?2",
+            params![new_id, old_id],
         )?;
         tx.commit()?;
         Ok(true)
     }
 
-    /// Mark a memory as reviewed (you've confirmed it's still accurate).
+    /// Record that `memory_id` was distilled as a near-duplicate of
+    /// `matched_id` but was too ambiguous to auto-supersede. First sighting of
+    /// a pair wins; re-flagging is a no-op.
+    pub fn memory_conflict_add(
+        &self,
+        memory_id: i64,
+        matched_id: i64,
+        score: Option<f64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_conflicts (memory_id, matched_id, score)
+             VALUES (?1, ?2, ?3)",
+            params![memory_id, matched_id, score],
+        )?;
+        Ok(())
+    }
+
+    /// Unresolved near-duplicate conflicts, oldest first. Pairs whose sides
+    /// are no longer both active are pruned here rather than tracked: merging
+    /// (supersede) or staling either side resolves a conflict implicitly.
+    pub fn memory_conflicts(&self) -> Result<Vec<MemoryConflict>> {
+        self.conn.execute(
+            "DELETE FROM memory_conflicts WHERE id IN (
+                 SELECT c.id FROM memory_conflicts c
+                 LEFT JOIN memory a ON a.id = c.memory_id
+                 LEFT JOIN memory b ON b.id = c.matched_id
+                 WHERE COALESCE(a.status, '') != 'active'
+                    OR COALESCE(b.status, '') != 'active')",
+            [],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, memory_id, matched_id, score, created_at
+             FROM memory_conflicts ORDER BY created_at, id",
+        )?;
+        let rows: Vec<(i64, i64, i64, Option<f64>, String)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut conflicts = Vec::with_capacity(rows.len());
+        for (id, memory_id, matched_id, score, created_at) in rows {
+            let (Some(memory), Some(matched)) = (
+                self.memory_get_by_id(memory_id)?,
+                self.memory_get_by_id(matched_id)?,
+            ) else {
+                continue;
+            };
+            conflicts.push(MemoryConflict {
+                id,
+                score,
+                created_at,
+                memory,
+                matched,
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// Mark a memory's ACTIVE row as reviewed (you've confirmed it's still accurate).
     pub fn memory_review(&self, key: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE memory SET reviewed_at = datetime('now') WHERE key = ?1",
+            "UPDATE memory SET reviewed_at = datetime('now')
+             WHERE key = ?1 AND status = 'active'",
             params![key],
         )?;
         Ok(n > 0)
@@ -390,7 +541,7 @@ impl Database {
         let memory_id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM memory WHERE key = ?1",
+                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
                 params![memory_key],
                 |r| r.get(0),
             )
@@ -409,7 +560,7 @@ impl Database {
         let memory_id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM memory WHERE key = ?1",
+                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
                 params![memory_key],
                 |r| r.get(0),
             )
@@ -430,7 +581,7 @@ impl Database {
              FROM people p
              JOIN memory_people mp ON p.id = mp.person_id
              JOIN memory m ON mp.memory_id = m.id
-             WHERE m.key = ?1
+             WHERE m.key = ?1 AND m.status = 'active'
              ORDER BY p.name",
         )?;
         let rows = stmt.query_map(params![memory_key], |row| {
@@ -620,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_near_duplicate() {
+    fn test_find_near_duplicates() {
         let db = Database::open_in_memory().unwrap();
         db.memory_set(
             "chunk-size-fix",
@@ -638,19 +789,137 @@ mod tests {
         .unwrap();
 
         // A near-duplicate of the chunk-size fact should be found.
-        let dup = db
-            .memory_find_near_duplicate(
+        let dups = db
+            .memory_find_near_duplicates(
                 "Chunk size for embeddings capped at 800 chars for the AllMiniLM model",
                 0.6,
             )
             .unwrap();
-        assert_eq!(dup.map(|m| m.key), Some("chunk-size-fix".to_string()));
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].entry.key, "chunk-size-fix");
 
         // An unrelated new fact should not match.
         let none = db
-            .memory_find_near_duplicate("User prefers dark mode in the terminal editor", 0.6)
+            .memory_find_near_duplicates("User prefers dark mode in the terminal editor", 0.6)
             .unwrap();
-        assert!(none.is_none());
+        assert!(none.is_empty());
+
+        // Two existing restatements of the same fact both match, best first.
+        db.memory_set(
+            "chunk-size-cap",
+            "Chunk size for embedding is capped at 800 chars for the AllMiniLM window",
+            "project",
+            None,
+        )
+        .unwrap();
+        let dups = db
+            .memory_find_near_duplicates(
+                "Chunk size for embeddings capped at 800 chars for the AllMiniLM model",
+                0.6,
+            )
+            .unwrap();
+        assert_eq!(dups.len(), 2);
+        assert!(dups[0].score >= dups[1].score);
+    }
+
+    #[test]
+    fn test_superseded_key_reuse_does_not_resurrect() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("fact", "v1", "project", None).unwrap();
+        let old_id = db.memory_get("fact").unwrap().unwrap().id;
+
+        assert!(db
+            .memory_supersede("fact", "fact-v2", "v2", "project", "manual")
+            .unwrap());
+
+        // Re-learning under the retired key creates a NEW active row; the old
+        // row stays superseded with its pointer intact.
+        let new_id = db.memory_set("fact", "v3", "project", None).unwrap();
+        assert_ne!(new_id, old_id);
+        let active = db.memory_get("fact").unwrap().unwrap();
+        assert_eq!(active.id, new_id);
+        assert_eq!(active.status, "active");
+        assert_eq!(active.superseded_by, None);
+
+        let history = db.memory_history("fact").unwrap();
+        let old = history.iter().find(|e| e.id == old_id).unwrap();
+        assert_eq!(old.status, "superseded");
+        let successor_id = old.superseded_by.unwrap();
+        let successor = db.memory_get_by_id(successor_id).unwrap().unwrap();
+        assert_eq!(successor.key, "fact-v2");
+        // The chain member fact-v2 is reachable from the key's history.
+        assert!(history.iter().any(|e| e.key == "fact-v2"));
+    }
+
+    #[test]
+    fn test_supersede_requires_active_old_and_distinct_keys() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(!db
+            .memory_supersede("missing", "new", "v", "project", "manual")
+            .unwrap());
+
+        db.memory_set("k", "v", "project", None).unwrap();
+        assert!(db
+            .memory_supersede("k", "k", "v2", "project", "manual")
+            .is_err());
+
+        // A retired key can't be superseded again.
+        db.memory_supersede("k", "k2", "v2", "project", "manual")
+            .unwrap();
+        assert!(!db
+            .memory_supersede("k", "k3", "v3", "project", "manual")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_supersede_converges_on_canonical() {
+        let db = Database::open_in_memory().unwrap();
+        let a = db
+            .memory_set("dup-a", "the fact, worded one way", "project", None)
+            .unwrap();
+        let b = db
+            .memory_set("dup-b", "the fact, worded another way", "project", None)
+            .unwrap();
+
+        db.memory_supersede("dup-a", "canonical", "the fact", "project", "manual")
+            .unwrap();
+        db.memory_supersede("dup-b", "canonical", "the fact", "project", "manual")
+            .unwrap();
+
+        // One active canonical row with no pointer; both dups point at it.
+        let canonical = db.memory_get("canonical").unwrap().unwrap();
+        assert_eq!(canonical.status, "active");
+        assert_eq!(canonical.superseded_by, None);
+        for id in [a, b] {
+            let e = db.memory_get_by_id(id).unwrap().unwrap();
+            assert_eq!(e.status, "superseded");
+            assert_eq!(e.superseded_by, Some(canonical.id));
+        }
+        let actives = db.memory_list(None, None).unwrap();
+        assert_eq!(actives.len(), 1);
+    }
+
+    #[test]
+    fn test_memory_conflicts_flag_and_self_prune() {
+        let db = Database::open_in_memory().unwrap();
+        let a = db.memory_set("a", "fact one", "project", None).unwrap();
+        let b = db
+            .memory_set("b", "fact one restated", "project", None)
+            .unwrap();
+
+        db.memory_conflict_add(a, b, Some(0.91)).unwrap();
+        db.memory_conflict_add(a, b, Some(0.99)).unwrap(); // duplicate pair: no-op
+
+        let conflicts = db.memory_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].memory.key, "a");
+        assert_eq!(conflicts[0].matched.key, "b");
+        assert_eq!(conflicts[0].score, Some(0.91));
+
+        // Resolving one side (supersede) makes the conflict disappear.
+        db.memory_supersede("b", "a-and-b", "fact one, merged", "project", "manual")
+            .unwrap();
+        assert!(db.memory_conflicts().unwrap().is_empty());
     }
 
     #[test]
@@ -684,15 +953,18 @@ mod tests {
         assert_eq!(res[0].entry.key, "a");
         assert_eq!(res[1].entry.key, "c");
 
-        // Semantic near-dup honours the threshold.
-        let hit = db
-            .memory_find_near_duplicate_semantic(&unit(0), 0.95)
+        // Semantic near-dups honour the threshold, best first: both 'a'
+        // (exact) and 'c' (cosine ~0.99) clear 0.95, while 'b' is orthogonal.
+        let hits = db
+            .memory_find_near_duplicates_semantic(&unit(0), 0.95, 8)
             .unwrap();
-        assert_eq!(hit.map(|m| m.key), Some("a".to_string()));
-        let miss = db
-            .memory_find_near_duplicate_semantic(&unit(2), 0.95)
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.key, "a");
+        assert_eq!(hits[1].entry.key, "c");
+        let misses = db
+            .memory_find_near_duplicates_semantic(&unit(2), 0.95, 8)
             .unwrap();
-        assert!(miss.is_none());
+        assert!(misses.is_empty());
 
         // Setting a key that doesn't exist returns false.
         assert!(!db.memory_set_embedding("nope", &unit(0)).unwrap());
