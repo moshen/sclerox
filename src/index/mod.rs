@@ -898,7 +898,11 @@ class Handler:
             &parent.path().to_string_lossy(),
             "live",
             None,
-            &parent.path().join(".sclerox").join("repo.db").to_string_lossy(),
+            &parent
+                .path()
+                .join(".sclerox")
+                .join("repo.db")
+                .to_string_lossy(),
             None,
         )
         .unwrap();
@@ -984,7 +988,10 @@ class Handler:
 
         let db = Database::open_in_memory().unwrap();
         RepoIndexer::new(None).index_repo(&db, &sub, None).unwrap();
-        assert!(sub.join(".sclerox").join("repo.db").exists(), "child indexed");
+        assert!(
+            sub.join(".sclerox").join("repo.db").exists(),
+            "child indexed"
+        );
         assert_eq!(db.repo_list().unwrap().len(), 1);
 
         let result = RepoIndexer::new(None)
@@ -1192,7 +1199,11 @@ class Handler:
         std::fs::create_dir_all(parent.path().join(".git")).unwrap();
         let child = parent.path().join("vendored");
         std::fs::create_dir_all(child.join(".sclerox")).unwrap();
-        std::fs::write(child.join(".sclerox").join("config.toml"), "index = false\n").unwrap();
+        std::fs::write(
+            child.join(".sclerox").join("config.toml"),
+            "index = false\n",
+        )
+        .unwrap();
 
         let db = Database::open_in_memory().unwrap();
         register_with_index(&db, parent.path(), true);

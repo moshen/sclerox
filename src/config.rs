@@ -275,7 +275,9 @@ pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("SCLEROX_CONFIG") {
         return PathBuf::from(p);
     }
-    crate::xdg::config_home().join("sclerox").join("config.toml")
+    crate::xdg::config_home()
+        .join("sclerox")
+        .join("config.toml")
 }
 
 impl Settings {

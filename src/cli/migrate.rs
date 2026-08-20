@@ -68,7 +68,9 @@ fn migrate_global_paths(legacy_home: &Path, dry_run: bool) -> Result<bool> {
 
     moved_any |= move_file(
         &legacy_home.join("config.toml"),
-        &crate::xdg::config_home().join("sclerox").join("config.toml"),
+        &crate::xdg::config_home()
+            .join("sclerox")
+            .join("config.toml"),
         dry_run,
     )?;
 

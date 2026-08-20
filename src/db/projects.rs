@@ -353,7 +353,13 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("Proj", None, &[]).unwrap();
         let repo_id = db
-            .repo_register("/repos/svc", "svc", None, "/repos/svc/.sclerox/repo.db", None)
+            .repo_register(
+                "/repos/svc",
+                "svc",
+                None,
+                "/repos/svc/.sclerox/repo.db",
+                None,
+            )
             .unwrap();
 
         db.project_link_repo(project_id, repo_id).unwrap();

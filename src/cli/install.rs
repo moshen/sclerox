@@ -48,7 +48,9 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     // changes no behaviour.
     super::config_cmd::install_default_config(args.dry_run)?;
     if super::migrate::legacy_data_present() {
-        println!("\nDetected an old `ol` install at ~/.ol — run `sclerox migrate` to move it over.");
+        println!(
+            "\nDetected an old `ol` install at ~/.ol — run `sclerox migrate` to move it over."
+        );
     }
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
@@ -167,7 +169,10 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
                 remove_skill(&dir.join("skills"), args.dry_run)?;
             }
             if !args.no_hooks {
-                remove_if_exists(&dir.join("plugins").join("sclerox-session.js"), args.dry_run)?;
+                remove_if_exists(
+                    &dir.join("plugins").join("sclerox-session.js"),
+                    args.dry_run,
+                )?;
             }
             if !args.no_instructions {
                 uninstall_section(&dir.join("AGENTS.md").to_string_lossy(), args.dry_run)?;
@@ -222,7 +227,11 @@ fn install_global_gitignore(dry_run: bool) -> Result<()> {
     // Check if .sclerox is already ignored (handle variations like /.sclerox, .sclerox/, **/.sclerox)
     if existing.lines().any(|l| {
         let l = l.trim();
-        l == ".sclerox" || l == "/.sclerox" || l == ".sclerox/" || l == "**/.sclerox" || l == ".sclerox/**"
+        l == ".sclerox"
+            || l == "/.sclerox"
+            || l == ".sclerox/"
+            || l == "**/.sclerox"
+            || l == ".sclerox/**"
     }) {
         if dry_run {
             println!(
@@ -953,7 +962,8 @@ mod tests {
 
     #[test]
     fn replaces_bounded_section_preserving_trailing_user_content() {
-        let existing = "# Notes\n\n<!-- sclerox-kb -->\nOLD\n<!-- /sclerox-kb -->\n\n# After the section\n";
+        let existing =
+            "# Notes\n\n<!-- sclerox-kb -->\nOLD\n<!-- /sclerox-kb -->\n\n# After the section\n";
         let out = rebuild_section(existing, BLOCK);
         assert!(out.contains("BODY") && !out.contains("OLD"));
         assert!(out.contains("# Notes"));

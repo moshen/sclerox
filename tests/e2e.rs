@@ -823,7 +823,10 @@ fn completions_bash() {
     let e = Env::new();
     let out = e.run(&["completions", "bash"]);
     // bash completions start with a function definition
-    assert!(out.contains("_sclerox"), "expected bash completion function");
+    assert!(
+        out.contains("_sclerox"),
+        "expected bash completion function"
+    );
 }
 
 #[test]
