@@ -4,8 +4,40 @@ A SQLite-backed personal knowledge base for AI-augmented engineering. Indexes yo
 
 ## Install
 
+Download a release binary. Or...
+
+### mise
+
+Releases publish a binary for each platform on every push to `main`. Install
+the latest with [mise](https://mise.jdx.dev) using the `github:` backend:
+
+```sh
+mise use -g "github:moshen/sclerox"
+```
+
+This downloads the release archive matching your OS/arch and adds the
+extracted binary's directory to your PATH so `sclerox` is directly invokable.
+
+If your `mise.toml` pins a specific version, the equivalent config is:
+
+```toml
+[tools."github:moshen/sclerox"]
+version = "latest"
+```
+
+Use `mise ls-remote github:moshen/sclerox` to see available versions. A
+specific version can be installed with
+`mise use -g "github:moshen/sclerox@<version>"`.
+
+### From source
+
 ```bash
 cargo install --path .
+```
+
+### Setup (either install method)
+
+```bash
 sclerox install          # sets up Claude Code skill + hooks + global gitignore
 ```
 
