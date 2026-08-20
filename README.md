@@ -2,8 +2,6 @@
 
 A SQLite-backed personal knowledge base for AI-augmented engineering. Indexes your code repos, meeting notes, todos, research investigations, and memories — all searchable from one place.
 
-Inspired by "Claude as an Operating Layer".
-
 ## Install
 
 ```bash
@@ -12,7 +10,7 @@ ol install          # sets up Claude Code skill + hooks + global gitignore
 ```
 
 `ol install` writes:
-- `~/.claude/skills/ol-kb.md` — skill file (or `~/.config/opencode/skills/` for OpenCode)
+- `~/.claude/skills/ol-kb/` — skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
 - `~/.claude/settings.json` — `SessionStart` and `Stop` hooks that auto-index repos and distill memories
 - `~/.config/git/ignore` — excludes `.ol/` from all repos
 
@@ -54,31 +52,44 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `ol repo index [path]` | Index a repo (embeddings on by default) |
 | `ol repo index --no-embed` | Index without embedding generation |
 | `ol repo list` | List all indexed repos |
-| `ol repo search <query>` | Find repos by name/description |
+| `ol repo search <query>` | Find repos by name/description (FTS + semantic) |
 | `ol repo show [path]` | Show indexed files and symbol counts |
-| `ol repo sync` | Remove stale entries, reindex missing DBs |
+| `ol repo unindex [path]` | Remove a repo from the registry |
+| `ol repo search-symbols <query>` | Search symbols across all indexed repos (self-healing) |
+| `ol repo sync [--force]` | Remove stale entries, reindex missing DBs, migrate old schemas |
+| `ol repo reembed [--repo <name>] [--force]` | Backfill embeddings for chunks that don't have one |
 
 ### `ol memory`
 | Command | Description |
 |---------|-------------|
-| `ol memory set <key> <value>` | Set a memory (types: user, feedback, project, reference, session) |
-| `ol memory get <key>` | Get a memory by key |
+| `ol memory set <key> <value>` | Set a memory (types: general, user, feedback, project, reference) |
+| `ol memory get <key> [--history]` | Get a memory by key |
+| `ol memory list [--type <t>] [--all]` | List memories (active only by default) |
 | `ol memory search <query>` | FTS search (active memories only; `--all` includes stale) |
+| `ol memory delete <key>` | Delete a memory permanently |
 | `ol memory stale <key>` | Mark as stale (preserved for history) |
 | `ol memory supersede <old> <new> <value>` | Replace with traceable back-link |
+| `ol memory review <key>` | Mark a memory as reviewed |
 | `ol memory needs-review [--days 30]` | List memories not reviewed recently |
+| `ol memory conflicts` | List unresolved near-duplicate conflicts from distillation |
+| `ol memory reembed [--force]` | Backfill embeddings for memories that don't have one |
 | `ol memory distill [<key>\|--from <file>]` | AI-compress via the `[ai].command` (default `claude -p …`) |
 | `ol memory import --agent claude` | Import from Claude Code auto-memory |
+| `ol memory people add\|remove\|list <key> <person_id>` | Link people to a memory entry |
 
 ### `ol todo`
 | Command | Description |
 |---------|-------------|
 | `ol todo list [--status open\|done\|watch\|all]` | List todos |
 | `ol todo add --title <title>` | Add a todo |
+| `ol todo get <id>` | Get a todo by ID |
+| `ol todo search <query>` | Full-text search todos (includes done items) |
+| `ol todo update <id> [--title\|--notes\|...]` | Edit a todo's fields |
 | `ol todo done <id> [--note]` | Mark done |
 | `ol todo watch <id>` | Convert to watch item |
 | `ol todo reopen <id>` | Reopen |
 | `ol todo history [<query>]` | Search completed todos |
+| `ol todo delete <id>` | Delete a todo permanently |
 | `ol todo people add\|remove\|list <id> <person_id>` | Link people |
 | `ol todo projects add\|remove\|list <id> <project_id>` | Link projects |
 
@@ -86,18 +97,27 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | Command | Description |
 |---------|-------------|
 | `ol meeting add --title <t> --date <d>` | Add meeting (embeddings on by default) |
-| `ol meeting search <query>` | FTS search |
-| `ol meeting similar <query>` | Semantic similarity search |
+| `ol meeting get <id>` | Get a meeting by ID |
+| `ol meeting search <query>` | FTS + semantic similarity search combined |
+| `ol meeting update <id> [--title\|--notes\|...]` | Update a meeting's fields |
+| `ol meeting delete <id>` | Delete a meeting |
 | `ol meeting people add\|remove\|list` | Manage attendees |
 
 ### `ol research`
 | Command | Description |
 |---------|-------------|
 | `ol research start --name <n> --slug <s>` | Start investigation |
+| `ol research get <id_or_slug>` | Get an investigation by ID or slug |
+| `ol research list [--status open\|concluded\|all]` | List investigations |
+| `ol research search <query>` | FTS + semantic similarity search combined |
+| `ol research update <id> [--name\|--plan\|--findings]` | Update plan, findings, or status |
 | `ol research add-source <id> --url <url>` | Add evidence URL |
+| `ol research sources <id>` | List sources for an investigation |
 | `ol research conclude <id> --findings <f>` | Record findings (required) |
 | `ol research reopen <id>` | Reopen concluded investigation |
-| `ol research search <query>` | Search name, plan, and findings |
+| `ol research delete <id>` | Delete an investigation permanently |
+| `ol research people add\|remove\|list <id> <person_id>` | Link people |
+| `ol research projects add\|remove\|list <id> <project_id>` | Link projects |
 
 ### `ol project`
 Manage projects with links to repos, meetings, people, and todos.
@@ -107,11 +127,12 @@ ol project add --name "Auth Service" --description "..." --link "url|GitHub"
 ol project repos add|remove|list <project_id> <repo_id>
 ol project meetings add|remove|list <project_id> <meeting_id>
 ol project people add|remove|list <project_id> <person_id> [--role lead]
+ol project links add|remove|list <project_id> <link>
 ```
 
 ### `ol people`
 ```bash
-ol people add --name "Alice" --email "alice@example.com" --github-username alicegit
+ol people add --name "Alice" --email "alice@example.com" --github alicegit
 ol people search "alice"
 ```
 
@@ -127,10 +148,11 @@ ol config path          # where the file lives
 ```
 
 Configurable sections include `[ai]` (distillation command/model), `[search]`
-(`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds,
-`[session_context]` sizes, `[distill]` chunking, `[embed]` chunk size,
-`[index] max_file_bytes`, and `[log] level`. Run `ol config init` to see every
-key with its default.
+(`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds, `[memory]`
+(`max_value_chars`), `[session_context]` sizes, `[distill]` chunking, `[embed]`
+chunk size, `[index]` (`max_file_bytes`, `max_files`, `auto`), `[install]`
+(which managed artifacts get refreshed on reinstall), and `[log] level`. Run
+`ol config init` to see every key with its default.
 
 `[ai].command` is the full distillation command (the transcript prompt is
 appended as the last argument). If unset, ol uses the built-in default for the
@@ -147,6 +169,7 @@ Environment variables still work and override the file:
 | `OL_AI_COMMAND` | agent default | Full distillation command (prompt appended last) |
 | `OL_AI_MODEL` | agent default | Model appended to the default command |
 | `OL_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
+| `OL_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
 
 ## How hooks work
 
@@ -159,8 +182,8 @@ Distillation is tracked per-session: re-runs only when the session has grown by 
 
 ## Supported languages
 
-Tree-sitter parsing (full symbol extraction): Rust, Python, TypeScript, JavaScript, Go, C#
+Tree-sitter parsing (full symbol extraction): Rust, Python, TypeScript, JavaScript, Go, C#, Java, C/C++, Ruby, Kotlin, SQL, Shell
 
-Line-based chunking (indexed but no symbol extraction): Java, C/C++, Ruby, Swift, Kotlin, Scala, PHP, Shell, SQL, Markdown
+Line-based chunking (indexed but no symbol extraction): Swift, Scala, PHP, Markdown
 
 All indexed content is searchable via `ol code search` and `ol search`.
