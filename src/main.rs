@@ -4,8 +4,10 @@ mod db;
 mod embed;
 mod index;
 mod logging;
+mod migrate;
 mod output;
 mod search;
+mod xdg;
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,6 +18,6 @@ fn main() -> Result<()> {
     // Load settings once and bridge config-only values (e.g. index file-size
     // limit) into the mechanisms that can't read settings() directly.
     config::init();
-    log::debug!("ol starting");
+    log::debug!("sclerox starting");
     cli::run(cli)
 }

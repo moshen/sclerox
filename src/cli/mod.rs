@@ -7,6 +7,7 @@ pub mod hook;
 pub mod install;
 pub mod meetings;
 pub mod memory;
+pub mod migrate;
 pub mod people;
 pub mod projects;
 pub mod repos;
@@ -23,8 +24,8 @@ use crate::output::OutputFormat;
 
 #[derive(Parser)]
 #[command(
-    name = "ol",
-    about = "Operating Layer CLI - your persistent knowledge base",
+    name = "sclerox",
+    about = "Sclerox CLI - your persistent knowledge base",
     version
 )]
 pub struct Cli {
@@ -32,7 +33,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "text", value_enum)]
     pub output: OutputFormat,
 
-    /// Log level (also reads $OL_LOG). Logs go to ~/.ol/logs/ol-YYYY-MM-DD.log
+    /// Log level (also reads $SCLEROX_LOG). Logs go to ~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log
     #[arg(long, global = true, value_parser = parse_level_filter)]
     pub log_level: Option<crate::logging::LevelFilter>,
 
@@ -79,7 +80,7 @@ pub enum Commands {
     #[command(subcommand)]
     Code(code::CodeCommand),
 
-    /// View and manage ol configuration (~/.ol/config.toml)
+    /// View and manage sclerox configuration (~/.config/sclerox/config.toml)
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
 
@@ -97,11 +98,16 @@ pub enum Commands {
     #[command(subcommand)]
     Hook(hook::HookCommand),
 
-    /// Install ol into your AI tool setup (Claude Code, OpenCode, Codex)
+    /// Install sclerox into your AI tool setup (Claude Code, OpenCode, Codex)
     Install(install::InstallArgs),
 
-    /// Remove ol integrations from your AI tool setup
+    /// Remove sclerox integrations from your AI tool setup
     Uninstall(install::InstallArgs),
+
+    /// One-time cleanup for a machine with an old, pre-rename `ol` install:
+    /// moves ~/.ol/* onto the new XDG layout and strips stale integrations
+    #[command(hide = true)]
+    Migrate(migrate::MigrateArgs),
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -110,6 +116,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Install(args) => install::run_install(args),
         Commands::Uninstall(args) => install::run_uninstall(args),
+        Commands::Migrate(args) => migrate::run_migrate(args),
         Commands::Completions(args) => completions::run(args),
         Commands::Config(cmd) => config_cmd::run(cmd, format),
         Commands::Hook(cmd) => {
@@ -136,6 +143,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Install(_)
                 | Commands::Uninstall(_)
+                | Commands::Migrate(_)
                 | Commands::Completions(_)
                 | Commands::Config(_)
                 | Commands::Hook(_) => unreachable!(),

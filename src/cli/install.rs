@@ -26,7 +26,7 @@ pub struct InstallArgs {
     /// Skip adding the Stop hook (Claude Code only)
     #[arg(long)]
     no_hooks: bool,
-    /// Skip appending ol-kb instructions to the global instructions file
+    /// Skip appending sclerox-kb instructions to the global instructions file
     /// (~/.claude/CLAUDE.md, ~/.config/opencode/AGENTS.md, ~/.codex/instructions.md)
     #[arg(long)]
     no_instructions: bool,
@@ -36,17 +36,20 @@ pub struct InstallArgs {
 }
 
 pub fn run_install(args: InstallArgs) -> Result<()> {
-    let ol_bin = current_binary_path()?;
+    let sclerox_bin = current_binary_path()?;
     for target in resolve_targets(args.target) {
         println!("Installing for {}...", target_name(target));
-        install_for_target(target, &ol_bin, &args)?;
+        install_for_target(target, &sclerox_bin, &args)?;
     }
     install_shell_completions(args.dry_run)?;
     install_global_gitignore(args.dry_run)?;
-    // Create a commented ~/.ol/config.toml so the tunables are discoverable.
+    // Create a commented ~/.config/sclerox/config.toml so the tunables are discoverable.
     // Never overwrites an existing file; every key ships commented, so this
     // changes no behaviour.
     super::config_cmd::install_default_config(args.dry_run)?;
+    if super::migrate::legacy_data_present() {
+        println!("\nDetected an old `ol` install at ~/.ol — run `sclerox migrate` to move it over.");
+    }
     if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
@@ -60,7 +63,7 @@ pub fn run_uninstall(args: InstallArgs) -> Result<()> {
         println!("Uninstalling for {}...", target_name(target));
         uninstall_for_target(target, &args)?;
     }
-    // Deliberately keep ~/.ol/config.toml — it holds user edits.
+    // Deliberately keep ~/.config/sclerox/config.toml — it holds user edits.
     let cfg = crate::config::config_path();
     if cfg.exists() {
         println!(
@@ -85,10 +88,10 @@ fn resolve_targets(target: InstallTarget) -> Vec<InstallTarget> {
     }
 }
 
-fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -> Result<()> {
+fn install_for_target(target: InstallTarget, sclerox_bin: &str, args: &InstallArgs) -> Result<()> {
     // Persistent per-artifact overwrite policy. A `--no-*` flag skips outright;
     // an `overwrite_* = false` protects an artifact that already exists (a fresh
-    // install still creates it). See `[install]` in ~/.ol/config.toml.
+    // install still creates it). See `[install]` in ~/.config/sclerox/config.toml.
     let policy = &crate::config::settings().install;
     match target {
         InstallTarget::Claude => {
@@ -98,7 +101,7 @@ fn install_for_target(target: InstallTarget, ol_bin: &str, args: &InstallArgs) -
             }
             if !args.no_hooks {
                 // Hook uses full path - runs without the user's shell profile.
-                install_claude_hook(&dir, ol_bin, policy.overwrite_hooks, args.dry_run)?;
+                install_claude_hook(&dir, sclerox_bin, policy.overwrite_hooks, args.dry_run)?;
             }
             if !args.no_instructions {
                 // Write to the global user CLAUDE.md, never to a per-repo file.
@@ -164,7 +167,7 @@ fn uninstall_for_target(target: InstallTarget, args: &InstallArgs) -> Result<()>
                 remove_skill(&dir.join("skills"), args.dry_run)?;
             }
             if !args.no_hooks {
-                remove_if_exists(&dir.join("plugins").join("ol-session.js"), args.dry_run)?;
+                remove_if_exists(&dir.join("plugins").join("sclerox-session.js"), args.dry_run)?;
             }
             if !args.no_instructions {
                 uninstall_section(&dir.join("AGENTS.md").to_string_lossy(), args.dry_run)?;
@@ -216,25 +219,25 @@ fn install_global_gitignore(dry_run: bool) -> Result<()> {
         String::new()
     };
 
-    // Check if .ol is already ignored (handle variations like /.ol, .ol/, **/.ol)
+    // Check if .sclerox is already ignored (handle variations like /.sclerox, .sclerox/, **/.sclerox)
     if existing.lines().any(|l| {
         let l = l.trim();
-        l == ".ol" || l == "/.ol" || l == ".ol/" || l == "**/.ol" || l == ".ol/**"
+        l == ".sclerox" || l == "/.sclerox" || l == ".sclerox/" || l == "**/.sclerox" || l == ".sclerox/**"
     }) {
         if dry_run {
             println!(
-                "Global gitignore: .ol already present in {}",
+                "Global gitignore: .sclerox already present in {}",
                 path.display()
             );
         }
         return Ok(());
     }
 
-    let entry = "\n# ol - Operating Layer CLI\n.ol/\n";
+    let entry = "\n# sclerox - Sclerox CLI\n.sclerox/\n";
 
     if dry_run {
         println!(
-            "Global gitignore: would append '.ol/' to {}",
+            "Global gitignore: would append '.sclerox/' to {}",
             path.display()
         );
     } else {
@@ -242,7 +245,7 @@ fn install_global_gitignore(dry_run: bool) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, format!("{}{}", existing.trim_end(), entry))?;
-        println!("Global gitignore: added '.ol/' to {}", path.display());
+        println!("Global gitignore: added '.sclerox/' to {}", path.display());
     }
     Ok(())
 }
@@ -284,7 +287,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
         None => {
             println!(
                 "Completions: unknown shell (set $SHELL). \
-                 Run `ol completions <bash|zsh|fish>` manually."
+                 Run `sclerox completions <bash|zsh|fish>` manually."
             );
             return Ok(());
         }
@@ -299,7 +302,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
     match shell_name {
         "zsh" => {
             let comp_dir = home.join(".zsh").join("completions");
-            let comp_file = comp_dir.join("_ol");
+            let comp_file = comp_dir.join("_sclerox");
             let zshrc = home.join(".zshrc");
             let fpath_line = "fpath=(~/.zsh/completions $fpath)";
 
@@ -329,7 +332,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
                 };
                 if !zshrc_content.contains(fpath_line) {
                     let append = format!(
-                        "\n# ol completions\n{fpath_line}\nautoload -Uz compinit && compinit\n"
+                        "\n# sclerox completions\n{fpath_line}\nautoload -Uz compinit && compinit\n"
                     );
                     std::fs::write(&zshrc, format!("{}{}", zshrc_content.trim_end(), append))?;
                     println!("  appended fpath setup to ~/.zshrc");
@@ -340,7 +343,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
         "bash" => {
             // XDG user completions dir, picked up automatically by bash-completion ≥ 2.x
             let comp_dir = home.join(".local/share/bash-completion/completions");
-            let comp_file = comp_dir.join("ol");
+            let comp_file = comp_dir.join("sclerox");
             if dry_run {
                 println!("Completions (bash): would write {}", comp_file.display());
             } else {
@@ -352,7 +355,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
         }
         "fish" => {
             let comp_dir = home.join(".config/fish/completions");
-            let comp_file = comp_dir.join("ol.fish");
+            let comp_file = comp_dir.join("sclerox.fish");
             if dry_run {
                 println!("Completions (fish): would write {}", comp_file.display());
             } else {
@@ -366,8 +369,8 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
             // $PROFILE varies by PowerShell version/host and Documents may be
             // OneDrive-redirected, so write to a stable path and print the line
             // to add rather than guess-editing the profile.
-            let comp_dir = home.join(".ol").join("completions");
-            let comp_file = comp_dir.join("ol.ps1");
+            let comp_dir = crate::xdg::data_home().join("sclerox").join("completions");
+            let comp_file = comp_dir.join("sclerox.ps1");
             if dry_run {
                 println!(
                     "Completions (powershell): would write {}",
@@ -433,7 +436,7 @@ fn install_skill(skills_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()
     Ok(())
 }
 
-/// Remove the installed skill: the `ol-kb/` directory (current layout) plus the
+/// Remove the installed skill: the `sclerox-kb/` directory (current layout) plus the
 /// legacy flat `ol-kb.md` if an older install left one.
 fn remove_skill(skills_dir: &Path, dry_run: bool) -> Result<()> {
     let skill_root = skills_dir.join(SKILL_DIR_NAME);
@@ -473,18 +476,18 @@ fn remove_if_exists(path: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-const HOOK_MARKER: &str = "# ol-kb-hook";
+const HOOK_MARKER: &str = "# sclerox-kb-hook";
 
 fn install_claude_hook(
     claude_dir: &Path,
-    ol_bin: &str,
+    sclerox_bin: &str,
     overwrite: bool,
     dry_run: bool,
 ) -> Result<()> {
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json(&settings_path)?;
 
-    if !overwrite && ol_hook_present(&settings) {
+    if !overwrite && sclerox_hook_present(&settings) {
         println!(
             "  hooks: kept existing in {} (install.overwrite_hooks = false)",
             settings_path.display()
@@ -501,25 +504,25 @@ fn install_claude_hook(
         .context("hooks is not an object")?;
 
     // SessionStart: index the repo immediately when entering a git directory.
-    let start_cmd = format!("{HOOK_MARKER}\n{ol_bin} hook start 2>/dev/null || true");
+    let start_cmd = format!("{HOOK_MARKER}\n{sclerox_bin} hook start 2>/dev/null || true");
     let start_arr = hooks_obj
         .entry("SessionStart")
         .or_insert_with(|| serde_json::json!([]));
     let start_arr = start_arr
         .as_array_mut()
         .context("hooks.SessionStart is not an array")?;
-    strip_ol_hooks(start_arr);
+    strip_sclerox_hooks(start_arr);
     start_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": start_cmd }] }));
 
     // Stop: index the repo + distill session memories from the transcript.
-    let stop_cmd = format!("{HOOK_MARKER}\n{ol_bin} hook stop 2>/dev/null || true");
+    let stop_cmd = format!("{HOOK_MARKER}\n{sclerox_bin} hook stop 2>/dev/null || true");
     let stop_arr = hooks_obj
         .entry("Stop")
         .or_insert_with(|| serde_json::json!([]));
     let stop_arr = stop_arr
         .as_array_mut()
         .context("hooks.Stop is not an array")?;
-    strip_ol_hooks(stop_arr);
+    strip_sclerox_hooks(stop_arr);
     stop_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": stop_cmd }] }));
 
     if dry_run {
@@ -550,7 +553,7 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
         let key = format!("/hooks/{event}");
         if let Some(arr) = settings.pointer_mut(&key).and_then(|v| v.as_array_mut()) {
             let before = arr.len();
-            strip_ol_hooks(arr);
+            strip_sclerox_hooks(arr);
             if arr.len() < before {
                 modified = true;
             }
@@ -568,15 +571,15 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
             println!("  removed hooks: {}", settings_path.display());
         }
     } else {
-        println!("  no ol hooks found");
+        println!("  no sclerox hooks found");
     }
     Ok(())
 }
 
-/// True if any SessionStart/Stop entry is an ol-installed hook (matched by the
+/// True if any SessionStart/Stop entry is an sclerox-installed hook (matched by the
 /// HOOK_MARKER embedded in its command). Used to protect a customized hook set
 /// when `install.overwrite_hooks = false`.
-fn ol_hook_present(settings: &Value) -> bool {
+fn sclerox_hook_present(settings: &Value) -> bool {
     ["SessionStart", "Stop"].iter().any(|event| {
         settings
             .pointer(&format!("/hooks/{event}"))
@@ -601,7 +604,7 @@ fn ol_hook_present(settings: &Value) -> bool {
     })
 }
 
-fn strip_ol_hooks(arr: &mut Vec<Value>) {
+fn strip_sclerox_hooks(arr: &mut Vec<Value>) {
     arr.retain(|entry| {
         !entry
             .get("hooks")
@@ -618,11 +621,11 @@ fn strip_ol_hooks(arr: &mut Vec<Value>) {
     });
 }
 
-const OPENCODE_PLUGIN_MARKER: &str = "// ol-kb-plugin";
+const OPENCODE_PLUGIN_MARKER: &str = "// sclerox-kb-plugin";
 
 fn install_opencode_plugin(opencode_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
     let plugins_dir = opencode_dir.join("plugins");
-    let plugin_path = plugins_dir.join("ol-session.js");
+    let plugin_path = plugins_dir.join("sclerox-session.js");
     let content = opencode_plugin_content();
 
     if !overwrite && plugin_path.exists() {
@@ -648,32 +651,32 @@ fn install_opencode_plugin(opencode_dir: &Path, overwrite: bool, dry_run: bool) 
 fn opencode_plugin_content() -> String {
     format!(
         r#"{OPENCODE_PLUGIN_MARKER}
-// ol Operating Layer - session hook for OpenCode
+// Sclerox - session hook for OpenCode
 // Indexes the current repo and distills session memories on idle.
-// Installed by: ol install --target opencode
+// Installed by: sclerox install --target opencode
 //
 // OpenCode plugins default-export an object with a `server(input)` function
 // returning a Hooks map. The only event hook is the catch-all `event`; there
 // is no per-event-type key, so we filter on `event.type === "session.idle"`.
 // The session.idle payload carries `properties.sessionID`.
 //
-// The `ol` binary is resolved at runtime: $OL_BIN if set, else `ol` from PATH
+// The `sclerox` binary is resolved at runtime: $SCLEROX_BIN if set, else `sclerox` from PATH
 // (Bun's `$` shell looks it up). This keeps the plugin portable across
 // machines/users instead of baking in an absolute path at install time.
 
-const OL_BIN = process.env.OL_BIN || "ol";
+const SCLEROX_BIN = process.env.SCLEROX_BIN || "sclerox";
 
 export default {{
-  id: "ol-session",
+  id: "sclerox-session",
   server: async ({{ $, directory }}) => ({{
     event: async ({{ event }}) => {{
       if (event.type !== "session.idle") return;
       try {{
         // Guard against recursion if opencode is the distillation binary
-        if (process.env.OL_HOOK_RUNNING) return;
+        if (process.env.SCLEROX_HOOK_RUNNING) return;
         const sessionID = event.properties?.sessionID;
         if (!sessionID) return;
-        await $`${{OL_BIN}} hook opencode ${{sessionID}} ${{directory}}`.quiet();
+        await $`${{SCLEROX_BIN}} hook opencode ${{sessionID}} ${{directory}}`.quiet();
       }} catch (_) {{
         // Never block session exit
       }}
@@ -684,10 +687,10 @@ export default {{
     )
 }
 
-const SECTION_MARKER: &str = "<!-- ol-kb -->";
-const SECTION_END_MARKER: &str = "<!-- /ol-kb -->";
+const SECTION_MARKER: &str = "<!-- sclerox-kb -->";
+const SECTION_END_MARKER: &str = "<!-- /sclerox-kb -->";
 
-/// Create the ol-kb section, or UPDATE it in place if already present, so a
+/// Create the sclerox-kb section, or UPDATE it in place if already present, so a
 /// re-install refreshes stale instructions (like the skill file). The section
 /// is bounded by start/end markers; content outside the markers is preserved.
 fn append_or_create_section(
@@ -703,10 +706,10 @@ fn append_or_create_section(
         String::new()
     };
     // Protect a customized section when asked. A fresh file (no marker yet) is
-    // still created — the policy only guards an existing ol-kb section.
+    // still created — the policy only guards an existing sclerox-kb section.
     if !overwrite && existing.contains(SECTION_MARKER) {
         println!(
-            "  {}: kept existing ol-kb section (install.overwrite_instructions = false)",
+            "  {}: kept existing sclerox-kb section (install.overwrite_instructions = false)",
             path.display()
         );
         return Ok(());
@@ -714,23 +717,23 @@ fn append_or_create_section(
     let updated = rebuild_section(&existing, block);
 
     if existed && updated == existing {
-        println!("  {}: ol-kb section up to date", path.display());
+        println!("  {}: sclerox-kb section up to date", path.display());
         return Ok(());
     }
     let verb = if existed { "update" } else { "create" };
     if dry_run {
-        println!("  would {verb} ol-kb section in: {}", path.display());
+        println!("  would {verb} sclerox-kb section in: {}", path.display());
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, &updated)?;
-    println!("  {verb}d ol-kb section in: {}", path.display());
+    println!("  {verb}d sclerox-kb section in: {}", path.display());
     Ok(())
 }
 
-/// Insert or replace the ol-kb block within `existing`, preserving everything
+/// Insert or replace the sclerox-kb block within `existing`, preserving everything
 /// outside the markers. Handles the legacy format (start marker, no end marker,
 /// section ran to EOF) by upgrading it to the bounded form.
 fn rebuild_section(existing: &str, block: &str) -> String {
@@ -775,11 +778,11 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
     }
     let content = std::fs::read_to_string(&path)?;
     let Some(start) = content.find(SECTION_MARKER) else {
-        println!("  {filename}: no ol-kb section");
+        println!("  {filename}: no sclerox-kb section");
         return Ok(());
     };
     if dry_run {
-        println!("  would remove ol-kb section from {filename}");
+        println!("  would remove sclerox-kb section from {filename}");
         return Ok(());
     }
     // Remove start..end-marker (new format) or start..EOF (legacy), keeping the
@@ -797,11 +800,11 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
         (false, false) => format!("{before}\n\n{after}\n"),
     };
     std::fs::write(&path, rebuilt)?;
-    println!("  removed ol-kb section from {filename}");
+    println!("  removed sclerox-kb section from {filename}");
     Ok(())
 }
 
-const SKILL_DIR_NAME: &str = "ol-kb";
+const SKILL_DIR_NAME: &str = "sclerox-kb";
 const LEGACY_SKILL_FILE: &str = "ol-kb.md";
 
 /// The skill as (path-relative-to-the-skill-dir, contents) pairs, baked into the
@@ -848,22 +851,22 @@ fn skill_files() -> &'static [(&'static str, &'static str)] {
 fn project_md_section() -> String {
     format!(
         "{SECTION_MARKER}\n\
-<!-- Managed by `ol install`: this section is regenerated on upgrade; edits\n\
+<!-- Managed by `sclerox install`: this section is regenerated on upgrade; edits\n\
 between these markers are overwritten. To keep changes, edit outside the\n\
-markers, or set install.overwrite_instructions = false in ~/.ol/config.toml. -->\n\
-# Knowledge Base (ol)\n\nSearch before starting work:\n\n```bash\n\
-ol search \"<topic>\"           # all tables\n\
-ol todo list                  # open todos\n\
-ol research list              # open investigations\n\
-ol meeting search \"<topic>\"   # past decisions\n\
+markers, or set install.overwrite_instructions = false in ~/.config/sclerox/config.toml. -->\n\
+# Knowledge Base (sclerox)\n\nSearch before starting work:\n\n```bash\n\
+sclerox search \"<topic>\"           # all tables\n\
+sclerox todo list                  # open todos\n\
+sclerox research list              # open investigations\n\
+sclerox meeting search \"<topic>\"   # past decisions\n\
 ```\n\n\
-Finding code: prefer `ol code` over Grep/Glob for symbols in indexed repos:\n\n```bash\n\
-ol code search \"<symbol>\"      # where is it defined (cross-repo, pre-indexed)\n\
-ol code refs <symbol>         # what calls it (impact of a change)\n\
+Finding code: prefer `sclerox code` over Grep/Glob for symbols in indexed repos:\n\n```bash\n\
+sclerox code search \"<symbol>\"      # where is it defined (cross-repo, pre-indexed)\n\
+sclerox code refs <symbol>         # what calls it (impact of a change)\n\
 ```\n\nRecord outcomes:\n\n```bash\n\
-ol todo done <id> --note \"<resolution>\"\n\
-ol research conclude <id> --findings \"<findings>\"\n\
-ol memory set \"<key>\" \"<value>\" --type project\n\
+sclerox todo done <id> --note \"<resolution>\"\n\
+sclerox research conclude <id> --findings \"<findings>\"\n\
+sclerox memory set \"<key>\" \"<value>\" --type project\n\
 ```\n\n{SECTION_END_MARKER}"
     )
 }
@@ -877,18 +880,18 @@ fn target_name(target: InstallTarget) -> &'static str {
     }
 }
 
-fn claude_dir() -> Result<PathBuf> {
+pub(crate) fn claude_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir().context("no home")?.join(".claude"))
 }
 
-fn opencode_dir() -> Result<PathBuf> {
+pub(crate) fn opencode_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("no home")?
         .join(".config")
         .join("opencode"))
 }
 
-fn codex_dir() -> Result<PathBuf> {
+pub(crate) fn codex_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir().context("no home")?.join(".codex"))
 }
 
@@ -899,7 +902,7 @@ fn current_binary_path() -> Result<String> {
         .into_owned())
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     if path.exists() {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -909,7 +912,7 @@ fn read_json(path: &Path) -> Result<Value> {
     }
 }
 
-fn write_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -924,7 +927,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 mod tests {
     use super::*;
 
-    const BLOCK: &str = "<!-- ol-kb -->\nBODY\n<!-- /ol-kb -->";
+    const BLOCK: &str = "<!-- sclerox-kb -->\nBODY\n<!-- /sclerox-kb -->";
 
     #[test]
     fn creates_in_empty_file() {
@@ -942,7 +945,7 @@ mod tests {
     #[test]
     fn replaces_legacy_section_running_to_eof() {
         // Legacy format: start marker, no end marker, section was the file tail.
-        let existing = "# Notes\n\n<!-- ol-kb -->\nOLD CONTENT\nmore old\n";
+        let existing = "# Notes\n\n<!-- sclerox-kb -->\nOLD CONTENT\nmore old\n";
         let out = rebuild_section(existing, BLOCK);
         assert_eq!(out, format!("# Notes\n\n{BLOCK}\n"));
         assert!(!out.contains("OLD CONTENT"));
@@ -950,7 +953,7 @@ mod tests {
 
     #[test]
     fn replaces_bounded_section_preserving_trailing_user_content() {
-        let existing = "# Notes\n\n<!-- ol-kb -->\nOLD\n<!-- /ol-kb -->\n\n# After the section\n";
+        let existing = "# Notes\n\n<!-- sclerox-kb -->\nOLD\n<!-- /sclerox-kb -->\n\n# After the section\n";
         let out = rebuild_section(existing, BLOCK);
         assert!(out.contains("BODY") && !out.contains("OLD"));
         assert!(out.contains("# Notes"));
@@ -1019,7 +1022,7 @@ mod tests {
         append_or_create_section(&path, &project_md_section(), true, false).unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(!out.contains("OLD"), "section refreshed");
-        assert!(out.contains("Knowledge Base (ol)"));
+        assert!(out.contains("Knowledge Base (sclerox)"));
     }
 
     #[test]
@@ -1086,8 +1089,8 @@ mod tests {
     }
 
     #[test]
-    fn ol_hook_present_detects_marker() {
-        assert!(!ol_hook_present(
+    fn sclerox_hook_present_detects_marker() {
+        assert!(!sclerox_hook_present(
             &serde_json::json!({ "hooks": { "Stop": [] } })
         ));
 
@@ -1095,6 +1098,6 @@ mod tests {
         let with_hook = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }] }
         });
-        assert!(ol_hook_present(&with_hook));
+        assert!(sclerox_hook_present(&with_hook));
     }
 }

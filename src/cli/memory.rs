@@ -76,7 +76,7 @@ pub enum MemoryCommand {
     /// A conflict means distillation found a new fact too similar to one or
     /// more existing memories to insert silently, but too ambiguous (several
     /// matches, or a manually written memory) to supersede automatically.
-    /// Resolve one by merging (ol memory supersede) or staling a side; the
+    /// Resolve one by merging (sclerox memory supersede) or staling a side; the
     /// pair disappears from this list as soon as either side is not active.
     Conflicts,
     /// List memories that haven't been reviewed recently
@@ -93,11 +93,11 @@ pub enum MemoryCommand {
     ///
     /// Command resolution order:
     ///   1. --via "<full command>"
-    ///   2. [ai].command / $OL_AI_COMMAND
+    ///   2. [ai].command / $SCLEROX_AI_COMMAND
     ///   3. built-in default (claude with headless flags)
     ///
     /// Model (applies to the DEFAULT command only): --model > [ai].model /
-    /// $OL_AI_MODEL > agent default. Bake the model into a custom --via command.
+    /// $SCLEROX_AI_MODEL > agent default. Bake the model into a custom --via command.
     Distill {
         /// Compress an existing memory entry (supersedes it with the distilled version)
         key: Option<String>,
@@ -105,7 +105,7 @@ pub enum MemoryCommand {
         #[arg(long)]
         from: Option<String>,
         /// Full AI command to run, e.g. "claude -p --safe-mode --tools="
-        /// (default: built-in claude command, or [ai].command / $OL_AI_COMMAND)
+        /// (default: built-in claude command, or [ai].command / $SCLEROX_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model for the default command (ignored when --via is a custom command)
@@ -382,7 +382,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         );
                     }
                     println!(
-                        "\n{} conflicts. Resolve by merging (ol memory supersede) or \
+                        "\n{} conflicts. Resolve by merging (sclerox memory supersede) or \
                          staling one side; resolved pairs disappear automatically.",
                         conflicts.len()
                     );
@@ -414,8 +414,8 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             dry_run,
         } => {
             // Precedence: --via/--model flag > settings.ai (which folds in the
-            // OL_AI_COMMAND / OL_AI_MODEL env vars) > built-in default. Manual
-            // `ol memory distill` defaults to the claude command.
+            // SCLEROX_AI_COMMAND / SCLEROX_AI_MODEL env vars) > built-in default. Manual
+            // `sclerox memory distill` defaults to the claude command.
             let cfg_ai = &settings().ai;
             let command = via.as_deref().or(cfg_ai.command.as_deref());
             let resolved_model = model.as_deref().or(cfg_ai.model.as_deref());
@@ -720,7 +720,7 @@ fn import_memories(
     } else {
         println!("Imported {imported} entries, skipped {skipped} (already exist)");
         if imported > 0 {
-            println!("Run `ol memory list` to see imported entries.");
+            println!("Run `sclerox memory list` to see imported entries.");
         }
     }
     Ok(())
@@ -790,7 +790,7 @@ fn default_command(agent: &str) -> Vec<String> {
 /// Resolve the distillation command into argv (program + args, WITHOUT the prompt).
 ///
 /// - `command`: an explicit full command (from `--via`, `[ai].command`, or
-///   `OL_AI_COMMAND`). Parsed shell-style and used verbatim; `model` is ignored
+///   `SCLEROX_AI_COMMAND`). Parsed shell-style and used verbatim; `model` is ignored
 ///   (bake the model flag into a custom command yourself).
 /// - `default_agent`: which built-in default to use when `command` is `None` —
 ///   `"claude"` for the Claude paths, `"opencode"` for the OpenCode hook.
@@ -892,7 +892,7 @@ fn distill_with_ai(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledM
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
                 "AI command '{program}' not found in PATH. \
-                 Set [ai].command in ~/.ol/config.toml (or $OL_AI_COMMAND). \
+                 Set [ai].command in ~/.config/sclerox/config.toml (or $SCLEROX_AI_COMMAND). \
                  On Windows an npm CLI is a .cmd shim the bare name can't \
                  resolve — point it at e.g. '{program}.cmd'."
             )

@@ -1,23 +1,23 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 pub use log::LevelFilter;
 
-/// File-based logger. Each day gets its own file: ~/.ol/logs/ol-YYYY-MM-DD.log.
-/// Multiple `ol` processes running concurrently safely append to the same file.
-pub struct OlLogger {
+/// File-based logger. Each day gets its own file: ~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log.
+/// Multiple `sclerox` processes running concurrently safely append to the same file.
+pub struct AldLogger {
     level: LevelFilter,
     file: Mutex<std::fs::File>,
     pid: u32,
 }
 
-impl OlLogger {
+impl AldLogger {
     pub fn new(level: LevelFilter, log_dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(log_dir)?;
         let date = chrono::Local::now().format("%Y-%m-%d");
-        let path = log_dir.join(format!("ol-{date}.log"));
+        let path = log_dir.join(format!("sclerox-{date}.log"));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             level,
@@ -27,16 +27,16 @@ impl OlLogger {
     }
 }
 
-impl log::Log for OlLogger {
+impl log::Log for AldLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
         if meta.level() > self.level {
             return false;
         }
         // Dependency crates (globset, ignore, ort, ...) are noisy at debug —
         // they were ~5% of a debug-level day. Keep them to warn and stronger;
-        // our own ol::* targets log at the configured level.
+        // our own sclerox::* targets log at the configured level.
         let t = meta.target();
-        t == "ol" || t.starts_with("ol::") || meta.level() <= log::Level::Warn
+        t == "sclerox" || t.starts_with("sclerox::") || meta.level() <= log::Level::Warn
     }
 
     fn log(&self, record: &log::Record) {
@@ -75,7 +75,7 @@ fn rss_mb() -> u64 {
 
 /// Initialise the logger. Call once at startup.
 /// Level is resolved in order: `--log-level` arg → `[log].level` (which folds
-/// in the `OL_LOG` env var) → default off.
+/// in the `SCLEROX_LOG` env var) → default off.
 pub fn init(level: Option<LevelFilter>) {
     let level = level
         .or_else(|| crate::config::settings().log.level.parse().ok())
@@ -85,26 +85,23 @@ pub fn init(level: Option<LevelFilter>) {
         return;
     }
 
-    let log_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ol")
-        .join("logs");
+    let log_dir = crate::xdg::state_home().join("sclerox").join("logs");
 
     prune_old_logs(&log_dir, crate::config::settings().log.retain_days);
 
-    match OlLogger::new(level, &log_dir) {
+    match AldLogger::new(level, &log_dir) {
         Ok(logger) => {
             if log::set_boxed_logger(Box::new(logger)).is_ok() {
                 log::set_max_level(level);
             }
         }
         Err(e) => {
-            eprintln!("[ol] could not open log file: {e}");
+            eprintln!("[sclerox] could not open log file: {e}");
         }
     }
 }
 
-/// Delete `ol-YYYY-MM-DD.log` files older than `retain_days` (0 = keep all).
+/// Delete `sclerox-YYYY-MM-DD.log` files older than `retain_days` (0 = keep all).
 /// Best-effort: any error is ignored — retention must never break startup.
 fn prune_old_logs(log_dir: &Path, retain_days: u32) {
     if retain_days == 0 {
@@ -118,7 +115,7 @@ fn prune_old_logs(log_dir: &Path, retain_days: u32) {
         let name = entry.file_name();
         let Some(date_part) = name
             .to_str()
-            .and_then(|n| n.strip_prefix("ol-"))
+            .and_then(|n| n.strip_prefix("sclerox-"))
             .and_then(|n| n.strip_suffix(".log"))
         else {
             continue;

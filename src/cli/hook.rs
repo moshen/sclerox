@@ -18,7 +18,7 @@ pub enum HookCommand {
     /// Reads the hook JSON from stdin (Claude Code passes session metadata this way).
     /// Safe to call even outside a hook context - missing transcript is a no-op.
     Stop {
-        /// Full AI command for distillation (default: built-in claude, or [ai].command / $OL_AI_COMMAND)
+        /// Full AI command for distillation (default: built-in claude, or [ai].command / $SCLEROX_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary (optional, uses agent default if omitted)
@@ -37,7 +37,7 @@ pub enum HookCommand {
         /// Claude Code session ID
         #[arg(long)]
         session_id: String,
-        /// Full AI command for distillation (default: built-in claude, or [ai].command / $OL_AI_COMMAND)
+        /// Full AI command for distillation (default: built-in claude, or [ai].command / $SCLEROX_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary
@@ -47,14 +47,14 @@ pub enum HookCommand {
 
     /// Run the OpenCode session.idle hook: index repo + distill session memories.
     ///
-    /// Called by the ol-session OpenCode plugin with the session ID and directory.
+    /// Called by the sclerox-session OpenCode plugin with the session ID and directory.
     /// Reads conversation history from OpenCode's SQLite database.
     Opencode {
         /// OpenCode session ID (passed by the plugin)
         session_id: String,
         /// Project directory (passed by the plugin via ctx.directory)
         directory: Option<String>,
-        /// Full AI command for distillation (default: built-in opencode, or [ai].command / $OL_AI_COMMAND)
+        /// Full AI command for distillation (default: built-in opencode, or [ai].command / $SCLEROX_AI_COMMAND)
         #[arg(long)]
         via: Option<String>,
         /// Model to pass to the AI binary (optional, uses agent default if omitted)
@@ -122,7 +122,7 @@ fn run_start(db: &Database) -> Result<()> {
 
     // Emit compact session context for Claude Code to inject (layer-1 index only).
     // Hard-capped at ~750 tokens so the agent knows what's available without
-    // loading full content. It then fetches detail via `ol memory get`, etc.
+    // loading full content. It then fetches detail via `sclerox memory get`, etc.
     if let Ok(ctx) = build_session_context(db, repo_name.as_deref()) {
         if !ctx.is_empty() {
             let payload = serde_json::json!({
@@ -140,12 +140,12 @@ fn run_start(db: &Database) -> Result<()> {
 
 /// Build a compact index of what's in the knowledge base so the agent knows
 /// what's available without loading every memory. The agent fetches detail
-/// on demand with `ol memory get`, `ol todo get`, etc. Section sizes and the
+/// on demand with `sclerox memory get`, `sclerox todo get`, etc. Section sizes and the
 /// overall budget come from `[session_context]` in config.
 fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<String> {
     let cfg = &crate::config::settings().session_context;
     let mut out = String::new();
-    out.push_str("## ol context (run `ol memory get <key>` etc. for full content)\n\n");
+    out.push_str("## sclerox context (run `sclerox memory get <key>` etc. for full content)\n\n");
 
     // Budget is enforced in real tokens (MiniLM tokenizer); max_chars is only a
     // final byte backstop applied at the end.
@@ -186,7 +186,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     if let Ok(conflicts) = db.memory_conflicts() {
         if !conflicts.is_empty() {
             let mut section = format!(
-                "### Memory conflicts ({}) — resolve with `ol memory conflicts`\n",
+                "### Memory conflicts ({}) — resolve with `sclerox memory conflicts`\n",
                 conflicts.len()
             );
             for c in conflicts.iter().take(5) {
@@ -227,7 +227,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     }
 
     // 5. Remaining active memory keys (excluding session + already-shown) — a
-    // single compact line of keys the agent can `ol memory get` on demand.
+    // single compact line of keys the agent can `sclerox memory get` on demand.
     if let Ok(all) = db.memory_list(None, Some("active")) {
         let others: Vec<&str> = all
             .iter()
@@ -245,13 +245,13 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // 6. Code index reminder — every session should know `ol code` exists and is
+    // 6. Code index reminder — every session should know `sclerox code` exists and is
     // the preferred symbol search across indexed repos.
     if let Ok(repos) = db.repo_list() {
         if !repos.is_empty() {
             let section = format!(
-                "### Code index\n{} repo(s) indexed. Prefer `ol code search <symbol>` \
-                 / `ol code refs <symbol>` over Grep for symbol lookup.\n\n",
+                "### Code index\n{} repo(s) indexed. Prefer `sclerox code search <symbol>` \
+                 / `sclerox code refs <symbol>` over Grep for symbol lookup.\n\n",
                 repos.len()
             );
             push_if_fits(&mut out, &section, budget);
@@ -325,7 +325,7 @@ fn relevant_memories(
         }
     }
 
-    // Tier 1: repo-name matches. Split on non-alphanumerics so "operating-layer-cli"
+    // Tier 1: repo-name matches. Split on non-alphanumerics so "sclerox-cli"
     // also matches memories phrased with the individual words.
     if let Some(name) = repo_name {
         for token in [name.to_string(), name.replace(['-', '_'], " ")] {
@@ -393,12 +393,12 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     // Guard against re-entrant calls: if `claude -p` (used for distillation)
     // also fires the Stop hook we'd recurse infinitely. The env var is inherited
     // by child processes, so the inner `claude -p` session sees it and skips.
-    if std::env::var("OL_HOOK_RUNNING").is_ok() {
+    if std::env::var("SCLEROX_HOOK_RUNNING").is_ok() {
         return Ok(());
     }
     // Safety: set before any subprocess is spawned; this process exits after
     // the hook returns so there's no need to unset it.
-    unsafe { std::env::set_var("OL_HOOK_RUNNING", "1") };
+    unsafe { std::env::set_var("SCLEROX_HOOK_RUNNING", "1") };
 
     // Always read stdin - Claude Code sends hook JSON here.
     // Consuming it prevents broken-pipe errors even if we don't use it all.
@@ -453,9 +453,8 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
     // their own Stop hooks, and avoids redundant work on re-runs.
     // Re-distills only after the session grows by distill.min_new_turns turns.
     let marker = distill_marker_path(session_id);
-    let last_distilled = marker
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let last_distilled = std::fs::read_to_string(&marker)
+        .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(0);
     if turn_count <= last_distilled + distill_cfg.min_new_turns {
@@ -473,7 +472,7 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         return Ok(());
     };
 
-    // Build args for `ol hook distill-session --session-id <id> [--via <bin>] [--model <m>]`
+    // Build args for `sclerox hook distill-session --session-id <id> [--via <bin>] [--model <m>]`
     let mut bg_args = vec![
         "hook".to_string(),
         "distill-session".to_string(),
@@ -489,11 +488,11 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
         bg_args.push(m.to_string());
     }
 
-    // Inherit OL_DB and OL_HOOK_RUNNING so the background process uses the
+    // Inherit SCLEROX_DB and SCLEROX_HOOK_RUNNING so the background process uses the
     // same database and does not trigger further distillation recursively.
     let _ = std::process::Command::new(&current_exe)
         .args(&bg_args)
-        .env("OL_HOOK_RUNNING", "1")
+        .env("SCLEROX_HOOK_RUNNING", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -501,12 +500,10 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
 
     // Write the marker immediately so concurrent Stop hooks spawned by
     // the background claude -p calls don't start a second distillation.
-    if let Some(p) = &marker {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(p, turn_count.to_string());
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(&marker, turn_count.to_string());
 
     log::debug!(
         "spawned background distillation for session {} ({} turns, last {})",
@@ -543,7 +540,7 @@ fn run_distill_session(
         return Ok(());
     }
 
-    // Precedence: --via/--model flag > [ai] (folds OL_AI_COMMAND/OL_AI_MODEL).
+    // Precedence: --via/--model flag > [ai] (folds SCLEROX_AI_COMMAND/SCLEROX_AI_MODEL).
     // This is a Claude Stop-hook path, so the default command is claude's.
     let command = via.or(cfg.ai.command.as_deref());
     let resolved_model = model.or(cfg.ai.model.as_deref());
@@ -572,12 +569,11 @@ fn run_distill_session(
     log::info!("background: distilled {total} memories from session {session_id}");
 
     // Write marker so this session isn't re-distilled unnecessarily.
-    if let Some(p) = distill_marker_path(session_id) {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&p, turns.len().to_string());
+    let p = distill_marker_path(session_id);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(&p, turns.len().to_string());
 
     Ok(())
 }
@@ -590,10 +586,10 @@ fn run_opencode(
     model: Option<&str>,
     no_distill: bool,
 ) -> Result<()> {
-    if std::env::var("OL_HOOK_RUNNING").is_ok() {
+    if std::env::var("SCLEROX_HOOK_RUNNING").is_ok() {
         return Ok(());
     }
-    unsafe { std::env::set_var("OL_HOOK_RUNNING", "1") };
+    unsafe { std::env::set_var("SCLEROX_HOOK_RUNNING", "1") };
 
     // Index the repo if directory is a git repo.
     // Walk up to the git root so sessions opened in subdirectories index the whole repo.
@@ -627,7 +623,7 @@ fn run_opencode(
         return Ok(());
     }
 
-    // Precedence: --via/--model flag > [ai] (folds OL_AI_COMMAND/OL_AI_MODEL).
+    // Precedence: --via/--model flag > [ai] (folds SCLEROX_AI_COMMAND/SCLEROX_AI_MODEL).
     // This is the OpenCode hook, so the default command is opencode's — a bare
     // [ai].command (if the user set one) still overrides it.
     let command = via.or(cfg.ai.command.as_deref());
@@ -646,7 +642,7 @@ fn run_opencode(
 
     let total = distill_chunked(db, &argv, &turns, "session")?;
     if total > 0 {
-        eprintln!("[ol] distilled {total} memories from opencode session");
+        eprintln!("[sclerox] distilled {total} memories from opencode session");
     }
     log::info!("opencode: distilled {total} memories from session {session_id}");
 
@@ -718,15 +714,14 @@ fn path_to_project_hash(path: &std::path::Path) -> String {
         .collect()
 }
 
-/// Path to the per-session distillation marker: ~/.ol/distilled/<session-id>
-/// Contains the turn count at which we last distilled this session.
-fn distill_marker_path(session_id: &str) -> Option<std::path::PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".ol")
-            .join("distilled")
-            .join(session_id),
-    )
+/// Path to the per-session distillation marker: `<state_home>/sclerox/distilled/<session-id>`
+/// (`~/.local/state/sclerox/distilled/<session-id>` by default, on every
+/// platform). Contains the turn count at which we last distilled this session.
+fn distill_marker_path(session_id: &str) -> std::path::PathBuf {
+    crate::xdg::state_home()
+        .join("sclerox")
+        .join("distilled")
+        .join(session_id)
 }
 
 /// Locks older than this are treated as abandoned by a crashed process and
@@ -756,10 +751,11 @@ enum LockOutcome {
     NoLock,
 }
 
-/// Acquire the per-session lock under `~/.ol/distilled/<id>.lock`.
+/// Acquire the per-session lock under `<state_home>/sclerox/distilled/<id>.lock`.
 fn try_lock_session(session_id: &str) -> LockOutcome {
-    match distill_marker_path(session_id).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        Some(dir) => try_lock_session_in(&dir, session_id, LOCK_STALE_SECS),
+    let marker = distill_marker_path(session_id);
+    match marker.parent() {
+        Some(dir) => try_lock_session_in(dir, session_id, LOCK_STALE_SECS),
         None => LockOutcome::NoLock,
     }
 }
@@ -858,7 +854,7 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// a background job must not silently replace it). Several matches mean a
 /// similarity score can't tell restated-same-fact from similar-distinct-facts
 /// — the new memory is stored and the cluster is flagged in memory_conflicts
-/// for content-aware review (`ol memory conflicts`).
+/// for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
     db: &Database,
     argv: &[String],
@@ -1073,14 +1069,14 @@ fn truncate_content(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Point OL_CONFIG at a nonexistent path so `settings()` yields built-in
-    /// defaults regardless of the developer's real ~/.ol/config.toml. All
+    /// Point SCLEROX_CONFIG at a nonexistent path so `settings()` yields built-in
+    /// defaults regardless of the developer's real ~/.config/sclerox/config.toml. All
     /// settings()-using tests call this; since settings() is a process-wide
     /// OnceLock, the first caller locks in defaults for the whole test binary.
     fn isolate_config() {
         // SAFETY: test-only; every caller writes the same value before the
         // OnceLock is first read.
-        unsafe { std::env::set_var("OL_CONFIG", "/nonexistent/ol-test-config.toml") };
+        unsafe { std::env::set_var("SCLEROX_CONFIG", "/nonexistent/sclerox-test-config.toml") };
     }
 
     #[test]
@@ -1268,7 +1264,7 @@ mod tests {
         isolate_config();
         let db = Database::open_in_memory().unwrap();
         let ctx = build_session_context(&db, None).unwrap();
-        assert!(ctx.contains("ol context"));
+        assert!(ctx.contains("sclerox context"));
     }
 
     #[test]

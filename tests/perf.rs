@@ -17,20 +17,20 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let db = dir.path().join("ol.db");
+        let db = dir.path().join("sclerox.db");
         Self { _dir: dir, db }
     }
 
     fn run(&self, args: &[&str]) -> String {
-        let out = Command::cargo_bin("ol")
+        let out = Command::cargo_bin("sclerox")
             .unwrap()
-            .env("OL_DB", &self.db)
+            .env("SCLEROX_DB", &self.db)
             .args(args)
             .output()
             .unwrap();
         assert!(
             out.status.success(),
-            "ol {} failed: {}",
+            "sclerox {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&out.stderr),
         );
@@ -168,11 +168,11 @@ fn per_table_search_500_research() {
 /// vec0 triggers populate `meeting_chunks_vec`, then time `meeting_similar`.
 /// This exercises the sqlite-vec index end-to-end without the fastembed model.
 fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
-    use ol::db::Database;
+    use sclerox::db::Database;
 
     let dims = 384usize;
     let dir = TempDir::new().unwrap();
-    let db = Database::open(&dir.path().join("ol.db")).unwrap();
+    let db = Database::open(&dir.path().join("sclerox.db")).unwrap();
     let meeting_id = db.meeting_add("Perf", None, None, None).unwrap();
 
     // Deterministic mock embeddings; each chunk points along a rotating basis.

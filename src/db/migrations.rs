@@ -13,7 +13,7 @@ pub const PRIMARY_VERSION: u32 = 12;
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 4;
 
-/// Migrations for the primary database (~/.ol/ol.db).
+/// Migrations for the primary database (~/.local/share/sclerox/sclerox.db).
 ///
 /// Version 1 is the baseline established by PRIMARY_SCHEMA - it is applied to
 /// fresh databases via execute_batch, not through this list.
@@ -83,7 +83,7 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Migrations for per-repo databases (<repo>/.ol/repo.db).
+/// Migrations for per-repo databases (<repo>/.sclerox/repo.db).
 pub const REPO_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,

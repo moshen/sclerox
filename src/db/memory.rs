@@ -412,7 +412,7 @@ impl Database {
     ) -> Result<bool> {
         if old_key == new_key {
             anyhow::bail!(
-                "old and new keys are both '{old_key}'; use `ol memory set` to update in place"
+                "old and new keys are both '{old_key}'; use `sclerox memory set` to update in place"
             );
         }
 

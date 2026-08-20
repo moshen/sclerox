@@ -195,7 +195,7 @@ mod tests {
                 "/home/user/myrepo",
                 "myrepo",
                 Some("A Rust web service"),
-                "/home/user/myrepo/.ol/repo.db",
+                "/home/user/myrepo/.sclerox/repo.db",
                 None,
             )
             .unwrap();
@@ -212,7 +212,7 @@ mod tests {
             "/path/repo",
             "repo",
             Some("old desc"),
-            "/path/.ol/repo.db",
+            "/path/.sclerox/repo.db",
             None,
         )
         .unwrap();
@@ -220,7 +220,7 @@ mod tests {
             "/path/repo",
             "repo",
             Some("new desc"),
-            "/path/.ol/repo.db",
+            "/path/.sclerox/repo.db",
             None,
         )
         .unwrap();
@@ -237,7 +237,7 @@ mod tests {
             "/a",
             "auth-service",
             Some("handles OAuth and JWT"),
-            "/a/.ol/repo.db",
+            "/a/.sclerox/repo.db",
             None,
         )
         .unwrap();
@@ -245,7 +245,7 @@ mod tests {
             "/b",
             "payment-api",
             Some("Stripe payment integration"),
-            "/b/.ol/repo.db",
+            "/b/.sclerox/repo.db",
             None,
         )
         .unwrap();
@@ -268,7 +268,7 @@ mod tests {
             "/a",
             "repo-a",
             Some("systems code"),
-            "/a/.ol/repo.db",
+            "/a/.sclerox/repo.db",
             Some(&unit(0)),
         )
         .unwrap();
@@ -276,7 +276,7 @@ mod tests {
             "/b",
             "repo-b",
             Some("web frontend"),
-            "/b/.ol/repo.db",
+            "/b/.sclerox/repo.db",
             Some(&unit(1)),
         )
         .unwrap();
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn test_repo_remove() {
         let db = Database::open_in_memory().unwrap();
-        db.repo_register("/x", "x", None, "/x/.ol/repo.db", None)
+        db.repo_register("/x", "x", None, "/x/.sclerox/repo.db", None)
             .unwrap();
         assert!(db.repo_remove("/x").unwrap());
         assert!(!db.repo_remove("/x").unwrap());

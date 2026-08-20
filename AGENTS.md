@@ -22,10 +22,10 @@ via `skill_files()` in `src/cli/install.rs`:
 
 When adding or changing a command or flag, update the matching
 `reference/<domain>.md`; add a new behavioral rule or a new domain link to
-`SKILL.md`. The skill is what the agent reads to use `ol` — if it's not there,
+`SKILL.md`. The skill is what the agent reads to use `sclerox` — if it's not there,
 the agent won't use it.
 
-Check that `ol <command> --help` output matches what the skill describes.
+Check that `sclerox <command> --help` output matches what the skill describes.
 
 # When adding a config setting
 
@@ -34,11 +34,11 @@ Check that `ol <command> --help` output matches what the skill describes.
 
 - Add the field to the relevant `*Settings` struct, its `Default`, and
   `validate()` in `src/config.rs`
-- Surface it in the `ol config` template (`src/cli/config_cmd.rs`)
+- Surface it in the `sclerox config` template (`src/cli/config_cmd.rs`)
 - If a library module needs it, bridge it to an env var in
   `config::init()` and read that env var from the module — do not make
-  library code call `settings()`. See `OL_MAX_INDEX_FILE_BYTES` and
-  `OL_MAX_INDEX_FILES`.
+  library code call `settings()`. See `SCLEROX_MAX_INDEX_FILE_BYTES` and
+  `SCLEROX_MAX_INDEX_FILES`.
 
 # Building
 

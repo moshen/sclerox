@@ -41,9 +41,9 @@ const SPLIT_OVERLAP_LINES: usize = 3;
 // Directories always excluded regardless of .gitignore.
 // .gitignore is the primary source of truth (via the ignore crate), but these
 // cover universal build/cache dirs that repos commonly omit from .gitignore,
-// plus our own .ol dir which should never appear in .gitignore.
+// plus our own .sclerox dir which should never appear in .gitignore.
 const HARDCODED_IGNORED: &[&str] = &[
-    ".ol",
+    ".sclerox",
     ".git",
     "node_modules",
     "target", // Rust build output
@@ -54,12 +54,12 @@ const HARDCODED_IGNORED: &[&str] = &[
     "bin", // .NET build output
 ];
 
-// Default tree-sitter file size limit. Override with OL_MAX_INDEX_FILE_BYTES env var.
+// Default tree-sitter file size limit. Override with SCLEROX_MAX_INDEX_FILE_BYTES env var.
 // Files above this fall back to line-based chunking (still indexed, no symbol extraction).
 const DEFAULT_MAX_TREE_SITTER_BYTES: usize = 1_000_000; // 1 MB
 
 fn max_tree_sitter_bytes() -> usize {
-    std::env::var("OL_MAX_INDEX_FILE_BYTES")
+    std::env::var("SCLEROX_MAX_INDEX_FILE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_TREE_SITTER_BYTES)
@@ -67,7 +67,7 @@ fn max_tree_sitter_bytes() -> usize {
 
 pub struct RepoIndexer<'a> {
     embedder: Option<&'a mut Embedder>,
-    /// Bypass the max-files cap (set by explicit `ol repo index --force`).
+    /// Bypass the max-files cap (set by explicit `sclerox repo index --force`).
     /// The unsafe-root refusal is never bypassed — home/root are always off-limits.
     force: bool,
     /// Override the max-files cap; `None` reads it from the env (bridged config).
@@ -89,7 +89,7 @@ impl<'a> RepoIndexer<'a> {
         self
     }
 
-    /// Override the max-files cap (otherwise read from `OL_MAX_INDEX_FILES`).
+    /// Override the max-files cap (otherwise read from `SCLEROX_MAX_INDEX_FILES`).
     /// Test-only: production callers set the cap via config/env.
     #[cfg(test)]
     pub fn with_max_files(mut self, max_files: usize) -> Self {
@@ -97,7 +97,7 @@ impl<'a> RepoIndexer<'a> {
         self
     }
 
-    /// Index a repo at `repo_root`, store results in `repo_root/.ol/repo.db`,
+    /// Index a repo at `repo_root`, store results in `repo_root/.sclerox/repo.db`,
     /// and register it in the primary `db`.
     pub fn index_repo(
         &mut self,
@@ -107,7 +107,7 @@ impl<'a> RepoIndexer<'a> {
     ) -> Result<IndexResult> {
         // Canonicalize up front so the registry, the index db path, and every
         // ancestry check use one normalized form regardless of caller (hooks
-        // pass a logical cwd; `ol repo index` canonicalizes). This keeps the
+        // pass a logical cwd; `sclerox repo index` canonicalizes). This keeps the
         // same directory from being registered twice under different spellings.
         let repo_root = canonical_or_self(repo_root);
         let repo_root = repo_root.as_path();
@@ -129,17 +129,22 @@ impl<'a> RepoIndexer<'a> {
             return Ok(IndexResult::default());
         }
 
+        // Self-heal a pre-rename `.ol/` left by an old `ol` install, before
+        // anything reads `.sclerox/` — otherwise a legacy opt-out in `.ol/config.toml`
+        // would be invisible to the check below. See `crate::migrate`.
+        crate::migrate::migrate_legacy_repo_dir(repo_root);
+
         // Honor a per-folder opt-out before touching anything so hooks silently
         // skip excluded folders. Also self-heal: if this folder was indexed
         // before being opted out, retract the now-stale index (repo.db + its
-        // WAL/SHM sidecars) and the primary registry entry. Keep .ol/config.toml
+        // WAL/SHM sidecars) and the primary registry entry. Keep .sclerox/config.toml
         // — it is the opt-out marker itself.
         if !repo_config(repo_root).index {
-            log::info!("skipping '{name}' — indexing disabled in .ol/config.toml");
-            let ol_dir = repo_root.join(".ol");
+            log::info!("skipping '{name}' — indexing disabled in .sclerox/config.toml");
+            let sclerox_dir = repo_root.join(".sclerox");
             let mut retracted = false;
             for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
-                let p = ol_dir.join(fname);
+                let p = sclerox_dir.join(fname);
                 if p.exists() {
                     match std::fs::remove_file(&p) {
                         Ok(()) => retracted = true,
@@ -178,13 +183,13 @@ impl<'a> RepoIndexer<'a> {
         if over_cap && !self.force {
             log::warn!(
                 "refusing to index '{name}' — more than {max_files} indexable files. \
-                 Re-run with `ol repo index --force` or raise [index].max_files.",
+                 Re-run with `sclerox repo index --force` or raise [index].max_files.",
             );
             return Ok(IndexResult::default());
         }
 
         log::info!("indexing repo '{}' at {}", name, repo_root.display());
-        let db_path = repo_root.join(".ol").join("repo.db");
+        let db_path = repo_root.join(".sclerox").join("repo.db");
         // Track whether the index existed before this run so we can clean up a
         // stub repo.db if the folder turns out to have nothing to index.
         let db_existed = db_path.exists();
@@ -194,7 +199,7 @@ impl<'a> RepoIndexer<'a> {
         repo_db.set_meta("name", &name)?;
 
         // Retract any nested child index this parent now covers: a subfolder was
-        // indexed on its own before the parent was, so its .ol/repo.db is now
+        // indexed on its own before the parent was, so its .sclerox/repo.db is now
         // redundant. A subfolder that explicitly opted out keeps its own index.
         retract_nested_child_indexes(db, repo_root)?;
 
@@ -335,7 +340,7 @@ impl<'a> RepoIndexer<'a> {
         );
 
         // Index each nested git repo hit at a boundary so a single index of the
-        // parent yields a separate entry (and .ol) per .git level. Recurse via
+        // parent yields a separate entry (and .sclerox) per .git level. Recurse via
         // self so nested repos deeper still are handled too; best-effort, so one
         // failing nested repo never fails the parent. Done before the empty
         // check so a parent whose only content is submodules still indexes them.
@@ -353,18 +358,18 @@ impl<'a> RepoIndexer<'a> {
         // reports zero indexed too, and must be left intact.
         if !db_existed && result.files_indexed == 0 && result.skipped == 0 {
             drop(repo_db);
-            let ol_dir = repo_root.join(".ol");
+            let sclerox_dir = repo_root.join(".sclerox");
             for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
-                let p = ol_dir.join(fname);
+                let p = sclerox_dir.join(fname);
                 if p.exists() {
                     if let Err(e) = std::fs::remove_file(&p) {
                         log::warn!("failed to remove empty index {}: {e}", p.display());
                     }
                 }
             }
-            // Remove .ol too if it's now empty; a no-op when anything else
+            // Remove .sclerox too if it's now empty; a no-op when anything else
             // (e.g. a config.toml) still lives there.
-            let _ = std::fs::remove_dir(&ol_dir);
+            let _ = std::fs::remove_dir(&sclerox_dir);
             log::info!("skipping '{name}' — nothing to index");
             return Ok(result);
         }
@@ -403,8 +408,8 @@ pub struct IndexResult {
     pub skipped: usize,
 }
 
-/// Per-repo ol config, read from `<root>/.ol/config.toml` (the per-repo analog
-/// of `~/.ol/config.toml`, alongside the repo's index db). Controls whether a
+/// Per-repo sclerox config, read from `<root>/.sclerox/config.toml` (the per-repo analog
+/// of `~/.config/sclerox/config.toml`, alongside the repo's index db). Controls whether a
 /// folder is indexed. A missing or malformed file means "index by default".
 #[derive(Debug, Clone)]
 pub struct RepoConfig {
@@ -417,10 +422,10 @@ impl Default for RepoConfig {
     }
 }
 
-/// Read `<root>/.ol/config.toml`. Tolerant: any read/parse error yields
+/// Read `<root>/.sclerox/config.toml`. Tolerant: any read/parse error yields
 /// defaults so a stray file never breaks indexing.
 pub fn repo_config(root: &Path) -> RepoConfig {
-    let path = root.join(".ol").join("config.toml");
+    let path = root.join(".sclerox").join("config.toml");
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return RepoConfig::default();
     };
@@ -441,11 +446,11 @@ pub fn repo_config(root: &Path) -> RepoConfig {
 
 /// Default cap on indexable files per folder. A folder with more than this many
 /// files is rejected (rather than partially indexed) unless forced. Override
-/// with the `OL_MAX_INDEX_FILES` env var (bridged from `[index].max_files`).
+/// with the `SCLEROX_MAX_INDEX_FILES` env var (bridged from `[index].max_files`).
 const DEFAULT_MAX_INDEX_FILES: usize = 50_000;
 
 fn max_index_files() -> usize {
-    std::env::var("OL_MAX_INDEX_FILES")
+    std::env::var("SCLEROX_MAX_INDEX_FILES")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
@@ -498,13 +503,13 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> WalkOutcome {
     // and global gitignore are all automatically respected.
     let walker = ignore::WalkBuilder::new(repo_root)
         .follow_links(false)
-        .hidden(false) // don't skip dot-files by default (we handle .ol ourselves)
+        .hidden(false) // don't skip dot-files by default (we handle .sclerox ourselves)
         .git_ignore(true) // respect .gitignore
         .git_global(true) // respect ~/.config/git/ignore
         .git_exclude(true) // respect .git/info/exclude
         .require_git(false) // respect .gitignore even outside a git repo
         .filter_entry(move |e| {
-            // Exclude our own .ol dir and other universal build/cache noise.
+            // Exclude our own .sclerox dir and other universal build/cache noise.
             let name = e.file_name().to_str().unwrap_or("");
             if HARDCODED_IGNORED.contains(&name) {
                 return false;
@@ -514,7 +519,7 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> WalkOutcome {
             if e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 // A nested git repo is its own index target — treat its .git as
                 // a boundary (don't absorb its files) and remember it so the
-                // caller can index it separately: one .ol per .git level.
+                // caller can index it separately: one .sclerox per .git level.
                 if is_git_repo(e.path()) {
                     if let Ok(mut v) = nested_filter.lock() {
                         v.push(e.path().to_path_buf());
@@ -582,9 +587,9 @@ fn nested_resolution(ancestor_is_git: bool, descendant_is_git: bool) -> NestedRe
 
 /// Consolidate registry entries made redundant by nesting: when one registered
 /// folder sits inside another, only one should own the overlapping code (see
-/// `nested_loser`). Retracts each loser's `.ol` index and deregisters it. A
+/// `nested_loser`). Retracts each loser's `.sclerox` index and deregisters it. A
 /// descendant that explicitly opted out keeps its independent index. Returns the
-/// stored paths that were removed. Used by `ol repo sync` to heal registries
+/// stored paths that were removed. Used by `sclerox repo sync` to heal registries
 /// polluted by the old hook that indexed non-git folders.
 pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
     let repos = db.repo_list()?;
@@ -620,16 +625,16 @@ pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
 
     let removed: Vec<String> = to_remove.into_iter().collect();
     for path in &removed {
-        let ol_dir = Path::new(path).join(".ol");
+        let sclerox_dir = Path::new(path).join(".sclerox");
         for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
-            let p = ol_dir.join(fname);
+            let p = sclerox_dir.join(fname);
             if p.exists() {
                 if let Err(e) = std::fs::remove_file(&p) {
                     log::warn!("failed to remove redundant index {}: {e}", p.display());
                 }
             }
         }
-        let _ = std::fs::remove_dir(&ol_dir);
+        let _ = std::fs::remove_dir(&sclerox_dir);
         let _ = db.repo_remove(path);
     }
     Ok(removed)
@@ -638,14 +643,14 @@ pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
 /// Canonicalize `p`, falling back to `p` as-is if it can't be resolved.
 /// Ancestry checks between a live `repo_root` and registry paths must compare
 /// the same normalized form: the hooks index the session's *logical* cwd
-/// (symlinks unresolved) while `ol repo index` canonicalizes, so `/tmp/x` and
+/// (symlinks unresolved) while `sclerox repo index` canonicalizes, so `/tmp/x` and
 /// `/private/tmp/x` denote the same dir but won't `starts_with`-match raw.
 fn canonical_or_self(p: &Path) -> std::path::PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Retract every registered index whose folder is a proper descendant of
-/// `repo_root`: the parent now covers those files, so the nested `.ol/repo.db`
+/// `repo_root`: the parent now covers those files, so the nested `.sclerox/repo.db`
 /// and its registry entry are redundant. A descendant that explicitly opted out
 /// (`index = false`) keeps its own index — that is a deliberate independent one.
 fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
@@ -667,10 +672,10 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
             continue; // explicit opt-out: leave the independent child index be
         }
         // fs / registry ops use the stored path form (where the index lives).
-        let ol_dir = child_raw.join(".ol");
+        let sclerox_dir = child_raw.join(".sclerox");
         let mut retracted = false;
         for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
-            let p = ol_dir.join(fname);
+            let p = sclerox_dir.join(fname);
             if p.exists() {
                 match std::fs::remove_file(&p) {
                     Ok(()) => retracted = true,
@@ -678,8 +683,8 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
                 }
             }
         }
-        // Remove .ol too if it's now empty (a no-op when e.g. a config.toml stays).
-        let _ = std::fs::remove_dir(&ol_dir);
+        // Remove .sclerox too if it's now empty (a no-op when e.g. a config.toml stays).
+        let _ = std::fs::remove_dir(&sclerox_dir);
         if db.repo_remove(&r.path)? {
             retracted = true;
         }
@@ -699,7 +704,7 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
 /// Returns the ancestor's (stored) path if one is registered, else `None`.
 fn parent_indexed_repo(db: &Database, repo_root: &Path) -> Result<Option<String>> {
     // A git repo is its own index even when nested inside another repo — each
-    // .git level gets its own .ol, and the parent's walk stops at the boundary
+    // .git level gets its own .sclerox, and the parent's walk stops at the boundary
     // so it never covered this repo anyway. Only a non-git folder is deemed
     // covered by a parent index.
     if is_git_repo(repo_root) {
@@ -781,7 +786,7 @@ class Handler:
     #[test]
     fn test_opt_out_retracts_stale_index() {
         // Index a repo, then opt it out and re-run: the stale repo.db and the
-        // registry entry must be retracted, while .ol/config.toml survives.
+        // registry entry must be retracted, while .sclerox/config.toml survives.
         let repo_dir = make_test_repo();
         let primary_db = Database::open_in_memory().unwrap();
         let mut indexer = RepoIndexer::new(None);
@@ -789,12 +794,12 @@ class Handler:
         indexer
             .index_repo(&primary_db, repo_dir.path(), None)
             .unwrap();
-        let db_path = repo_dir.path().join(".ol").join("repo.db");
+        let db_path = repo_dir.path().join(".sclerox").join("repo.db");
         assert!(db_path.exists(), "index built");
         assert_eq!(primary_db.repo_list().unwrap().len(), 1, "registered");
 
         // Opt out and re-run (as a hook would).
-        let cfg = repo_dir.path().join(".ol").join("config.toml");
+        let cfg = repo_dir.path().join(".sclerox").join("config.toml");
         std::fs::write(&cfg, "index = false\n").unwrap();
         let result = indexer
             .index_repo(&primary_db, repo_dir.path(), None)
@@ -823,7 +828,7 @@ class Handler:
         assert_eq!(result.files_indexed, 0, "nothing indexable");
         assert_eq!(result.skipped, 0);
         assert!(
-            !dir.path().join(".ol").join("repo.db").exists(),
+            !dir.path().join(".sclerox").join("repo.db").exists(),
             "stub repo.db should not be left behind"
         );
         assert!(
@@ -852,7 +857,7 @@ class Handler:
         let result = indexer.index_repo(&primary_db, &sub, None).unwrap();
         assert_eq!(result.files_indexed, 0, "subfolder indexing skipped");
         assert!(
-            !sub.join(".ol").join("repo.db").exists(),
+            !sub.join(".sclerox").join("repo.db").exists(),
             "no nested repo.db under an already-indexed parent"
         );
         assert_eq!(
@@ -867,13 +872,13 @@ class Handler:
         // A registry entry whose directory no longer exists is stale and must
         // not be reported as a covering parent.
         let db = Database::open_in_memory().unwrap();
-        let missing = std::env::temp_dir().join("ol-nonexistent-parent-xyz-123");
+        let missing = std::env::temp_dir().join("sclerox-nonexistent-parent-xyz-123");
         assert!(!missing.exists(), "test precondition: path must not exist");
         db.repo_register(
             &missing.to_string_lossy(),
             "ghost",
             None,
-            &missing.join(".ol").join("repo.db").to_string_lossy(),
+            &missing.join(".sclerox").join("repo.db").to_string_lossy(),
             None,
         )
         .unwrap();
@@ -893,7 +898,7 @@ class Handler:
             &parent.path().to_string_lossy(),
             "live",
             None,
-            &parent.path().join(".ol").join("repo.db").to_string_lossy(),
+            &parent.path().join(".sclerox").join("repo.db").to_string_lossy(),
             None,
         )
         .unwrap();
@@ -955,7 +960,7 @@ class Handler:
         let result = indexer.index_repo(&db, dir.path(), None).unwrap();
         assert_eq!(result.files_indexed, 0, "over-cap folder rejected");
         assert!(
-            !dir.path().join(".ol").join("repo.db").exists(),
+            !dir.path().join(".sclerox").join("repo.db").exists(),
             "no index created for a rejected folder"
         );
         assert!(db.repo_list().unwrap().is_empty(), "not registered");
@@ -964,7 +969,7 @@ class Handler:
         let mut indexer = RepoIndexer::new(None).with_max_files(1).with_force(true);
         let result = indexer.index_repo(&db, dir.path(), None).unwrap();
         assert!(result.files_indexed > 0, "force indexes past the cap");
-        assert!(dir.path().join(".ol").join("repo.db").exists());
+        assert!(dir.path().join(".sclerox").join("repo.db").exists());
     }
 
     #[test]
@@ -979,7 +984,7 @@ class Handler:
 
         let db = Database::open_in_memory().unwrap();
         RepoIndexer::new(None).index_repo(&db, &sub, None).unwrap();
-        assert!(sub.join(".ol").join("repo.db").exists(), "child indexed");
+        assert!(sub.join(".sclerox").join("repo.db").exists(), "child indexed");
         assert_eq!(db.repo_list().unwrap().len(), 1);
 
         let result = RepoIndexer::new(None)
@@ -987,7 +992,7 @@ class Handler:
             .unwrap();
         assert!(result.files_indexed > 0, "parent indexed its files");
         assert!(
-            !sub.join(".ol").join("repo.db").exists(),
+            !sub.join(".sclerox").join("repo.db").exists(),
             "nested child repo.db retracted"
         );
         let repos = db.repo_list().unwrap();
@@ -1006,17 +1011,17 @@ class Handler:
         let parent = TempDir::new().unwrap();
         std::fs::write(parent.path().join("main.rs"), "fn main() {}").unwrap();
         let sub = parent.path().join("vendored");
-        std::fs::create_dir_all(sub.join(".ol")).unwrap();
-        std::fs::write(sub.join(".ol").join("config.toml"), "index = false\n").unwrap();
+        std::fs::create_dir_all(sub.join(".sclerox")).unwrap();
+        std::fs::write(sub.join(".sclerox").join("config.toml"), "index = false\n").unwrap();
         std::fs::write(sub.join("thing.rs"), "fn thing() {}").unwrap();
-        std::fs::write(sub.join(".ol").join("repo.db"), b"stub").unwrap();
+        std::fs::write(sub.join(".sclerox").join("repo.db"), b"stub").unwrap();
 
         let db = Database::open_in_memory().unwrap();
         db.repo_register(
             &sub.to_string_lossy(),
             "vendored",
             None,
-            &sub.join(".ol").join("repo.db").to_string_lossy(),
+            &sub.join(".sclerox").join("repo.db").to_string_lossy(),
             None,
         )
         .unwrap();
@@ -1027,11 +1032,11 @@ class Handler:
 
         // Opted-out child index untouched.
         assert!(
-            sub.join(".ol").join("repo.db").exists(),
+            sub.join(".sclerox").join("repo.db").exists(),
             "opted-out child index preserved"
         );
         // Its files were not absorbed into the parent index.
-        let repo_db = RepoDb::open(&parent.path().join(".ol").join("repo.db")).unwrap();
+        let repo_db = RepoDb::open(&parent.path().join(".sclerox").join("repo.db")).unwrap();
         let files = repo_db.list_files().unwrap();
         assert!(
             !files.iter().any(|f| f.path.starts_with("vendored/")),
@@ -1043,7 +1048,7 @@ class Handler:
     fn test_parent_detected_across_path_forms() {
         // The parent is registered under one path form (e.g. the hook's logical
         // cwd) while the subfolder is queried under the canonicalized form (e.g.
-        // `ol repo index`). They must still match. On macOS TempDir lives under
+        // `sclerox repo index`). They must still match. On macOS TempDir lives under
         // /var → /private/var, giving two real forms for the same directory.
         let parent = TempDir::new().unwrap();
         let raw = parent.path();
@@ -1059,7 +1064,7 @@ class Handler:
             &raw.to_string_lossy(),
             "parent",
             None,
-            &raw.join(".ol").join("repo.db").to_string_lossy(),
+            &raw.join(".sclerox").join("repo.db").to_string_lossy(),
             None,
         )
         .unwrap();
@@ -1094,11 +1099,11 @@ class Handler:
         );
     }
 
-    /// Register `path` with a stub `.ol/repo.db` so pruning has something to
+    /// Register `path` with a stub `.sclerox/repo.db` so pruning has something to
     /// retract. Optionally mark it a git repo.
     fn register_with_index(db: &Database, path: &Path, git: bool) {
-        std::fs::create_dir_all(path.join(".ol")).unwrap();
-        std::fs::write(path.join(".ol").join("repo.db"), b"stub").unwrap();
+        std::fs::create_dir_all(path.join(".sclerox")).unwrap();
+        std::fs::write(path.join(".sclerox").join("repo.db"), b"stub").unwrap();
         if git {
             std::fs::create_dir_all(path.join(".git")).unwrap();
         }
@@ -1106,7 +1111,7 @@ class Handler:
             &path.to_string_lossy(),
             path.file_name().unwrap().to_str().unwrap(),
             None,
-            &path.join(".ol").join("repo.db").to_string_lossy(),
+            &path.join(".sclerox").join("repo.db").to_string_lossy(),
             None,
         )
         .unwrap();
@@ -1132,11 +1137,11 @@ class Handler:
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].path, child.to_string_lossy());
         assert!(
-            !ws.path().join(".ol").join("repo.db").exists(),
+            !ws.path().join(".sclerox").join("repo.db").exists(),
             "spurious parent index retracted"
         );
         assert!(
-            child.join(".ol").join("repo.db").exists(),
+            child.join(".sclerox").join("repo.db").exists(),
             "child index preserved"
         );
     }
@@ -1186,8 +1191,8 @@ class Handler:
         let parent = TempDir::new().unwrap();
         std::fs::create_dir_all(parent.path().join(".git")).unwrap();
         let child = parent.path().join("vendored");
-        std::fs::create_dir_all(child.join(".ol")).unwrap();
-        std::fs::write(child.join(".ol").join("config.toml"), "index = false\n").unwrap();
+        std::fs::create_dir_all(child.join(".sclerox")).unwrap();
+        std::fs::write(child.join(".sclerox").join("config.toml"), "index = false\n").unwrap();
 
         let db = Database::open_in_memory().unwrap();
         register_with_index(&db, parent.path(), true);
@@ -1205,7 +1210,7 @@ class Handler:
     fn test_nested_git_repos_index_separately() {
         // A git repo containing a nested git repo: the outer index must stop at
         // the inner .git boundary (not absorb inner files), and the inner repo
-        // must get its own index — one .ol per .git level.
+        // must get its own index — one .sclerox per .git level.
         let outer = TempDir::new().unwrap();
         std::fs::create_dir_all(outer.path().join(".git")).unwrap();
         std::fs::write(outer.path().join("outer.rs"), "fn outer() {}").unwrap();
@@ -1220,7 +1225,7 @@ class Handler:
             .unwrap();
 
         // Outer index holds only its own file, not the nested repo's.
-        let outer_db = RepoDb::open(&outer.path().join(".ol").join("repo.db")).unwrap();
+        let outer_db = RepoDb::open(&outer.path().join(".sclerox").join("repo.db")).unwrap();
         let outer_files = outer_db.list_files().unwrap();
         assert!(
             outer_files.iter().any(|f| f.path == "outer.rs"),
@@ -1231,8 +1236,8 @@ class Handler:
             "outer must not absorb the nested repo's files"
         );
 
-        // The nested repo was indexed automatically — its own .ol with its file.
-        let inner_db = RepoDb::open(&inner.join(".ol").join("repo.db")).unwrap();
+        // The nested repo was indexed automatically — its own .sclerox with its file.
+        let inner_db = RepoDb::open(&inner.join(".sclerox").join("repo.db")).unwrap();
         assert!(
             inner_db
                 .list_files()
@@ -1269,7 +1274,7 @@ class Handler:
             .unwrap();
 
         assert!(
-            inner.join(".ol").join("repo.db").exists(),
+            inner.join(".sclerox").join("repo.db").exists(),
             "nested repo indexed even when parent has nothing of its own"
         );
         let repos = db.repo_list().unwrap();
@@ -1291,7 +1296,7 @@ class Handler:
             .unwrap();
 
         // target/main.rs should be skipped
-        let db_path = repo_dir.path().join(".ol").join("repo.db");
+        let db_path = repo_dir.path().join(".sclerox").join("repo.db");
         let repo_db = RepoDb::open(&db_path).unwrap();
         let files = repo_db.list_files().unwrap();
         assert!(
@@ -1346,7 +1351,7 @@ class Handler:
         let mut indexer = RepoIndexer::new(None);
         let _ = indexer.index_repo(&primary_db, dir.path(), None).unwrap();
 
-        let db_path = dir.path().join(".ol").join("repo.db");
+        let db_path = dir.path().join(".sclerox").join("repo.db");
         let repo_db = RepoDb::open(&db_path).unwrap();
         let files = repo_db.list_files().unwrap();
         assert!(
@@ -1369,11 +1374,11 @@ class Handler:
         std::fs::write(dir.path().join("normal.py"), &source).unwrap();
 
         // Set limit to 100 bytes so our ~480-byte file triggers the fallback
-        std::env::set_var("OL_MAX_INDEX_FILE_BYTES", "100");
+        std::env::set_var("SCLEROX_MAX_INDEX_FILE_BYTES", "100");
         let primary_db = Database::open_in_memory().unwrap();
         let mut indexer = RepoIndexer::new(None);
         let result = indexer.index_repo(&primary_db, dir.path(), None).unwrap();
-        std::env::remove_var("OL_MAX_INDEX_FILE_BYTES");
+        std::env::remove_var("SCLEROX_MAX_INDEX_FILE_BYTES");
 
         assert_eq!(
             result.files_indexed, 1,

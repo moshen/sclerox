@@ -1,14 +1,14 @@
 # Config
 
-Tunables live in `~/.ol/config.toml` (created by `ol install`).
+Tunables live in `~/.config/sclerox/config.toml` (created by `sclerox install`).
 
 ```bash
-ol config show                       # effective settings (file + env + defaults)
-ol config init [--force]             # write a commented config.toml
-ol config path                       # where the config file lives
+sclerox config show                       # effective settings (file + env + defaults)
+sclerox config init [--force]             # write a commented config.toml
+sclerox config path                       # where the config file lives
 ```
 
-Precedence: CLI flag > env var > `~/.ol/config.toml` > built-in default.
+Precedence: CLI flag > env var > `~/.config/sclerox/config.toml` > built-in default.
 
 Tunables include `search.semantic_threshold`, dedup thresholds,
 `session_context.max_tokens` (real MiniLM-token budget for injected context),

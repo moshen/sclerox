@@ -44,7 +44,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
         CodeCommand::Search { needle, repo } => {
             let repos = db.repo_list()?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
+                println!("No repos indexed. Run `sclerox repo index [path]` first.");
                 return Ok(());
             }
 
@@ -122,7 +122,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
         CodeCommand::Calls { symbol, repo } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
+                println!("No repos indexed. Run `sclerox repo index [path]` first.");
                 return Ok(());
             }
 
@@ -171,14 +171,14 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 
             if !any {
                 println!("Symbol '{symbol}' not found or has no recorded outbound edges.");
-                println!("Tip: re-index with `ol repo index` to capture call graph edges.");
+                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
             }
         }
 
         CodeCommand::Refs { symbol, repo } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
+                println!("No repos indexed. Run `sclerox repo index [path]` first.");
                 return Ok(());
             }
 
@@ -203,7 +203,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 
             if !any {
                 println!("No recorded references to '{symbol}'.");
-                println!("Tip: re-index with `ol repo index` to capture call graph edges.");
+                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
             }
         }
 
@@ -214,7 +214,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
         } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
+                println!("No repos indexed. Run `sclerox repo index [path]` first.");
                 return Ok(());
             }
 
@@ -295,7 +295,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 
             if !found_seed && queue.is_empty() {
                 println!("Symbol '{symbol}' not found in any indexed repo.");
-                println!("Tip: re-index with `ol repo index` to capture call graph edges.");
+                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
             }
         }
     }

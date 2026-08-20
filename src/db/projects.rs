@@ -324,7 +324,7 @@ mod tests {
                 "/repos/auth-service",
                 "auth-service",
                 None,
-                "/repos/auth-service/.ol/repo.db",
+                "/repos/auth-service/.sclerox/repo.db",
                 None,
             )
             .unwrap();
@@ -333,7 +333,7 @@ mod tests {
                 "/repos/user-service",
                 "user-service",
                 None,
-                "/repos/user-service/.ol/repo.db",
+                "/repos/user-service/.sclerox/repo.db",
                 None,
             )
             .unwrap();
@@ -353,7 +353,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project_id = db.project_add("Proj", None, &[]).unwrap();
         let repo_id = db
-            .repo_register("/repos/svc", "svc", None, "/repos/svc/.ol/repo.db", None)
+            .repo_register("/repos/svc", "svc", None, "/repos/svc/.sclerox/repo.db", None)
             .unwrap();
 
         db.project_link_repo(project_id, repo_id).unwrap();

@@ -9,7 +9,7 @@ use crate::output::{print_output, OutputFormat};
 pub enum ConfigCommand {
     /// Show the effective settings (file + env + defaults, merged)
     Show,
-    /// Write a commented ~/.ol/config.toml with every key at its default
+    /// Write a commented ~/.config/sclerox/config.toml with every key at its default
     Init {
         /// Overwrite an existing config file
         #[arg(long)]
@@ -49,7 +49,7 @@ fn show(format: OutputFormat) -> Result<()> {
         } else {
             format!("no file at {} — using defaults", path.display())
         };
-        println!("# ol effective settings ({source})");
+        println!("# sclerox effective settings ({source})");
         let overrides = active_env_overrides();
         if !overrides.is_empty() {
             println!("# env overrides active: {}", overrides.join(", "));
@@ -64,12 +64,12 @@ fn show(format: OutputFormat) -> Result<()> {
 
 fn active_env_overrides() -> Vec<&'static str> {
     [
-        "OL_DB",
-        "OL_AI_COMMAND",
-        "OL_AI_MODEL",
-        "OL_MAX_INDEX_FILE_BYTES",
-        "OL_LOG",
-        "OL_CONFIG",
+        "SCLEROX_DB",
+        "SCLEROX_AI_COMMAND",
+        "SCLEROX_AI_MODEL",
+        "SCLEROX_MAX_INDEX_FILE_BYTES",
+        "SCLEROX_LOG",
+        "SCLEROX_CONFIG",
     ]
     .into_iter()
     .filter(|v| std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false))
@@ -81,24 +81,24 @@ fn active_env_overrides() -> Vec<&'static str> {
 pub fn config_template() -> String {
     let d = Settings::default();
     format!(
-        "# ol configuration — all keys optional; defaults shown.\n\
+        "# sclerox configuration — all keys optional; defaults shown.\n\
          # Precedence: CLI flag > env var > this file > built-in default.\n\
-         # Uncomment a line to change it. `ol install` refreshes this file and\n\
+         # Uncomment a line to change it. `sclerox install` refreshes this file and\n\
          # preserves any values you've set.\n\
          \n\
-         # db_path = \"~/.ol/ol.db\"            # env: OL_DB\n\
+         # db_path = \"~/.local/share/sclerox/sclerox.db\"            # env: SCLEROX_DB\n\
          \n\
          [ai]\n\
          # Full distillation command; the transcript prompt is appended as the\n\
-         # final argument. If unset, ol uses the built-in default for the agent\n\
+         # final argument. If unset, sclerox uses the built-in default for the agent\n\
          # that invoked it:\n\
          #   claude -p --safe-mode --no-session-persistence --tools=\n\
          #   opencode run --pure\n\
          # Windows: an npm-installed CLI is a .cmd shim, which the bare name\n\
          # won't resolve. Point command at the shim explicitly, e.g.\n\
          #   command = \"claude.cmd -p --safe-mode --no-session-persistence --tools=\"\n\
-         # command = \"\"   # full command incl. flags; env: OL_AI_COMMAND\n\
-         # model = \"\"     # appended to the DEFAULT command only; env: OL_AI_MODEL\n\
+         # command = \"\"   # full command incl. flags; env: SCLEROX_AI_COMMAND\n\
+         # model = \"\"     # appended to the DEFAULT command only; env: SCLEROX_AI_MODEL\n\
          \n\
          [search]\n\
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
@@ -131,19 +131,19 @@ pub fn config_template() -> String {
          # chunk_overlap = {embed_overlap}\n\
          \n\
          [index]\n\
-         # max_file_bytes = {max_bytes}           # env: OL_MAX_INDEX_FILE_BYTES\n\
+         # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
          # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
-         # max_files = {max_files}                    # reject folders over this many files (--force to override); env: OL_MAX_INDEX_FILES\n\
+         # max_files = {max_files}                    # reject folders over this many files (--force to override); env: SCLEROX_MAX_INDEX_FILES\n\
          \n\
          [install]\n\
          # Refresh each managed artifact on a re-install/upgrade. Set false to keep\n\
          # your customizations; a fresh install still creates a missing artifact.\n\
-         # overwrite_skill = {ow_skill}               # skills/ol-kb.md\n\
+         # overwrite_skill = {ow_skill}               # skills/sclerox-kb.md\n\
          # overwrite_hooks = {ow_hooks}               # SessionStart/Stop hooks + opencode plugin\n\
-         # overwrite_instructions = {ow_instr}        # the <!-- ol-kb --> section body\n\
+         # overwrite_instructions = {ow_instr}        # the <!-- sclerox-kb --> section body\n\
          \n\
          [log]\n\
-         # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.ol/logs/. env: OL_LOG\n\
+         # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.local/state/sclerox/logs/. env: SCLEROX_LOG\n\
          # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n",
         sem_thr = d.search.semantic_threshold,
         sem_lim = d.search.semantic_limit,
@@ -175,11 +175,11 @@ pub fn config_template() -> String {
 }
 
 /// Write the template to `path`. If the file exists and `overwrite` is false,
-/// leaves it untouched. Used by `ol config init`.
+/// leaves it untouched. Used by `sclerox config init`.
 pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
     if path.exists() && !overwrite {
         println!(
-            "config: {} already exists, leaving it untouched (run `ol install` to upgrade it)",
+            "config: {} already exists, leaving it untouched (run `sclerox install` to upgrade it)",
             path.display()
         );
         return Ok(());
@@ -196,7 +196,7 @@ pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Res
 /// Install-time helper: create the config if missing, or UPGRADE it in place —
 /// regenerate the commented template (refreshed docs + any new keys) while
 /// preserving every value the user has set. Like the CLAUDE.md / skill refresh,
-/// this keeps the file current across ol versions. Never loses user settings; a
+/// this keeps the file current across sclerox versions. Never loses user settings; a
 /// file that can't be parsed is left untouched.
 pub fn install_default_config(dry_run: bool) -> Result<()> {
     let path = config_path();
@@ -216,7 +216,7 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
     let Some(values) = flatten_user_values(&existing) else {
         println!(
             "config: {} could not be parsed, leaving it untouched \
-             (fix it or run `ol config init --force`)",
+             (fix it or run `sclerox config init --force`)",
             path.display()
         );
         return Ok(());

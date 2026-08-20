@@ -3,5 +3,6 @@
 pub mod db;
 pub mod embed;
 pub mod index;
+pub mod migrate;
 pub mod output;
 pub mod search;

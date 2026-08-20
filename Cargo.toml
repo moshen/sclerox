@@ -1,15 +1,15 @@
 [package]
-name = "ol"
+name = "sclerox"
 version = "0.1.0"
 edition = "2021"
-description = "Operating Layer CLI - SQLite-backed knowledge base for AI-augmented engineering"
+description = "Sclerox CLI - SQLite-backed knowledge base for AI-augmented engineering"
 
 [[bin]]
-name = "ol"
+name = "sclerox"
 path = "src/main.rs"
 
 [lib]
-name = "ol"
+name = "sclerox"
 path = "src/lib.rs"
 
 [dependencies]

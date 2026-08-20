@@ -76,12 +76,15 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             force,
         } => {
             let canonical = path.canonicalize().unwrap_or(path);
-            // Walk up to the git root so `ol repo index` from a subdirectory indexes the whole repo.
+            // Walk up to the git root so `sclerox repo index` from a subdirectory indexes the whole repo.
             let canonical = find_git_root(&canonical);
+            // Self-heal a pre-rename `.ol/` before the opt-out check below reads
+            // `.sclerox/config.toml` — see `crate::migrate`.
+            crate::migrate::migrate_legacy_repo_dir(&canonical);
             // Respect a per-folder opt-out before loading the (expensive) model.
             if !crate::index::repo_config(&canonical).index {
                 println!(
-                    "Skipping {}: indexing disabled in .ol/config.toml",
+                    "Skipping {}: indexing disabled in .sclerox/config.toml",
                     canonical.display()
                 );
                 return Ok(());
@@ -103,7 +106,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         RepoCommand::List => {
             let repos = db.repo_list()?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` to add one.");
+                println!("No repos indexed. Run `sclerox repo index [path]` to add one.");
             } else {
                 for r in &repos {
                     let indexed = r.last_indexed.as_deref().unwrap_or("never");
@@ -168,12 +171,12 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let repo_entry = db.repo_get_by_path(&canonical.to_string_lossy())?;
             let db_path = match &repo_entry {
                 Some(r) => PathBuf::from(&r.db_path),
-                None => canonical.join(".ol").join("repo.db"),
+                None => canonical.join(".sclerox").join("repo.db"),
             };
 
             if !db_path.exists() {
                 println!(
-                    "Repo not indexed. Run `ol repo index {}`",
+                    "Repo not indexed. Run `sclerox repo index {}`",
                     canonical.display()
                 );
                 return Ok(());
@@ -221,7 +224,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
 
             let repos = db.repo_list()?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `ol repo index [path]` first.");
+                println!("No repos indexed. Run `sclerox repo index [path]` first.");
                 return Ok(());
             }
 
@@ -247,7 +250,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             }
             if !any {
                 println!("No symbols match: {query}");
-                println!("Tip: run `ol repo index [path]` to index a repository first.");
+                println!("Tip: run `sclerox repo index [path]` to index a repository first.");
             }
         }
 
@@ -267,7 +270,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
 fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Result<()> {
     let repos = db.repo_list()?;
     if repos.is_empty() {
-        println!("No repos indexed. Run `ol repo index [path]` first.");
+        println!("No repos indexed. Run `sclerox repo index [path]` first.");
         return Ok(());
     }
 

@@ -110,8 +110,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             print_output(format, &inv, || {
                 println!("Started investigation #{id}: {name}");
                 println!("  slug: {slug}");
-                println!("\nNext: add sources with `ol research add-source {id} --url <url>`");
-                println!("      conclude with `ol research conclude {id} --findings <...>`");
+                println!("\nNext: add sources with `sclerox research add-source {id} --url <url>`");
+                println!("      conclude with `sclerox research conclude {id} --findings <...>`");
             });
         }
 
@@ -244,7 +244,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         println!(
                             "\nFindings recorded. Consider saving key conclusions as memories:"
                         );
-                        println!("  ol memory set \"research/{id}/finding\" \"<key finding>\" --type project");
+                        println!("  sclerox memory set \"research/{id}/finding\" \"<key finding>\" --type project");
                     }
                 }
             } else {

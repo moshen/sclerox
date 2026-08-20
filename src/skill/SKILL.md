@@ -1,9 +1,9 @@
 ---
-name: ol-kb
-description: Operating Layer knowledge base for people, meetings, projects, todos, decisions, research, and cross-repo code search. Use when the user asks about colleagues, past decisions, meetings, projects, todos, or research; when a decision is made (record it immediately, unprompted); or when searching for code symbols or callers (prefer `ol code` over Grep). Full command reference and workflows live in reference/.
+name: sclerox-kb
+description: Sclerox knowledge base for people, meetings, projects, todos, decisions, research, and cross-repo code search. Use when the user asks about colleagues, past decisions, meetings, projects, todos, or research; when a decision is made (record it immediately, unprompted); or when searching for code symbols or callers (prefer `sclerox code` over Grep). Full command reference and workflows live in reference/.
 ---
 
-# ol - Operating Layer Knowledge Base
+# sclerox - Sclerox Knowledge Base
 
 Use when the user asks about people, meetings, projects, todos, past
 decisions, research, or code, or when knowledge base context would help.
@@ -21,7 +21,7 @@ Reference index at the end.
 - A decision is made: record it as a memory IMMEDIATELY, unprompted (see below)
 - After learning something: save to memory for future sessions
 - When a memory is wrong or outdated: mark it stale or supersede it
-- Looking for code: use `ol code` (see below) BEFORE Grep/Glob
+- Looking for code: use `sclerox code` (see below) BEFORE Grep/Glob
 
 ## Decisions — record automatically, don't wait to be asked
 
@@ -38,29 +38,29 @@ Triggers (any of these = a decision):
 - A meeting note or document you're processing states a decision
 
 ```bash
-ol memory set "<area>-<decision-slug>" \
+sclerox memory set "<area>-<decision-slug>" \
   "<what was decided>. Why: <reasoning>. Rejected: <alternatives, if any>" \
   --type project
 ```
 
 Include the why and the rejected alternatives — future sessions need the
 reasoning, not just the verdict. If the decision reverses an earlier one, use
-`ol memory supersede <old_key> <new_key> "<new value>"` instead of a bare set.
+`sclerox memory supersede <old_key> <new_key> "<new value>"` instead of a bare set.
 
 ## Code search — prefer this over Grep/Glob
 
 When searching for symbols, functions, types, or callers in ANY indexed repo,
-use `ol code` BEFORE reaching for Grep or Glob. It is pre-indexed (no directory
+use `sclerox code` BEFORE reaching for Grep or Glob. It is pre-indexed (no directory
 walk), cross-repo (finds callers in OTHER repos Grep can't see), structural
 (matches symbols, not raw strings), and call-graph aware. Fall back to Grep
-only when the repo is not indexed (`ol repo list`) or the query is free text
+only when the repo is not indexed (`sclerox repo list`) or the query is free text
 rather than a symbol.
 
 ```bash
-ol code search "X"                  # where is X defined?
-ol code refs X                      # what calls X? (impact analysis, cross-repo)
-ol code calls X                     # what does X call?
-ol code graph X --depth 4           # BFS call graph
+sclerox code search "X"                  # where is X defined?
+sclerox code refs X                      # what calls X? (impact analysis, cross-repo)
+sclerox code calls X                     # what does X call?
+sclerox code graph X --depth 4           # BFS call graph
 ```
 
 For scoping to one repo and composing with ast-grep for structural matching,
@@ -68,14 +68,14 @@ see [reference/repos-and-code.md](reference/repos-and-code.md).
 
 ## Patterns
 
-**Before any task:** `ol search "<topic>"`
-**Finding code (prefer over Grep):** `ol code search "<symbol>"` / `ol code refs <symbol>`
+**Before any task:** `sclerox search "<topic>"`
+**Finding code (prefer over Grep):** `sclerox code search "<symbol>"` / `sclerox code refs <symbol>`
 **After a decision:** record immediately, unprompted (see "Decisions" above)
-**When a memory is wrong:** `ol memory stale <key> --reason "<why>"`
-**When a memory is outdated:** `ol memory supersede <old> <new> "<updated value>"`
-**After research:** `ol research conclude <id> --findings "<findings>"`
-**Attributing a memory:** `ol memory people add <key> <person_id>`
-**Session summary:** `ol memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
+**When a memory is wrong:** `sclerox memory stale <key> --reason "<why>"`
+**When a memory is outdated:** `sclerox memory supersede <old> <new> "<updated value>"`
+**After research:** `sclerox research conclude <id> --findings "<findings>"`
+**Attributing a memory:** `sclerox memory people add <key> <person_id>`
+**Session summary:** `sclerox memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
 
 ## Privacy — wrap secrets in `<private>` BEFORE you reply
 
@@ -115,15 +115,15 @@ needs to recall later.
 
 ## Session start context
 
-When a session starts in a git repo, `ol hook start` automatically injects a
+When a session starts in a git repo, `sclerox hook start` automatically injects a
 compact index of open todos, open research, recent sessions, and memory keys
-(capped at ~750 tokens). You do NOT need to run `ol todo list` or `ol memory
-list` at session start — they're already visible. Use `ol memory get <key>`,
-`ol todo get <id>`, etc. to fetch full content for items that look relevant.
+(capped at ~750 tokens). You do NOT need to run `sclerox todo list` or `sclerox memory
+list` at session start — they're already visible. Use `sclerox memory get <key>`,
+`sclerox todo get <id>`, etc. to fetch full content for items that look relevant.
 
 ## Reference
 
-Global search across everything: `ol search "<query>"`. For an area's full
+Global search across everything: `sclerox search "<query>"`. For an area's full
 commands and its workflow, read the matching file on demand:
 
 - [reference/memory.md](reference/memory.md) — set/get/search, stale, supersede, review, distill, import
@@ -132,5 +132,5 @@ commands and its workflow, read the matching file on demand:
 - [reference/todos.md](reference/todos.md) — todos, linking a todo to a project
 - [reference/research.md](reference/research.md) — investigations, starting one and linking it to a project
 - [reference/projects.md](reference/projects.md) — projects and their people/meetings/repos links
-- [reference/repos-and-code.md](reference/repos-and-code.md) — repo indexing, `ol code` search/refs/graph, ast-grep, indexing workflows
-- [reference/config.md](reference/config.md) — `ol config`, tunables, precedence
+- [reference/repos-and-code.md](reference/repos-and-code.md) — repo indexing, `sclerox code` search/refs/graph, ast-grep, indexing workflows
+- [reference/config.md](reference/config.md) — `sclerox config`, tunables, precedence

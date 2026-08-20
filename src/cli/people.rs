@@ -55,7 +55,7 @@ pub enum IdentifierCmd {
     /// Set (add or update) an identifier for a person
     Add {
         person_id: i64,
-        /// Identifier type (must exist in `ol people types list`)
+        /// Identifier type (must exist in `sclerox people types list`)
         #[arg(value_name = "TYPE")]
         identifier_type: String,
         /// The identifier value
@@ -194,8 +194,8 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                 if !db.identifier_type_exists(&identifier_type)? {
                     bail!(
                         "Unknown identifier type '{identifier_type}'. \
-                         Run `ol people types list` to see valid types, \
-                         or `ol people types add {identifier_type}` to register it."
+                         Run `sclerox people types list` to see valid types, \
+                         or `sclerox people types add {identifier_type}` to register it."
                     );
                 }
                 db.people_identifier_set(person_id, &identifier_type, &value)?;

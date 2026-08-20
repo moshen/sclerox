@@ -51,9 +51,9 @@ fn copy_directml_dll() {
     // `ort-sys` statically links onnxruntime.lib but ships DirectML.dll next
     // to it in its cache dir; ORT loads DirectML.dll at runtime via
     // LoadLibrary, which searches the exe's directory. Copy it next to
-    // ol.exe so a distributed binary finds it without the pyke cache.
+    // sclerox.exe so a distributed binary finds it without the pyke cache.
     let Some(dll) = find_directml_dll() else {
-        println!("cargo:warning=DirectML.dll not found in pyke cache; GPU EP will need it on PATH or next to ol.exe");
+        println!("cargo:warning=DirectML.dll not found in pyke cache; GPU EP will need it on PATH or next to sclerox.exe");
         return;
     };
 

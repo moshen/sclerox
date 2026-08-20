@@ -1,4 +1,4 @@
-//! Configuration: typed settings loaded from `~/.ol/config.toml`.
+//! Configuration: typed settings loaded from `~/.config/sclerox/config.toml`.
 //!
 //! Precedence (highest first): CLI flag > env var > config file > built-in
 //! default. Every key is optional; a missing or malformed file falls back to
@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Path to the primary SQLite database. Env: `OL_DB`.
+    /// Path to the primary SQLite database. Env: `SCLEROX_DB`.
     pub db_path: PathBuf,
     pub ai: AiSettings,
     pub search: SearchSettings,
@@ -36,10 +36,10 @@ pub struct Settings {
 pub struct AiSettings {
     /// Full distillation command (binary + flags), parsed shell-style; the
     /// transcript prompt is appended as the final argument. `None` = use the
-    /// built-in default for whichever agent invoked ol. Env: `OL_AI_COMMAND`.
+    /// built-in default for whichever agent invoked sclerox. Env: `SCLEROX_AI_COMMAND`.
     pub command: Option<String>,
     /// Model for the DEFAULT command only (ignored when `command` is set — bake
-    /// the model flag into a custom command yourself). Env: `OL_AI_MODEL`.
+    /// the model flag into a custom command yourself). Env: `SCLEROX_AI_MODEL`.
     pub model: Option<String>,
 }
 
@@ -113,27 +113,27 @@ pub struct EmbedSettings {
 #[serde(default)]
 pub struct IndexSettings {
     /// Files larger than this skip tree-sitter symbol extraction (still indexed
-    /// via line chunks). Env: `OL_MAX_INDEX_FILE_BYTES`.
+    /// via line chunks). Env: `SCLEROX_MAX_INDEX_FILE_BYTES`.
     pub max_file_bytes: usize,
     /// Automatic (session-hook) indexing policy: `"git"` indexes the session's
     /// git repo root only; `"off"` disables auto-indexing entirely. Explicit
-    /// `ol repo index` is unaffected. Unknown values fall back to `"git"`.
+    /// `sclerox repo index` is unaffected. Unknown values fall back to `"git"`.
     pub auto: String,
     /// Reject indexing a folder with more than this many indexable files (unless
-    /// `ol repo index --force`). Guards against indexing a giant tree. Env:
-    /// `OL_MAX_INDEX_FILES`.
+    /// `sclerox repo index --force`). Guards against indexing a giant tree. Env:
+    /// `SCLEROX_MAX_INDEX_FILES`.
     pub max_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstallSettings {
-    /// Refresh `skills/ol-kb.md` on re-install. Set false to keep a customized
+    /// Refresh `skills/sclerox-kb.md` on re-install. Set false to keep a customized
     /// skill file across upgrades (a fresh install still creates it if missing).
     pub overwrite_skill: bool,
     /// Refresh the SessionStart/Stop hooks and the OpenCode plugin on re-install.
     pub overwrite_hooks: bool,
-    /// Refresh the `<!-- ol-kb -->` section body in the global instructions file.
+    /// Refresh the `<!-- sclerox-kb -->` section body in the global instructions file.
     /// Content outside the markers is always preserved regardless.
     pub overwrite_instructions: bool,
 }
@@ -142,7 +142,7 @@ pub struct InstallSettings {
 #[serde(default)]
 pub struct LogSettings {
     /// Log level: off|error|warn|info|debug|trace. Logs go to
-    /// `~/.ol/logs/ol-YYYY-MM-DD.log`. Env: `OL_LOG`; the `--log-level` flag
+    /// `~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log`. Env: `SCLEROX_LOG`; the `--log-level` flag
     /// overrides both.
     pub level: String,
     /// Delete daily log files older than this many days (0 = keep forever).
@@ -263,21 +263,19 @@ impl Default for LogSettings {
 }
 
 fn default_db_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".ol").join("ol.db"))
-        .unwrap_or_else(|| PathBuf::from("ol.db"))
+    crate::xdg::data_home().join("sclerox").join("sclerox.db")
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
 
-/// Resolved config file path: `$OL_CONFIG` if set, else `~/.ol/config.toml`.
+/// Resolved config file path: `$SCLEROX_CONFIG` if set, else
+/// `$XDG_CONFIG_HOME/sclerox/config.toml` (`~/.config/sclerox/config.toml` by default,
+/// on every platform including Windows).
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("OL_CONFIG") {
+    if let Ok(p) = std::env::var("SCLEROX_CONFIG") {
         return PathBuf::from(p);
     }
-    dirs::home_dir()
-        .map(|h| h.join(".ol").join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("config.toml"))
+    crate::xdg::config_home().join("sclerox").join("config.toml")
 }
 
 impl Settings {
@@ -317,32 +315,32 @@ impl Settings {
 
     /// Env vars beat the file (but not CLI flags, which win at their call sites).
     fn apply_env_overrides(&mut self) {
-        if let Ok(p) = std::env::var("OL_DB") {
+        if let Ok(p) = std::env::var("SCLEROX_DB") {
             if !p.is_empty() {
                 self.db_path = PathBuf::from(p);
             }
         }
-        if let Ok(c) = std::env::var("OL_AI_COMMAND") {
+        if let Ok(c) = std::env::var("SCLEROX_AI_COMMAND") {
             if !c.is_empty() {
                 self.ai.command = Some(c);
             }
         }
-        if let Ok(m) = std::env::var("OL_AI_MODEL") {
+        if let Ok(m) = std::env::var("SCLEROX_AI_MODEL") {
             if !m.is_empty() {
                 self.ai.model = Some(m);
             }
         }
-        if let Ok(v) = std::env::var("OL_MAX_INDEX_FILE_BYTES") {
+        if let Ok(v) = std::env::var("SCLEROX_MAX_INDEX_FILE_BYTES") {
             if let Ok(n) = v.parse::<usize>() {
                 self.index.max_file_bytes = n;
             }
         }
-        if let Ok(v) = std::env::var("OL_MAX_INDEX_FILES") {
+        if let Ok(v) = std::env::var("SCLEROX_MAX_INDEX_FILES") {
             if let Ok(n) = v.parse::<usize>() {
                 self.index.max_files = n;
             }
         }
-        if let Ok(l) = std::env::var("OL_LOG") {
+        if let Ok(l) = std::env::var("SCLEROX_LOG") {
             if !l.is_empty() {
                 self.log.level = l;
             }
@@ -472,11 +470,11 @@ pub fn settings() -> &'static Settings {
 pub fn init() {
     let s = settings();
     let is_default = s.index.max_file_bytes == IndexSettings::default().max_file_bytes;
-    if !is_default && std::env::var("OL_MAX_INDEX_FILE_BYTES").is_err() {
+    if !is_default && std::env::var("SCLEROX_MAX_INDEX_FILE_BYTES").is_err() {
         // SAFETY: single-threaded startup, before any indexing thread is spawned.
         unsafe {
             std::env::set_var(
-                "OL_MAX_INDEX_FILE_BYTES",
+                "SCLEROX_MAX_INDEX_FILE_BYTES",
                 s.index.max_file_bytes.to_string(),
             );
         }
@@ -484,10 +482,10 @@ pub fn init() {
     // Same bridge for the max-files cap: the library indexer reads it from the
     // env var, so surface a customized config value there.
     let files_is_default = s.index.max_files == IndexSettings::default().max_files;
-    if !files_is_default && std::env::var("OL_MAX_INDEX_FILES").is_err() {
+    if !files_is_default && std::env::var("SCLEROX_MAX_INDEX_FILES").is_err() {
         // SAFETY: single-threaded startup, before any indexing thread is spawned.
         unsafe {
-            std::env::set_var("OL_MAX_INDEX_FILES", s.index.max_files.to_string());
+            std::env::set_var("SCLEROX_MAX_INDEX_FILES", s.index.max_files.to_string());
         }
     }
 }

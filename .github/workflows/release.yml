@@ -47,27 +47,27 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-            artifact: ol
+            artifact: sclerox
             cross: ''
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-            artifact: ol
+            artifact: sclerox
             cross: zig
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
-            artifact: ol
+            artifact: sclerox
             cross: ''
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
-            artifact: ol
+            artifact: sclerox
             cross: ''
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
-            artifact: ol.exe
+            artifact: sclerox.exe
             cross: ''
 
     steps:
@@ -105,7 +105,7 @@ jobs:
         run: |
           mkdir -p stage
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} stage/
-          tar czf ol-${{ matrix.target }}.tar.gz -C stage .
+          tar czf sclerox-${{ matrix.target }}.tar.gz -C stage .
 
       - name: Stage artifact (Windows)
         if: matrix.archive == 'zip'
@@ -115,12 +115,12 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination stage/
           Get-ChildItem -Path "target/${{ matrix.target }}/release" -Filter *.dll -File |
             Copy-Item -Destination stage/
-          Compress-Archive -Path "stage/*" -DestinationPath "ol-${{ matrix.target }}.zip"
+          Compress-Archive -Path "stage/*" -DestinationPath "sclerox-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ol-${{ matrix.target }}
-          path: ol-${{ matrix.target }}.${{ matrix.archive }}
+          name: sclerox-${{ matrix.target }}
+          path: sclerox-${{ matrix.target }}.${{ matrix.archive }}
 
   release:
     name: Create release

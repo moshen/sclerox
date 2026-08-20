@@ -1,4 +1,4 @@
-/// End-to-end tests: invoke the compiled `ol` binary against a real SQLite database.
+/// End-to-end tests: invoke the compiled `sclerox` binary against a real SQLite database.
 /// Each test gets an isolated temp directory so tests are fully independent.
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -16,7 +16,7 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let db = dir.path().join("ol.db");
+        let db = dir.path().join("sclerox.db");
         let config = dir.path().join("config.toml");
         Self {
             _dir: dir,
@@ -26,14 +26,14 @@ impl Env {
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::cargo_bin("ol").unwrap();
-        c.env("OL_DB", &self.db);
-        // Isolate from the developer's real ~/.ol/config.toml. The path starts
-        // out nonexistent (pure defaults); `ol config init` can create it here.
-        c.env("OL_CONFIG", &self.config);
-        // Never write test noise into the developer's real ~/.ol/logs/ (an
-        // exported OL_LOG=debug once made a day's log 100x normal size).
-        c.env("OL_LOG", "off");
+        let mut c = Command::cargo_bin("sclerox").unwrap();
+        c.env("SCLEROX_DB", &self.db);
+        // Isolate from the developer's real ~/.config/sclerox/config.toml. The path starts
+        // out nonexistent (pure defaults); `sclerox config init` can create it here.
+        c.env("SCLEROX_CONFIG", &self.config);
+        // Never write test noise into the developer's real ~/.local/state/sclerox/logs/ (an
+        // exported SCLEROX_LOG=debug once made a day's log 100x normal size).
+        c.env("SCLEROX_LOG", "off");
         c
     }
 
@@ -42,7 +42,7 @@ impl Env {
         let out = self.cmd().args(args).output().unwrap();
         assert!(
             out.status.success(),
-            "ol {} failed:\nstdout: {}\nstderr: {}",
+            "sclerox {} failed:\nstdout: {}\nstderr: {}",
             args.join(" "),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
@@ -640,11 +640,11 @@ fn research_json_output() {
 // ─── Repos ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn repo_index_respects_ol_config_opt_out() {
+fn repo_index_respects_sclerox_config_opt_out() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();
-    std::fs::create_dir_all(dir.path().join(".ol")).unwrap();
-    std::fs::write(dir.path().join(".ol/config.toml"), "index = false\n").unwrap();
+    std::fs::create_dir_all(dir.path().join(".sclerox")).unwrap();
+    std::fs::write(dir.path().join(".sclerox/config.toml"), "index = false\n").unwrap();
     std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
 
     let out = e.run(&["repo", "index", dir.path().to_str().unwrap()]);
@@ -659,9 +659,9 @@ fn repo_index_respects_ol_config_opt_out() {
         !list.contains(dir.path().to_str().unwrap()),
         "opted-out folder was registered: {list}"
     );
-    // The index db must not have been created (only our config.toml is in .ol/).
+    // The index db must not have been created (only our config.toml is in .sclerox/).
     assert!(
-        !dir.path().join(".ol/repo.db").exists(),
+        !dir.path().join(".sclerox/repo.db").exists(),
         "repo.db created despite opt-out"
     );
 }
@@ -823,7 +823,7 @@ fn completions_bash() {
     let e = Env::new();
     let out = e.run(&["completions", "bash"]);
     // bash completions start with a function definition
-    assert!(out.contains("_ol"), "expected bash completion function");
+    assert!(out.contains("_sclerox"), "expected bash completion function");
 }
 
 #[test]
@@ -909,7 +909,7 @@ fn commands_stay_fast() {
     // Best-of-N: take the FASTEST of several runs. Tests run in parallel, so a
     // single run can be inflated by a transient scheduler/CI load spike; the
     // best case still reflects true command cost, so a real regression fails it
-    // while noise doesn't. (Model load can't be amortized this way — each `ol`
+    // while noise doesn't. (Model load can't be amortized this way — each `sclerox`
     // invocation is a fresh process — which is why `search` is budgeted below.)
     let best_of = |args: &[&str], runs: u32| -> Duration {
         (0..runs)
@@ -940,7 +940,7 @@ fn commands_stay_fast() {
         );
     }
 
-    // `ol search` loads the embedding model on every invocation — a fixed
+    // `sclerox search` loads the embedding model on every invocation — a fixed
     // startup cost (~100ms+, hardware-dependent), not a data-size regression.
     // It gets a looser budget that still catches gross slowdowns (seconds).
     let t = best_of(&["search", "perf"], 3);

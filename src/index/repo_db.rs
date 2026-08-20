@@ -315,7 +315,7 @@ impl RepoDb {
     }
 
     /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
-    /// list for `ol repo reembed` — hook-indexed repos have chunks but no
+    /// list for `sclerox repo reembed` — hook-indexed repos have chunks but no
     /// embeddings, since the auto-indexer runs without an embedder.
     pub fn chunks_without_embedding(&self) -> Result<Vec<(i64, String)>> {
         let mut stmt = self

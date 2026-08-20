@@ -82,7 +82,7 @@ pub enum ProjectMeetingsCmd {
 
 #[derive(clap::Subcommand)]
 pub enum ProjectReposCmd {
-    /// Link a repo to this project (use the repo ID from `ol repo list`)
+    /// Link a repo to this project (use the repo ID from `sclerox repo list`)
     Add { project_id: i64, repo_id: i64 },
     /// Remove a repo from this project
     Remove { project_id: i64, repo_id: i64 },
