@@ -38,6 +38,7 @@ pub fn run_migrate(args: MigrateArgs) -> Result<()> {
     }
 
     did_anything |= strip_legacy_integrations(args.dry_run)?;
+    did_anything |= migrate_registered_repos(args.dry_run)?;
 
     if !did_anything {
         println!("Nothing to migrate — already on the sclerox / XDG layout.");
@@ -89,7 +90,15 @@ pub fn legacy_data_present() -> bool {
             .iter()
             .any(|(_, dst)| !dst.exists())
     });
-    paths_pending || legacy_integrations_present()
+    if paths_pending || legacy_integrations_present() || !legacy_repos().is_empty() {
+        return true;
+    }
+    let ancestors = crate::db::Database::open(&crate::config::settings().db_path)
+        .ok()
+        .and_then(|d| d.repo_list().ok())
+        .map(|rs| rs.into_iter().map(|r| r.path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    !legacy_ancestor_dirs(&ancestors).is_empty()
 }
 
 /// True if any old-marker tool integration is still installed. These are
@@ -158,6 +167,178 @@ fn legacy_binary_name() -> &'static str {
     } else {
         "ol"
     }
+}
+
+// ─── Per-repo index directories (<repo>/.ol → <repo>/.sclerox) ──────────────
+
+/// A registered repo still carrying a pre-rename `.ol/` index directory.
+struct LegacyRepo {
+    path: String,
+    name: String,
+    new_db_path: PathBuf,
+}
+
+/// True if a recorded `db_path` still points inside a `.ol/` index directory.
+///
+/// Compares whole path components so a repo that merely has `.ol` inside a
+/// longer name (`~/code/tools.old/...`) is not mistaken for a legacy index.
+fn points_at_legacy_index(db_path: &str) -> bool {
+    Path::new(db_path)
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".ol"))
+}
+
+/// Registered repos whose index directory is still `.ol/`.
+///
+/// Keyed off the recorded `db_path` rather than the directory alone, because
+/// the registry is what `sclerox code search` actually reads: a repo whose
+/// folder was renamed but whose row still points into `.ol/` is the broken
+/// state worth reporting.
+fn legacy_repos() -> Vec<LegacyRepo> {
+    let Ok(db) = crate::db::Database::open(&crate::config::settings().db_path) else {
+        return Vec::new();
+    };
+    let Ok(repos) = db.repo_list() else {
+        return Vec::new();
+    };
+    repos
+        .into_iter()
+        .filter_map(|r| {
+            let legacy_dir = Path::new(&r.path).join(".ol");
+            (points_at_legacy_index(&r.db_path) || legacy_dir.exists()).then(|| LegacyRepo {
+                new_db_path: Path::new(&r.path).join(".sclerox").join("repo.db"),
+                path: r.path,
+                name: r.name,
+            })
+        })
+        .collect()
+}
+
+/// Unregistered folders carrying a legacy `.ol/` directory, found by walking up
+/// from each registered repo to the home directory.
+///
+/// These are almost always per-folder opt-out markers (`.ol/config.toml` with
+/// `index = false`) on a catch-all parent that is deliberately not indexed, so
+/// it never appears in the registry and the repo sweep cannot see it. Bounded
+/// to ancestors of known repos rather than scanning the filesystem.
+fn legacy_ancestor_dirs(repo_paths: &[String]) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for path in repo_paths {
+        for ancestor in Path::new(path).ancestors().skip(1) {
+            // Stop at (and do not include) the home directory: `~/.ol` is the
+            // global install, handled by the global path migration.
+            if home.as_deref().is_some_and(|h| ancestor == h) {
+                break;
+            }
+            if ancestor.parent().is_none() {
+                break;
+            }
+            if ancestor.join(".ol").is_dir() && !ancestor.join(".sclerox").exists() {
+                seen.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Rename legacy `.ol/` directories on unregistered ancestor folders.
+///
+/// Left alone these silently change behaviour rather than break: `repo_config`
+/// falls back to reading the legacy marker, but the folder keeps a stale
+/// directory name that nothing else recognises.
+fn migrate_ancestor_dirs(repo_paths: &[String], dry_run: bool) -> Result<bool> {
+    let mut did_anything = false;
+    for dir in legacy_ancestor_dirs(repo_paths) {
+        if dry_run {
+            println!(
+                "  would migrate folder config: {}/.ol -> .sclerox",
+                dir.display()
+            );
+            did_anything = true;
+            continue;
+        }
+        if crate::migrate::migrate_legacy_repo_dir(&dir) {
+            println!(
+                "  migrated folder config: {}/.ol -> .sclerox",
+                dir.display()
+            );
+            did_anything = true;
+        }
+    }
+    Ok(did_anything)
+}
+
+/// Rename each registered repo's `.ol/` index directory to `.sclerox/` and
+/// repoint the registry at it.
+///
+/// `sclerox repo sync` will not do this: a repo whose `.ol/repo.db` still
+/// exists reports healthy, so sync skips it. Left alone, these only migrate
+/// when each repo next happens to be re-indexed, which can be months. The
+/// index itself stays valid across the rename, so this is a directory rename
+/// plus a path update, never a re-index.
+fn migrate_registered_repos(dry_run: bool) -> Result<bool> {
+    let db = crate::db::Database::open(&crate::config::settings().db_path).ok();
+    let all_paths: Vec<String> = db
+        .as_ref()
+        .and_then(|d| d.repo_list().ok())
+        .map(|rs| rs.into_iter().map(|r| r.path).collect())
+        .unwrap_or_default();
+
+    // Ancestors first: a catch-all parent's opt-out marker should be under its
+    // current name before anything walks back through that folder.
+    let mut did_anything = migrate_ancestor_dirs(&all_paths, dry_run)?;
+
+    let legacy = legacy_repos();
+    if legacy.is_empty() {
+        return Ok(did_anything);
+    }
+
+    for repo in &legacy {
+        let new_db = repo.new_db_path.to_string_lossy().into_owned();
+        if dry_run {
+            println!("  would migrate repo index: {}/.ol -> .sclerox", repo.path);
+            did_anything = true;
+            continue;
+        }
+
+        // Rename is a no-op when `.sclerox` already exists; the registry still
+        // needs repointing in that case, so don't gate the update on it.
+        crate::migrate::migrate_legacy_repo_dir(Path::new(&repo.path));
+
+        if !repo.new_db_path.exists() {
+            // Distinguish the two ways this happens: the repo is gone entirely
+            // (a stale registry row `sclerox repo sync` prunes), versus present
+            // but missing its index (which a re-index rebuilds).
+            if Path::new(&repo.path).exists() {
+                println!(
+                    "  skipped repo index {}: no .sclerox/repo.db after rename \
+                     (rebuild with `sclerox repo index {}`)",
+                    repo.name, repo.path
+                );
+            } else {
+                println!(
+                    "  skipped repo index {}: directory no longer exists \
+                     (stale registry entry; prune with `sclerox repo sync`)",
+                    repo.name
+                );
+            }
+            continue;
+        }
+        if let Some(db) = &db {
+            match db.repo_set_db_path(&repo.path, &new_db) {
+                Ok(true) => {
+                    println!("  migrated repo index: {} -> .sclerox", repo.name);
+                    did_anything = true;
+                }
+                Ok(false) => println!("  repo {} not in registry; left as-is", repo.name),
+                Err(e) => println!("  repo {}: failed to update registry ({e})", repo.name),
+            }
+        }
+    }
+
+    Ok(did_anything)
 }
 
 // ─── Global path relocation (~/.ol/* → XDG) ─────────────────────────────────
@@ -491,6 +672,58 @@ mod tests {
             .iter()
             .map(|(_, d)| d.file_name().unwrap().to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn legacy_ancestor_dirs_finds_optout_on_unregistered_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("work");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo.join(".sclerox")).unwrap();
+        std::fs::create_dir_all(parent.join(".ol")).unwrap();
+        std::fs::write(parent.join(".ol").join("config.toml"), "index = false").unwrap();
+
+        let found = legacy_ancestor_dirs(&[repo.to_string_lossy().into_owned()]);
+        assert_eq!(found, vec![parent]);
+    }
+
+    #[test]
+    fn legacy_ancestor_dirs_skips_already_migrated_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("work");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo).unwrap();
+        std::fs::create_dir_all(parent.join(".ol")).unwrap();
+        std::fs::create_dir_all(parent.join(".sclerox")).unwrap();
+
+        let found = legacy_ancestor_dirs(&[parent.join("repo").to_string_lossy().into_owned()]);
+        assert!(found.is_empty(), "a parent with .sclerox is already done");
+    }
+
+    #[test]
+    fn legacy_ancestor_dirs_dedupes_shared_parents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = dir.path().join("work");
+        std::fs::create_dir_all(parent.join("a")).unwrap();
+        std::fs::create_dir_all(parent.join("b")).unwrap();
+        std::fs::create_dir_all(parent.join(".ol")).unwrap();
+
+        let found = legacy_ancestor_dirs(&[
+            parent.join("a").to_string_lossy().into_owned(),
+            parent.join("b").to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(found.len(), 1, "shared parent reported once, got {found:?}");
+    }
+
+    #[test]
+    fn points_at_legacy_index_matches_whole_component_only() {
+        assert!(points_at_legacy_index("/home/me/code/repo/.ol/repo.db"));
+        assert!(!points_at_legacy_index(
+            "/home/me/code/repo/.sclerox/repo.db"
+        ));
+        // Directories that merely contain ".ol" in their name are not indexes.
+        assert!(!points_at_legacy_index("/home/me/code/tools.old/repo.db"));
+        assert!(!points_at_legacy_index("/home/me/.olive/repo.db"));
     }
 
     #[test]
