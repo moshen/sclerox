@@ -8,25 +8,29 @@ One command does the whole move:
 ```bash
 sclerox migrate --dry-run          # show every action, change nothing
 sclerox migrate                    # do it
-sclerox install                    # AFTER migrate, never before
+sclerox install                    # either order works
 ```
 
 `sclerox migrate` is hidden from `sclerox --help`. `sclerox install` prints a
 pointer to it when it finds an old install.
 
-## Run migrate BEFORE install
+## Order does not matter
 
-Order matters and getting it wrong is quiet, not loud.
+Install and migrate can run in either order. Install will not create a default
+`~/.config/sclerox/config.toml` while a `~/.ol/config.toml` is still waiting to
+be migrated, because taking that slot would make migration skip the real config
+and strand your settings at the old path. It says so and leaves the slot free.
 
-`sclerox install` creates a default `~/.config/sclerox/config.toml` when none
-exists. `sclerox migrate` never overwrites a file already at the destination.
-So installing first leaves a fresh default config in place, migrate declines to
-move your real one, and your settings stay orphaned at `~/.ol/config.toml`.
-Migrate says so when it happens, but migrating first avoids it entirely.
+If an older build already wrote a default config there, migration resolves it:
+a generated template has nothing set in it, so it is replaced by your real
+config. A config you have actually edited is never overwritten. Migration keeps
+both files and tells you to merge them:
 
-If you already installed first: copy your settings across by hand from
-`~/.ol/config.toml`, or delete the generated config and re-run `sclerox
-migrate`.
+```
+kept ~/.config/sclerox/config.toml — it has settings of its own,
+so ~/.ol/config.toml was left in place.
+    Merge the two by hand, then delete the old file.
+```
 
 ## Back up first
 

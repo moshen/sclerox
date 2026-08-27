@@ -78,6 +78,15 @@ fn legacy_home_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".ol"))
 }
 
+/// The pre-rename `~/.ol/config.toml`, if it still needs migrating.
+///
+/// `sclerox install` consults this so it never writes a default config into a
+/// slot a pending migration is about to fill.
+pub fn pending_legacy_config() -> Option<PathBuf> {
+    let legacy = legacy_home_dir()?.join("config.toml");
+    legacy.is_file().then_some(legacy)
+}
+
 /// True if migration still has work to do. Used by `sclerox install` to point
 /// at `sclerox migrate` when it finds an old install.
 ///
@@ -413,12 +422,80 @@ fn global_path_moves(legacy_home: &Path) -> Vec<(PathBuf, PathBuf)> {
 fn migrate_global_paths(legacy_home: &Path, dry_run: bool) -> Result<bool> {
     let mut moved_any = false;
     for (src, dst) in global_path_moves(legacy_home) {
-        moved_any |= move_file(&src, &dst, dry_run)?;
+        if src.file_name() == Some(std::ffi::OsStr::new("config.toml")) {
+            moved_any |= migrate_config_file(&src, &dst, dry_run)?;
+        } else {
+            moved_any |= move_file(&src, &dst, dry_run)?;
+        }
     }
     if !dry_run {
         remove_if_empty(legacy_home);
     }
     Ok(moved_any)
+}
+
+/// Move the config, resolving the one case where a destination already exists.
+///
+/// `sclerox install` used to create a commented default config, which took the
+/// destination slot and made a later migrate skip the real one. That made the
+/// install/migrate order matter silently. A generated template has nothing set
+/// in it, so it carries no user intent and is replaced. A config someone has
+/// actually edited is never clobbered: both files are kept and the conflict is
+/// reported for a manual merge.
+fn migrate_config_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
+    if !src.exists() || !dst.exists() {
+        return move_file(src, dst, dry_run);
+    }
+
+    let pristine = std::fs::read_to_string(dst)
+        .ok()
+        .and_then(|c| super::config_cmd::is_pristine_template(&c));
+
+    match pristine {
+        Some(true) => {
+            if dry_run {
+                println!(
+                    "  would replace generated default {} with {}",
+                    dst.display(),
+                    src.display()
+                );
+                return Ok(true);
+            }
+            replace_file(src, dst)?;
+            println!(
+                "  moved {} -> {} (replaced a generated default with nothing set in it)",
+                src.display(),
+                dst.display()
+            );
+            Ok(true)
+        }
+        // Edited, or unparseable so its contents are unknown. Either way it is
+        // not ours to overwrite.
+        _ => {
+            println!(
+                "  kept {} — it has settings of its own, so {} was left in place.",
+                dst.display(),
+                src.display()
+            );
+            println!("    Merge the two by hand, then delete the old file.");
+            Ok(false)
+        }
+    }
+}
+
+/// Rename over an existing destination, falling back to copy+remove across
+/// filesystems (`fs::rename` overwrites, but only within one device).
+fn replace_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if std::fs::rename(src, dst).is_err() {
+        std::fs::copy(src, dst)
+            .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+        std::fs::remove_file(src).with_context(|| format!("removing {}", src.display()))?;
+    }
+    Ok(())
 }
 
 /// Move a single file, skipping (and warning) if the destination already
@@ -618,6 +695,69 @@ fn strip_legacy_section(path: &Path, dry_run: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (src, dst) inside a temp dir, with `dst` pre-seeded when given.
+    fn config_pair(dir: &Path, dst_contents: Option<&str>) -> (PathBuf, PathBuf) {
+        let src = dir.join("old").join("config.toml");
+        let dst = dir.join("new").join("config.toml");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "index = false\n").unwrap();
+        if let Some(c) = dst_contents {
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::write(&dst, c).unwrap();
+        }
+        (src, dst)
+    }
+
+    #[test]
+    fn migrate_config_moves_when_destination_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (src, dst) = config_pair(dir.path(), None);
+        assert!(migrate_config_file(&src, &dst, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "index = false\n");
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn migrate_config_replaces_a_generated_default() {
+        // The install-then-migrate case: install wrote a fully commented
+        // template, which carries no user intent and must not block the move.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (src, dst) = config_pair(dir.path(), Some("# max_value_chars = 800\n"));
+        assert!(migrate_config_file(&src, &dst, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "index = false\n");
+        assert!(!src.exists(), "legacy config consumed");
+    }
+
+    #[test]
+    fn migrate_config_never_clobbers_an_edited_destination() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let edited = "[memory]\nmax_value_chars = 1200\n";
+        let (src, dst) = config_pair(dir.path(), Some(edited));
+        assert!(!migrate_config_file(&src, &dst, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), edited);
+        assert!(src.exists(), "legacy config kept for a manual merge");
+    }
+
+    #[test]
+    fn migrate_config_leaves_an_unparseable_destination_alone() {
+        // Unparseable means unknown, and unknown is not safe to overwrite.
+        let dir = tempfile::TempDir::new().unwrap();
+        let junk = "this is not [valid toml";
+        let (src, dst) = config_pair(dir.path(), Some(junk));
+        assert!(!migrate_config_file(&src, &dst, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), junk);
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn migrate_config_dry_run_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (src, dst) = config_pair(dir.path(), Some("# commented = 1\n"));
+        assert!(migrate_config_file(&src, &dst, true).unwrap());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "# commented = 1\n");
+        assert!(src.exists());
+    }
 
     #[test]
     fn move_file_skips_when_destination_exists() {

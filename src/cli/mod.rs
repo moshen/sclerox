@@ -106,7 +106,8 @@ pub enum Commands {
 
     /// One-time cleanup for a machine with an old, pre-rename `ol` install:
     /// moves ~/.ol/* onto the new XDG layout, renames per-repo .ol/ index
-    /// directories, and strips stale integrations. Run BEFORE `sclerox install`
+    /// directories, and strips stale integrations. Safe to run before or
+    /// after `sclerox install`
     #[command(hide = true)]
     Migrate(migrate::MigrateArgs),
 }

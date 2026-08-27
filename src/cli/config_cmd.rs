@@ -206,6 +206,20 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
     let path = config_path();
 
     if !path.exists() {
+        // A pre-rename config still waiting to be migrated is the real one.
+        // Writing a default here would take the destination slot and make
+        // migration skip it, silently stranding the user's settings at the old
+        // path. Leave the slot free so `sclerox migrate` can fill it, in either
+        // order.
+        if let Some(legacy) = super::migrate::pending_legacy_config() {
+            println!(
+                "config: not creating {} yet — {} is waiting to be migrated \
+                 (run `sclerox migrate`)",
+                path.display(),
+                legacy.display()
+            );
+            return Ok(());
+        }
         if dry_run {
             println!("  would create: {}", path.display());
         } else {
@@ -247,6 +261,15 @@ fn write(path: &Path, contents: &str) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// True if `contents` is a generated template with nothing set in it, i.e. it
+/// carries no user intent and can be replaced without losing anything.
+///
+/// `None` when the file isn't valid TOML: unparseable means unknown, and the
+/// caller must not treat unknown as safe to overwrite.
+pub fn is_pristine_template(contents: &str) -> Option<bool> {
+    flatten_user_values(contents).map(|v| v.is_empty())
 }
 
 /// Parse a config file into a map of (section, key) -> value for every key the
@@ -347,6 +370,24 @@ fn render_toml_value(v: &toml::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pristine_template_distinguishes_generated_from_edited() {
+        // The shipped template has every key commented out.
+        assert_eq!(is_pristine_template(&config_template()), Some(true));
+        assert_eq!(
+            is_pristine_template("# max_value_chars = 800\n"),
+            Some(true)
+        );
+        assert_eq!(is_pristine_template(""), Some(true));
+
+        assert_eq!(
+            is_pristine_template("[memory]\nmax_value_chars = 1200\n"),
+            Some(false)
+        );
+        // Unparseable is unknown, not safe.
+        assert_eq!(is_pristine_template("not [valid toml"), None);
+    }
 
     #[test]
     fn template_parses_back_to_defaults() {
