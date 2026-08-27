@@ -1,8 +1,9 @@
 //! `sclerox migrate` — one-time cleanup for a machine that has an old, pre-rename
 //! `ol` install: moves `~/.ol/*` onto the new XDG layout and strips
 //! old-marker tool integrations (hooks, skill dir, OpenCode plugin, doc
-//! sections) that `sclerox install` doesn't recognize as its own. See
-//! `MIGRATION.md` for the full picture.
+//! sections) that `sclerox install` doesn't recognize as its own, and renames
+//! per-repo `.ol/` index directories. See `src/skill/reference/migration.md`
+//! for the user-facing procedure.
 //!
 //! Self-contained on purpose: everything specific to the `ol` → `sclerox`
 //! transition lives here (plus `crate::migrate` for the per-repo half), so

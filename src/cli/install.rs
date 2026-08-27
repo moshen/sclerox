@@ -854,6 +854,10 @@ fn skill_files() -> &'static [(&'static str, &'static str)] {
             "reference/config.md",
             include_str!("../skill/reference/config.md"),
         ),
+        (
+            "reference/migration.md",
+            include_str!("../skill/reference/migration.md"),
+        ),
     ]
 }
 
