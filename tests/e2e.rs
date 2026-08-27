@@ -953,3 +953,75 @@ fn commands_stay_fast() {
         t.as_millis()
     );
 }
+
+// ─── ol -> sclerox migration ─────────────────────────────────────────────────
+
+/// `sclerox install` must adopt a pre-rename `~/.ol/config.toml` rather than
+/// writing a default beside it.
+///
+/// Writing a default would claim the destination, so a later `sclerox migrate`
+/// would decline to overwrite it and the user's real settings would stay
+/// stranded at the old path with nothing reporting a failure. Adopting also
+/// means install and migrate work in either order.
+#[test]
+fn install_adopts_a_pre_rename_config() {
+    let home = TempDir::new().unwrap();
+    let legacy = home.path().join(".ol").join("config.toml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "[memory]\nmax_value_chars = 1234\n").unwrap();
+
+    let mut c = Command::cargo_bin("sclerox").unwrap();
+    // Pin every path this touches into the temp home. SCLEROX_CONFIG is
+    // deliberately NOT set: this exercises real XDG resolution.
+    c.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_STATE_HOME", home.path().join(".local/state"))
+        .env("SCLEROX_LOG", "off")
+        .env_remove("SCLEROX_CONFIG")
+        .args(["install", "--target", "claude"]);
+    c.assert().success();
+
+    let adopted = home.path().join(".config/sclerox/config.toml");
+    let contents = std::fs::read_to_string(&adopted).expect("config at the new path");
+    assert!(
+        contents.contains("max_value_chars = 1234"),
+        "the user's setting survived adoption, got:\n{contents}"
+    );
+    assert!(
+        contents.contains("# cosine_threshold"),
+        "template refreshed around the adopted value, got:\n{contents}"
+    );
+    assert!(!legacy.exists(), "legacy config consumed, not left behind");
+}
+
+/// A config already at the new path that the user has edited is never replaced
+/// by adoption, and the legacy file is kept for a manual merge.
+#[test]
+fn install_never_overwrites_an_edited_config() {
+    let home = TempDir::new().unwrap();
+    let legacy = home.path().join(".ol").join("config.toml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "[memory]\nmax_value_chars = 1234\n").unwrap();
+
+    let current = home.path().join(".config/sclerox/config.toml");
+    std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+    std::fs::write(&current, "[dedup]\ncosine_threshold = 0.9\n").unwrap();
+
+    let mut c = Command::cargo_bin("sclerox").unwrap();
+    c.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_STATE_HOME", home.path().join(".local/state"))
+        .env("SCLEROX_LOG", "off")
+        .env_remove("SCLEROX_CONFIG")
+        .args(["install", "--target", "claude"]);
+    c.assert().success();
+
+    let contents = std::fs::read_to_string(&current).unwrap();
+    assert!(
+        contents.contains("cosine_threshold = 0.9"),
+        "the edited value is untouched, got:\n{contents}"
+    );
+    assert!(legacy.exists(), "legacy config kept for a manual merge");
+}

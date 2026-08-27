@@ -16,21 +16,29 @@ pointer to it when it finds an old install.
 
 ## Order does not matter
 
-Install and migrate can run in either order. Install will not create a default
-`~/.config/sclerox/config.toml` while a `~/.ol/config.toml` is still waiting to
-be migrated, because taking that slot would make migration skip the real config
-and strand your settings at the old path. It says so and leaves the slot free.
+Install and migrate can run in either order, and either one moves you onto the
+new config.
 
-If an older build already wrote a default config there, migration resolves it:
-a generated template has nothing set in it, so it is replaced by your real
-config. A config you have actually edited is never overwritten. Migration keeps
-both files and tells you to merge them:
+If `~/.ol/config.toml` is still there when `sclerox install` runs, install
+adopts it: the file moves to `~/.config/sclerox/config.toml`, your values are
+kept, and the surrounding template is refreshed with any keys added since. It
+prints what it did. Writing a fresh default instead would claim the destination
+and make a later migrate decline to overwrite it, stranding your settings at
+the old path with nothing reporting a problem.
+
+A config already at the new path is never overwritten by either command. When
+both exist and the current one has settings of its own, both files are kept and
+the conflict is reported:
 
 ```
 kept ~/.config/sclerox/config.toml — it has settings of its own,
 so ~/.ol/config.toml was left in place.
     Merge the two by hand, then delete the old file.
 ```
+
+The one exception is a generated template with nothing set in it. That carries
+no intent, so migration replaces it with your real config rather than treating
+it as a conflict.
 
 ## Back up first
 

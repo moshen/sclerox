@@ -78,13 +78,20 @@ fn legacy_home_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".ol"))
 }
 
-/// The pre-rename `~/.ol/config.toml`, if it still needs migrating.
-///
-/// `sclerox install` consults this so it never writes a default config into a
-/// slot a pending migration is about to fill.
+/// The pre-rename `~/.ol/config.toml`, if one is still sitting there.
 pub fn pending_legacy_config() -> Option<PathBuf> {
     let legacy = legacy_home_dir()?.join("config.toml");
     legacy.is_file().then_some(legacy)
+}
+
+/// Move a pre-rename config to its XDG home, for `sclerox install` to adopt.
+///
+/// Only the config is moved outside `sclerox migrate`. The database move stays
+/// in the explicit command because it can race a background process still
+/// writing to it; a config file has no such writer, so adopting it during
+/// install is safe and saves the user a second step.
+pub fn adopt_legacy_config(src: &Path, dst: &Path) -> Result<()> {
+    replace_file(src, dst)
 }
 
 /// True if migration still has work to do. Used by `sclerox install` to point

@@ -206,27 +206,43 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
     let path = config_path();
 
     if !path.exists() {
-        // A pre-rename config still waiting to be migrated is the real one.
-        // Writing a default here would take the destination slot and make
-        // migration skip it, silently stranding the user's settings at the old
-        // path. Leave the slot free so `sclerox migrate` can fill it, in either
-        // order.
-        if let Some(legacy) = super::migrate::pending_legacy_config() {
-            println!(
-                "config: not creating {} yet — {} is waiting to be migrated \
-                 (run `sclerox migrate`)",
-                path.display(),
-                legacy.display()
-            );
-            return Ok(());
+        // A pre-rename `~/.ol/config.toml` IS the real config. Writing a
+        // default beside it would take the destination slot and make a later
+        // migrate skip it, stranding the user's settings at the old path.
+        //
+        // Adopt it rather than refusing to act: blocking on the file's mere
+        // existence just defers the problem and leaves install degraded until
+        // someone runs a second command. Moving it is non-destructive, ends
+        // with the user on the new config, and falls through to the upgrade
+        // below so the template refreshes around the values it carried.
+        match super::migrate::pending_legacy_config() {
+            Some(legacy) if dry_run => {
+                println!(
+                    "  would move {} -> {} (adopting your existing settings)",
+                    legacy.display(),
+                    path.display()
+                );
+                return Ok(());
+            }
+            Some(legacy) => {
+                super::migrate::adopt_legacy_config(&legacy, &path)?;
+                println!(
+                    "config: moved {} -> {} (adopted your existing settings)",
+                    legacy.display(),
+                    path.display()
+                );
+                // Falls through to the upgrade path below.
+            }
+            None if dry_run => {
+                println!("  would create: {}", path.display());
+                return Ok(());
+            }
+            None => {
+                write(&path, &config_template())?;
+                println!("config: wrote {}", path.display());
+                return Ok(());
+            }
         }
-        if dry_run {
-            println!("  would create: {}", path.display());
-        } else {
-            write(&path, &config_template())?;
-            println!("config: wrote {}", path.display());
-        }
-        return Ok(());
     }
 
     let existing =
