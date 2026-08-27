@@ -46,7 +46,28 @@ pub fn run_migrate(args: MigrateArgs) -> Result<()> {
     } else {
         println!("\nMigration complete.");
     }
+
+    warn_about_stale_ol_binary();
     Ok(())
+}
+
+/// Tell the user about an old `ol` binary still on PATH. Printed after every
+/// migrate run (including "nothing to migrate"), because the binary outliving
+/// the data is precisely the state that produces silent empty results.
+fn warn_about_stale_ol_binary() {
+    let Some(path) = stale_ol_binary() else {
+        return;
+    };
+    println!(
+        "\nWarning: an old `ol` binary is still on your PATH:\n  \
+         {}\n\
+         Its database has moved. Running it now does not fail — it creates a new\n\
+         EMPTY ~/.ol/ol.db and returns no results with exit 0, so anything still\n\
+         calling `ol ...` will silently read an empty knowledge base.\n\
+         Remove it once you are happy with this migration, and update any of your\n\
+         own docs, skills, or aliases that still invoke `ol` to use `sclerox`.",
+        path.display()
+    );
 }
 
 /// `~/.ol`, the pre-rename flat layout every real install actually wrote
@@ -55,96 +76,165 @@ fn legacy_home_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".ol"))
 }
 
-/// True if there's an old `ol` install left to migrate. Used by `sclerox install`
-/// to print a one-line pointer at `sclerox migrate` when it finds one.
+/// True if migration still has work to do. Used by `sclerox install` to point
+/// at `sclerox migrate` when it finds an old install.
+///
+/// Deliberately NOT "does `~/.ol` exist": that directory routinely outlives a
+/// successful migration because it holds files migration never claims (an
+/// `ol.db.pre-v12-backup`, say). Reporting on mere existence made `install`
+/// advise a migrate that `migrate` itself then reported as already done.
 pub fn legacy_data_present() -> bool {
-    legacy_home_dir().is_some_and(|p| p.exists())
+    let paths_pending = legacy_home_dir().is_some_and(|home| {
+        global_path_moves(&home)
+            .iter()
+            .any(|(_, dst)| !dst.exists())
+    });
+    paths_pending || legacy_integrations_present()
+}
+
+/// True if any old-marker tool integration is still installed. These are
+/// independent of `~/.ol`: a machine whose data moved can still carry an
+/// `ol-kb` skill dir or an `# ol-kb-hook` entry.
+fn legacy_integrations_present() -> bool {
+    let skill_or_plugin = [
+        claude_dir().map(|d| d.join("skills").join(LEGACY_SKILL_DIR_NAME)),
+        opencode_dir().map(|d| d.join("skills").join(LEGACY_SKILL_DIR_NAME)),
+        opencode_dir().map(|d| d.join("plugins").join(LEGACY_OPENCODE_PLUGIN_FILE)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|p| p.exists());
+
+    let sections = [
+        claude_dir().map(|d| d.join("CLAUDE.md")),
+        opencode_dir().map(|d| d.join("AGENTS.md")),
+        codex_dir().map(|d| d.join("instructions.md")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|p| {
+        std::fs::read_to_string(&p)
+            .map(|c| c.contains(LEGACY_SECTION_MARKER))
+            .unwrap_or(false)
+    });
+
+    skill_or_plugin || sections || legacy_hook_present()
+}
+
+fn legacy_hook_present() -> bool {
+    let Ok(dir) = claude_dir() else {
+        return false;
+    };
+    std::fs::read_to_string(dir.join("settings.json"))
+        .map(|c| c.contains(LEGACY_HOOK_MARKER))
+        .unwrap_or(false)
+}
+
+/// Find an executable named `ol` on PATH, if one is still installed.
+///
+/// Worth a warning because the old binary does not fail once its database has
+/// moved: it silently creates a fresh empty `~/.ol/ol.db` and returns no
+/// results with exit 0. Any doc, skill, or habit still invoking `ol ...` then
+/// reads an empty knowledge base and reports "not found" rather than erroring.
+pub fn stale_ol_binary() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    find_legacy_binary(&path, |p| p.is_file())
+}
+
+/// Pure half of [`stale_ol_binary`] so it is testable without touching the
+/// process environment.
+fn find_legacy_binary(
+    path_var: &std::ffi::OsStr,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(legacy_binary_name()))
+        .find(|cand| exists(cand))
+}
+
+fn legacy_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "ol.exe"
+    } else {
+        "ol"
+    }
 }
 
 // ─── Global path relocation (~/.ol/* → XDG) ─────────────────────────────────
 
-fn migrate_global_paths(legacy_home: &Path, dry_run: bool) -> Result<bool> {
-    let mut moved_any = false;
-
-    moved_any |= move_file(
-        &legacy_home.join("config.toml"),
-        &crate::xdg::config_home()
-            .join("sclerox")
-            .join("config.toml"),
-        dry_run,
-    )?;
-
+/// Every global (src, dst) pair migration would move, in order.
+///
+/// Single source of truth for both the mover and [`legacy_data_present`], so
+/// "is anything left to migrate?" can never drift from what actually moves.
+/// That drift is exactly what made `sclerox install` keep advising a migrate
+/// that `sclerox migrate` then reported as already done.
+fn global_path_moves(legacy_home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let config_dst = crate::xdg::config_home()
+        .join("sclerox")
+        .join("config.toml");
     let db_dst = crate::xdg::data_home().join("sclerox").join("sclerox.db");
-    moved_any |= move_file(&legacy_home.join("ol.db"), &db_dst, dry_run)?;
-    // Best-effort sidecar files left by an interrupted write (default rollback
-    // journal mode only leaves these transiently, but a crash mid-write can
-    // strand one).
+    let logs_dst = crate::xdg::state_home().join("sclerox").join("logs");
+    let distilled_dst = crate::xdg::state_home().join("sclerox").join("distilled");
+
+    let mut moves = vec![
+        (legacy_home.join("config.toml"), config_dst),
+        (legacy_home.join("ol.db"), db_dst.clone()),
+    ];
+
+    // Best-effort sidecars from an interrupted write. SQLite deletes -wal/-shm
+    // on a clean close, so these are usually already gone by migrate time.
     for suffix in ["-journal", "-wal", "-shm"] {
-        let dst = db_dst.with_extension(format!("db{suffix}"));
-        moved_any |= move_file(&legacy_home.join(format!("ol.db{suffix}")), &dst, dry_run)?;
+        moves.push((
+            legacy_home.join(format!("ol.db{suffix}")),
+            db_dst.with_extension(format!("db{suffix}")),
+        ));
     }
 
-    moved_any |= move_renamed_logs(
-        legacy_home,
-        &crate::xdg::state_home().join("sclerox").join("logs"),
-        dry_run,
-    )?;
+    // `ol-YYYY-MM-DD.log` -> `sclerox-YYYY-MM-DD.log` (the prefix changed too).
+    if let Ok(entries) = std::fs::read_dir(legacy_home.join("logs")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix("ol-") else {
+                continue;
+            };
+            moves.push((
+                legacy_home.join("logs").join(name),
+                logs_dst.join(format!("sclerox-{rest}")),
+            ));
+        }
+    }
 
-    moved_any |= move_dir_contents(
-        &legacy_home.join("distilled"),
-        &crate::xdg::state_home().join("sclerox").join("distilled"),
-        dry_run,
-    )?;
+    // `distilled/` keeps its session-id-keyed filenames.
+    if let Ok(entries) = std::fs::read_dir(legacy_home.join("distilled")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            moves.push((
+                legacy_home.join("distilled").join(&name),
+                distilled_dst.join(&name),
+            ));
+        }
+    }
 
-    moved_any |= move_file(
-        &legacy_home.join("completions").join("ol.ps1"),
-        &crate::xdg::data_home()
+    moves.push((
+        legacy_home.join("completions").join("ol.ps1"),
+        crate::xdg::data_home()
             .join("sclerox")
             .join("completions")
             .join("sclerox.ps1"),
-        dry_run,
-    )?;
+    ));
 
+    moves.retain(|(src, _)| src.exists());
+    moves
+}
+
+fn migrate_global_paths(legacy_home: &Path, dry_run: bool) -> Result<bool> {
+    let mut moved_any = false;
+    for (src, dst) in global_path_moves(legacy_home) {
+        moved_any |= move_file(&src, &dst, dry_run)?;
+    }
     if !dry_run {
         remove_if_empty(legacy_home);
-    }
-
-    Ok(moved_any)
-}
-
-/// `~/.ol/logs/ol-YYYY-MM-DD.log` → `<state_home>/sclerox/logs/sclerox-YYYY-MM-DD.log`,
-/// one file at a time (the `ol-` → `sclerox-` filename prefix changed too).
-fn move_renamed_logs(legacy_home: &Path, dst_dir: &Path, dry_run: bool) -> Result<bool> {
-    let src_dir = legacy_home.join("logs");
-    let Ok(entries) = std::fs::read_dir(&src_dir) else {
-        return Ok(false);
-    };
-    let mut moved_any = false;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix("ol-") else {
-            continue;
-        };
-        moved_any |= move_file(
-            &src_dir.join(name),
-            &dst_dir.join(format!("sclerox-{rest}")),
-            dry_run,
-        )?;
-    }
-    Ok(moved_any)
-}
-
-/// Move every entry of `src_dir` into `dst_dir`, same filenames (used for
-/// `distilled/`, whose session-id-keyed marker/lock filenames didn't change).
-fn move_dir_contents(src_dir: &Path, dst_dir: &Path, dry_run: bool) -> Result<bool> {
-    let Ok(entries) = std::fs::read_dir(src_dir) else {
-        return Ok(false);
-    };
-    let mut moved_any = false;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        moved_any |= move_file(&src_dir.join(&name), &dst_dir.join(&name), dry_run)?;
     }
     Ok(moved_any)
 }
@@ -384,17 +474,80 @@ mod tests {
         assert!(!dst.exists());
     }
 
-    #[test]
-    fn move_renamed_logs_renames_prefix() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let legacy_home = dir.path().join(".ol");
-        let logs = legacy_home.join("logs");
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("ol-2026-01-01.log"), "log").unwrap();
+    /// Build a `~/.ol` containing exactly `files` (relative paths).
+    fn legacy_home_with(dir: &Path, files: &[&str]) -> PathBuf {
+        let home = dir.join(".ol");
+        for rel in files {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
 
-        let dst_dir = dir.path().join("logs-dst");
-        assert!(move_renamed_logs(&legacy_home, &dst_dir, false).unwrap());
-        assert!(dst_dir.join("sclerox-2026-01-01.log").exists());
+    fn dst_names(moves: &[(PathBuf, PathBuf)]) -> Vec<String> {
+        moves
+            .iter()
+            .map(|(_, d)| d.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn global_path_moves_renames_log_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = legacy_home_with(dir.path(), &["logs/ol-2026-01-01.log"]);
+        let names = dst_names(&global_path_moves(&home));
+        assert!(
+            names.contains(&"sclerox-2026-01-01.log".to_string()),
+            "got {names:?}"
+        );
+    }
+
+    #[test]
+    fn global_path_moves_covers_db_config_and_distilled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = legacy_home_with(
+            dir.path(),
+            &["config.toml", "ol.db", "distilled/session-abc"],
+        );
+        let names = dst_names(&global_path_moves(&home));
+        assert!(names.contains(&"sclerox.db".to_string()), "got {names:?}");
+        assert!(names.contains(&"config.toml".to_string()), "got {names:?}");
+        assert!(names.contains(&"session-abc".to_string()), "got {names:?}");
+    }
+
+    #[test]
+    fn global_path_moves_ignores_files_migration_never_claims() {
+        // The regression: a `~/.ol` holding only an old hand-made backup has
+        // nothing left to migrate, but used to keep `sclerox install` advising
+        // a migrate that `sclerox migrate` reported as already done.
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = legacy_home_with(dir.path(), &["ol.db.pre-v12-backup"]);
+        assert!(
+            global_path_moves(&home).is_empty(),
+            "unclaimed leftovers must not count as pending migration"
+        );
+    }
+
+    #[test]
+    fn global_path_moves_ignores_non_ol_log_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = legacy_home_with(dir.path(), &["logs/unrelated.log"]);
+        assert!(global_path_moves(&home).is_empty());
+    }
+
+    #[test]
+    fn find_legacy_binary_locates_ol_on_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join(legacy_binary_name());
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+
+        assert_eq!(
+            find_legacy_binary(&path_var, |p| p == bin),
+            Some(bin.clone())
+        );
+        assert_eq!(find_legacy_binary(&path_var, |_| false), None);
     }
 
     #[test]
