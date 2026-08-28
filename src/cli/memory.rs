@@ -574,7 +574,7 @@ fn resolve_import_path(
     if let Some(p) = path {
         return Ok(std::path::PathBuf::from(p));
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let home = crate::xdg::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     let resolved = match agent {
         Some("claude") | None => home.join(".claude").join("projects"),
         Some("opencode") => home.join(".config").join("opencode").join("memory"),

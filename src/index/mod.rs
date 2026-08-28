@@ -481,7 +481,7 @@ fn is_unsafe_index_root(root: &Path) -> bool {
     if root.components().count() < 3 {
         return true;
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::xdg::home_dir() {
         // The home dir itself, or any ancestor of it (`/Users`, `/home`).
         if root == home || home.starts_with(root) {
             return true;
@@ -988,7 +988,7 @@ class Handler:
             "/Users/nobody/code/some-project"
         )));
         // The home dir itself is refused.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::xdg::home_dir() {
             assert!(is_unsafe_index_root(&home));
         }
     }

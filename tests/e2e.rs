@@ -972,8 +972,11 @@ fn install_adopts_a_pre_rename_config() {
 
     let mut c = Command::cargo_bin("sclerox").unwrap();
     // Pin every path this touches into the temp home. SCLEROX_CONFIG is
-    // deliberately NOT set: this exercises real XDG resolution.
+    // deliberately NOT set: this exercises real XDG resolution. USERPROFILE is
+    // the home variable on Windows, where HOME alone is ignored -- without it
+    // `~/.ol` and `~/.claude` would resolve to the runner's real profile.
     c.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
@@ -1010,6 +1013,7 @@ fn install_never_overwrites_an_edited_config() {
 
     let mut c = Command::cargo_bin("sclerox").unwrap();
     c.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))

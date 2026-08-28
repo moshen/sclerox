@@ -75,7 +75,7 @@ fn warn_about_stale_ol_binary() {
 /// `~/.ol`, the pre-rename flat layout every real install actually wrote
 /// (nothing shipped under the `sclerox` name before the XDG move existed).
 fn legacy_home_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ol"))
+    crate::xdg::home_dir().map(|h| h.join(".ol"))
 }
 
 /// The pre-rename `~/.ol/config.toml`, if one is still sitting there.
@@ -239,7 +239,7 @@ fn legacy_repos() -> Vec<LegacyRepo> {
 /// it never appears in the registry and the repo sweep cannot see it. Bounded
 /// to ancestors of known repos rather than scanning the filesystem.
 fn legacy_ancestor_dirs(repo_paths: &[String]) -> Vec<PathBuf> {
-    let home = dirs::home_dir();
+    let home = crate::xdg::home_dir();
     let mut seen = std::collections::BTreeSet::new();
 
     for path in repo_paths {
