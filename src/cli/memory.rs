@@ -433,7 +433,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 (None, None) => anyhow::bail!("provide a memory key or --from <file>"),
             };
 
-            let memories = distill_with_ai(&argv, &text)?;
+            // No dedup context here: this path is user-driven and prints what
+            // it extracted before writing, and the single-key case already
+            // resolves the old/new key relationship explicitly below.
+            let memories = distill_with_ai(&argv, &text, "")?;
 
             if memories.is_empty() {
                 println!("No memories extracted.");
@@ -732,20 +735,42 @@ pub struct DistilledMemory {
     pub key: String,
     pub value: String,
     pub memory_type: String,
+    /// Existing memory key this entry replaces, when the distiller was shown
+    /// that key and judged it the same fact. `None` means "new fact as far as
+    /// the distiller could tell"; the similarity check still runs.
+    pub supersedes: Option<String>,
 }
 
 const DISTILL_PROMPT: &str = r#"You are extracting structured memory entries from the provided text.
 
-Extract 1-8 concise, factual memory entries. Each entry should capture a single
-distinct fact, preference, decision, or piece of context worth remembering.
+Extract 0-8 concise, factual memory entries. Each entry should capture a single
+distinct fact, preference, decision, or piece of context that will still matter
+weeks from now.
 
-Keep each "value" concise: 1-3 sentences and UNDER 800 characters. If a fact
-needs more than that, it is really several facts — split it into separate
-entries rather than writing one long value.
+Returning an empty array is a valid and common answer. Most text contains
+nothing worth remembering. Prefer [] over a weak entry.
+
+DO NOT record:
+  - What was already recorded. If an existing memory below already states the
+    fact, do not restate it under a new key.
+  - The process of finding something out ("investigated X, checked Y, then
+    confirmed Z"). Record the conclusion, not the search that reached it.
+  - Transient state: what a command printed, what is currently open or
+    in-progress, what someone is about to do next.
+  - Corrections to statements made earlier in this same text. Record only the
+    final, correct fact.
+  - Restatements of general knowledge, or of instructions given in the text.
+
+Keep each "value" concise: 1-3 sentences and UNDER 800 characters.
+
+Keep ONE topic in ONE entry. Do not split a single finding across several
+entries (a fact entry, a source entry, a detail entry). If a coherent fact does
+not fit in 800 characters, tighten the wording; only split when the text really
+does contain two unrelated facts.
 
 Output ONLY a JSON array with no surrounding text or markdown fences:
 [
-  {"key": "kebab-case-slug", "value": "concise 1-3 sentence statement", "type": "feedback|project|user|reference|session"},
+  {"key": "kebab-case-slug", "value": "concise 1-3 sentence statement", "type": "feedback|project|user|reference", "supersedes": null},
   ...
 ]
 
@@ -754,16 +779,17 @@ Type guide:
   project     - decisions, facts specific to a project
   user        - facts about the user's role, context, or goals
   reference   - pointers to external resources
-  session     - summary of what happened in a session
 
-Key naming:
-  Use stable, descriptive kebab-case slugs. If a fact updates or corrects an
-  earlier fact, reuse the same key you would have used before rather than
-  inventing a new near-identical slug (e.g. reuse "chunk-size-limit", do not
-  add "chunk-size-fix" then "chunk-size-limit-v2"). Prefer the plainest slug
-  that names the fact.
+Key naming and supersedes:
+  Use stable, descriptive kebab-case slugs. Prefer the plainest slug that names
+  the fact.
 
-Text to distill:
+  If an entry updates, corrects, or restates one of the existing memories listed
+  below, reuse that memory's exact key AND set "supersedes" to that same key.
+  That merges the two instead of leaving a near-duplicate pair behind.
+
+  Set "supersedes" to null for a genuinely new fact. Never set it to a key that
+  is not in the list below.
 "#;
 
 /// Built-in default distillation command (argv, WITHOUT the prompt) for a known
@@ -822,10 +848,47 @@ pub fn resolve_distill_command(
     Ok(argv)
 }
 
+/// Max chars of each existing memory's value shown to the distiller. Enough to
+/// judge "same fact?" without spending the prompt budget on full values.
+const CONTEXT_VALUE_CHARS: usize = 240;
+
+/// Render related existing memories as the prompt block the distiller reads to
+/// decide whether a fact is new or an update to something already stored.
+///
+/// Takes plain (key, value) pairs rather than db types so it stays unit-testable
+/// and keeps `memory.rs` free of storage concerns.
+pub fn format_existing_block(entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return "\nExisting memories related to this text: (none)\n".to_string();
+    }
+    let mut out = String::from(
+        "\nExisting memories related to this text. Reuse one of these keys \
+         (and set \"supersedes\" to it) if your entry updates or restates it:\n",
+    );
+    for (key, value) in entries {
+        let flat = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed: String = flat.chars().take(CONTEXT_VALUE_CHARS).collect();
+        let ellipsis = if flat.chars().count() > CONTEXT_VALUE_CHARS {
+            "..."
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {key}: {trimmed}{ellipsis}\n"));
+    }
+    out
+}
+
 /// Run the resolved AI command (argv) with the distillation prompt appended as
 /// the final argument, and parse the JSON response.
-pub fn distill_with_ai_pub(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledMemory>> {
-    distill_with_ai(argv, text)
+///
+/// `existing` is the block from [`format_existing_block`]; pass an empty string
+/// to distill without any dedup context.
+pub fn distill_with_ai_pub(
+    argv: &[String],
+    text: &str,
+    existing: &str,
+) -> anyhow::Result<Vec<DistilledMemory>> {
+    distill_with_ai(argv, text, existing)
 }
 
 /// Search `path_var` × `pathext` for `program`, returning the first candidate
@@ -876,8 +939,12 @@ fn resolve_program(program: &str) -> String {
     program.to_string()
 }
 
-fn distill_with_ai(argv: &[String], text: &str) -> anyhow::Result<Vec<DistilledMemory>> {
-    let prompt = format!("{DISTILL_PROMPT}{text}");
+fn distill_with_ai(
+    argv: &[String],
+    text: &str,
+    existing: &str,
+) -> anyhow::Result<Vec<DistilledMemory>> {
+    let prompt = format!("{DISTILL_PROMPT}{existing}\nText to distill:\n{text}");
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("AI command is empty"))?;
@@ -935,12 +1002,21 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
             .ok_or_else(|| anyhow::anyhow!("entry missing 'value' field"))?
             .to_string();
         let memory_type = item["type"].as_str().unwrap_or("project").to_string();
+        // Absent, null, or empty all mean "no merge target". A key the model
+        // invented rather than copied is rejected later, against the list it
+        // was actually shown.
+        let supersedes = item["supersedes"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         if !key.is_empty() && !value.is_empty() {
             memories.push(DistilledMemory {
                 key,
                 value,
                 memory_type,
+                supersedes,
             });
         }
     }
@@ -951,6 +1027,71 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_distilled_reads_supersedes() {
+        let json = r#"[{"key":"a","value":"v","type":"project","supersedes":"old-key"}]"#;
+        let got = parse_distilled_json(json).unwrap();
+        assert_eq!(got[0].supersedes.as_deref(), Some("old-key"));
+    }
+
+    #[test]
+    fn parse_distilled_treats_null_absent_and_blank_supersedes_as_none() {
+        // All three shapes show up in real model output.
+        let json = r#"[
+            {"key":"a","value":"v","type":"project","supersedes":null},
+            {"key":"b","value":"v","type":"project"},
+            {"key":"c","value":"v","type":"project","supersedes":"   "}
+        ]"#;
+        let got = parse_distilled_json(json).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|m| m.supersedes.is_none()));
+    }
+
+    #[test]
+    fn parse_distilled_trims_supersedes_whitespace() {
+        let json = r#"[{"key":"a","value":"v","type":"project","supersedes":" old-key "}]"#;
+        let got = parse_distilled_json(json).unwrap();
+        assert_eq!(got[0].supersedes.as_deref(), Some("old-key"));
+    }
+
+    #[test]
+    fn parse_distilled_accepts_empty_array() {
+        // The prompt now tells the model that [] is a valid answer, so the
+        // parser must treat "nothing worth remembering" as success, not error.
+        assert!(parse_distilled_json("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_block_says_none_when_empty() {
+        let block = format_existing_block(&[]);
+        assert!(block.contains("(none)"), "got: {block}");
+    }
+
+    #[test]
+    fn existing_block_lists_keys_and_values() {
+        let entries = vec![
+            ("alpha-key".to_string(), "alpha value".to_string()),
+            ("beta-key".to_string(), "beta value".to_string()),
+        ];
+        let block = format_existing_block(&entries);
+        assert!(block.contains("alpha-key: alpha value"));
+        assert!(block.contains("beta-key: beta value"));
+        assert!(block.contains("supersedes"), "explains how to use the keys");
+    }
+
+    #[test]
+    fn existing_block_truncates_long_values_and_flattens_newlines() {
+        let long = "word ".repeat(200);
+        let entries = vec![("k".to_string(), format!("line one\nline two {long}"))];
+        let block = format_existing_block(&entries);
+        assert!(block.ends_with("...\n"), "long value is elided");
+        assert_eq!(
+            block.lines().count(),
+            3,
+            "one header, one entry, no wrapping"
+        );
+    }
 
     #[test]
     fn resolve_via_pathext_finds_shim_and_respects_order() {

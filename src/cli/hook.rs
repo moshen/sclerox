@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Subcommand;
+use std::cmp::Ordering;
 use std::io::Read;
 
 use crate::db::Database;
@@ -863,6 +864,7 @@ fn distill_chunked(
 ) -> Result<usize> {
     let dedup = &crate::config::settings().dedup;
     let chunk_chars = crate::config::settings().distill.chunk_chars;
+    let ctx_limit = crate::config::settings().distill.context_memories;
     let mut stored = 0usize;
     let mut seen_keys = std::collections::HashSet::new();
     // Best-effort embedder, reused across all chunks. None if the model is
@@ -870,9 +872,19 @@ fn distill_chunked(
     let mut embedder = crate::embed::Embedder::new().ok();
 
     for chunk in chunk_turns(turns, chunk_chars) {
+        // Show the distiller the memories this chunk is topically near, so it
+        // can reuse an existing key instead of inventing a near-identical slug.
+        // Without this it is asked to guess what a previous run named a fact it
+        // cannot see, which is how one fact ends up under three keys.
+        let context_entries = related_memories_for_chunk(db, embedder.as_mut(), &chunk, ctx_limit);
+        let existing_keys: std::collections::HashSet<String> =
+            context_entries.iter().map(|(k, _)| k.clone()).collect();
+        let existing_block = crate::cli::memory::format_existing_block(&context_entries);
+
         // A failed chunk must be LOUD in the logs: swallowing it silently hid a
         // broken claude flag for 8 days of zero distillations.
-        let memories = match crate::cli::memory::distill_with_ai_pub(argv, &chunk) {
+        let memories = match crate::cli::memory::distill_with_ai_pub(argv, &chunk, &existing_block)
+        {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("distill chunk failed (command: {}): {e:#}", argv.join(" "));
@@ -911,27 +923,43 @@ fn distill_chunked(
             .filter(|sm| sm.entry.key != m.key)
             .collect();
 
-            match near_dups.as_slice() {
-                [] => {
+            // The distiller was shown a list of existing keys and may have
+            // named one as the same fact. Only honour a key that was actually
+            // on that list (never a hallucinated one) and never one the user
+            // wrote by hand.
+            let declared = m.supersedes.as_deref().filter(|k| {
+                *k != m.key
+                    && existing_keys.contains(*k)
+                    && db
+                        .memory_get(k)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|e| e.source != "manual")
+            });
+
+            let candidates: Vec<Candidate<'_>> = near_dups
+                .iter()
+                .map(|sm| Candidate {
+                    key: &sm.entry.key,
+                    source: &sm.entry.source,
+                    score: sm.score,
+                })
+                .collect();
+
+            match decide_dedup_action(declared, &candidates, dedup.merge_threshold) {
+                DedupAction::Insert => {
                     let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
                 }
-                [single] if single.entry.source != "manual" => {
-                    let _ = db.memory_supersede(
-                        &single.entry.key,
-                        &m.key,
-                        &m.value,
-                        &m.memory_type,
-                        source,
-                    );
+                DedupAction::Merge(old_key) => {
+                    let _ = db.memory_supersede(&old_key, &m.key, &m.value, &m.memory_type, source);
                 }
-                matches => {
-                    // Ambiguous cluster, or a human-written memory: store the
-                    // new fact and flag the pair(s) for review instead of
-                    // guessing which side should win.
+                DedupAction::Flag => {
+                    // Genuinely ambiguous, or the only matches are hand-written:
+                    // store and flag rather than guess which side should win.
                     if let Ok(new_id) =
                         db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source)
                     {
-                        for sm in matches {
+                        for sm in &near_dups {
                             let _ =
                                 db.memory_conflict_add(new_id, sm.entry.id, Some(sm.score as f64));
                         }
@@ -939,7 +967,7 @@ fn distill_chunked(
                             "memory '{}' near-duplicates {} existing entries; flagged in \
                              memory_conflicts for review",
                             m.key,
-                            matches.len()
+                            near_dups.len()
                         );
                     }
                 }
@@ -953,6 +981,90 @@ fn distill_chunked(
     }
 
     Ok(stored)
+}
+
+/// What to do with a freshly distilled memory, decided before any writes.
+#[derive(Debug, PartialEq, Eq)]
+enum DedupAction {
+    /// No close match: store it as a new memory.
+    Insert,
+    /// Merge into this existing key, superseding it.
+    Merge(String),
+    /// Too ambiguous to merge: store it and flag every match for review.
+    Flag,
+}
+
+/// One near-duplicate candidate, reduced to what the decision needs.
+struct Candidate<'a> {
+    key: &'a str,
+    source: &'a str,
+    score: f32,
+}
+
+/// Decide how a distilled memory relates to the existing memories it matched.
+///
+/// `declared` is the key the distiller named via `supersedes`, already validated
+/// by the caller as an eligible target. It wins over the scores because the
+/// model saw both values and judged them the same fact, whereas cosine only
+/// says they are worded alike.
+///
+/// Hand-written memories are never merged into automatically: the user wrote
+/// them deliberately, so a cluster whose only matches are manual is flagged.
+///
+/// The `many` arm is the important one. Flagging every multi-match ratchets a
+/// cluster wider (once a topic has two entries, each later mention matches 2+
+/// and adds a third), so a match at or above `merge_threshold` merges instead.
+fn decide_dedup_action(
+    declared: Option<&str>,
+    candidates: &[Candidate<'_>],
+    merge_threshold: f64,
+) -> DedupAction {
+    if let Some(key) = declared {
+        return DedupAction::Merge(key.to_string());
+    }
+    match candidates {
+        [] => DedupAction::Insert,
+        [single] if single.source != "manual" => DedupAction::Merge(single.key.to_string()),
+        many => many
+            .iter()
+            .filter(|c| c.source != "manual")
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
+            .filter(|c| c.score as f64 >= merge_threshold)
+            .map(|c| DedupAction::Merge(c.key.to_string()))
+            .unwrap_or(DedupAction::Flag),
+    }
+}
+
+/// Existing active memories topically near `chunk`, as (key, value) pairs for
+/// the distiller's dedup context.
+///
+/// Uses a deliberately loose cosine floor: the point is to surface the keys
+/// that already cover this topic so the model can reuse one, not to decide
+/// anything. The strict thresholds still gate the actual writes.
+fn related_memories_for_chunk(
+    db: &Database,
+    embedder: Option<&mut crate::embed::Embedder>,
+    chunk: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    /// Below this the retrieved memories are noise rather than context.
+    const CONTEXT_COSINE_FLOOR: f32 = 0.30;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Some(embedder) = embedder else {
+        return Vec::new();
+    };
+    let capped: String = chunk.chars().take(crate::index::MAX_EMBED_CHARS).collect();
+    let Ok(emb) = embedder.embed_one(&capped) else {
+        return Vec::new();
+    };
+    db.memory_find_near_duplicates_semantic(&emb, CONTEXT_COSINE_FLOOR, limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sm| (sm.entry.key, sm.entry.value))
+        .collect()
 }
 
 /// Split turns into chunks of up to `max_chars` each.
@@ -1158,6 +1270,94 @@ mod tests {
     fn test_extract_text_content_empty_blocks() {
         let val = serde_json::json!([{"type": "tool_use", "id": "x"}]);
         assert_eq!(extract_text_content(&val), None);
+    }
+
+    fn cand<'a>(key: &'a str, source: &'a str, score: f32) -> Candidate<'a> {
+        Candidate { key, source, score }
+    }
+
+    #[test]
+    fn dedup_inserts_when_nothing_matches() {
+        assert_eq!(decide_dedup_action(None, &[], 0.95), DedupAction::Insert);
+    }
+
+    #[test]
+    fn dedup_merges_single_distilled_match() {
+        let c = [cand("existing", "session", 0.86)];
+        assert_eq!(
+            decide_dedup_action(None, &c, 0.95),
+            DedupAction::Merge("existing".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_never_auto_merges_a_single_manual_match() {
+        // The user wrote it deliberately; a distilled near-match must not
+        // silently replace it, however high the score.
+        let c = [cand("hand-written", "manual", 0.99)];
+        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+    }
+
+    #[test]
+    fn dedup_merges_best_match_above_threshold_instead_of_ratcheting() {
+        // This is the regression that grew the conflict list: several matches
+        // used to mean "insert a third entry and flag", every time.
+        let c = [
+            cand("older", "session", 0.91),
+            cand("closest", "session", 0.97),
+        ];
+        assert_eq!(
+            decide_dedup_action(None, &c, 0.95),
+            DedupAction::Merge("closest".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_flags_ambiguous_cluster_below_threshold() {
+        let c = [cand("one", "session", 0.88), cand("two", "session", 0.90)];
+        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+    }
+
+    #[test]
+    fn dedup_skips_manual_when_picking_the_best_of_many() {
+        // The manual entry scores highest but is not an eligible target, so the
+        // best distilled match wins instead.
+        let c = [
+            cand("hand-written", "manual", 0.99),
+            cand("distilled", "session", 0.96),
+        ];
+        assert_eq!(
+            decide_dedup_action(None, &c, 0.95),
+            DedupAction::Merge("distilled".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_flags_when_every_high_scorer_is_manual() {
+        let c = [
+            cand("hand-a", "manual", 0.99),
+            cand("hand-b", "manual", 0.97),
+        ];
+        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+    }
+
+    #[test]
+    fn dedup_declared_supersedes_wins_over_scores() {
+        // The model saw both values and judged them the same fact; cosine only
+        // says they are worded alike. Below-threshold matches must not override.
+        let c = [cand("some-other", "session", 0.60)];
+        assert_eq!(
+            decide_dedup_action(Some("declared-key"), &c, 0.95),
+            DedupAction::Merge("declared-key".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_declared_supersedes_applies_with_no_matches_at_all() {
+        assert_eq!(
+            decide_dedup_action(Some("declared-key"), &[], 0.95),
+            DedupAction::Merge("declared-key".to_string())
+        );
     }
 
     #[test]
