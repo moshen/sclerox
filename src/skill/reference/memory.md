@@ -28,7 +28,9 @@ into ONE canonical key — repeated supersedes converge on it. Retired keys
 never block reuse: setting a superseded key creates a fresh entry instead
 of resurrecting the old row.
 
-A conflict is a near-duplicate cluster distillation refused to auto-merge
-(several matches, or a manually written memory). Resolve one by reading
-both sides and either superseding the loser into the winner or staling it;
-the pair leaves the list as soon as either side is not active.
+A conflict is a near-duplicate cluster distillation refused to auto-merge:
+the matches were too far apart to be confidently the same fact, or the only
+close ones were written by hand and must not be overwritten automatically.
+Resolve one by reading both sides and either superseding the loser into the
+winner or staling it; the pair leaves the list as soon as either side is
+not active.

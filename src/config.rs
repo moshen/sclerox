@@ -60,6 +60,13 @@ pub struct DedupSettings {
     pub cosine_threshold: f64,
     /// Lexical token-overlap fallback threshold (used when no embedder).
     pub lexical_threshold: f64,
+    /// Cosine score at/above which a distilled memory merges into the BEST
+    /// match even when several existing memories match it.
+    ///
+    /// Without this, any fact matching 2+ existing memories is inserted and
+    /// flagged, so a topic that already has two entries accumulates a third on
+    /// every mention. That ratchet is what grows the conflict list.
+    pub merge_threshold: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +105,9 @@ pub struct DistillSettings {
     pub min_turns: usize,
     /// Re-distill only after the session grows by this many turns.
     pub min_new_turns: usize,
+    /// Existing related memories shown to the distiller so it can reuse a key
+    /// and set `supersedes` instead of inventing a near-identical slug.
+    pub context_memories: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +195,7 @@ impl Default for DedupSettings {
         Self {
             cosine_threshold: 0.85_f64,
             lexical_threshold: 0.7_f64,
+            merge_threshold: 0.95_f64,
         }
     }
 }
@@ -218,6 +229,7 @@ impl Default for DistillSettings {
             chunk_chars: 20_000,
             min_turns: 5,
             min_new_turns: 50,
+            context_memories: 12,
         }
     }
 }
@@ -357,6 +369,7 @@ impl Settings {
         );
         clamp_unit("dedup.cosine_threshold", &mut self.dedup.cosine_threshold);
         clamp_unit("dedup.lexical_threshold", &mut self.dedup.lexical_threshold);
+        clamp_unit("dedup.merge_threshold", &mut self.dedup.merge_threshold);
 
         require_positive("search.semantic_limit", &mut self.search.semantic_limit, 5);
         require_positive(

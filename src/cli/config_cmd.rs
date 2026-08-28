@@ -107,6 +107,7 @@ pub fn config_template() -> String {
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
          # lexical_threshold = {lex_thr}            # token-overlap fallback (no embedder)\n\
+         # merge_threshold = {merge_thr}              # merge into best match even when several match\n\
          \n\
          [memory]\n\
          # max_value_chars = {max_val}              # warn (not reject) above this length\n\
@@ -125,6 +126,7 @@ pub fn config_template() -> String {
          # chunk_chars = {chunk_chars}                # transcript chars per AI call\n\
          # min_turns = {min_turns}                     # sessions shorter than this are skipped\n\
          # min_new_turns = {min_new}                 # re-distill only after this much growth\n\
+         # context_memories = {ctx_mem}               # related memories shown to the distiller for key reuse\n\
          \n\
          [embed]\n\
          # chunk_size = {embed_size}                 # entity-text chunking for embeddings\n\
@@ -149,6 +151,7 @@ pub fn config_template() -> String {
         sem_lim = d.search.semantic_limit,
         cos_thr = d.dedup.cosine_threshold,
         lex_thr = d.dedup.lexical_threshold,
+        merge_thr = d.dedup.merge_threshold,
         max_val = d.memory.max_value_chars,
         ctx_tokens = d.session_context.max_tokens,
         ctx_max = d.session_context.max_chars,
@@ -161,6 +164,7 @@ pub fn config_template() -> String {
         chunk_chars = d.distill.chunk_chars,
         min_turns = d.distill.min_turns,
         min_new = d.distill.min_new_turns,
+        ctx_mem = d.distill.context_memories,
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
         max_bytes = d.index.max_file_bytes,
