@@ -206,13 +206,43 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
     let path = config_path();
 
     if !path.exists() {
-        if dry_run {
-            println!("  would create: {}", path.display());
-        } else {
-            write(&path, &config_template())?;
-            println!("config: wrote {}", path.display());
+        // A pre-rename `~/.ol/config.toml` IS the real config. Writing a
+        // default beside it would take the destination slot and make a later
+        // migrate skip it, stranding the user's settings at the old path.
+        //
+        // Adopt it rather than refusing to act: blocking on the file's mere
+        // existence just defers the problem and leaves install degraded until
+        // someone runs a second command. Moving it is non-destructive, ends
+        // with the user on the new config, and falls through to the upgrade
+        // below so the template refreshes around the values it carried.
+        match super::migrate::pending_legacy_config() {
+            Some(legacy) if dry_run => {
+                println!(
+                    "  would move {} -> {} (adopting your existing settings)",
+                    legacy.display(),
+                    path.display()
+                );
+                return Ok(());
+            }
+            Some(legacy) => {
+                super::migrate::adopt_legacy_config(&legacy, &path)?;
+                println!(
+                    "config: moved {} -> {} (adopted your existing settings)",
+                    legacy.display(),
+                    path.display()
+                );
+                // Falls through to the upgrade path below.
+            }
+            None if dry_run => {
+                println!("  would create: {}", path.display());
+                return Ok(());
+            }
+            None => {
+                write(&path, &config_template())?;
+                println!("config: wrote {}", path.display());
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
     let existing =
@@ -247,6 +277,15 @@ fn write(path: &Path, contents: &str) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// True if `contents` is a generated template with nothing set in it, i.e. it
+/// carries no user intent and can be replaced without losing anything.
+///
+/// `None` when the file isn't valid TOML: unparseable means unknown, and the
+/// caller must not treat unknown as safe to overwrite.
+pub fn is_pristine_template(contents: &str) -> Option<bool> {
+    flatten_user_values(contents).map(|v| v.is_empty())
 }
 
 /// Parse a config file into a map of (section, key) -> value for every key the
@@ -347,6 +386,24 @@ fn render_toml_value(v: &toml::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pristine_template_distinguishes_generated_from_edited() {
+        // The shipped template has every key commented out.
+        assert_eq!(is_pristine_template(&config_template()), Some(true));
+        assert_eq!(
+            is_pristine_template("# max_value_chars = 800\n"),
+            Some(true)
+        );
+        assert_eq!(is_pristine_template(""), Some(true));
+
+        assert_eq!(
+            is_pristine_template("[memory]\nmax_value_chars = 1200\n"),
+            Some(false)
+        );
+        // Unparseable is unknown, not safe.
+        assert_eq!(is_pristine_template("not [valid toml"), None);
+    }
 
     #[test]
     fn template_parses_back_to_defaults() {

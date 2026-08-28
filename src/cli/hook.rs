@@ -652,7 +652,7 @@ fn run_opencode(
 
 /// Extract conversation turns from OpenCode's SQLite database for a given session.
 fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
-    let db_path = dirs::home_dir()
+    let db_path = crate::xdg::home_dir()
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?
         .join(".local/share/opencode/opencode.db");
 
@@ -803,7 +803,7 @@ fn lock_is_stale(path: &std::path::Path, stale_secs: u64) -> bool {
 }
 
 fn find_transcript(cwd: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = crate::xdg::home_dir()?;
     let filename = format!("{session_id}.jsonl");
 
     // Fast path: try the hash derived from cwd first.

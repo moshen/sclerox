@@ -7,13 +7,13 @@ pub use log::LevelFilter;
 
 /// File-based logger. Each day gets its own file: ~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log.
 /// Multiple `sclerox` processes running concurrently safely append to the same file.
-pub struct AldLogger {
+pub struct ScleroxLogger {
     level: LevelFilter,
     file: Mutex<std::fs::File>,
     pid: u32,
 }
 
-impl AldLogger {
+impl ScleroxLogger {
     pub fn new(level: LevelFilter, log_dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(log_dir)?;
         let date = chrono::Local::now().format("%Y-%m-%d");
@@ -27,7 +27,7 @@ impl AldLogger {
     }
 }
 
-impl log::Log for AldLogger {
+impl log::Log for ScleroxLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
         if meta.level() > self.level {
             return false;
@@ -89,7 +89,7 @@ pub fn init(level: Option<LevelFilter>) {
 
     prune_old_logs(&log_dir, crate::config::settings().log.retain_days);
 
-    match AldLogger::new(level, &log_dir) {
+    match ScleroxLogger::new(level, &log_dir) {
         Ok(logger) => {
             if log::set_boxed_logger(Box::new(logger)).is_ok() {
                 log::set_max_level(level);

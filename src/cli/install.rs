@@ -201,7 +201,7 @@ fn global_gitignore_path() -> Option<std::path::PathBuf> {
         if !s.is_empty() {
             // Expand ~ if present
             let path = if s.starts_with('~') {
-                dirs::home_dir()?.join(&s[2..])
+                crate::xdg::home_dir()?.join(&s[2..])
             } else {
                 std::path::PathBuf::from(&s)
             };
@@ -209,7 +209,7 @@ fn global_gitignore_path() -> Option<std::path::PathBuf> {
         }
     }
     // XDG default: ~/.config/git/ignore
-    Some(dirs::home_dir()?.join(".config/git/ignore"))
+    Some(crate::xdg::home_dir()?.join(".config/git/ignore"))
 }
 
 fn install_global_gitignore(dry_run: bool) -> Result<()> {
@@ -306,7 +306,7 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("unsupported shell: {shell_name}"))?;
     let content = super::completions::generate_to_string(shell);
-    let home = dirs::home_dir().context("no home directory")?;
+    let home = crate::xdg::home_dir().context("no home directory")?;
 
     match shell_name {
         "zsh" => {
@@ -854,6 +854,10 @@ fn skill_files() -> &'static [(&'static str, &'static str)] {
             "reference/config.md",
             include_str!("../skill/reference/config.md"),
         ),
+        (
+            "reference/migration.md",
+            include_str!("../skill/reference/migration.md"),
+        ),
     ]
 }
 
@@ -890,18 +894,18 @@ fn target_name(target: InstallTarget) -> &'static str {
 }
 
 pub(crate) fn claude_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir().context("no home")?.join(".claude"))
+    Ok(crate::xdg::home_dir().context("no home")?.join(".claude"))
 }
 
 pub(crate) fn opencode_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(crate::xdg::home_dir()
         .context("no home")?
         .join(".config")
         .join("opencode"))
 }
 
 pub(crate) fn codex_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir().context("no home")?.join(".codex"))
+    Ok(crate::xdg::home_dir().context("no home")?.join(".codex"))
 }
 
 fn current_binary_path() -> Result<String> {

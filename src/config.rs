@@ -321,7 +321,7 @@ impl Settings {
     /// Expand a leading `~/` in db_path to the home directory.
     fn expand_db_path(&mut self) {
         if let Ok(rest) = self.db_path.strip_prefix("~") {
-            if let Some(home) = dirs::home_dir() {
+            if let Some(home) = crate::xdg::home_dir() {
                 self.db_path = home.join(rest);
             }
         }

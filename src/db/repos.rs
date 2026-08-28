@@ -109,6 +109,19 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Point a registered repo at a new `repo.db` without re-indexing it.
+    ///
+    /// Used by the `ol` -> `sclerox` migration: the per-repo index directory is
+    /// renamed `.ol` -> `.sclerox` in place, so the index itself is still valid
+    /// and only the recorded path needs to catch up.
+    pub fn repo_set_db_path(&self, path: &str, db_path: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE repos SET db_path = ?1 WHERE path = ?2",
+            params![db_path, path],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn repo_remove(&self, path: &str) -> Result<bool> {
         let n = self
             .conn

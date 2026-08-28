@@ -134,3 +134,4 @@ commands and its workflow, read the matching file on demand:
 - [reference/projects.md](reference/projects.md) — projects and their people/meetings/repos links
 - [reference/repos-and-code.md](reference/repos-and-code.md) — repo indexing, `sclerox code` search/refs/graph, ast-grep, indexing workflows
 - [reference/config.md](reference/config.md) — `sclerox config`, tunables, precedence
+- [reference/migration.md](reference/migration.md) — migrating a machine from the old `ol` install

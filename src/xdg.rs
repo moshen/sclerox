@@ -6,6 +6,25 @@
 
 use std::path::PathBuf;
 
+/// The user's home directory.
+///
+/// `dirs::home_dir()` asks Windows for `FOLDERID_Profile` and ignores the
+/// environment entirely, so on that platform a process cannot be pointed at a
+/// different home. That silently breaks `~`-relative paths for anything that
+/// sets one deliberately — a test pinning every path into a temp dir, a
+/// service account, a `runas` shell. Consult the platform's home variable
+/// first, the way `std::env::home_dir` does, and fall back to `dirs` when it
+/// is unset.
+///
+/// On Unix this is what `dirs` already does; only Windows changes.
+pub fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    match std::env::var_os(var) {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => dirs::home_dir(),
+    }
+}
+
 /// `$XDG_CONFIG_HOME`, else `~/.config`. Holds `config.toml`.
 pub fn config_home() -> PathBuf {
     from_env_or_home("XDG_CONFIG_HOME", ".config")
@@ -29,7 +48,7 @@ fn from_env_or_home(var: &str, fallback_rel: &str) -> PathBuf {
             return PathBuf::from(v);
         }
     }
-    dirs::home_dir()
+    home_dir()
         .map(|h| h.join(fallback_rel))
         .unwrap_or_else(|| PathBuf::from(fallback_rel))
 }

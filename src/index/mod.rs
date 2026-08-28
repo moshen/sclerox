@@ -424,10 +424,22 @@ impl Default for RepoConfig {
 
 /// Read `<root>/.sclerox/config.toml`. Tolerant: any read/parse error yields
 /// defaults so a stray file never breaks indexing.
+///
+/// Falls back to the pre-rename `<root>/.ol/config.toml` when the current path
+/// is absent. Callers that index a repo root self-heal the directory name
+/// first, but the child-folder opt-out checks (nested pruning, subfolder
+/// coverage) run inside walkers where renaming per entry would be wrong and
+/// costly. Reading the legacy marker keeps an opt-out honoured everywhere
+/// until `sclerox migrate` renames it. Defaults are `index = true`, so missing
+/// this file silently re-enables indexing on a folder that opted out.
 pub fn repo_config(root: &Path) -> RepoConfig {
     let path = root.join(".sclerox").join("config.toml");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return RepoConfig::default();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => match std::fs::read_to_string(root.join(".ol").join("config.toml")) {
+            Ok(c) => c,
+            Err(_) => return RepoConfig::default(),
+        },
     };
     #[derive(serde::Deserialize)]
     struct Raw {
@@ -469,7 +481,7 @@ fn is_unsafe_index_root(root: &Path) -> bool {
     if root.components().count() < 3 {
         return true;
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::xdg::home_dir() {
         // The home dir itself, or any ancestor of it (`/Users`, `/home`).
         if root == home || home.starts_with(root) {
             return true;
@@ -739,6 +751,52 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn repo_config_prefers_current_path() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".sclerox")).unwrap();
+        std::fs::write(
+            dir.path().join(".sclerox").join("config.toml"),
+            "index = false",
+        )
+        .unwrap();
+        assert!(!repo_config(dir.path()).index);
+    }
+
+    #[test]
+    fn repo_config_falls_back_to_legacy_optout() {
+        // A pre-rename opt-out must keep working until `sclerox migrate`
+        // renames it; defaults are index = true, so missing it would silently
+        // re-enable indexing on a folder that deliberately opted out.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ol")).unwrap();
+        std::fs::write(dir.path().join(".ol").join("config.toml"), "index = false").unwrap();
+        assert!(!repo_config(dir.path()).index);
+    }
+
+    #[test]
+    fn repo_config_current_path_wins_over_legacy() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".sclerox")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ol")).unwrap();
+        std::fs::write(
+            dir.path().join(".sclerox").join("config.toml"),
+            "index = true",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".ol").join("config.toml"), "index = false").unwrap();
+        assert!(
+            repo_config(dir.path()).index,
+            "current path is authoritative"
+        );
+    }
+
+    #[test]
+    fn repo_config_defaults_to_indexing_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(repo_config(dir.path()).index);
+    }
+
     fn make_test_repo() -> TempDir {
         let dir = TempDir::new().unwrap();
         std::fs::write(
@@ -930,7 +988,7 @@ class Handler:
             "/Users/nobody/code/some-project"
         )));
         // The home dir itself is refused.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::xdg::home_dir() {
             assert!(is_unsafe_index_root(&home));
         }
     }
