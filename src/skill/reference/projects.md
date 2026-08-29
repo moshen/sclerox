@@ -9,5 +9,5 @@ sclerox project meetings add|remove|list <project_id> <meeting_id>
 sclerox project repos add|remove|list <project_id> <repo_id>
 ```
 
-Linking a repo to a project is part of the repo workflow — see
+Linking a repo to a project is part of the repo workflow - see
 [repos-and-code.md](repos-and-code.md).

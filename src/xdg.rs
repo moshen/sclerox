@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// `dirs::home_dir()` asks Windows for `FOLDERID_Profile` and ignores the
 /// environment entirely, so on that platform a process cannot be pointed at a
 /// different home. That silently breaks `~`-relative paths for anything that
-/// sets one deliberately — a test pinning every path into a temp dir, a
+/// sets one deliberately - a test pinning every path into a temp dir, a
 /// service account, a `runas` shell. Consult the platform's home variable
 /// first, the way `std::env::home_dir` does, and fall back to `dirs` when it
 /// is unset.

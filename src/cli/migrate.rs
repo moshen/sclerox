@@ -1,4 +1,4 @@
-//! `sclerox migrate` — one-time cleanup for a machine that has an old, pre-rename
+//! `sclerox migrate` - one-time cleanup for a machine that has an old, pre-rename
 //! `ol` install: moves `~/.ol/*` onto the new XDG layout and strips
 //! old-marker tool integrations (hooks, skill dir, OpenCode plugin, doc
 //! sections) that `sclerox install` doesn't recognize as its own, and renames
@@ -7,7 +7,7 @@
 //!
 //! Self-contained on purpose: everything specific to the `ol` → `sclerox`
 //! transition lives here (plus `crate::migrate` for the per-repo half), so
-//! this file — and its one `Commands::Migrate` arm in `cli/mod.rs` — can be
+//! this file - and its one `Commands::Migrate` arm in `cli/mod.rs` - can be
 //! deleted wholesale once upgraders have had a couple of releases to run it.
 //!
 //! Explicit command, not automatic-on-startup: an automatic migration could
@@ -42,7 +42,7 @@ pub fn run_migrate(args: MigrateArgs) -> Result<()> {
     did_anything |= migrate_registered_repos(args.dry_run)?;
 
     if !did_anything {
-        println!("Nothing to migrate — already on the sclerox / XDG layout.");
+        println!("Nothing to migrate - already on the sclerox / XDG layout.");
     } else if args.dry_run {
         println!("\n(dry-run: nothing was written)");
     } else {
@@ -63,7 +63,7 @@ fn warn_about_stale_ol_binary() {
     println!(
         "\nWarning: an old `ol` binary is still on your PATH:\n  \
          {}\n\
-         Its database has moved. Running it now does not fail — it creates a new\n\
+         Its database has moved. Running it now does not fail - it creates a new\n\
          EMPTY ~/.ol/ol.db and returns no results with exit 0, so anything still\n\
          calling `ol ...` will silently read an empty knowledge base.\n\
          Remove it once you are happy with this migration, and update any of your\n\
@@ -480,7 +480,7 @@ fn migrate_config_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
         // not ours to overwrite.
         _ => {
             println!(
-                "  kept {} — it has settings of its own, so {} was left in place.",
+                "  kept {} - it has settings of its own, so {} was left in place.",
                 dst.display(),
                 src.display()
             );
@@ -506,14 +506,14 @@ fn replace_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Move a single file, skipping (and warning) if the destination already
-/// exists — never clobber something that's already at the new location.
+/// exists - never clobber something that's already at the new location.
 fn move_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
     if !src.exists() {
         return Ok(false);
     }
     if dst.exists() {
         println!(
-            "  kept existing {} — left old {} in place (remove it manually once you've confirmed the new one is correct)",
+            "  kept existing {} - left old {} in place (remove it manually once you've confirmed the new one is correct)",
             dst.display(),
             src.display()
         );

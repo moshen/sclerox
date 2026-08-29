@@ -912,8 +912,8 @@ fn commands_stay_fast() {
     // Best-of-N: take the FASTEST of several runs. Tests run in parallel, so a
     // single run can be inflated by a transient scheduler/CI load spike; the
     // best case still reflects true command cost, so a real regression fails it
-    // while noise doesn't. (Model load can't be amortized this way — each `sclerox`
-    // invocation is a fresh process — which is why `search` is budgeted below.)
+    // while noise doesn't. (Model load can't be amortized this way - each `sclerox`
+    // invocation is a fresh process - which is why `search` is budgeted below.)
     let best_of = |args: &[&str], runs: u32| -> Duration {
         (0..runs)
             .map(|_| {
@@ -925,7 +925,7 @@ fn commands_stay_fast() {
             .unwrap()
     };
 
-    // Pure SQLite-backed commands must stay fast — this is the real regression
+    // Pure SQLite-backed commands must stay fast - this is the real regression
     // guard (e.g. catching an accidental full-table scan).
     let fast: &[(&[&str], &str)] = &[
         (&["memory", "list"], "memory list"),
@@ -943,7 +943,7 @@ fn commands_stay_fast() {
         );
     }
 
-    // `sclerox search` loads the embedding model on every invocation — a fixed
+    // `sclerox search` loads the embedding model on every invocation - a fixed
     // startup cost (~100ms+, hardware-dependent), not a data-size regression.
     // It gets a looser budget that still catches gross slowdowns (seconds).
     let t = best_of(&["search", "perf"], 3);

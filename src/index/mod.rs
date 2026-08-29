@@ -68,7 +68,7 @@ fn max_tree_sitter_bytes() -> usize {
 pub struct RepoIndexer<'a> {
     embedder: Option<&'a mut Embedder>,
     /// Bypass the max-files cap (set by explicit `sclerox repo index --force`).
-    /// The unsafe-root refusal is never bypassed — home/root are always off-limits.
+    /// The unsafe-root refusal is never bypassed - home/root are always off-limits.
     force: bool,
     /// Override the max-files cap; `None` reads it from the env (bridged config).
     max_files: Option<usize>,
@@ -123,14 +123,14 @@ impl<'a> RepoIndexer<'a> {
         // an index of the entire home directory. Not bypassable by --force.
         if is_unsafe_index_root(repo_root) {
             log::warn!(
-                "refusing to index '{}' — too high in the filesystem (home/root/top-level)",
+                "refusing to index '{}' - too high in the filesystem (home/root/top-level)",
                 repo_root.display()
             );
             return Ok(IndexResult::default());
         }
 
         // Self-heal a pre-rename `.ol/` left by an old `ol` install, before
-        // anything reads `.sclerox/` — otherwise a legacy opt-out in `.ol/config.toml`
+        // anything reads `.sclerox/` - otherwise a legacy opt-out in `.ol/config.toml`
         // would be invisible to the check below. See `crate::migrate`.
         crate::migrate::migrate_legacy_repo_dir(repo_root);
 
@@ -138,9 +138,9 @@ impl<'a> RepoIndexer<'a> {
         // skip excluded folders. Also self-heal: if this folder was indexed
         // before being opted out, retract the now-stale index (repo.db + its
         // WAL/SHM sidecars) and the primary registry entry. Keep .sclerox/config.toml
-        // — it is the opt-out marker itself.
+        // - it is the opt-out marker itself.
         if !repo_config(repo_root).index {
-            log::info!("skipping '{name}' — indexing disabled in .sclerox/config.toml");
+            log::info!("skipping '{name}' - indexing disabled in .sclerox/config.toml");
             let sclerox_dir = repo_root.join(".sclerox");
             let mut retracted = false;
             for fname in ["repo.db", "repo.db-wal", "repo.db-shm"] {
@@ -162,10 +162,10 @@ impl<'a> RepoIndexer<'a> {
         }
 
         // Don't create a nested index when an ancestor folder is already
-        // indexed — the parent's index already covers this subtree. Only a
+        // indexed - the parent's index already covers this subtree. Only a
         // *proper* ancestor counts, so re-indexing the same root still works.
         if let Some(parent) = parent_indexed_repo(db, repo_root)? {
-            log::info!("skipping '{name}' — already covered by parent index at {parent}");
+            log::info!("skipping '{name}' - already covered by parent index at {parent}");
             return Ok(IndexResult::default());
         }
 
@@ -182,7 +182,7 @@ impl<'a> RepoIndexer<'a> {
         } = collect_indexable_files(repo_root, max_files);
         if over_cap && !self.force {
             log::warn!(
-                "refusing to index '{name}' — more than {max_files} indexable files. \
+                "refusing to index '{name}' - more than {max_files} indexable files. \
                  Re-run with `sclerox repo index --force` or raise [index].max_files.",
             );
             return Ok(IndexResult::default());
@@ -351,7 +351,7 @@ impl<'a> RepoIndexer<'a> {
         }
 
         // Nothing to index: a fresh run over a folder with no indexable source
-        // files. Don't leave a stub repo.db or a registry entry behind — drop
+        // files. Don't leave a stub repo.db or a registry entry behind - drop
         // the handle, remove the db (and its WAL/SHM sidecars), and skip
         // registration. Only do this when we created the db this run
         // (`!db_existed`); an existing index whose files are all unchanged
@@ -370,7 +370,7 @@ impl<'a> RepoIndexer<'a> {
             // Remove .sclerox too if it's now empty; a no-op when anything else
             // (e.g. a config.toml) still lives there.
             let _ = std::fs::remove_dir(&sclerox_dir);
-            log::info!("skipping '{name}' — nothing to index");
+            log::info!("skipping '{name}' - nothing to index");
             return Ok(result);
         }
 
@@ -493,7 +493,7 @@ fn is_unsafe_index_root(root: &Path) -> bool {
 /// Files to index plus the nested git repos discovered at boundaries.
 struct WalkOutcome {
     files: Vec<std::path::PathBuf>,
-    /// Nested git repo roots pruned at their `.git` boundary — each is indexed
+    /// Nested git repo roots pruned at their `.git` boundary - each is indexed
     /// on its own so a parent index produces a separate entry per `.git` level.
     nested_repos: Vec<std::path::PathBuf>,
     /// The file count exceeded `max_files`; the caller rejects or forces.
@@ -506,7 +506,7 @@ struct WalkOutcome {
 fn collect_indexable_files(repo_root: &Path, max_files: usize) -> WalkOutcome {
     use std::sync::{Arc, Mutex};
     // filter_entry must be Fn + Send + Sync + 'static, so it can't borrow a
-    // local Vec — collect nested repo roots through shared interior mutability.
+    // local Vec - collect nested repo roots through shared interior mutability.
     // The walker is single-threaded, so there's no real contention.
     let nested: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let nested_filter = Arc::clone(&nested);
@@ -529,7 +529,7 @@ fn collect_indexable_files(repo_root: &Path, max_files: usize) -> WalkOutcome {
             // Directory rules below apply only to *sub*directories; depth() > 0
             // skips re-checking the root itself.
             if e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                // A nested git repo is its own index target — treat its .git as
+                // A nested git repo is its own index target - treat its .git as
                 // a boundary (don't absorb its files) and remember it so the
                 // caller can index it separately: one .sclerox per .git level.
                 if is_git_repo(e.path()) {
@@ -575,7 +575,7 @@ fn is_git_repo(p: &Path) -> bool {
 /// How to resolve a nested (ancestor, descendant) pair of registered folders.
 #[derive(Debug, PartialEq, Eq)]
 enum NestedResolution {
-    /// Both are real repos (nested git) — each keeps its own index.
+    /// Both are real repos (nested git) - each keeps its own index.
     KeepBoth,
     /// Drop the ancestor (a spurious non-git "workspace" holding a real repo).
     DropAncestor,
@@ -584,7 +584,7 @@ enum NestedResolution {
 }
 
 /// Decide what to do when one registered folder sits inside another.
-/// Two git repos nested one inside the other are independent — the parent's
+/// Two git repos nested one inside the other are independent - the parent's
 /// walk stops at the inner .git boundary, so each keeps its own index. A non-git
 /// ancestor holding a git descendant is a spurious "workspace" folder (indexed
 /// by an over-eager hook) and loses to its real repo child. Otherwise the
@@ -616,7 +616,7 @@ pub fn prune_nested_repos(db: &Database) -> Result<Vec<String>> {
         for (j, (_, cj)) in canon.iter().enumerate() {
             // Only consider ci as a *proper* ancestor of cj. `starts_with` is
             // component-wise. `ci == cj` (two rows for the same real dir) is
-            // left alone here — canonical registration prevents new ones.
+            // left alone here - canonical registration prevents new ones.
             if i == j || ci == cj || !cj.starts_with(ci) {
                 continue;
             }
@@ -664,7 +664,7 @@ fn canonical_or_self(p: &Path) -> std::path::PathBuf {
 /// Retract every registered index whose folder is a proper descendant of
 /// `repo_root`: the parent now covers those files, so the nested `.sclerox/repo.db`
 /// and its registry entry are redundant. A descendant that explicitly opted out
-/// (`index = false`) keeps its own index — that is a deliberate independent one.
+/// (`index = false`) keeps its own index - that is a deliberate independent one.
 fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
     let repo_root = canonical_or_self(repo_root);
     for r in db.repo_list()? {
@@ -702,7 +702,7 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
         }
         if retracted {
             log::info!(
-                "retracted nested index under {} — covered by parent {}",
+                "retracted nested index under {} - covered by parent {}",
                 child_raw.display(),
                 repo_root.display()
             );
@@ -715,7 +715,7 @@ fn retract_nested_child_indexes(db: &Database, repo_root: &Path) -> Result<()> {
 /// Used to skip indexing a subfolder that a parent index already covers.
 /// Returns the ancestor's (stored) path if one is registered, else `None`.
 fn parent_indexed_repo(db: &Database, repo_root: &Path) -> Result<Option<String>> {
-    // A git repo is its own index even when nested inside another repo — each
+    // A git repo is its own index even when nested inside another repo - each
     // .git level gets its own .sclerox, and the parent's walk stops at the boundary
     // so it never covered this repo anyway. Only a non-git folder is deemed
     // covered by a parent index.
@@ -726,7 +726,7 @@ fn parent_indexed_repo(db: &Database, repo_root: &Path) -> Result<Option<String>
     for r in db.repo_list()? {
         // Canonicalize both sides so differing path forms still match. A
         // registry entry whose directory is gone fails to canonicalize and is
-        // skipped — that doubles as the stale-parent guard. `starts_with` is
+        // skipped - that doubles as the stale-parent guard. `starts_with` is
         // component-wise, so `/a/bc` is not treated as under `/a/b`, and the
         // equality check excludes the repo itself (only a proper ancestor
         // short-circuits, so re-indexing the same root still works).
@@ -1279,7 +1279,7 @@ class Handler:
     fn test_nested_git_repos_index_separately() {
         // A git repo containing a nested git repo: the outer index must stop at
         // the inner .git boundary (not absorb inner files), and the inner repo
-        // must get its own index — one .sclerox per .git level.
+        // must get its own index - one .sclerox per .git level.
         let outer = TempDir::new().unwrap();
         std::fs::create_dir_all(outer.path().join(".git")).unwrap();
         std::fs::write(outer.path().join("outer.rs"), "fn outer() {}").unwrap();
@@ -1305,7 +1305,7 @@ class Handler:
             "outer must not absorb the nested repo's files"
         );
 
-        // The nested repo was indexed automatically — its own .sclerox with its file.
+        // The nested repo was indexed automatically - its own .sclerox with its file.
         let inner_db = RepoDb::open(&inner.join(".sclerox").join("repo.db")).unwrap();
         assert!(
             inner_db
@@ -1316,7 +1316,7 @@ class Handler:
             "nested repo indexed on its own"
         );
 
-        // Two registry entries — one per .git level, from a single index call.
+        // Two registry entries - one per .git level, from a single index call.
         let repos = db.repo_list().unwrap();
         assert_eq!(repos.len(), 2, "two repo entries from one index");
         // Both are stored canonicalized (index_repo canonicalizes before register).

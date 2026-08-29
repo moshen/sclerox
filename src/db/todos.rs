@@ -148,7 +148,7 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
         let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|t| t.id).collect();
 
-        // Tier 2: LIKE substring fallback — catches mid-word occurrences not found by FTS
+        // Tier 2: LIKE substring fallback - catches mid-word occurrences not found by FTS
         let mut stmt2 = self.conn.prepare(
             "SELECT id, title, notes, status, source_url, category, originated_date,
                     deadline_date, completed_at, created_at, updated_at

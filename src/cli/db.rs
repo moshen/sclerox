@@ -727,7 +727,7 @@ mod tests {
         assert!(dir.path().join("people/colin-kennedy.md").exists());
         assert!(dir.path().join("memory/project/active.md").exists());
 
-        // Re-run after deleting the person — their file should vanish.
+        // Re-run after deleting the person - their file should vanish.
         let _ = db.people_delete(pid);
         export(&db, dir.path()).unwrap();
         assert!(!dir.path().join("people/colin-kennedy.md").exists());

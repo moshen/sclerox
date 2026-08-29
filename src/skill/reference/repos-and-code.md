@@ -44,8 +44,8 @@ sclerox code search "<symbol>" --output json \
 ## Workflow: entering a repo/folder not yet indexed
 
 The SessionStart hook auto-indexes the git repo you start in. If you're about to
-work in a folder that is NOT already indexed (check `sclerox repo list`) — especially
-a large monorepo or a catch-all working directory — ASK the user whether to
+work in a folder that is NOT already indexed (check `sclerox repo list`) - especially
+a large monorepo or a catch-all working directory - ASK the user whether to
 index it before running `sclerox repo index`. Indexing large trees adds many embedded
 chunks and slows search. If they decline, create `<repo-root>/.sclerox/config.toml`
 with `index = false` so the hook and future `sclerox repo index` calls skip it

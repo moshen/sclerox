@@ -9,7 +9,7 @@ Use when the user asks about people, meetings, projects, todos, past
 decisions, research, or code, or when knowledge base context would help.
 
 Per-domain detail (each area's commands plus its workflow) lives in
-`reference/`. Read the one file for whatever you're working on — see the
+`reference/`. Read the one file for whatever you're working on - see the
 Reference index at the end.
 
 ## When to use
@@ -23,10 +23,10 @@ Reference index at the end.
 - When a memory is wrong or outdated: mark it stale or supersede it
 - Looking for code: use `sclerox code` (see below) BEFORE Grep/Glob
 
-## Decisions — record automatically, don't wait to be asked
+## Decisions - record automatically, don't wait to be asked
 
 Whenever a decision is encountered in conversation, write it to memory at that
-moment. Do not ask permission and do not defer to session distillation — the
+moment. Do not ask permission and do not defer to session distillation - the
 decision and its WHY should survive even if the session is never distilled.
 
 Triggers (any of these = a decision):
@@ -43,11 +43,11 @@ sclerox memory set "<area>-<decision-slug>" \
   --type project
 ```
 
-Include the why and the rejected alternatives — future sessions need the
+Include the why and the rejected alternatives - future sessions need the
 reasoning, not just the verdict. If the decision reverses an earlier one, use
 `sclerox memory supersede <old_key> <new_key> "<new value>"` instead of a bare set.
 
-## Code search — prefer this over Grep/Glob
+## Code search - prefer this over Grep/Glob
 
 When searching for symbols, functions, types, or callers in ANY indexed repo,
 use `sclerox code` BEFORE reaching for Grep or Glob. It is pre-indexed (no directory
@@ -77,7 +77,7 @@ see [reference/repos-and-code.md](reference/repos-and-code.md).
 **Attributing a memory:** `sclerox memory people add <key> <person_id>`
 **Session summary:** `sclerox memory set "session/<YYYY-MM-DD>/<slug>" "<what was done>" --type session`
 
-## Privacy — wrap secrets in `<private>` BEFORE you reply
+## Privacy - wrap secrets in `<private>` BEFORE you reply
 
 The Stop hook distills every session into long-lived memory. **Anything you
 include in a reply that isn't wrapped in `<private>...</private>` is fair game
@@ -110,7 +110,7 @@ Only "Here are the prod credentials I just pulled:" and "We need to rotate
 them tomorrow." can be distilled. The keys themselves are dropped.
 
 **Do not** wrap normal technical discussion, error messages without
-credentials, file paths, or commit hashes — that's the content the agent
+credentials, file paths, or commit hashes - that's the content the agent
 needs to recall later.
 
 ## Session start context
@@ -118,7 +118,7 @@ needs to recall later.
 When a session starts in a git repo, `sclerox hook start` automatically injects a
 compact index of open todos, open research, recent sessions, and memory keys
 (capped at ~750 tokens). You do NOT need to run `sclerox todo list` or `sclerox memory
-list` at session start — they're already visible. Use `sclerox memory get <key>`,
+list` at session start - they're already visible. Use `sclerox memory get <key>`,
 `sclerox todo get <id>`, etc. to fetch full content for items that look relevant.
 
 ## Reference
@@ -126,12 +126,12 @@ list` at session start — they're already visible. Use `sclerox memory get <key
 Global search across everything: `sclerox search "<query>"`. For an area's full
 commands and its workflow, read the matching file on demand:
 
-- [reference/memory.md](reference/memory.md) — set/get/search, stale, supersede, review, distill, import
-- [reference/people.md](reference/people.md) — people and their identifiers
-- [reference/meetings.md](reference/meetings.md) — meetings, storing full transcripts, recording a meeting
-- [reference/todos.md](reference/todos.md) — todos, linking a todo to a project
-- [reference/research.md](reference/research.md) — investigations, starting one and linking it to a project
-- [reference/projects.md](reference/projects.md) — projects and their people/meetings/repos links
-- [reference/repos-and-code.md](reference/repos-and-code.md) — repo indexing, `sclerox code` search/refs/graph, ast-grep, indexing workflows
-- [reference/config.md](reference/config.md) — `sclerox config`, tunables, precedence
-- [reference/migration.md](reference/migration.md) — migrating a machine from the old `ol` install
+- [reference/memory.md](reference/memory.md) - set/get/search, stale, supersede, review, distill, import
+- [reference/people.md](reference/people.md) - people and their identifiers
+- [reference/meetings.md](reference/meetings.md) - meetings, storing full transcripts, recording a meeting
+- [reference/todos.md](reference/todos.md) - todos, linking a todo to a project
+- [reference/research.md](reference/research.md) - investigations, starting one and linking it to a project
+- [reference/projects.md](reference/projects.md) - projects and their people/meetings/repos links
+- [reference/repos-and-code.md](reference/repos-and-code.md) - repo indexing, `sclerox code` search/refs/graph, ast-grep, indexing workflows
+- [reference/config.md](reference/config.md) - `sclerox config`, tunables, precedence
+- [reference/migration.md](reference/migration.md) - migrating a machine from the old `ol` install

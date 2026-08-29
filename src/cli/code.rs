@@ -48,7 +48,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 return Ok(());
             }
 
-            // Embed the query once for the semantic tier (best-effort — skipped
+            // Embed the query once for the semantic tier (best-effort - skipped
             // if the model is unavailable). FTS symbol search always runs.
             let query_emb = crate::embed::Embedder::new()
                 .ok()

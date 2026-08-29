@@ -55,7 +55,7 @@ pub enum SearchResult {
         start_line: i64,
     },
     /// A semantically-matched code chunk (not a named symbol) from a repo's
-    /// indexed content — catches comments, strings, and logic FTS symbol search
+    /// indexed content - catches comments, strings, and logic FTS symbol search
     /// misses.
     CodeChunk {
         repo_name: String,

@@ -19,7 +19,7 @@ use migrations::{Migration, PRIMARY_MIGRATIONS, PRIMARY_VERSION};
 static VEC_INIT: Once = Once::new();
 
 /// Register the sqlite-vec extension so `vec0` virtual tables are available on
-/// every connection opened AFTER this call. Idempotent — call before each
+/// every connection opened AFTER this call. Idempotent - call before each
 /// `Connection::open` (primary and per-repo). Must run before any migration
 /// that creates a vec0 table.
 pub fn register_vec_extension() {
@@ -269,7 +269,7 @@ mod tests {
         run_migrations(&conn, 1, PRIMARY_MIGRATIONS, 11).unwrap();
 
         // Legacy shape: key-based pointers, plus one resurrected row (active
-        // but still carrying a stale pointer — the corruption v12 fixes).
+        // but still carrying a stale pointer - the corruption v12 fixes).
         conn.execute_batch(
             "INSERT INTO memory (key, value, status, superseded_by) VALUES
                  ('old', 'v1', 'superseded', 'new'),

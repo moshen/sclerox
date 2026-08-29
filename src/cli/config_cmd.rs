@@ -47,7 +47,7 @@ fn show(format: OutputFormat) -> Result<()> {
         let source = if path.exists() {
             format!("loaded from {}", path.display())
         } else {
-            format!("no file at {} — using defaults", path.display())
+            format!("no file at {} - using defaults", path.display())
         };
         println!("# sclerox effective settings ({source})");
         let overrides = active_env_overrides();
@@ -81,7 +81,7 @@ fn active_env_overrides() -> Vec<&'static str> {
 pub fn config_template() -> String {
     let d = Settings::default();
     format!(
-        "# sclerox configuration — all keys optional; defaults shown.\n\
+        "# sclerox configuration - all keys optional; defaults shown.\n\
          # Precedence: CLI flag > env var > this file > built-in default.\n\
          # Uncomment a line to change it. `sclerox install` refreshes this file and\n\
          # preserves any values you've set.\n\
@@ -197,7 +197,7 @@ pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Res
     Ok(())
 }
 
-/// Install-time helper: create the config if missing, or UPGRADE it in place —
+/// Install-time helper: create the config if missing, or UPGRADE it in place -
 /// regenerate the commented template (refreshed docs + any new keys) while
 /// preserving every value the user has set. Like the CLAUDE.md / skill refresh,
 /// this keeps the file current across sclerox versions. Never loses user settings; a

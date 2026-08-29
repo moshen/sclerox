@@ -56,7 +56,7 @@ pub enum RepoCommand {
     ///
     /// The auto-index hooks index without an embedder, so hook-indexed repos
     /// have code chunks but no embeddings (semantic code search skips them).
-    /// This embeds the stored chunk text in place — no re-parsing.
+    /// This embeds the stored chunk text in place - no re-parsing.
     Reembed {
         /// Restrict to repos whose name contains this string
         #[arg(long)]
@@ -79,7 +79,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             // Walk up to the git root so `sclerox repo index` from a subdirectory indexes the whole repo.
             let canonical = find_git_root(&canonical);
             // Self-heal a pre-rename `.ol/` before the opt-out check below reads
-            // `.sclerox/config.toml` — see `crate::migrate`.
+            // `.sclerox/config.toml` - see `crate::migrate`.
             crate::migrate::migrate_legacy_repo_dir(&canonical);
             // Respect a per-folder opt-out before loading the (expensive) model.
             if !crate::index::repo_config(&canonical).index {

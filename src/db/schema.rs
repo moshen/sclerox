@@ -543,7 +543,7 @@ END;
 /// active row by the old resurrection bug is cleared during the copy.
 ///
 /// memory_people references memory(id), so with foreign_keys=ON its rows are
-/// parked in a plain backup table first — otherwise DROP TABLE memory's
+/// parked in a plain backup table first - otherwise DROP TABLE memory's
 /// implicit DELETE would cascade into it. The FTS and vec sync triggers die
 /// with the old table and are recreated verbatim; both indexes are rebuilt
 /// (row ids are preserved, but a rebuild makes consistency unconditional).
@@ -645,7 +645,7 @@ CREATE TABLE memory_conflicts (
 );
 ";
 
-/// Migration v8: merge jira into atlassian — one Atlassian account covers all products.
+/// Migration v8: merge jira into atlassian - one Atlassian account covers all products.
 pub const MIGRATION_V8: &str = "
 DELETE FROM identifier_types WHERE name = 'jira';
 UPDATE identifier_types

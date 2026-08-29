@@ -1,6 +1,26 @@
-# sclerox — Sclerox CLI
+# Sclerox
 
-A SQLite-backed personal knowledge base for AI-augmented engineering. Indexes your code repos, meeting notes, todos, research investigations, and memories — all searchable from one place.
+![Sclerox Logo](README/sclerox-logo.svg)
+
+A SQLite-backed personal knowledge base for AI-augmented engineering. Sclerox
+indexes your code repos, meeting notes, todos, research investigations, and
+memories. All with a single executable.
+
+## Why?
+
+There are a plethora of implementations of durable memory replacement and search
+systems for local agents. This one has largely been generated in a guided way as
+an experiment and as an effort to explore creating my own agent tooling.
+
+After reading through a few other implementations, their requirements for full
+functionality amounted to installing a locally running distributed system, or a
+loose collection of tools. I mostly wanted something that was easy to install
+and reason about, all while being backed by a database that could be read
+indepenent of the tool itself (in this case sqlite).
+
+I'm continuing to use this too daily, while expanding the capabilities and
+fixing bugs. If you've come to rely on this, please feel free to drop a message
+in the issues for any feature requests or bug reports.
 
 ## Install
 
@@ -42,9 +62,9 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 ```
 
 `sclerox install` writes:
-- `~/.claude/skills/sclerox-kb/` — skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
-- `~/.claude/settings.json` — `SessionStart` and `Stop` hooks that auto-index repos and distill memories
-- `~/.config/git/ignore` — excludes `.sclerox/` from all repos
+- `~/.claude/skills/sclerox-kb/` - skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
+- `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories
+- `~/.config/git/ignore` - excludes `.sclerox/` from all repos
 
 ## Quick start
 
@@ -188,7 +208,7 @@ chunk size, `[index]` (`max_file_bytes`, `max_files`, `auto`), `[install]`
 
 `[ai].command` is the full distillation command (the transcript prompt is
 appended as the last argument). If unset, sclerox uses the built-in default for the
-agent that invoked it — `claude -p --safe-mode --no-session-persistence --tools=`
+agent that invoked it - `claude -p --safe-mode --no-session-persistence --tools=`
 or `opencode run --pure`.
 
 Environment variables still work and override the file:
@@ -197,7 +217,7 @@ Environment variables still work and override the file:
 |----------|---------|-------------|
 | `SCLEROX_CONFIG` | `~/.config/sclerox/config.toml` | Config file path |
 | `SCLEROX_DB` | `~/.local/share/sclerox/sclerox.db` | Primary database path |
-| `SCLEROX_LOG` | off | Log level: `error\|warn\|info\|debug` → `~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log` |
+| `SCLEROX_LOG` | off | Log level: `error\|warn\|info\|debug` -> `~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log` |
 | `SCLEROX_AI_COMMAND` | agent default | Full distillation command (prompt appended last) |
 | `SCLEROX_AI_MODEL` | agent default | Model appended to the default command |
 | `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
@@ -207,14 +227,17 @@ Environment variables still work and override the file:
 
 After `sclerox install`, two Claude Code lifecycle hooks are active:
 
-- **`SessionStart`** — `sclerox hook start` indexes the current repo if it has a `.git` directory (incremental, fast)
-- **`Stop`** — `sclerox hook stop` re-indexes the repo, then spawns a background process that distills session memories via `claude -p` and stores them in `sclerox memory`
+- **`SessionStart`** - `sclerox hook start` indexes the current repo if it has a `.git` directory (incremental, fast)
+- **`Stop`** - `sclerox hook stop` re-indexes the repo, then spawns a background
+  process that distills session memories via `claude -p` and stores them in
+  `sclerox memory`
 
 Distillation is tracked per-session: re-runs only when the session has grown by 50+ new turns.
 
 ## Supported languages
 
-Tree-sitter parsing (full symbol extraction): Rust, Python, TypeScript, JavaScript, Go, C#, Java, C/C++, Ruby, Kotlin, SQL, Shell
+Tree-sitter parsing (full symbol extraction): Rust, Python, TypeScript,
+JavaScript, Go, C#, Java, C/C++, Ruby, Kotlin, SQL, Shell
 
 Line-based chunking (indexed but no symbol extraction): Swift, Scala, PHP, Markdown
 

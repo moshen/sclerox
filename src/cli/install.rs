@@ -49,7 +49,7 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     super::config_cmd::install_default_config(args.dry_run)?;
     if super::migrate::legacy_data_present() {
         println!(
-            "\nDetected an old `ol` install at ~/.ol — run `sclerox migrate` to move it over."
+            "\nDetected an old `ol` install at ~/.ol - run `sclerox migrate` to move it over."
         );
     }
     if args.dry_run {
@@ -65,7 +65,7 @@ pub fn run_uninstall(args: InstallArgs) -> Result<()> {
         println!("Uninstalling for {}...", target_name(target));
         uninstall_for_target(target, &args)?;
     }
-    // Deliberately keep ~/.config/sclerox/config.toml — it holds user edits.
+    // Deliberately keep ~/.config/sclerox/config.toml - it holds user edits.
     let cfg = crate::config::config_path();
     if cfg.exists() {
         println!(
@@ -715,7 +715,7 @@ fn append_or_create_section(
         String::new()
     };
     // Protect a customized section when asked. A fresh file (no marker yet) is
-    // still created — the policy only guards an existing sclerox-kb section.
+    // still created - the policy only guards an existing sclerox-kb section.
     if !overwrite && existing.contains(SECTION_MARKER) {
         println!(
             "  {}: kept existing sclerox-kb section (install.overwrite_instructions = false)",

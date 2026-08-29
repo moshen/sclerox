@@ -61,7 +61,7 @@ impl Database {
     ///
     /// The upsert targets the active-only partial unique index: an existing
     /// ACTIVE row with this key is updated in place, while retired (superseded
-    /// or stale) rows never conflict — reusing their key creates a fresh row
+    /// or stale) rows never conflict - reusing their key creates a fresh row
     /// instead of resurrecting history. Returns the active row's id.
     pub fn memory_set_full(
         &self,
@@ -312,7 +312,7 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Active memories with no embedding yet — the backfill work list.
+    /// Active memories with no embedding yet - the backfill work list.
     pub fn memory_needing_embedding(&self) -> Result<Vec<MemoryEntry>> {
         let sql = format!(
             "SELECT {MEMORY_COLS} FROM memory
@@ -400,7 +400,7 @@ impl Database {
     /// row is marked superseded with its pointer set to the new row's id. The
     /// new entry upserts against the active-only key index, so repeated
     /// supersedes can converge on one canonical key without ever resurrecting
-    /// a retired row. Errors when old and new keys are the same — that is an
+    /// a retired row. Errors when old and new keys are the same - that is an
     /// in-place update, not a supersession.
     pub fn memory_supersede(
         &self,

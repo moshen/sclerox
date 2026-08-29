@@ -32,7 +32,7 @@ impl log::Log for ScleroxLogger {
         if meta.level() > self.level {
             return false;
         }
-        // Dependency crates (globset, ignore, ort, ...) are noisy at debug —
+        // Dependency crates (globset, ignore, ort, ...) are noisy at debug -
         // they were ~5% of a debug-level day. Keep them to warn and stronger;
         // our own sclerox::* targets log at the configured level.
         let t = meta.target();
@@ -102,7 +102,7 @@ pub fn init(level: Option<LevelFilter>) {
 }
 
 /// Delete `sclerox-YYYY-MM-DD.log` files older than `retain_days` (0 = keep all).
-/// Best-effort: any error is ignored — retention must never break startup.
+/// Best-effort: any error is ignored - retention must never break startup.
 fn prune_old_logs(log_dir: &Path, retain_days: u32) {
     if retain_days == 0 {
         return;
