@@ -853,8 +853,8 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// doesn't create drift. Superseding is only automatic when it is safe:
 /// exactly one match, and not a manually written memory (a human wrote it, so
 /// a background job must not silently replace it). Several matches mean a
-/// similarity score can't tell restated-same-fact from similar-distinct-facts
-/// - the new memory is stored and the cluster is flagged in memory_conflicts
+/// similarity score can't tell restated-same-fact from similar-distinct-facts.
+/// The new memory is stored and the cluster is flagged in memory_conflicts
 /// for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
     db: &Database,
