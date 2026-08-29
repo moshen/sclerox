@@ -534,7 +534,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Warn (to stderr) when a memory value exceeds the recommended length.
-/// The value is still stored — this is an assist, not a hard limit — but over-
+/// The value is still stored - this is an assist, not a hard limit - but over-
 /// long values embed worse (the vector is capped at the model window) and crowd
 /// the session-start context, so we nudge the writer to shorten them.
 fn warn_if_long(key: &str, value: &str) {
@@ -800,7 +800,7 @@ fn default_command(agent: &str) -> Vec<String> {
         "opencode" => &["opencode", "run", "--pure"],
         // claude (default): headless flags that skip hooks/skills/persistence.
         // NOTE: --tools= must be the single-token equals form. The space form
-        // (`--tools ""`) broke when the claude CLI made --tools variadic — it
+        // (`--tools ""`) broke when the claude CLI made --tools variadic - it
         // swallowed the prompt argument and every distillation failed.
         _ => &[
             "claude",
@@ -818,7 +818,7 @@ fn default_command(agent: &str) -> Vec<String> {
 /// - `command`: an explicit full command (from `--via`, `[ai].command`, or
 ///   `SCLEROX_AI_COMMAND`). Parsed shell-style and used verbatim; `model` is ignored
 ///   (bake the model flag into a custom command yourself).
-/// - `default_agent`: which built-in default to use when `command` is `None` —
+/// - `default_agent`: which built-in default to use when `command` is `None` -
 ///   `"claude"` for the Claude paths, `"opencode"` for the OpenCode hook.
 /// - `model`: appended to the DEFAULT command only, per the agent's flag
 ///   convention (`--model` for claude, `-m` for opencode).
@@ -961,7 +961,7 @@ fn distill_with_ai(
                 "AI command '{program}' not found in PATH. \
                  Set [ai].command in ~/.config/sclerox/config.toml (or $SCLEROX_AI_COMMAND). \
                  On Windows an npm CLI is a .cmd shim the bare name can't \
-                 resolve — point it at e.g. '{program}.cmd'."
+                 resolve - point it at e.g. '{program}.cmd'."
             )
         } else {
             anyhow::anyhow!("failed to run '{program}': {e}")

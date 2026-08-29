@@ -394,7 +394,7 @@ fn extract_call_target(node: &Node, source: &str, language: &str) -> Option<Stri
                 "method_index_expression" => name_node
                     .child_by_field_name("method")
                     .map(|m| source[m.start_byte()..m.end_byte()].to_string()),
-                // chained call: already-resolved function_call as callee — skip
+                // chained call: already-resolved function_call as callee - skip
                 _ => None,
             }
         }
@@ -408,7 +408,7 @@ fn extract_call_target(node: &Node, source: &str, language: &str) -> Option<Stri
                     Some(source[callee.start_byte()..callee.end_byte()].to_string())
                 }
                 "navigation_expression" => {
-                    // obj.method() — last named child is the method identifier
+                    // obj.method() - last named child is the method identifier
                     let n = callee.named_child_count();
                     let last = callee.named_child(n.checked_sub(1)?)?;
                     Some(source[last.start_byte()..last.end_byte()].to_string())
@@ -430,37 +430,37 @@ fn extract_leaf_name(node: &Node, source: &str) -> Option<String> {
         | "type_identifier"
         | "identifier_name" => Some(source[node.start_byte()..node.end_byte()].to_string()),
 
-        // Rust: self.method() — field_expression { value, field }
+        // Rust: self.method() - field_expression { value, field }
         "field_expression" => node
             .child_by_field_name("field")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // Rust: path::to::func — scoped_identifier { path, name }
+        // Rust: path::to::func - scoped_identifier { path, name }
         "scoped_identifier" => node
             .child_by_field_name("name")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // JS/TS: obj.method — member_expression { object, property }
+        // JS/TS: obj.method - member_expression { object, property }
         "member_expression" => node
             .child_by_field_name("property")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // Python: obj.attr — attribute { object, attribute }
+        // Python: obj.attr - attribute { object, attribute }
         "attribute" => node
             .child_by_field_name("attribute")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // Go: pkg.Func — selector_expression { operand, field }
+        // Go: pkg.Func - selector_expression { operand, field }
         "selector_expression" => node
             .child_by_field_name("field")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // C#: obj.Method — member_access_expression { expression, name }
+        // C#: obj.Method - member_access_expression { expression, name }
         "member_access_expression" => node
             .child_by_field_name("name")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
 
-        // C++: Namespace::func — qualified_identifier { scope, name }
+        // C++: Namespace::func - qualified_identifier { scope, name }
         "qualified_identifier" => node
             .child_by_field_name("name")
             .map(|n| source[n.start_byte()..n.end_byte()].to_string()),
@@ -536,7 +536,7 @@ fn extract_structural_edges(
         }
 
         "rust" => {
-            // impl Trait for Type — emit (Type → Trait, kind=implements)
+            // impl Trait for Type - emit (Type → Trait, kind=implements)
             if node.kind() == "impl_item" {
                 if let Some(trait_node) = node.child_by_field_name("trait") {
                     if let Some(name) = extract_leaf_name(&trait_node, source) {
@@ -835,7 +835,7 @@ fn extract_cpp_declarator_name(node: &Node, source: &str) -> Option<String> {
         "function_declarator" => node
             .child_by_field_name("declarator")
             .and_then(|d| extract_cpp_declarator_name(&d, source)),
-        // *fn or &fn — skip the operator token and look at named children
+        // *fn or &fn - skip the operator token and look at named children
         "pointer_declarator" | "reference_declarator" | "abstract_pointer_declarator" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {

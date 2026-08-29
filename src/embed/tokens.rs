@@ -37,7 +37,7 @@ fn load_tokenizer() -> Option<Tokenizer> {
     };
     // The model's tokenizer.json enables padding (to a fixed length) and
     // truncation for *embedding*. For *counting* we want the true token length,
-    // so disable both — otherwise every encoding comes back the padded length.
+    // so disable both - otherwise every encoding comes back the padded length.
     tok.with_padding(None);
     let _ = tok.with_truncation(None);
     Some(tok)
@@ -49,7 +49,7 @@ fn load_tokenizer() -> Option<Tokenizer> {
 }
 
 /// Count the tokens in `text` with the MiniLM tokenizer, or a coarse estimate
-/// when it is unavailable. Special tokens ([CLS]/[SEP]) are not added — this is
+/// when it is unavailable. Special tokens ([CLS]/[SEP]) are not added - this is
 /// a pure content-token count, which is what budgeting wants.
 pub fn count_tokens(text: &str) -> usize {
     match tokenizer() {

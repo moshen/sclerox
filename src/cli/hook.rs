@@ -152,7 +152,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     // final byte backstop applied at the end.
     let budget = cfg.max_tokens;
 
-    // 1. Open todos (deadline-sorted). Highest priority — actionable now.
+    // 1. Open todos (deadline-sorted). Highest priority - actionable now.
     if let Ok(todos) = db.todo_list(Some("open")) {
         if !todos.is_empty() {
             let mut section = format!("### Open todos ({})\n", todos.len());
@@ -181,13 +181,13 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // 2b. Unresolved memory conflicts — near-duplicate clusters distillation
+    // 2b. Unresolved memory conflicts - near-duplicate clusters distillation
     // refused to auto-merge. One line each; they need a content-aware human
     // (or agent) decision, which is exactly what a session can provide.
     if let Ok(conflicts) = db.memory_conflicts() {
         if !conflicts.is_empty() {
             let mut section = format!(
-                "### Memory conflicts ({}) — resolve with `sclerox memory conflicts`\n",
+                "### Memory conflicts ({}) - resolve with `sclerox memory conflicts`\n",
                 conflicts.len()
             );
             for c in conflicts.iter().take(5) {
@@ -198,7 +198,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // 3. Relevant knowledge — FULL values of the top memories, not just keys.
+    // 3. Relevant knowledge - FULL values of the top memories, not just keys.
     // Priority: feedback (user corrections) > project, repo-matched first, then
     // most-recent as fallback. This is the section that actually gets read.
     let relevant = relevant_memories(db, repo_name, cfg.relevant_memories);
@@ -214,7 +214,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         push_if_fits(&mut out, &section, budget);
     }
 
-    // 4. Recent session memories (last 3) — chronological brief.
+    // 4. Recent session memories (last 3) - chronological brief.
     if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
         if !sessions.is_empty() {
             let mut section = String::from("### Recent sessions\n");
@@ -227,7 +227,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // 5. Remaining active memory keys (excluding session + already-shown) — a
+    // 5. Remaining active memory keys (excluding session + already-shown) - a
     // single compact line of keys the agent can `sclerox memory get` on demand.
     if let Ok(all) = db.memory_list(None, Some("active")) {
         let others: Vec<&str> = all
@@ -246,7 +246,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // 6. Code index reminder — every session should know `sclerox code` exists and is
+    // 6. Code index reminder - every session should know `sclerox code` exists and is
     // the preferred symbol search across indexed repos.
     if let Ok(repos) = db.repo_list() {
         if !repos.is_empty() {
@@ -259,7 +259,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         }
     }
 
-    // Final byte backstop — the token budget should already keep us well under
+    // Final byte backstop - the token budget should already keep us well under
     // this, but guard against runaway growth. Leave room for the marker and cut
     // on a char boundary so the result stays within max_chars and a multibyte
     // sequence at the limit can't panic the session-start hook.
@@ -277,7 +277,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
 /// Collect up to `limit` distinct active memories to surface with full values.
 /// A configurable number of feedback slots (user corrections) are guaranteed
 /// when feedback exists. Remaining slots go to repo-name matches, then
-/// most-recent feedback, then most-recent project — deduplicated by key.
+/// most-recent feedback, then most-recent project - deduplicated by key.
 fn relevant_memories(
     db: &Database,
     repo_name: Option<&str>,
@@ -565,7 +565,7 @@ fn run_distill_session(
         session_id
     );
     let total = distill_chunked(db, &argv, &turns, "session")?;
-    // Always log the outcome — a run of zero-memory sessions is the signal
+    // Always log the outcome - a run of zero-memory sessions is the signal
     // that distillation is broken, so it must be visible.
     log::info!("background: distilled {total} memories from session {session_id}");
 
@@ -625,7 +625,7 @@ fn run_opencode(
     }
 
     // Precedence: --via/--model flag > [ai] (folds SCLEROX_AI_COMMAND/SCLEROX_AI_MODEL).
-    // This is the OpenCode hook, so the default command is opencode's — a bare
+    // This is the OpenCode hook, so the default command is opencode's - a bare
     // [ai].command (if the user set one) still overrides it.
     let command = via.or(cfg.ai.command.as_deref());
     let resolved_model = model.or(cfg.ai.model.as_deref());
@@ -726,7 +726,7 @@ fn distill_marker_path(session_id: &str) -> std::path::PathBuf {
 }
 
 /// Locks older than this are treated as abandoned by a crashed process and
-/// stolen — a distiller that died must not block the session forever. Set well
+/// stolen - a distiller that died must not block the session forever. Set well
 /// above any real distillation time (minutes).
 const LOCK_STALE_SECS: u64 = 30 * 60;
 
@@ -743,11 +743,11 @@ impl Drop for SessionLock {
 
 /// Outcome of trying to acquire the per-session distillation lock.
 enum LockOutcome {
-    /// Acquired — hold the guard for the duration of distillation.
+    /// Acquired - hold the guard for the duration of distillation.
     Acquired(SessionLock),
-    /// Another live process is already distilling this session — skip.
+    /// Another live process is already distilling this session - skip.
     Contended,
-    /// Locking infrastructure is unavailable — proceed WITHOUT a lock rather
+    /// Locking infrastructure is unavailable - proceed WITHOUT a lock rather
     /// than skip (a broken lock dir must never stop distillation entirely).
     NoLock,
 }
@@ -776,7 +776,7 @@ fn try_lock_session_in(dir: &std::path::Path, session_id: &str, stale_secs: u64)
         {
             Ok(mut f) => {
                 use std::io::Write;
-                // PID is informational — the lock is the file's existence.
+                // PID is informational - the lock is the file's existence.
                 let _ = write!(f, "{}", std::process::id());
                 return LockOutcome::Acquired(SessionLock { path });
             }
@@ -854,7 +854,7 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// exactly one match, and not a manually written memory (a human wrote it, so
 /// a background job must not silently replace it). Several matches mean a
 /// similarity score can't tell restated-same-fact from similar-distinct-facts
-/// — the new memory is stored and the cluster is flagged in memory_conflicts
+/// - the new memory is stored and the cluster is flagged in memory_conflicts
 /// for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
     db: &Database,
@@ -868,7 +868,7 @@ fn distill_chunked(
     let mut stored = 0usize;
     let mut seen_keys = std::collections::HashSet::new();
     // Best-effort embedder, reused across all chunks. None if the model is
-    // unavailable — dedup then falls back to lexical and no vectors are stored.
+    // unavailable - dedup then falls back to lexical and no vectors are stored.
     let mut embedder = crate::embed::Embedder::new().ok();
 
     for chunk in chunk_turns(turns, chunk_chars) {

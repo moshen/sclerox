@@ -1,6 +1,6 @@
 # Memory
 
-Recording decisions is a core behavior — see the "Decisions" section in
+Recording decisions is a core behavior - see the "Decisions" section in
 SKILL.md; do it immediately and unprompted.
 
 ```bash
@@ -24,7 +24,7 @@ sclerox memory people add|remove|list <key> <person_id>
 
 Supersede requires an ACTIVE old key and a DIFFERENT new key (a same-key
 update is `sclerox memory set`). To merge several duplicates, supersede each
-into ONE canonical key — repeated supersedes converge on it. Retired keys
+into ONE canonical key - repeated supersedes converge on it. Retired keys
 never block reuse: setting a superseded key creates a fresh entry instead
 of resurrecting the old row.
 

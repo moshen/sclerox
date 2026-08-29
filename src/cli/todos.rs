@@ -205,7 +205,7 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             // Tier 1+2: FTS prefix + LIKE substring
             let fts_results = db.todo_search(&query)?;
 
-            // Tier 3: semantic similarity — always runs alongside FTS+LIKE.
+            // Tier 3: semantic similarity - always runs alongside FTS+LIKE.
             // Results are deduped against FTS hits and filtered by a minimum score.
             // Model load costs ~1s; acceptable for a search that already has context.
             let sem = &settings().search;

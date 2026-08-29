@@ -14,7 +14,7 @@ use std::path::Path;
 
 /// If `repo_root/.ol` exists and `repo_root/.sclerox` doesn't, rename it in place
 /// so `repo.db` / `config.toml` become `.sclerox`'s without re-indexing. No-op
-/// (returns `false`) if there's nothing to migrate — e.g. this repo was
+/// (returns `false`) if there's nothing to migrate - e.g. this repo was
 /// always `.sclerox`-only, or was already migrated.
 pub fn migrate_legacy_repo_dir(repo_root: &Path) -> bool {
     let legacy = repo_root.join(".ol");

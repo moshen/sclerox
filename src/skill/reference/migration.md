@@ -31,7 +31,7 @@ both exist and the current one has settings of its own, both files are kept and
 the conflict is reported:
 
 ```
-kept ~/.config/sclerox/config.toml — it has settings of its own,
+kept ~/.config/sclerox/config.toml - it has settings of its own,
 so ~/.ol/config.toml was left in place.
     Merge the two by hand, then delete the old file.
 ```

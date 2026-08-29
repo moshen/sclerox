@@ -38,7 +38,7 @@ pub struct AiSettings {
     /// transcript prompt is appended as the final argument. `None` = use the
     /// built-in default for whichever agent invoked sclerox. Env: `SCLEROX_AI_COMMAND`.
     pub command: Option<String>,
-    /// Model for the DEFAULT command only (ignored when `command` is set — bake
+    /// Model for the DEFAULT command only (ignored when `command` is set - bake
     /// the model flag into a custom command yourself). Env: `SCLEROX_AI_MODEL`.
     pub model: Option<String>,
 }
@@ -82,7 +82,7 @@ pub struct SessionContextSettings {
     /// Token budget for injected session-start context, enforced with the real
     /// MiniLM tokenizer (`embed::count_tokens`).
     pub max_tokens: usize,
-    /// Hard byte backstop on the injected context — a coarse final guard so a
+    /// Hard byte backstop on the injected context - a coarse final guard so a
     /// tokenizer hiccup can never emit a runaway payload. Keep it comfortably
     /// above `max_tokens` × ~4 bytes/token.
     pub max_chars: usize,
@@ -392,7 +392,7 @@ impl Settings {
             &mut self.session_context.relevant_memories,
             5,
         );
-        // feedback_reserved may legitimately be 0 (no reserved slot) — don't force > 0.
+        // feedback_reserved may legitimately be 0 (no reserved slot) - don't force > 0.
         require_positive(
             "session_context.todos_shown",
             &mut self.session_context.todos_shown,

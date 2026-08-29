@@ -16,7 +16,7 @@ sclerox meeting people add|remove|list <meeting_id> <person_id> [--role "<role>"
 ## Workflow: recording a meeting
 
 1. If you have the full transcript (e.g. Gemini/Zoom notes, a pasted log),
-   store ALL of it — write it to a temp file and pass `--transcript-file`.
+   store ALL of it - write it to a temp file and pass `--transcript-file`.
    The transcript is chunked and embedded, so semantic search can later find
    what was actually said, not just a summary. Add `--notes` for a short recap
    on top. Do NOT collapse a real transcript into a notes summary.
