@@ -784,12 +784,19 @@ Key naming and supersedes:
   Use stable, descriptive kebab-case slugs. Prefer the plainest slug that names
   the fact.
 
-  If an entry updates, corrects, or restates one of the existing memories listed
-  below, reuse that memory's exact key AND set "supersedes" to that same key.
-  That merges the two instead of leaving a near-duplicate pair behind.
+  "supersedes" names the OTHER memory your entry replaces. It is never the same
+  as your own "key".
 
-  Set "supersedes" to null for a genuinely new fact. Never set it to a key that
-  is not in the list below.
+  If your entry updates or corrects one of the existing memories listed below,
+  you have two ways to say so:
+    - Rewriting it under its own name: set "key" to that memory's exact key and
+      leave "supersedes" null. The stored memory is updated in place.
+    - Replacing it with a better-named one: set "key" to the new name and
+      "supersedes" to the old key.
+  Either way the old wording is replaced instead of leaving a duplicate pair.
+
+  Set "supersedes" to null for a genuinely new fact. Never set it to your own
+  key, and never to a key that is not in the list above.
 "#;
 
 /// Built-in default distillation command (argv, WITHOUT the prompt) for a known
