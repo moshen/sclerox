@@ -877,6 +877,11 @@ fn distill_chunked(
         // Without this it is asked to guess what a previous run named a fact it
         // cannot see, which is how one fact ends up under three keys.
         let context_entries = related_memories_for_chunk(db, embedder.as_mut(), &chunk, ctx_limit);
+        log::info!(
+            "distill chunk ({} chars): {} related memories offered as dedup context",
+            chunk.len(),
+            context_entries.len()
+        );
         let existing_keys: std::collections::HashSet<String> =
             context_entries.iter().map(|(k, _)| k.clone()).collect();
         let existing_block = crate::cli::memory::format_existing_block(&context_entries);
@@ -936,6 +941,42 @@ fn distill_chunked(
                         .flatten()
                         .is_some_and(|e| e.source != "manual")
             });
+            // Say why a declared merge target was refused. Silence here made a
+            // broken retrieval path look identical to a model that simply never
+            // used the field.
+            // Self-naming means "this IS that memory, rewritten": an in-place
+            // update, not a supersede. The old prompt actively asked for this
+            // form, so it arrives often and must not be discarded — dropping it
+            // threw away the model's explicit statement that the fact already
+            // existed, which is the whole signal `supersedes` carries.
+            let claims_self = m.supersedes.as_deref() == Some(m.key.as_str());
+            if claims_self {
+                log::info!("memory '{}' rewritten in place (declared itself)", m.key);
+                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
+                if let Some(v) = &emb {
+                    let _ = db.memory_set_embedding(&m.key, v);
+                }
+                stored += 1;
+                continue;
+            }
+
+            if let Some(want) = m.supersedes.as_deref() {
+                if declared.is_none() {
+                    let why = if want == m.key {
+                        "names itself"
+                    } else if !existing_keys.contains(want) {
+                        "was not in the context it was shown"
+                    } else {
+                        "is hand-written and never auto-merged"
+                    };
+                    log::info!(
+                        "memory '{}' declared supersedes '{want}' but it {why}",
+                        m.key
+                    );
+                } else {
+                    log::info!("memory '{}' declared supersedes '{want}'", m.key);
+                }
+            }
 
             let candidates: Vec<Candidate<'_>> = near_dups
                 .iter()
@@ -952,6 +993,7 @@ fn distill_chunked(
                 }
                 DedupAction::Merge(old_key) => {
                     let _ = db.memory_supersede(&old_key, &m.key, &m.value, &m.memory_type, source);
+                    log::info!("memory '{}' merged into '{old_key}'", m.key);
                 }
                 DedupAction::Flag => {
                     // Genuinely ambiguous, or the only matches are hand-written:
@@ -1038,8 +1080,18 @@ fn decide_dedup_action(
 /// Existing active memories topically near `chunk`, as (key, value) pairs for
 /// the distiller's dedup context.
 ///
-/// Uses a deliberately loose cosine floor: the point is to surface the keys
-/// that already cover this topic so the model can reuse one, not to decide
+/// Probes several windows across the chunk rather than embedding its head. One
+/// embedding covers `MAX_EMBED_CHARS` (800) of a chunk that may be
+/// `distill.chunk_chars` (20k by default) long, so a single head embedding
+/// describes ~4% of the text: it retrieves context for whatever the chunk
+/// happened to open with (often a slash-command banner or an unrelated first
+/// question) and nothing for the facts extracted from the body. The distiller
+/// was then shown irrelevant keys, correctly declined to reuse any, and minted
+/// a fresh near-identical slug instead — which is exactly what `supersedes`
+/// exists to prevent.
+///
+/// Uses a deliberately loose cosine floor: the point is to surface keys that
+/// already cover these topics so the model can reuse one, not to decide
 /// anything. The strict thresholds still gate the actual writes.
 fn related_memories_for_chunk(
     db: &Database,
@@ -1049,6 +1101,8 @@ fn related_memories_for_chunk(
 ) -> Vec<(String, String)> {
     /// Below this the retrieved memories are noise rather than context.
     const CONTEXT_COSINE_FLOOR: f32 = 0.30;
+    /// Windows sampled evenly across the chunk, including its head and tail.
+    const PROBES: usize = 8;
 
     if limit == 0 {
         return Vec::new();
@@ -1056,14 +1110,62 @@ fn related_memories_for_chunk(
     let Some(embedder) = embedder else {
         return Vec::new();
     };
-    let capped: String = chunk.chars().take(crate::index::MAX_EMBED_CHARS).collect();
-    let Ok(emb) = embedder.embed_one(&capped) else {
+
+    // Best score wins when several probes surface the same memory.
+    let mut best: std::collections::HashMap<String, (f32, String)> =
+        std::collections::HashMap::new();
+    for text in probe_windows(chunk, crate::index::MAX_EMBED_CHARS, PROBES) {
+        let Ok(emb) = embedder.embed_one(&text) else {
+            continue;
+        };
+        for sm in db
+            .memory_find_near_duplicates_semantic(&emb, CONTEXT_COSINE_FLOOR, limit)
+            .unwrap_or_default()
+        {
+            let slot = best
+                .entry(sm.entry.key.clone())
+                .or_insert((sm.score, sm.entry.value.clone()));
+            if sm.score > slot.0 {
+                *slot = (sm.score, sm.entry.value);
+            }
+        }
+    }
+
+    let mut ranked: Vec<(f32, String, String)> =
+        best.into_iter().map(|(k, (s, v))| (s, k, v)).collect();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(_, k, v)| (k, v)).collect()
+}
+
+/// Evenly spaced windows of `window` chars across `text`, head and tail
+/// included, deduplicated. Returns one window when the text already fits.
+///
+/// Split out from the retrieval so the sampling is testable without an
+/// embedder or a database.
+fn probe_windows(text: &str, window: usize, probes: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() || window == 0 || probes == 0 {
         return Vec::new();
+    }
+    if chars.len() <= window {
+        return vec![chars.iter().collect()];
+    }
+
+    let span = chars.len() - window;
+    let mut starts: Vec<usize> = if probes == 1 {
+        vec![0]
+    } else {
+        (0..probes).map(|i| span * i / (probes - 1)).collect()
     };
-    db.memory_find_near_duplicates_semantic(&emb, CONTEXT_COSINE_FLOOR, limit)
-        .unwrap_or_default()
+    starts.dedup();
+    starts
         .into_iter()
-        .map(|sm| (sm.entry.key, sm.entry.value))
+        .map(|s| chars[s..s + window].iter().collect())
         .collect()
 }
 
@@ -1274,6 +1376,52 @@ mod tests {
 
     fn cand<'a>(key: &'a str, source: &'a str, score: f32) -> Candidate<'a> {
         Candidate { key, source, score }
+    }
+
+    #[test]
+    fn probe_windows_returns_whole_text_when_it_fits() {
+        assert_eq!(probe_windows("short", 800, 8), vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn probe_windows_covers_head_and_tail() {
+        // The regression: embedding only the head described ~4% of a 20k chunk,
+        // so retrieval saw the opening banner and nothing from the body.
+        let text: String = (0..2000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let wins = probe_windows(&text, 100, 5);
+        assert_eq!(wins.len(), 5);
+        assert!(text.starts_with(&wins[0]), "first probe is the head");
+        assert!(
+            text.ends_with(wins.last().unwrap()),
+            "last probe is the tail"
+        );
+    }
+
+    #[test]
+    fn probe_windows_spread_across_the_text() {
+        let text: String = (0..1000).map(|_| 'x').collect();
+        let wins = probe_windows(&text, 100, 4);
+        // Distinct windows, none longer than the embedder's limit.
+        assert_eq!(wins.len(), 4);
+        assert!(wins.iter().all(|w| w.chars().count() == 100));
+    }
+
+    #[test]
+    fn probe_windows_handles_degenerate_inputs() {
+        assert!(probe_windows("", 800, 8).is_empty());
+        assert!(probe_windows("abc", 0, 8).is_empty());
+        assert!(probe_windows("abc", 800, 0).is_empty());
+        assert_eq!(probe_windows("abcdef", 3, 1).len(), 1);
+    }
+
+    #[test]
+    fn probe_windows_is_char_safe_on_multibyte_text() {
+        // Slicing by bytes here would panic mid-character.
+        let text: String = "日本語のテキスト".repeat(50);
+        let wins = probe_windows(&text, 10, 4);
+        assert!(wins.iter().all(|w| w.chars().count() == 10));
     }
 
     #[test]
