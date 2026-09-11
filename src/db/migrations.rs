@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 12;
+pub const PRIMARY_VERSION: u32 = 13;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 4;
@@ -80,6 +80,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 12,
         description: "memory: active-only key uniqueness, id-based supersession, conflicts table",
         sql: crate::db::schema::MIGRATION_V12,
+    },
+    Migration {
+        version: 13,
+        description: "memory_distinct: pairs a human judged genuinely different",
+        sql: crate::db::schema::MIGRATION_V13,
     },
 ];
 
