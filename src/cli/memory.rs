@@ -760,6 +760,11 @@ DO NOT record:
   - Corrections to statements made earlier in this same text. Record only the
     final, correct fact.
   - Restatements of general knowledge, or of instructions given in the text.
+  - Environment and harness state echoed into the transcript: the model in use,
+    slash-command banners, tool or MCP availability, session configuration
+    output. That describes the session, not the work, and it reappears verbatim
+    in every transcript, so recording it produces one near-identical memory per
+    session forever.
 
 Keep each "value" concise: 1-3 sentences and UNDER 800 characters.
 
