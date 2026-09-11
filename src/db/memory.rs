@@ -474,6 +474,87 @@ impl Database {
     /// Unresolved near-duplicate conflicts, oldest first. Pairs whose sides
     /// are no longer both active are pruned here rather than tracked: merging
     /// (supersede) or staling either side resolves a conflict implicitly.
+    /// Record that two memories are genuinely different facts, so the pair is
+    /// never flagged as a conflict and distillation never merges one into the
+    /// other.
+    ///
+    /// Without this a conflict could only clear by one side ceasing to be
+    /// active, so "these are distinct, keep both" was inexpressible: the pair
+    /// stayed flagged and the only way to silence it was to merge, which is the
+    /// opposite of the judgement being made.
+    ///
+    /// Symmetric: the pair is normalized so argument order never matters.
+    /// Marking an already-marked pair refreshes the reason rather than failing.
+    pub fn memory_distinct_add(&self, a_id: i64, b_id: i64, reason: Option<&str>) -> Result<bool> {
+        if a_id == b_id {
+            return Ok(false);
+        }
+        let (lo, hi) = if a_id < b_id {
+            (a_id, b_id)
+        } else {
+            (b_id, a_id)
+        };
+        self.conn.execute(
+            "INSERT INTO memory_distinct (lo_id, hi_id, reason) VALUES (?1, ?2, ?3)
+             ON CONFLICT(lo_id, hi_id) DO UPDATE SET reason = excluded.reason",
+            params![lo, hi, reason],
+        )?;
+        // The pair may already be flagged; drop that row now it is resolved.
+        self.conn.execute(
+            "DELETE FROM memory_conflicts
+             WHERE (memory_id = ?1 AND matched_id = ?2)
+                OR (memory_id = ?2 AND matched_id = ?1)",
+            params![lo, hi],
+        )?;
+        Ok(true)
+    }
+
+    /// Undo a distinct marking, so the pair can be flagged and merged again.
+    pub fn memory_distinct_remove(&self, a_id: i64, b_id: i64) -> Result<bool> {
+        let (lo, hi) = if a_id < b_id {
+            (a_id, b_id)
+        } else {
+            (b_id, a_id)
+        };
+        let n = self.conn.execute(
+            "DELETE FROM memory_distinct WHERE lo_id = ?1 AND hi_id = ?2",
+            params![lo, hi],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// True if this pair has been marked as genuinely different.
+    pub fn memory_is_distinct(&self, a_id: i64, b_id: i64) -> Result<bool> {
+        let (lo, hi) = if a_id < b_id {
+            (a_id, b_id)
+        } else {
+            (b_id, a_id)
+        };
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM memory_distinct WHERE lo_id = ?1 AND hi_id = ?2",
+                params![lo, hi],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every distinct-marked pair, as (key_a, key_b, reason), for `sclerox
+    /// memory distinct list`. Rows whose memories were deleted are skipped.
+    pub fn memory_distinct_list(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.key, b.key, d.reason
+             FROM memory_distinct d
+             JOIN memory a ON a.id = d.lo_id
+             JOIN memory b ON b.id = d.hi_id
+             ORDER BY d.created_at, d.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn memory_conflicts(&self) -> Result<Vec<MemoryConflict>> {
         self.conn.execute(
             "DELETE FROM memory_conflicts WHERE id IN (
@@ -481,7 +562,11 @@ impl Database {
                  LEFT JOIN memory a ON a.id = c.memory_id
                  LEFT JOIN memory b ON b.id = c.matched_id
                  WHERE COALESCE(a.status, '') != 'active'
-                    OR COALESCE(b.status, '') != 'active')",
+                    OR COALESCE(b.status, '') != 'active'
+                    OR EXISTS (
+                        SELECT 1 FROM memory_distinct d
+                        WHERE d.lo_id = MIN(c.memory_id, c.matched_id)
+                          AND d.hi_id = MAX(c.memory_id, c.matched_id)))",
             [],
         )?;
         let mut stmt = self.conn.prepare(
@@ -768,6 +853,83 @@ mod tests {
 
         // Empty proposed -> zero.
         assert_eq!(token_overlap("the and for", "anything here"), 0.0);
+    }
+
+    /// Two active memories plus a flagged conflict between them.
+    fn db_with_conflicting_pair() -> (Database, i64, i64) {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("alpha", "first fact", "project", None)
+            .unwrap();
+        db.memory_set("beta", "second fact", "project", None)
+            .unwrap();
+        let a = db.memory_get("alpha").unwrap().unwrap().id;
+        let b = db.memory_get("beta").unwrap().unwrap().id;
+        db.memory_conflict_add(a, b, Some(0.9)).unwrap();
+        (db, a, b)
+    }
+
+    #[test]
+    fn distinct_marking_clears_and_suppresses_the_conflict() {
+        let (db, a, b) = db_with_conflicting_pair();
+        assert_eq!(db.memory_conflicts().unwrap().len(), 1);
+
+        db.memory_distinct_add(a, b, Some("different facts"))
+            .unwrap();
+        assert!(
+            db.memory_conflicts().unwrap().is_empty(),
+            "marking distinct clears the existing flag"
+        );
+
+        // And a later re-flag of the same pair does not come back.
+        db.memory_conflict_add(a, b, Some(0.9)).unwrap();
+        assert!(
+            db.memory_conflicts().unwrap().is_empty(),
+            "a re-flagged distinct pair stays suppressed"
+        );
+    }
+
+    #[test]
+    fn distinct_marking_is_symmetric() {
+        let (db, a, b) = db_with_conflicting_pair();
+        db.memory_distinct_add(b, a, None).unwrap();
+        assert!(db.memory_is_distinct(a, b).unwrap());
+        assert!(db.memory_is_distinct(b, a).unwrap());
+    }
+
+    #[test]
+    fn distinct_marking_can_be_undone() {
+        let (db, a, b) = db_with_conflicting_pair();
+        db.memory_distinct_add(a, b, None).unwrap();
+        assert!(
+            db.memory_distinct_remove(b, a).unwrap(),
+            "order-independent"
+        );
+        assert!(!db.memory_is_distinct(a, b).unwrap());
+
+        // Removing restores normal behaviour: the pair can be flagged again.
+        db.memory_conflict_add(a, b, Some(0.9)).unwrap();
+        assert_eq!(db.memory_conflicts().unwrap().len(), 1);
+        assert!(
+            !db.memory_distinct_remove(a, b).unwrap(),
+            "second remove is a no-op"
+        );
+    }
+
+    #[test]
+    fn distinct_add_is_idempotent_and_refreshes_reason() {
+        let (db, a, b) = db_with_conflicting_pair();
+        db.memory_distinct_add(a, b, Some("first reason")).unwrap();
+        db.memory_distinct_add(a, b, Some("better reason")).unwrap();
+        let pairs = db.memory_distinct_list().unwrap();
+        assert_eq!(pairs.len(), 1, "no duplicate row");
+        assert_eq!(pairs[0].2.as_deref(), Some("better reason"));
+    }
+
+    #[test]
+    fn distinct_rejects_a_memory_against_itself() {
+        let (db, a, _b) = db_with_conflicting_pair();
+        assert!(!db.memory_distinct_add(a, a, None).unwrap());
+        assert!(db.memory_distinct_list().unwrap().is_empty());
     }
 
     #[test]

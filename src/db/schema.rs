@@ -654,6 +654,29 @@ UPDATE identifier_types
 ";
 
 /// Migration v2: symbol_edges for call graph (callers, callees, graph traversal).
+/// v13 records pairs a human judged to be genuinely different facts.
+///
+/// Before this, a conflict could only leave the list by one side ceasing to be
+/// active, so the judgement "these two are distinct, keep both" had no way to
+/// be expressed: the pair stayed flagged forever, and the only way to silence
+/// it was to merge — exactly the wrong action. Rows here suppress the flag AND
+/// stop distillation merging one into the other.
+///
+/// Pairs are stored normalized (lo_id < hi_id) so a marking is symmetric.
+pub const MIGRATION_V13: &str = "
+CREATE TABLE IF NOT EXISTS memory_distinct (
+    id INTEGER PRIMARY KEY,
+    lo_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    hi_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (lo_id, hi_id),
+    CHECK (lo_id < hi_id)
+);
+CREATE INDEX IF NOT EXISTS memory_distinct_lo ON memory_distinct(lo_id);
+CREATE INDEX IF NOT EXISTS memory_distinct_hi ON memory_distinct(hi_id);
+";
+
 pub const REPO_MIGRATION_V2: &str = "
 CREATE TABLE IF NOT EXISTS symbol_edges (
     id INTEGER PRIMARY KEY,

@@ -987,8 +987,17 @@ fn distill_chunked(
                 }
             }
 
+            // Drop candidates a human marked as genuinely different from this
+            // memory. Without this the merge would quietly undo a deliberate
+            // split, which is what makes hand-curation stick rather than being
+            // reversed on the next mention of the topic.
+            let self_id = db.memory_get(&m.key).ok().flatten().map(|e| e.id);
             let candidates: Vec<Candidate<'_>> = near_dups
                 .iter()
+                .filter(|sm| match self_id {
+                    Some(id) => !db.memory_is_distinct(id, sm.entry.id).unwrap_or(false),
+                    None => true,
+                })
                 .map(|sm| Candidate {
                     key: &sm.entry.key,
                     source: &sm.entry.source,
@@ -1010,7 +1019,9 @@ fn distill_chunked(
                     if let Ok(new_id) =
                         db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source)
                     {
-                        for sm in &near_dups {
+                        for sm in near_dups.iter().filter(|sm| {
+                            !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
+                        }) {
                             let _ =
                                 db.memory_conflict_add(new_id, sm.entry.id, Some(sm.score as f64));
                         }

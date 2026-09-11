@@ -12,6 +12,9 @@ sclerox memory search "<query>" --all     # include stale/superseded
 sclerox memory stale <key> [--reason "why it's no longer valid"]
 sclerox memory supersede <old_key> <new_key> "<new_value>"
 sclerox memory conflicts                  # near-duplicate clusters flagged at distillation
+sclerox memory distinct add <a> <b> [--reason "<why>"]   # these two are different facts
+sclerox memory distinct remove <a> <b>    # undo that
+sclerox memory distinct list              # pairs marked distinct
 sclerox memory review <key>               # confirm memory is still accurate
 sclerox memory needs-review [--days 30]   # list memories not reviewed recently
 sclerox memory distill <key>              # compress verbose entry via your agent CLI
@@ -34,3 +37,16 @@ close ones were written by hand and must not be overwritten automatically.
 Resolve one by reading both sides and either superseding the loser into the
 winner or staling it; the pair leaves the list as soon as either side is
 not active.
+
+Resolving by merging or staling assumes the pair IS a duplicate. When it is
+not - two genuinely different facts that happen to read alike - say so instead:
+
+```bash
+sclerox memory distinct add retry-policy-http-client retry-policy-queue-worker \
+  --reason "same retry count, different services"
+```
+
+That clears the flag, stops the pair being re-flagged, and stops distillation
+merging one into the other. Without it a deliberate split has no protection:
+the pair stays flagged forever, and the only way to silence it is to merge -
+the opposite of the judgement being made.

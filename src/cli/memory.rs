@@ -131,9 +131,34 @@ pub enum MemoryCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mark two memories as genuinely different, so the pair stops being
+    /// flagged as a conflict and distillation stops merging them
+    ///
+    /// A conflict otherwise only clears when one side stops being active, so
+    /// "these are distinct, keep both" has no other way to be recorded and the
+    /// only way to silence the pair is to merge it — the opposite of the call
+    /// being made.
+    #[command(subcommand)]
+    Distinct(MemoryDistinctCmd),
     /// Manage people linked to a memory entry
     #[command(subcommand)]
     People(MemoryPeopleCmd),
+}
+
+#[derive(clap::Subcommand)]
+pub enum MemoryDistinctCmd {
+    /// Mark two memories as genuinely different facts
+    Add {
+        key_a: String,
+        key_b: String,
+        /// Why they are distinct (shown by `distinct list`)
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Undo a marking, letting the pair be flagged and merged again
+    Remove { key_a: String, key_b: String },
+    /// List every pair marked distinct
+    List,
 }
 
 #[derive(clap::Subcommand)]
@@ -491,6 +516,56 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             let resolved = resolve_import_path(path.as_deref(), agent.as_deref())?;
             import_memories(db, &resolved, dry_run)?;
         }
+
+        MemoryCommand::Distinct(sub) => match sub {
+            MemoryDistinctCmd::Add {
+                key_a,
+                key_b,
+                reason,
+            } => {
+                let a = db
+                    .memory_get(&key_a)?
+                    .ok_or_else(|| anyhow::anyhow!("no active memory: {key_a}"))?;
+                let b = db
+                    .memory_get(&key_b)?
+                    .ok_or_else(|| anyhow::anyhow!("no active memory: {key_b}"))?;
+                if a.id == b.id {
+                    anyhow::bail!("'{key_a}' and '{key_b}' are the same memory");
+                }
+                db.memory_distinct_add(a.id, b.id, reason.as_deref())?;
+                println!("Marked distinct: '{key_a}' and '{key_b}'");
+            }
+            MemoryDistinctCmd::Remove { key_a, key_b } => {
+                let a = db
+                    .memory_get(&key_a)?
+                    .ok_or_else(|| anyhow::anyhow!("no active memory: {key_a}"))?;
+                let b = db
+                    .memory_get(&key_b)?
+                    .ok_or_else(|| anyhow::anyhow!("no active memory: {key_b}"))?;
+                if db.memory_distinct_remove(a.id, b.id)? {
+                    println!("Removed distinct marking: '{key_a}' and '{key_b}'");
+                } else {
+                    println!("Not marked distinct: '{key_a}' and '{key_b}'");
+                }
+            }
+            MemoryDistinctCmd::List => {
+                let pairs = db.memory_distinct_list()?;
+                print_output(format, &pairs, || {
+                    if pairs.is_empty() {
+                        println!("No pairs marked distinct.");
+                        return;
+                    }
+                    for (a, b, reason) in &pairs {
+                        let why = reason
+                            .as_deref()
+                            .map(|r| format!(" - {r}"))
+                            .unwrap_or_default();
+                        println!("{a}  <>  {b}{why}");
+                    }
+                    println!("\n{} pairs marked distinct.", pairs.len());
+                });
+            }
+        },
 
         MemoryCommand::People(sub) => match sub {
             MemoryPeopleCmd::Add { key, person_id } => {
