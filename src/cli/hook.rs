@@ -877,10 +877,19 @@ fn distill_chunked(
         // Without this it is asked to guess what a previous run named a fact it
         // cannot see, which is how one fact ends up under three keys.
         let context_entries = related_memories_for_chunk(db, embedder.as_mut(), &chunk, ctx_limit);
+        // Log the keys, not just the count. A count alone cannot distinguish
+        // "retrieval surfaced the right memories and the model ignored them"
+        // from "retrieval surfaced the wrong ones", which is exactly the
+        // ambiguity that hid the head-only-embedding bug.
         log::info!(
-            "distill chunk ({} chars): {} related memories offered as dedup context",
+            "distill chunk ({} chars): {} related memories offered as dedup context [{}]",
             chunk.len(),
-            context_entries.len()
+            context_entries.len(),
+            context_entries
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let existing_keys: std::collections::HashSet<String> =
             context_entries.iter().map(|(k, _)| k.clone()).collect();
