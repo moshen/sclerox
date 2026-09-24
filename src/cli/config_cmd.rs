@@ -107,7 +107,7 @@ pub fn config_template() -> String {
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
          # lexical_threshold = {lex_thr}            # token-overlap fallback (no embedder)\n\
-         # merge_threshold = {merge_thr}              # merge into best match even when several match\n\
+         # merge_threshold = {merge_thr}              # merge into best match even when several match (calibrated: real dupes sit 0.85-0.93)\n\
          \n\
          [memory]\n\
          # max_value_chars = {max_val}              # warn (not reject) above this length\n\

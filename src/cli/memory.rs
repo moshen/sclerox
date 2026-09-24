@@ -867,7 +867,13 @@ Key naming and supersedes:
   "supersedes" names the OTHER memory your entry replaces. It is never the same
   as your own "key".
 
-  If your entry updates or corrects one of the existing memories listed below,
+  BEFORE choosing a key, read the existing memories listed above. If any of
+  them already states the fact you are about to record, reuse ITS key. Do not
+  invent a new wording of the same key: "chrome-tab-id-is-text" and
+  "applescript-chrome-id-is-text" are the same memory under two names, and
+  storing both is the single most common way this ends up with duplicates.
+
+  If your entry updates or corrects one of the existing memories listed above,
   you have two ways to say so:
     - Rewriting it under its own name: set "key" to that memory's exact key and
       leave "supersedes" null. The stored memory is updated in place.
