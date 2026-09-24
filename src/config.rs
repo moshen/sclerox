@@ -66,6 +66,14 @@ pub struct DedupSettings {
     /// Without this, any fact matching 2+ existing memories is inserted and
     /// flagged, so a topic that already has two entries accumulates a third on
     /// every mention. That ratchet is what grows the conflict list.
+    ///
+    /// Calibrate against real scores, not intuition. This shipped at 0.95 and
+    /// fired zero times in a month: MiniLM does not score short paraphrases
+    /// that high. Two near-verbatim statements of the same Chrome tab-id fact
+    /// scored 0.853, and across 40 real conflicts none reached 0.95 while 26
+    /// sat in 0.85-0.90. 0.88 merges the clear cases and still leaves a
+    /// reviewable band; 0.85 would merge everything flagged and make the
+    /// conflict list dead code.
     pub merge_threshold: f64,
 }
 
@@ -195,7 +203,7 @@ impl Default for DedupSettings {
         Self {
             cosine_threshold: 0.85_f64,
             lexical_threshold: 0.7_f64,
-            merge_threshold: 0.95_f64,
+            merge_threshold: 0.88_f64,
         }
     }
 }
