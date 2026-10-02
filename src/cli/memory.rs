@@ -874,12 +874,15 @@ Key naming and supersedes:
   storing both is the single most common way this ends up with duplicates.
 
   If your entry updates or corrects one of the existing memories listed above,
-  you have two ways to say so:
-    - Rewriting it under its own name: set "key" to that memory's exact key and
-      leave "supersedes" null. The stored memory is updated in place.
-    - Replacing it with a better-named one: set "key" to the new name and
-      "supersedes" to the old key.
-  Either way the old wording is replaced instead of leaving a duplicate pair.
+  KEEP ITS KEY: set "key" to that memory's exact key and leave "supersedes"
+  null. The stored memory is updated in place. Do this even when you would have
+  named it differently - a key you merely prefer is not a reason to rename one
+  that already exists, and renaming costs the reader the ability to look the
+  memory up by the name they saw last time.
+
+  Rename only when the existing key is actually wrong: it names the wrong
+  subject, or says something the memory no longer claims. Then set "key" to the
+  corrected name and "supersedes" to the old key.
 
   Set "supersedes" to null for a genuinely new fact. Never set it to your own
   key, and never to a key that is not in the list above.
