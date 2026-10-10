@@ -417,15 +417,15 @@ mod tests {
         let db = db();
         let id = db
             .investigation_start(
-                "Bill Attach Traffic Spike",
-                "bill-attach-traffic",
-                Some("Investigate why bill attachment uploads spiked 3x on 2026-06-01."),
+                "Upload Traffic Spike",
+                "upload-traffic",
+                Some("Investigate why file uploads spiked 3x on 2026-06-01."),
             )
             .unwrap();
 
         let inv = db.investigation_get(id).unwrap().unwrap();
         assert_eq!(inv.status, "open");
-        assert_eq!(inv.slug, "bill-attach-traffic");
+        assert_eq!(inv.slug, "upload-traffic");
 
         db.investigation_conclude(
             id,
@@ -483,14 +483,14 @@ mod tests {
             .unwrap();
         db.investigation_conclude(
             id,
-            "Found that accounting-doc-worker has 30s hard limit. Increased to 120s.",
+            "Found that report-gen-worker has 30s hard limit. Increased to 120s.",
         )
         .unwrap();
 
         let results = db.investigation_search("Temporal").unwrap();
         assert_eq!(results.len(), 1);
 
-        let results = db.investigation_search("accounting-doc-worker").unwrap();
+        let results = db.investigation_search("report-gen-worker").unwrap();
         assert_eq!(results.len(), 1);
     }
 

@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn test_slugify_basic() {
         assert_eq!(slugify("Hello World"), "hello-world");
-        assert_eq!(slugify("Colin Kennedy"), "colin-kennedy");
+        assert_eq!(slugify("Jane Doe"), "jane-doe");
         assert_eq!(slugify("multi   space"), "multi-space");
         assert_eq!(slugify("Foo/Bar:Baz"), "foo-bar-baz");
         assert_eq!(slugify("---trim---"), "trim");
@@ -703,7 +703,7 @@ mod tests {
         let user_file = dir.path().join("my-notes.md");
         fs::write(&user_file, "user content").unwrap();
 
-        let pid = db.people_add("Colin Kennedy", None).unwrap();
+        let pid = db.people_add("Jane Doe", None).unwrap();
         db.people_identifier_set(pid, "email", "c@x").unwrap();
         let _mid = db
             .memory_set("project/active", "sclerox-cli", "project", None)
@@ -724,13 +724,13 @@ mod tests {
         assert!(dir.path().join("memory").exists());
         assert!(dir.path().join("todos").exists());
         assert!(user_file.exists());
-        assert!(dir.path().join("people/colin-kennedy.md").exists());
+        assert!(dir.path().join("people/jane-doe.md").exists());
         assert!(dir.path().join("memory/project/active.md").exists());
 
         // Re-run after deleting the person - their file should vanish.
         let _ = db.people_delete(pid);
         export(&db, dir.path()).unwrap();
-        assert!(!dir.path().join("people/colin-kennedy.md").exists());
+        assert!(!dir.path().join("people/jane-doe.md").exists());
         assert!(user_file.exists(), "user file must survive re-export");
     }
 

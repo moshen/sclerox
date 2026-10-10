@@ -13,7 +13,7 @@ pub enum ResearchCommand {
     Start {
         #[arg(long)]
         name: String,
-        /// Short slug for the investigation (e.g. "bill-attach-traffic")
+        /// Short slug for the investigation (e.g. "upload-traffic")
         #[arg(long)]
         slug: String,
         /// Initial plan / scope

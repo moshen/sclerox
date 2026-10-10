@@ -606,7 +606,7 @@ fn research_search_plan_and_findings() {
         "conclude",
         &id.to_string(),
         "--findings",
-        "accounting-doc-worker had 30s limit; increased to 120s",
+        "report-gen-worker had 30s limit; increased to 120s",
     ]);
 
     // Search by plan content
@@ -614,7 +614,7 @@ fn research_search_plan_and_findings() {
     assert!(by_plan.contains("Timeout investigation"));
 
     // Search by findings content (hyphenated identifier)
-    let by_findings = e.run(&["research", "search", "accounting-doc-worker"]);
+    let by_findings = e.run(&["research", "search", "report-gen-worker"]);
     assert!(by_findings.contains("Timeout investigation"));
 }
 

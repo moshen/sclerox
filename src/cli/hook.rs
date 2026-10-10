@@ -701,7 +701,7 @@ fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
 
 /// Derive the Claude Code project hash from a working directory path.
 /// Claude Code replaces every non-alphanumeric character (slash, dot, etc.)
-/// with `-`, so `/Users/colin.kennedy/code/proj` → `-Users-colin-kennedy-code-proj`.
+/// with `-`, so `/Users/jane.doe/code/proj` → `-Users-jane-doe-code-proj`.
 fn path_to_project_hash(path: &std::path::Path) -> String {
     path.to_string_lossy()
         .chars()
@@ -1362,13 +1362,13 @@ mod tests {
     fn test_path_to_project_hash() {
         // Plain path
         assert_eq!(
-            path_to_project_hash(std::path::Path::new("/Users/colin/code/myproject")),
-            "-Users-colin-code-myproject"
+            path_to_project_hash(std::path::Path::new("/Users/jane/code/myproject")),
+            "-Users-jane-code-myproject"
         );
         // Dots in username are also replaced
         assert_eq!(
-            path_to_project_hash(std::path::Path::new("/Users/colin.kennedy/code/my-project")),
-            "-Users-colin-kennedy-code-my-project"
+            path_to_project_hash(std::path::Path::new("/Users/jane.doe/code/my-project")),
+            "-Users-jane-doe-code-my-project"
         );
     }
 

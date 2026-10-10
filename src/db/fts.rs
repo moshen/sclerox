@@ -2,8 +2,8 @@
 ///
 /// FTS5 treats `-`, `AND`, `OR`, `NOT`, `*`, `(`, `)` as operators.
 /// Wrapping each term in `"term"*` syntax gives us:
-///   - Literal matching (no operator interpretation, so "account-doc" is a phrase,
-///     not `account NOT doc NOT worker`).
+///   - Literal matching (no operator interpretation, so "report-gen" is a phrase,
+///     not `report NOT gen NOT worker`).
 ///   - Prefix matching: `"split"*` matches "split", "splits", "splitting", etc.
 ///     This is the standard expectation for a search box.
 ///
@@ -29,8 +29,8 @@ mod tests {
     #[test]
     fn test_hyphenated_identifier() {
         assert_eq!(
-            sanitize("accounting-doc-worker"),
-            "\"accounting-doc-worker\"*"
+            sanitize("report-gen-worker"),
+            "\"report-gen-worker\"*"
         );
     }
 

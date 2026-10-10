@@ -73,8 +73,8 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 sclerox repo index ~/code/my-service
 
 # Search code
-sclerox code search "FinancialDocument"
-sclerox code search --repo my-service "createJob"
+sclerox code search "UserSession"
+sclerox code search --repo my-service "processOrder"
 
 # Global search across everything
 sclerox search "auth latency"
