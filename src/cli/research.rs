@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::config::settings;
 use crate::db::Database;
-use crate::embed::{chunk_text, Embedder};
+use crate::embed::chunk_text;
 use crate::output::{print_output, OutputFormat};
 
 #[derive(Subcommand)]
@@ -173,8 +173,9 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             }
 
             // Semantic results - appended, deduped against FTS hits
-            let mut embedder = Embedder::new()?;
-            if let Ok(query_emb) = embedder.embed_one(&query) {
+            let query_emb = crate::embed::optional(db.semantic_ready())
+                .and_then(|mut e| e.embed_query(&query).ok());
+            if let Some(query_emb) = query_emb {
                 let similar = db.investigation_similar(&query_emb, 5).unwrap_or_default();
                 let semantic: Vec<_> = similar
                     .iter()
@@ -388,13 +389,18 @@ fn embed_investigation(
     }
     let emb_cfg = &settings().embed;
     let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
-    let mut embedder = Embedder::new()?;
-    let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
-    let embeddings = embedder.embed_batch(&texts)?;
-    let chunks: Vec<(String, Option<Vec<f32>>)> = raw
-        .into_iter()
-        .zip(embeddings.into_iter().map(Some))
-        .collect();
+    // Without an embedder (model unavailable) the chunks are
+    // stored without vectors; `db reembed` can fill them later.
+    let chunks: Vec<(String, Option<Vec<f32>>)> =
+        if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
+            let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+            let embeddings = embedder.embed_batch(&texts)?;
+            raw.into_iter()
+                .zip(embeddings.into_iter().map(Some))
+                .collect()
+        } else {
+            raw.into_iter().map(|c| (c, None)).collect()
+        };
     db.investigation_store_chunks(id, &chunks)?;
     Ok(())
 }

@@ -415,8 +415,9 @@ ALTER TABLE memory ADD COLUMN embedding BLOB;
 /// (memory, meeting/todo/investigation chunks, repo descriptions), mirroring
 /// what REPO_MIGRATION_V4 did for code chunks. The base `embedding` columns stay
 /// the source of truth; each `*_vec` vec0 table is kept in sync by triggers and
-/// backfilled from existing rows. 384 dims = AllMiniLM-L6-v2; cosine distance to
-/// match the previous cosine_similarity ranking. Requires the sqlite-vec
+/// backfilled from existing rows. 384 dims, the dimension of every supported
+/// embedding model (`embed::models::SUPPORTED_DIM`); cosine distance to match
+/// the previous cosine_similarity ranking. Requires the sqlite-vec
 /// extension (registered in Database::open before migrating).
 pub const MIGRATION_V11: &str = "
 -- memory (embedding on the row itself, keyed by memory.id). memory_similar
@@ -677,6 +678,30 @@ CREATE INDEX IF NOT EXISTS memory_distinct_lo ON memory_distinct(lo_id);
 CREATE INDEX IF NOT EXISTS memory_distinct_hi ON memory_distinct(hi_id);
 ";
 
+/// Migration v14: record which embedding model produced the stored vectors.
+///
+/// Vectors from two models are not comparable, so each database records its
+/// model under `meta.embedding_model`, and sclerox refuses to mix in vectors
+/// from another one (see `embed::models::ModelCheck`). Every vector written
+/// before this migration came from the then-default MiniLM model.
+///
+/// Only databases that already contain embeddings are stamped. A fresh
+/// database runs every migration, including this one, and must not be marked
+/// as MiniLM: it records whichever model writes its first vector instead.
+pub const MIGRATION_V14: &str = "
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO meta (key, value)
+SELECT 'embedding_model', 'Qdrant/all-MiniLM-L6-v2-onnx:model'
+WHERE EXISTS (SELECT 1 FROM memory               WHERE embedding IS NOT NULL)
+   OR EXISTS (SELECT 1 FROM meeting_chunks       WHERE embedding IS NOT NULL)
+   OR EXISTS (SELECT 1 FROM todo_chunks          WHERE embedding IS NOT NULL)
+   OR EXISTS (SELECT 1 FROM investigation_chunks WHERE embedding IS NOT NULL)
+   OR EXISTS (SELECT 1 FROM repos                WHERE description_embedding IS NOT NULL);
+";
+
 pub const REPO_MIGRATION_V2: &str = "
 CREATE TABLE IF NOT EXISTS symbol_edges (
     id INTEGER PRIMARY KEY,
@@ -700,8 +725,9 @@ pub const REPO_MIGRATION_V3: &str =
 /// `chunks.embedding` (LE-f32 BLOB) stays the source of truth; `chunks_vec` is
 /// a vec0 index keyed by chunk id, kept in sync by triggers, and backfilled
 /// from existing embeddings. Requires the sqlite-vec extension to be registered
-/// on the connection (RepoDb::open does this before migrating). 384 dims =
-/// AllMiniLM-L6-v2; cosine distance to match the previous cosine_similarity.
+/// on the connection (RepoDb::open does this before migrating). 384 dims, the
+/// dimension of every supported embedding model; cosine distance to match the
+/// previous cosine_similarity.
 pub const REPO_MIGRATION_V4: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
     embedding float[384] distance_metric=cosine
@@ -727,6 +753,16 @@ CREATE TRIGGER IF NOT EXISTS chunks_vec_ad AFTER DELETE ON chunks
 BEGIN
     DELETE FROM chunks_vec WHERE rowid = old.id;
 END;
+";
+
+/// Migration v5: record which embedding model produced the stored code-chunk
+/// vectors; see `MIGRATION_V14` on the primary database. A fresh repo database
+/// skips migrations entirely, so it starts with no `embedding_model` key and
+/// records whichever model writes its first vector.
+pub const REPO_MIGRATION_V5: &str = "
+INSERT OR IGNORE INTO repo_meta (key, value)
+SELECT 'embedding_model', 'Qdrant/all-MiniLM-L6-v2-onnx:model'
+WHERE EXISTS (SELECT 1 FROM chunks WHERE embedding IS NOT NULL);
 ";
 
 pub const REPO_SCHEMA: &str = "

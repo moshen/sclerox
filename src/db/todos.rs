@@ -359,19 +359,27 @@ impl Database {
         todo_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM todo_chunks WHERE todo_id = ?1",
-            params![todo_id],
-        )?;
-        for (i, (text, emb)) in chunks.iter().enumerate() {
-            let emb_bytes = emb.as_deref().map(crate::db::embedding_to_bytes);
+        // Replacing the chunks and deciding whether their vectors may be kept
+        // happen in one transaction; see `write_with_vectors`.
+        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
+        self.write_with_vectors(wants_vectors, |keep_vectors| {
             self.conn.execute(
-                "INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![todo_id, i as i64, text, emb_bytes],
+                "DELETE FROM todo_chunks WHERE todo_id = ?1",
+                params![todo_id],
             )?;
-        }
-        Ok(())
+            for (i, (text, emb)) in chunks.iter().enumerate() {
+                let emb_bytes = emb
+                    .as_deref()
+                    .filter(|_| keep_vectors)
+                    .map(crate::db::embedding_to_bytes);
+                self.conn.execute(
+                    "INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text, embedding)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![todo_id, i as i64, text, emb_bytes],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Returns todos that have no rows in todo_chunks yet (need embedding).
@@ -390,9 +398,10 @@ impl Database {
     /// Todos whose chunks are nearest to `query_embedding`, via the sqlite-vec
     /// KNN index (`todo_chunks_vec`, cosine). `score` = 1 - cosine distance.
     pub fn todo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarTodo>> {
-        let query = crate::db::embedding_to_bytes(query_embedding);
-        let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.title, t.notes, t.status, t.source_url, t.category,
+        self.semantic_read(|| {
+            let query = crate::db::embedding_to_bytes(query_embedding);
+            let mut stmt = self.conn.prepare(
+                "SELECT t.id, t.title, t.notes, t.status, t.source_url, t.category,
                     t.originated_date, t.deadline_date, t.completed_at, t.created_at, t.updated_at,
                     tc.chunk_text, v.distance
              FROM todo_chunks_vec v
@@ -400,30 +409,31 @@ impl Database {
              JOIN todos t ON t.id = tc.todo_id
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |r| {
-            let todo = Todo {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                notes: r.get(2)?,
-                status: r.get(3)?,
-                source_url: r.get(4)?,
-                category: r.get(5)?,
-                originated_date: r.get(6)?,
-                deadline_date: r.get(7)?,
-                completed_at: r.get(8)?,
-                created_at: r.get(9)?,
-                updated_at: r.get(10)?,
-            };
-            let matched_chunk: String = r.get(11)?;
-            let distance: f64 = r.get(12)?;
-            Ok(SimilarTodo {
-                todo,
-                score: 1.0 - distance as f32,
-                matched_chunk,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            )?;
+            let rows = stmt.query_map(rusqlite::params![query, limit as i64], |r| {
+                let todo = Todo {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    notes: r.get(2)?,
+                    status: r.get(3)?,
+                    source_url: r.get(4)?,
+                    category: r.get(5)?,
+                    originated_date: r.get(6)?,
+                    deadline_date: r.get(7)?,
+                    completed_at: r.get(8)?,
+                    created_at: r.get(9)?,
+                    updated_at: r.get(10)?,
+                };
+                let matched_chunk: String = r.get(11)?;
+                let distance: f64 = r.get(12)?;
+                Ok(SimilarTodo {
+                    todo,
+                    score: 1.0 - distance as f32,
+                    matched_chunk,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 }
 

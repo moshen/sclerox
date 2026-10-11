@@ -1,77 +1,83 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
+pub mod download;
+pub mod models;
 pub mod tokens;
+pub use models::ModelSpec;
 pub use tokens::count_tokens;
 
-/// Path to the pre-downloaded model cache, baked in at compile time.
-/// Only set when the model was downloaded during `cargo build`.
-#[cfg(bundled_model)]
-const MODEL_CACHE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.model-cache");
+/// The embedder for a command whose whole job is embedding (`db reembed`,
+/// `memory reembed`, `repo reembed`). Fails when the model cannot be loaded.
+pub fn required() -> Result<Embedder> {
+    Embedder::new()
+}
 
-/// Generate embeddings using fastembed (AllMiniLML6V2, 384 dims).
+/// The embedder for everything else, where vectors are a bonus on top of
+/// keyword search and plain storage. `None` when the database being used is
+/// `!ready` (its vectors came from another model, see
+/// `Database::semantic_ready`), or when the model fails to load - in which
+/// case the caller carries on without vectors and the user is told once.
+pub fn optional(ready: bool) -> Option<Embedder> {
+    if !ready {
+        return None;
+    }
+    match Embedder::new() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            let msg = format!("embedding model unavailable, continuing without vectors: {e:#}");
+            log::warn!("{msg}");
+            eprintln!("warning: {msg}");
+            None
+        }
+    }
+}
+
+/// Generate embeddings with the configured model (see [`models`]). Obtained
+/// through [`required`] or [`optional`].
 pub struct Embedder {
     inner: fastembed::TextEmbedding,
+    spec: &'static ModelSpec,
 }
 
 impl Embedder {
-    /// Initialize the embedder.
-    ///
-    /// When the model was downloaded at build time (`cargo build`), loads from the
-    /// compile-time `.model-cache/` path instantly (no network). If that path is
-    /// inaccessible (binary moved to another machine), falls back to fastembed's
-    /// standard runtime download into `~/.cache/huggingface/`.
-    pub fn new() -> Result<Self> {
-        #[cfg(bundled_model)]
-        if let Ok(inner) = Self::try_load_from_cache() {
-            return Ok(Self { inner });
-        }
-
-        // Runtime download fallback
-        let inner = fastembed::TextEmbedding::try_new(
-            fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
-                .with_show_download_progress(true),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to initialize embedder: {e}"))?;
-        Ok(Self { inner })
+    /// Load the model selected by `embed.model` (bridged through
+    /// `SCLEROX_EMBED_MODEL`), downloading it on first use.
+    fn new() -> Result<Self> {
+        Self::with_model(models::configured()?)
     }
 
-    #[cfg(bundled_model)]
-    fn try_load_from_cache() -> anyhow::Result<fastembed::TextEmbedding> {
-        use fastembed::{
-            InitOptionsUserDefined, Pooling, QuantizationMode, TokenizerFiles,
-            UserDefinedEmbeddingModel,
-        };
-        use std::path::Path;
-
-        let dir = Path::new(MODEL_CACHE_DIR);
-        let read = |name: &str| -> anyhow::Result<Vec<u8>> {
-            std::fs::read(dir.join(name))
-                .map_err(|e| anyhow::anyhow!("model cache missing {name}: {e}"))
-        };
-
-        let model_def = UserDefinedEmbeddingModel {
-            onnx_file: read("model.onnx")?,
-            external_initializers: vec![],
-            tokenizer_files: TokenizerFiles {
-                tokenizer_file: read("tokenizer.json")?,
-                config_file: read("config.json")?,
-                special_tokens_map_file: read("special_tokens_map.json")?,
-                tokenizer_config_file: read("tokenizer_config.json")?,
-            },
-            pooling: Some(Pooling::Mean),
-            quantization: QuantizationMode::None,
-            output_key: None,
-        };
-
-        fastembed::TextEmbedding::try_new_from_user_defined(
-            model_def,
-            InitOptionsUserDefined::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to load model from cache: {e}"))
+    /// Load `spec`, downloading its files into the sclerox model cache
+    /// (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
+    pub fn with_model(spec: &'static ModelSpec) -> Result<Self> {
+        spec.check_supported()?;
+        let files = ensure_downloaded(spec)?;
+        let inner = load(spec, &files)
+            .with_context(|| format!("failed to load embedding model '{}'", spec.name))?;
+        Ok(Self { inner, spec })
     }
 
+    /// The model this embedder runs.
+    pub fn model(&self) -> &'static ModelSpec {
+        self.spec
+    }
+
+    /// Embed text that will be stored and searched against.
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         log::debug!("embedding {} chars", text.len());
+        let prefixed = format!("{}{text}", self.spec.document_prefix);
+        self.embed_single(&prefixed)
+    }
+
+    /// Embed a search query. Differs from [`Self::embed_one`] only for models
+    /// that expect a query prefix.
+    pub fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        log::debug!("embedding query of {} chars", text.len());
+        let prefixed = format!("{}{text}", self.spec.query_prefix);
+        self.embed_single(&prefixed)
+    }
+
+    fn embed_single(&mut self, text: &str) -> Result<Vec<f32>> {
         let mut results = self
             .inner
             .embed(std::slice::from_ref(&text), None)
@@ -85,10 +91,72 @@ impl Embedder {
     }
 
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let prefix = self.spec.document_prefix;
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
         self.inner
-            .embed(texts, None)
+            .embed(&prefixed, None)
             .map_err(|e| anyhow::anyhow!("batch embedding failed: {e}"))
     }
+}
+
+pub use download::cache_dir as model_cache_dir;
+
+/// Whether every file `spec` needs is already in the model cache.
+pub fn is_downloaded(spec: &ModelSpec) -> bool {
+    spec.pinned().is_cached()
+}
+
+/// Make sure every file `spec` needs is in the model cache, downloading and
+/// verifying any that are missing, and return their local paths keyed by repo
+/// path.
+pub fn ensure_downloaded(spec: &ModelSpec) -> Result<Vec<(&'static str, PathBuf)>> {
+    let paths = spec
+        .pinned()
+        .fetch(&format!("embedding model '{}'", spec.name))?;
+    Ok(spec.files.iter().map(|f| f.path).zip(paths).collect())
+}
+
+fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed::TextEmbedding> {
+    use fastembed::{
+        InitOptionsUserDefined, OutputKey, QuantizationMode, TokenizerFiles,
+        UserDefinedEmbeddingModel,
+    };
+
+    let read = |name: &str| -> Result<Vec<u8>> {
+        let path = files
+            .iter()
+            .find(|(f, _)| *f == name)
+            .map(|(_, p)| p)
+            .with_context(|| format!("model file {name} was not downloaded"))?;
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+    };
+
+    let [tokenizer, config, special_tokens_map, tokenizer_config] = models::TOKENIZER_FILES;
+    let mut model_def = UserDefinedEmbeddingModel::new(
+        read(spec.onnx_file)?,
+        TokenizerFiles {
+            tokenizer_file: read(tokenizer)?,
+            config_file: read(config)?,
+            special_tokens_map_file: read(special_tokens_map)?,
+            tokenizer_config_file: read(tokenizer_config)?,
+        },
+    )
+    .with_pooling(spec.pooling.clone())
+    .with_quantization(QuantizationMode::None);
+    model_def.output_key = spec.output_name.map(OutputKey::ByName);
+
+    // The graph names its external weights by base name; that is the name
+    // onnxruntime must find them under.
+    for data in spec.external_data {
+        let graph_name = Path::new(data)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("bad external data path {data}"))?;
+        model_def = model_def.with_external_initializer(graph_name.to_string(), read(data)?);
+    }
+
+    fastembed::TextEmbedding::try_new_from_user_defined(model_def, InitOptionsUserDefined::new())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Chunk text into overlapping windows of ~`max_chars` characters,
@@ -130,6 +198,60 @@ pub fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    }
+
+    /// Granite through fastembed must match onnxruntime in Python on the same
+    /// int8 model. Cosines all near 0.6-0.7 would mean mean pooling crept in
+    /// where CLS belongs.
+    ///
+    /// Queries and passages are each embedded as one batch, as the reference
+    /// was. The int8 graph quantizes activations dynamically, with a scale
+    /// taken over the whole padded batch, so the same text embedded alone
+    /// comes out slightly different (~0.995 cosine) and drifts past the
+    /// tolerance.
+    #[test]
+    #[ignore = "downloads Granite small (~52 MB) into the model cache"]
+    fn granite_parity_with_reference() {
+        let mut e = Embedder::with_model(&models::GRANITE_SMALL_R2).unwrap();
+        let queries = ["Who made the song My achy breaky heart?", "summit define"];
+        let passages = [
+            "Achy Breaky Heart is a country song written by Don Von Tress. Originally \
+             titled Don't Tell My Heart and performed by The Marcy Brothers in 1991.",
+            "Definition of summit for English Language Learners. : 1 the highest point \
+             of a mountain : the top of a mountain. : 2 the highest level.",
+        ];
+        let reference = [[0.888, 0.638], [0.686, 0.826]];
+
+        let q = e.embed_batch(&queries).unwrap();
+        let p = e.embed_batch(&passages).unwrap();
+        for (i, qv) in q.iter().enumerate() {
+            assert_eq!(qv.len(), 384);
+            for (j, pv) in p.iter().enumerate() {
+                let got = cosine(qv, pv);
+                assert!(
+                    (got - reference[i][j]).abs() <= 0.005,
+                    "query {i} / passage {j}: got {got:.4}, reference {}",
+                    reference[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "downloads MiniLM (~90 MB) into the model cache"]
+    fn minilm_still_loads() {
+        let mut e = Embedder::with_model(&models::MINILM_L6_V2).unwrap();
+        let a = e.embed_one("the cat sat on the mat").unwrap();
+        let b = e.embed_one("a cat was sitting on a mat").unwrap();
+        let c = e.embed_one("quarterly revenue projections").unwrap();
+        assert_eq!(a.len(), 384);
+        assert!(cosine(&a, &b) > cosine(&a, &c));
+    }
 
     #[test]
     fn test_chunk_short_text_is_single() {

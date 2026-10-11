@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::config::settings;
 use crate::db::{todos::TodoStatus, Database};
-use crate::embed::{chunk_text, Embedder};
+use crate::embed::chunk_text;
 use crate::output::{print_output, OutputFormat};
 
 #[derive(Subcommand)]
@@ -209,22 +209,32 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             // Results are deduped against FTS hits and filtered by a minimum score.
             // Model load costs ~1s; acceptable for a search that already has context.
             let sem = &settings().search;
-            let floor = sem.semantic_threshold as f32;
+            let floor = crate::config::settings().semantic_threshold() as f32;
             let fts_ids: std::collections::HashSet<i64> =
                 fts_results.iter().map(|t| t.id).collect();
-            let semantic: Vec<_> = if let Ok(mut emb) = Embedder::new() {
-                if let Ok(query_emb) = emb.embed_one(&query) {
-                    db.todo_similar(&query_emb, sem.semantic_limit)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= floor)
-                        .collect()
+            let semantic: Vec<_> =
+                if let Some(mut emb) = crate::embed::optional(db.semantic_ready()) {
+                    if let Ok(query_emb) = emb.embed_query(&query) {
+                        let hits = db
+                            .todo_similar(&query_emb, sem.semantic_limit)
+                            .unwrap_or_default();
+                        let margin = crate::config::settings()
+                            .semantic_margin()
+                            .map(|m| m as f32);
+                        let cut = crate::embed::models::semantic_cutoff(
+                            hits.iter().map(|r| r.score),
+                            floor,
+                            margin,
+                        );
+                        hits.into_iter()
+                            .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= cut)
+                            .collect()
+                    } else {
+                        vec![]
+                    }
                 } else {
                     vec![]
-                }
-            } else {
-                vec![]
-            };
+                };
 
             print_output(
                 format,
@@ -381,7 +391,7 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
         Some(n) if !n.trim().is_empty() => format!("{title}\n\n{n}"),
         _ => title.to_string(),
     };
-    if let Ok(mut embedder) = Embedder::new() {
+    if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
         let emb_cfg = &settings().embed;
         let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
         if let Ok(embeddings) =
@@ -404,7 +414,7 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
     if pending.is_empty() {
         return;
     }
-    let Ok(mut embedder) = Embedder::new() else {
+    let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) else {
         return;
     };
     log::debug!("backfilling embeddings for {} todos", pending.len());

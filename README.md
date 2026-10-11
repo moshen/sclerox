@@ -65,6 +65,7 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 - `~/.claude/skills/sclerox-kb/` - skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
 - `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories
 - `~/.config/git/ignore` - excludes `.sclerox/` from all repos
+- `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, downloaded once and hash-checked; `--no-model-download` defers it to first use)
 
 ## Quick start
 
@@ -110,6 +111,13 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `sclerox repo search-symbols <query>` | Search symbols across all indexed repos (self-healing) |
 | `sclerox repo sync [--force]` | Remove stale entries, reindex missing DBs, migrate old schemas |
 | `sclerox repo reembed [--repo <name>] [--force]` | Backfill embeddings for chunks that don't have one |
+
+### `sclerox db`
+| Command | Description |
+|---------|-------------|
+| `sclerox db migrate [--repos]` | Schema version, pending migrations, and each database's embedding model |
+| `sclerox db reembed [--force]` | Re-embed every database recorded under a different embedding model, and embed items saved without a vector |
+| `sclerox db export <dir>` | Export the knowledge base as plaintext markdown |
 
 ### `sclerox memory`
 | Command | Description |
@@ -202,9 +210,37 @@ sclerox config path          # where the file lives
 Configurable sections include `[ai]` (distillation command/model), `[search]`
 (`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds, `[memory]`
 (`max_value_chars`), `[session_context]` sizes, `[distill]` chunking, `[embed]`
-chunk size, `[index]` (`max_file_bytes`, `max_files`, `auto`), `[install]`
+model and chunk size, `[index]` (`max_file_bytes`, `max_files`, `auto`), `[install]`
 (which managed artifacts get refreshed on reinstall), and `[log] level`. Run
 `sclerox config init` to see every key with its default.
+
+### Embedding model
+
+`[embed] model` selects the embedding model: `granite-small-r2` (default) or
+`minilm-l6-v2`. Models download once into `$XDG_CACHE_HOME/sclerox/models/`
+(`~/.cache/sclerox/models/`), never into the shared `~/.cache/huggingface/`.
+Every file is pinned to a Hugging Face commit and checked against a sha256
+built into sclerox; a file that fails the check is never used. Set
+`HF_ENDPOINT` to download from a mirror.
+
+Each database records which model produced its vectors. If that differs from
+the configured model - after changing `embed.model`, or after upgrading from a
+version that used MiniLM - sclerox warns, and semantic search and dedup are off
+for that database until you run `sclerox db reembed`. Keyword search keeps
+working throughout.
+
+If the model can't be loaded (offline on first use, say) commands carry on
+keyword-only with a warning, except `db reembed`, `memory reembed` and
+`repo reembed`, which fail.
+
+`sclerox install` (and re-running it after an upgrade) re-embeds any database
+still on another model automatically, and embeds items saved without a vector;
+`--no-model-download` skips that.
+
+The `[search]` and `[dedup]` thresholds default per model, because each model
+scores on its own scale; `sclerox config show` prints the effective values.
+`search.semantic_margin` also drops semantic hits scoring more than that below
+the best hit for the query (Granite: 0.05; `1.0` turns it off).
 
 `[ai].command` is the full distillation command (the transcript prompt is
 appended as the last argument). If unset, sclerox uses the built-in default for the
@@ -222,6 +258,9 @@ Environment variables still work and override the file:
 | `SCLEROX_AI_MODEL` | agent default | Model appended to the default command |
 | `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
+| `SCLEROX_EMBED_MODEL` | `granite-small-r2` | Embedding model (`granite-small-r2\|minilm-l6-v2`) |
+| `XDG_CACHE_HOME` | `~/.cache` | Downloaded models live in `$XDG_CACHE_HOME/sclerox/models/` |
+| `HF_ENDPOINT` | `https://huggingface.co` | Where models download from (a mirror); files are still hash-checked |
 
 ## How hooks work
 

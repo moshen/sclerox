@@ -42,9 +42,9 @@ Check that `sclerox <command> --help` output matches what the skill describes.
 
 # Building
 
-`build.rs` downloads the MiniLM embedding model into `.model-cache/` on
-the first build (needs network plus `curl` or `wget`) and sets the
-`bundled_model` cfg; the model's tokenizer is then embedded in the binary
-for exact token counts. Set `SKIP_MODEL_DOWNLOAD=1` to skip the download -
-embeddings then fall back to a runtime download and token counts to a
-coarse estimate.
+Nothing is downloaded at build time. The embedding models and the
+token-counting tokenizer download on first use into
+`$XDG_CACHE_HOME/sclerox/models/`, pinned to a commit and checked against the
+size and sha256 recorded in `src/embed/models.rs` (see `src/embed/download.rs`).
+To change a model's files, bump `revision` and every hash together; if the
+vectors change, the model `id` must change too so databases get re-embedded.

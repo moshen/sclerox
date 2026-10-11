@@ -303,13 +303,19 @@ impl Database {
 
     /// Store (or replace) the embedding vector for a memory's ACTIVE row.
     /// Returns false if the key has no active row.
+    /// Returns false, storing nothing, if the database holds another model's
+    /// vectors.
     pub fn memory_set_embedding(&self, key: &str, embedding: &[f32]) -> Result<bool> {
-        let bytes = embedding_to_bytes(embedding);
-        let n = self.conn.execute(
-            "UPDATE memory SET embedding = ?1 WHERE key = ?2 AND status = 'active'",
-            params![bytes, key],
-        )?;
-        Ok(n > 0)
+        self.write_with_vectors(true, |keep| {
+            if !keep {
+                return Ok(false);
+            }
+            let n = self.conn.execute(
+                "UPDATE memory SET embedding = ?1 WHERE key = ?2 AND status = 'active'",
+                params![embedding_to_bytes(embedding), key],
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Active memories with no embedding yet - the backfill work list.
@@ -334,24 +340,26 @@ impl Database {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarMemory>> {
-        let query = embedding_to_bytes(query_embedding);
-        let sql = format!(
-            "SELECT {MEMORY_COLS}, v.distance
+        self.semantic_read(|| {
+            let query = embedding_to_bytes(query_embedding);
+            let sql = format!(
+                "SELECT {MEMORY_COLS}, v.distance
              FROM memory_vec v
              JOIN memory m ON m.id = v.rowid
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let entry = row_to_memory(row)?;
-            let distance: f64 = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
-            Ok(SimilarMemory {
-                entry,
-                score: 1.0 - distance as f32,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![query, limit as i64], |row| {
+                let entry = row_to_memory(row)?;
+                let distance: f64 = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
+                Ok(SimilarMemory {
+                    entry,
+                    score: 1.0 - distance as f32,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 
     /// Semantic counterpart to `memory_find_near_duplicates`: the up-to-`limit`
@@ -1094,7 +1102,7 @@ mod tests {
         // Before embedding: all three need backfill.
         assert_eq!(db.memory_needing_embedding().unwrap().len(), 3);
 
-        // 384-dim mock embeddings (the vec0 index enforces the AllMiniLM dim).
+        // 384-dim mock embeddings (the vec0 index enforces the model dim).
         // 'c' is close to 'a', 'b' is orthogonal.
         let unit = |i: usize| {
             let mut v = vec![0.0f32; 384];

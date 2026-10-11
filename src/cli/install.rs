@@ -30,6 +30,11 @@ pub struct InstallArgs {
     /// (~/.claude/CLAUDE.md, ~/.config/opencode/AGENTS.md, ~/.codex/instructions.md)
     #[arg(long)]
     no_instructions: bool,
+    /// Skip downloading the embedding model now; it downloads on first use
+    /// instead (possibly inside a session hook). Also skips re-embedding
+    /// databases left on a previous model; run `sclerox db reembed` for that
+    #[arg(long)]
+    no_model_download: bool,
     /// Show what would be done without writing anything
     #[arg(long)]
     dry_run: bool,
@@ -47,6 +52,14 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     // Never overwrites an existing file; every key ships commented, so this
     // changes no behaviour.
     super::config_cmd::install_default_config(args.dry_run)?;
+    if args.no_model_download {
+        if !args.dry_run {
+            report_reembed_needed();
+        }
+    } else {
+        prefetch_embedding_model(args.dry_run);
+        reembed_on_install(args.dry_run);
+    }
     if super::migrate::legacy_data_present() {
         println!(
             "\nDetected an old `ol` install at ~/.ol - run `sclerox migrate` to move it over."
@@ -58,6 +71,95 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         println!("\nDone. Reload any open sessions to pick up the new skill.");
     }
     Ok(())
+}
+
+/// Download the embedding model and the token-counting tokenizer now, so the
+/// first session hook to need them is not the one stalled by the download.
+/// Best-effort: a failure only means the download is retried on first use.
+fn prefetch_embedding_model(dry_run: bool) {
+    let spec = crate::config::settings().embed_model();
+    let dir = crate::embed::model_cache_dir();
+    let tokenizer = crate::embed::models::TOKEN_COUNTER;
+    if crate::embed::is_downloaded(spec) && tokenizer.is_cached() {
+        println!(
+            "embedding model: {} already in {}",
+            spec.name,
+            dir.display()
+        );
+    } else if dry_run {
+        println!(
+            "  would download embedding model {} and tokenizer to {}",
+            spec.name,
+            dir.display()
+        );
+    } else {
+        let fetched = crate::embed::ensure_downloaded(spec)
+            .and_then(|_| tokenizer.fetch("the token-counting tokenizer"));
+        match fetched {
+            Ok(_) => println!(
+                "embedding model: downloaded {} to {}",
+                spec.name,
+                dir.display()
+            ),
+            Err(e) => println!("embedding model: download failed, will retry on first use ({e:#})"),
+        }
+    }
+}
+
+/// After an upgrade that changed the embedding model (or after editing
+/// `embed.model`), convert every database still on the old one, so semantic
+/// search and dedup keep working without a separate step. Best-effort: a
+/// failure is reported and left for `sclerox db reembed`, never fails install.
+/// Never creates the database just to check it.
+fn reembed_on_install(dry_run: bool) {
+    let path = &crate::config::settings().db_path;
+    if !path.exists() {
+        return;
+    }
+    if dry_run {
+        // Opening the database migrates it, which a dry run must not do, so
+        // whether anything is stale can't be checked here.
+        println!("  would re-embed any database recorded under another embedding model");
+        return;
+    }
+    let db = match crate::db::Database::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            println!("embeddings: could not open {} ({e:#})", path.display());
+            return;
+        }
+    };
+    if !super::db::embeddings_need_work(&db) {
+        return;
+    }
+    println!(
+        "\nUpdating embeddings for {} (large repos take minutes)...",
+        crate::config::settings().embed.model
+    );
+    if let Err(e) = super::db::reembed(&db, false) {
+        println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
+    }
+}
+
+/// Say how to convert the existing knowledge base when install was told not
+/// to download the model (and so cannot re-embed). Never creates the database.
+fn report_reembed_needed() {
+    let path = &crate::config::settings().db_path;
+    if !path.exists() {
+        return;
+    }
+    let Ok(db) = crate::db::Database::open(path) else {
+        return;
+    };
+    if let Ok(crate::embed::models::ModelCheck::Mismatch { recorded }) = db.embedding_model_check()
+    {
+        println!(
+            "\nYour knowledge base was embedded with '{}'. Run `sclerox db reembed` to \
+             switch it to '{}'; until then semantic search and dedup are off for it.",
+            crate::embed::models::display_id(&recorded),
+            crate::config::settings().embed.model
+        );
+    }
 }
 
 pub fn run_uninstall(args: InstallArgs) -> Result<()> {

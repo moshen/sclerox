@@ -120,9 +120,14 @@ fn memory_set_warns_but_stores_long_value() {
 fn config_show_reflects_defaults_and_edits() {
     let e = Env::new();
 
-    // No file yet → show reports defaults.
+    // No file yet → show reports defaults. Thresholds default per embedding
+    // model, so show prints the effective values for the default model.
     let out = e.run(&["config", "show"]);
-    assert!(out.contains("semantic_threshold = 0.45"), "got: {out}");
+    assert!(out.contains("model = \"granite-small-r2\""), "got: {out}");
+    assert!(
+        out.contains("effective thresholds for granite-small-r2: semantic 0.72, margin 0.05"),
+        "got: {out}"
+    );
     assert!(
         out.contains("using defaults") || out.contains("no file"),
         "got: {out}"
@@ -152,6 +157,7 @@ fn config_show_reflects_defaults_and_edits() {
     std::fs::write(&e.config, "[search]\nsemantic_threshold = 0.9\n").unwrap();
     let edited = e.run(&["config", "show"]);
     assert!(edited.contains("semantic_threshold = 0.9"), "got: {edited}");
+    assert!(edited.contains("semantic 0.9,"), "got: {edited}");
 }
 
 #[test]
@@ -982,7 +988,7 @@ fn install_adopts_a_pre_rename_config() {
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
         .env_remove("SCLEROX_CONFIG")
-        .args(["install", "--target", "claude"]);
+        .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
 
     let adopted = home.path().join(".config/sclerox/config.toml");
@@ -1019,7 +1025,7 @@ fn install_never_overwrites_an_edited_config() {
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
         .env_remove("SCLEROX_CONFIG")
-        .args(["install", "--target", "claude"]);
+        .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
 
     let contents = std::fs::read_to_string(&current).unwrap();

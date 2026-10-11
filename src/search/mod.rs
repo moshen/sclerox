@@ -68,19 +68,25 @@ pub enum SearchResult {
 /// Search every table for `query`. FTS/LIKE always runs; semantic (cosine)
 /// tiers run when an embedder is available, keeping hits at/above
 /// `semantic_threshold` and capping each entity type at `semantic_limit`.
-/// Both tunables are passed in so this library function stays config-free.
+/// With a `semantic_margin`, hits more than that far below the best hit of
+/// their entity type are dropped too (see `embed::models::semantic_cutoff`).
+/// The tunables are passed in so this library function stays config-free.
 pub fn global_search(
     db: &Database,
     query: &str,
     semantic_threshold: f32,
+    semantic_margin: Option<f32>,
     semantic_limit: usize,
 ) -> Result<Vec<SearchResult>> {
+    let cutoff = |scores: &mut dyn Iterator<Item = f32>| {
+        crate::embed::models::semantic_cutoff(scores, semantic_threshold, semantic_margin)
+    };
     let mut results = Vec::new();
 
     // Initialise embedder once; embed query once. Both are None if unavailable.
-    let query_emb: Option<Vec<f32>> = crate::embed::Embedder::new()
-        .ok()
-        .and_then(|mut emb| emb.embed_one(query).ok());
+    // Each database checks its own recorded model when searched.
+    let query_emb: Option<Vec<f32>> =
+        crate::embed::optional(true).and_then(|mut emb| emb.embed_query(query).ok());
 
     let memory_fts = db.memory_search(query)?;
     let memory_fts_ids: std::collections::HashSet<i64> = memory_fts.iter().map(|m| m.id).collect();
@@ -92,8 +98,10 @@ pub fn global_search(
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.memory_similar(qe, semantic_limit).unwrap_or_default() {
-            if !memory_fts_ids.contains(&r.entry.id) && r.score >= semantic_threshold {
+        let hits = db.memory_similar(qe, semantic_limit).unwrap_or_default();
+        let cut = cutoff(&mut hits.iter().map(|r| r.score));
+        for r in hits {
+            if !memory_fts_ids.contains(&r.entry.id) && r.score >= cut {
                 results.push(SearchResult::Memory {
                     id: r.entry.id,
                     key: r.entry.key,
@@ -128,8 +136,10 @@ pub fn global_search(
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.meeting_similar(qe, semantic_limit).unwrap_or_default() {
-            if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= semantic_threshold {
+        let hits = db.meeting_similar(qe, semantic_limit).unwrap_or_default();
+        let cut = cutoff(&mut hits.iter().map(|r| r.score));
+        for r in hits {
+            if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= cut {
                 results.push(SearchResult::Meeting {
                     id: r.meeting.id,
                     title: r.meeting.title,
@@ -159,8 +169,10 @@ pub fn global_search(
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.todo_similar(qe, semantic_limit).unwrap_or_default() {
-            if !todo_fts_ids.contains(&r.todo.id) && r.score >= semantic_threshold {
+        let hits = db.todo_similar(qe, semantic_limit).unwrap_or_default();
+        let cut = cutoff(&mut hits.iter().map(|r| r.score));
+        for r in hits {
+            if !todo_fts_ids.contains(&r.todo.id) && r.score >= cut {
                 results.push(SearchResult::Todo {
                     id: r.todo.id,
                     title: r.todo.title,
@@ -189,11 +201,12 @@ pub fn global_search(
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db
+        let hits = db
             .investigation_similar(qe, semantic_limit)
-            .unwrap_or_default()
-        {
-            if !inv_fts_ids.contains(&r.investigation.id) && r.score >= semantic_threshold {
+            .unwrap_or_default();
+        let cut = cutoff(&mut hits.iter().map(|r| r.score));
+        for r in hits {
+            if !inv_fts_ids.contains(&r.investigation.id) && r.score >= cut {
                 results.push(SearchResult::Investigation {
                     id: r.investigation.id,
                     name: r.investigation.name,
@@ -216,8 +229,10 @@ pub fn global_search(
         });
     }
     if let Some(ref qe) = query_emb {
-        for r in db.repo_similar(qe, semantic_limit).unwrap_or_default() {
-            if !repo_fts_ids.contains(&r.repo.id) && r.score >= semantic_threshold {
+        let hits = db.repo_similar(qe, semantic_limit).unwrap_or_default();
+        let cut = cutoff(&mut hits.iter().map(|r| r.score));
+        for r in hits {
+            if !repo_fts_ids.contains(&r.repo.id) && r.score >= cut {
                 results.push(SearchResult::Repo {
                     id: r.repo.id,
                     name: r.repo.name,
@@ -274,7 +289,10 @@ pub fn global_search(
             }
         }
     }
-    // Rank code chunks across all repos and keep the global top N.
+    // Rank code chunks across all repos and keep the global top N, dropping
+    // any too far below the best of them.
+    let cut = cutoff(&mut code_chunks.iter().map(|(s, _, _)| *s));
+    code_chunks.retain(|(s, _, _)| *s >= cut);
     code_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     code_chunks.truncate(semantic_limit);
     for (_, repo_name, c) in code_chunks {
@@ -328,7 +346,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = global_search(&db, "Rust", 0.45, 5).unwrap();
+        let results = global_search(&db, "Rust", 0.45, None, 5).unwrap();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",

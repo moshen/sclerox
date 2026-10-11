@@ -8,10 +8,10 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 13;
+pub const PRIMARY_VERSION: u32 = 14;
 
 /// Current target schema version for per-repo databases.
-pub const REPO_VERSION: u32 = 4;
+pub const REPO_VERSION: u32 = 5;
 
 /// Migrations for the primary database (~/.local/share/sclerox/sclerox.db).
 ///
@@ -86,6 +86,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         description: "memory_distinct: pairs a human judged genuinely different",
         sql: crate::db::schema::MIGRATION_V13,
     },
+    Migration {
+        version: 14,
+        description: "meta table; record the embedding model of existing vectors",
+        sql: crate::db::schema::MIGRATION_V14,
+    },
 ];
 
 /// Migrations for per-repo databases (<repo>/.sclerox/repo.db).
@@ -104,6 +109,11 @@ pub const REPO_MIGRATIONS: &[Migration] = &[
         version: 4,
         description: "add chunks_vec sqlite-vec KNN index over code chunks",
         sql: crate::db::schema::REPO_MIGRATION_V4,
+    },
+    Migration {
+        version: 5,
+        description: "record the embedding model of existing chunk vectors",
+        sql: crate::db::schema::REPO_MIGRATION_V5,
     },
 ];
 
