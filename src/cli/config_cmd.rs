@@ -55,6 +55,9 @@ fn show(format: OutputFormat) -> Result<()> {
             println!("# env overrides active: {}", overrides.join(", "));
         }
         let off = |v: Option<f64>| v.map_or("off".to_string(), |v| v.to_string());
+        if !s.embed.enabled {
+            println!("# embeddings are off (embed.enabled = false): keyword search only");
+        }
         println!(
             "# effective thresholds for {}: semantic {}, margin {}, dedup cosine {}, merge {}",
             s.embed.model,
@@ -78,6 +81,7 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_AI_MODEL",
         "SCLEROX_MAX_INDEX_FILE_BYTES",
         "SCLEROX_EMBED_MODEL",
+        "SCLEROX_EMBED_ENABLED",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]
@@ -144,6 +148,7 @@ pub fn config_template() -> String {
          # context_memories = {ctx_mem}               # related memories shown to the distiller for key reuse\n\
          \n\
          [embed]\n\
+         # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
          # model = \"{embed_model}\"   # {model_names}; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
          # chunk_size = {embed_size}                 # entity-text chunking for embeddings\n\
          # chunk_overlap = {embed_overlap}\n\

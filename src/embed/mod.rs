@@ -7,19 +7,49 @@ pub mod tokens;
 pub use models::ModelSpec;
 pub use tokens::count_tokens;
 
+/// Env var carrying `embed.enabled` from `config::init()` into this
+/// settings-free module. Unset means enabled; see [`parse_switch`].
+pub const ENABLED_ENV: &str = "SCLEROX_EMBED_ENABLED";
+
+/// Read an on/off value: `1`/`true`/`on`/`yes` or `0`/`false`/`off`/`no`,
+/// any case. `None` for anything else.
+pub fn parse_switch(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether embeddings are on (`embed.enabled`). When off, nothing loads the
+/// model: no vectors are written and searches are keyword-only.
+pub fn enabled() -> bool {
+    std::env::var(ENABLED_ENV)
+        .ok()
+        .and_then(|v| parse_switch(&v))
+        .unwrap_or(true)
+}
+
 /// The embedder for a command whose whole job is embedding (`db reembed`,
-/// `memory reembed`, `repo reembed`). Fails when the model cannot be loaded.
+/// `memory reembed`, `repo reembed`). Fails when embeddings are off or the
+/// model cannot be loaded.
 pub fn required() -> Result<Embedder> {
+    if !enabled() {
+        anyhow::bail!(
+            "embeddings are turned off (embed.enabled = false or {ENABLED_ENV}); \
+             turn them on to embed"
+        );
+    }
     Embedder::new()
 }
 
 /// The embedder for everything else, where vectors are a bonus on top of
-/// keyword search and plain storage. `None` when the database being used is
-/// `!ready` (its vectors came from another model, see
+/// keyword search and plain storage. `None` when embeddings are off, when the
+/// database being used is `!ready` (its vectors came from another model, see
 /// `Database::semantic_ready`), or when the model fails to load - in which
 /// case the caller carries on without vectors and the user is told once.
 pub fn optional(ready: bool) -> Option<Embedder> {
-    if !ready {
+    if !enabled() || !ready {
         return None;
     }
     match Embedder::new() {
@@ -34,7 +64,7 @@ pub fn optional(ready: bool) -> Option<Embedder> {
 }
 
 /// Generate embeddings with the configured model (see [`models`]). Obtained
-/// through [`required`] or [`optional`].
+/// through [`required`] or [`optional`], which apply `embed.enabled`.
 pub struct Embedder {
     inner: fastembed::TextEmbedding,
     spec: &'static ModelSpec,
@@ -251,6 +281,17 @@ mod tests {
         let c = e.embed_one("quarterly revenue projections").unwrap();
         assert_eq!(a.len(), 384);
         assert!(cosine(&a, &b) > cosine(&a, &c));
+    }
+
+    #[test]
+    fn switch_values() {
+        for on in ["1", "true", "ON", " yes "] {
+            assert_eq!(parse_switch(on), Some(true), "{on}");
+        }
+        for off in ["0", "false", "Off", "NO"] {
+            assert_eq!(parse_switch(off), Some(false), "{off}");
+        }
+        assert_eq!(parse_switch("maybe"), None);
     }
 
     #[test]

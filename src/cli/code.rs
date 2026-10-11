@@ -49,7 +49,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             }
 
             // Embed the query once for the semantic tier (best-effort - skipped
-            // if the model is unavailable; each repo DB
+            // if embeddings are off or the model is unavailable; each repo DB
             // checks its own model). FTS symbol search always runs.
             let query_emb =
                 crate::embed::optional(true).and_then(|mut e| e.embed_query(&needle).ok());

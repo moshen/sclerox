@@ -131,6 +131,10 @@ pub struct DistillSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedSettings {
+    /// Generate and use embeddings at all. `false` keeps the model from ever
+    /// loading or downloading: nothing gets a vector and every search is
+    /// keyword-only. Env: `SCLEROX_EMBED_ENABLED`.
+    pub enabled: bool,
     /// Embedding model, by registry name (`embed::models`). Changing it means
     /// running `sclerox db reembed`; until then semantic search and dedup are
     /// off for databases embedded with the old model. Env: `SCLEROX_EMBED_MODEL`.
@@ -260,6 +264,7 @@ impl Default for DistillSettings {
 impl Default for EmbedSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             model: crate::embed::models::DEFAULT_MODEL.to_string(),
             chunk_size: 800,
             chunk_overlap: 200,
@@ -381,6 +386,16 @@ impl Settings {
         if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {
             if !m.is_empty() {
                 self.embed.model = m;
+            }
+        }
+        if let Ok(v) = std::env::var(crate::embed::ENABLED_ENV) {
+            match crate::embed::parse_switch(&v) {
+                Some(on) => self.embed.enabled = on,
+                None if v.is_empty() => {}
+                None => eprintln!(
+                    "warning: {} = {v} is not true/false; ignoring it",
+                    crate::embed::ENABLED_ENV
+                ),
             }
         }
         if let Ok(l) = std::env::var("SCLEROX_LOG") {
@@ -572,6 +587,22 @@ pub fn settings() -> &'static Settings {
 /// when the user hasn't already set it AND has actually customized the value
 /// (setting it unconditionally would make `config show` report a phantom env
 /// override, and is unnecessary since the indexer's own default matches ours).
+/// The value to put in `SCLEROX_EMBED_ENABLED` so the embed module (which
+/// reads only the env var) agrees with the resolved `embed.enabled`, or `None`
+/// when it already does. An env value that isn't a switch was ignored when
+/// settings resolved, so it must not decide anything later either.
+fn enabled_bridge(resolved: bool, env: Option<&str>) -> Option<&'static str> {
+    let from_env = env.and_then(crate::embed::parse_switch);
+    match (resolved, from_env) {
+        (false, Some(false)) => None,
+        (false, _) => Some("false"),
+        // Unset or unparseable both read as on.
+        (true, Some(true) | None) => None,
+        // Unreachable: a valid env value always wins when settings resolve.
+        (true, Some(false)) => Some("true"),
+    }
+}
+
 pub fn init() {
     let s = settings();
     let is_default = s.index.max_file_bytes == IndexSettings::default().max_file_bytes;
@@ -590,6 +621,14 @@ pub fn init() {
         // SAFETY: single-threaded startup, before any thread is spawned.
         unsafe {
             std::env::set_var(crate::embed::models::MODEL_ENV, &s.embed.model);
+        }
+    }
+    // ...and whether embeddings are on at all.
+    let env = std::env::var(crate::embed::ENABLED_ENV).ok();
+    if let Some(v) = enabled_bridge(s.embed.enabled, env.as_deref()) {
+        // SAFETY: single-threaded startup, before any thread is spawned.
+        unsafe {
+            std::env::set_var(crate::embed::ENABLED_ENV, v);
         }
     }
     // Same bridge for the max-files cap: the library indexer reads it from the
@@ -707,6 +746,29 @@ semantic_threshold = 0.7
         let mut ok = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         ok.validate();
         assert_eq!(ok.embed.model, "minilm-l6-v2");
+    }
+
+    #[test]
+    fn embeddings_default_on_and_can_be_turned_off() {
+        assert!(Settings::from_toml_str("").unwrap().embed.enabled);
+        let off = Settings::from_toml_str("[embed]\nenabled = false\n").unwrap();
+        assert!(!off.embed.enabled);
+        // The model choice is kept, so turning them back on needs no re-embed.
+        assert_eq!(off.embed.model, "granite-small-r2");
+    }
+
+    #[test]
+    fn the_embed_module_sees_the_resolved_switch() {
+        // Off in the file, env unset: bridge it.
+        assert_eq!(enabled_bridge(false, None), Some("false"));
+        // Off in the file, env not a switch: it was ignored, so overwrite it
+        // (the embed module would otherwise read it as on).
+        assert_eq!(enabled_bridge(false, Some("maybe")), Some("false"));
+        // Already agreeing: leave the user's variable alone.
+        assert_eq!(enabled_bridge(false, Some("off")), None);
+        assert_eq!(enabled_bridge(true, None), None);
+        assert_eq!(enabled_bridge(true, Some("yes")), None);
+        assert_eq!(enabled_bridge(true, Some("maybe")), None);
     }
 
     #[test]
