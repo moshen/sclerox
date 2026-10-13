@@ -42,6 +42,7 @@ pub enum CodeCommand {
 pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
     match cmd {
         CodeCommand::Search { needle, repo } => {
+            db.repo_prune_gone()?;
             let repos = db.repo_list()?;
             if repos.is_empty() {
                 println!("No repos indexed. Run `sclerox repo index [path]` first.");
@@ -314,6 +315,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 
 /// Open all repo DBs, optionally filtered by name.
 fn open_matching_repos(db: &Database, repo_filter: Option<&str>) -> Result<Vec<(String, RepoDb)>> {
+    db.repo_prune_gone()?;
     let entries = db.repo_list()?;
     let mut result = Vec::new();
     for entry in entries {

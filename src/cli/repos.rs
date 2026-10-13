@@ -107,6 +107,9 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         }
 
         RepoCommand::List => {
+            for removed in db.repo_prune_gone()? {
+                println!("Removing stale entry: {} (directory gone)", removed.name);
+            }
             let repos = db.repo_list()?;
             if repos.is_empty() {
                 println!("No repos indexed. Run `sclerox repo index [path]` to add one.");
@@ -126,6 +129,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
         }
 
         RepoCommand::Search { query } => {
+            db.repo_prune_gone()?;
             // FTS on name/description first
             let fts_hits = db.repo_search(&query)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|r| r.id).collect();
@@ -272,6 +276,9 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
 /// Backfill (or force-recompute) embeddings for indexed code chunks across
 /// registered repos, embedding the stored chunk text in place.
 fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Result<()> {
+    for removed in db.repo_prune_gone()? {
+        println!("Removing stale entry: {} (directory gone)", removed.name);
+    }
     let repos = db.repo_list()?;
     if repos.is_empty() {
         println!("No repos indexed. Run `sclerox repo index [path]` first.");

@@ -135,6 +135,30 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Delete registry rows whose repo directory is gone and return them.
+    /// A path that cannot be checked is kept, and a failed delete is logged
+    /// rather than returned so the calling command still runs.
+    pub fn repo_prune_gone(&self) -> Result<Vec<RepoEntry>> {
+        let mut removed = Vec::new();
+        for repo in self.repo_list()? {
+            if !matches!(std::path::Path::new(&repo.path).try_exists(), Ok(false)) {
+                continue;
+            }
+            match self.repo_remove(&repo.path) {
+                Ok(_) => {
+                    log::info!(
+                        "removed stale repo entry '{}' (directory gone: {})",
+                        repo.name,
+                        repo.path
+                    );
+                    removed.push(repo);
+                }
+                Err(e) => log::warn!("could not remove stale repo entry '{}': {e:#}", repo.name),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Check all registered repos and return health actions for each.
     /// Does not perform any writes - callers act on the returned report.
     pub fn repo_health_check(&self) -> Result<Vec<RepoHealth>> {
@@ -222,6 +246,49 @@ mod tests {
         let entry = db.repo_get_by_path("/home/user/myrepo").unwrap().unwrap();
         assert_eq!(entry.name, "myrepo");
         assert_eq!(entry.description.as_deref(), Some("A Rust web service"));
+    }
+
+    #[test]
+    fn prune_gone_removes_only_rows_whose_directory_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        let kept = kept.to_str().unwrap();
+        let gone = dir.path().join("gone");
+        let gone = gone.to_str().unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        // The kept repo has no repo.db: a missing index is `sync`'s job to
+        // rebuild, not a reason to drop the row.
+        db.repo_register(
+            kept,
+            "kept",
+            None,
+            &format!("{kept}/.sclerox/repo.db"),
+            None,
+        )
+        .unwrap();
+        db.repo_register(
+            gone,
+            "gone",
+            None,
+            &format!("{gone}/.sclerox/repo.db"),
+            None,
+        )
+        .unwrap();
+
+        let removed = db.repo_prune_gone().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "gone");
+        let left: Vec<_> = db
+            .repo_list()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(left, ["kept"]);
+
+        assert!(db.repo_prune_gone().unwrap().is_empty(), "idempotent");
     }
 
     #[test]
