@@ -247,7 +247,9 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     }
 
     // 6. Code index reminder - every session should know `sclerox code` exists and is
-    // the preferred symbol search across indexed repos.
+    // the preferred symbol search across indexed repos. Deleted clones are
+    // pruned first so the count is accurate; that must not fail the hook.
+    let _ = db.repo_prune_gone();
     if let Ok(repos) = db.repo_list() {
         if !repos.is_empty() {
             let section = format!(

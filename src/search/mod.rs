@@ -218,6 +218,8 @@ pub fn global_search(
         }
     }
 
+    // Drop deleted clones before any repo rows are read.
+    db.repo_prune_gone()?;
     let repo_fts = db.repo_search(query)?;
     let repo_fts_ids: std::collections::HashSet<i64> = repo_fts.iter().map(|r| r.id).collect();
     for r in repo_fts {

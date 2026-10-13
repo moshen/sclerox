@@ -145,9 +145,13 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
         (true, false) => println!("  {}", describe_skip(&main_state)),
     }
 
+    let pruned = db.repo_prune_gone()?;
     let repos = db.repo_list()?;
-    if !repos.is_empty() {
+    if !repos.is_empty() || !pruned.is_empty() {
         println!("\nRepo indexes:");
+    }
+    for repo in &pruned {
+        println!("  {}: removed stale entry (directory gone)", repo.name);
     }
     for repo in &repos {
         let db_path = PathBuf::from(&repo.db_path);
