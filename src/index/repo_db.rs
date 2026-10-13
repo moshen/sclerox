@@ -23,6 +23,14 @@ pub struct IndexedFile {
     pub last_modified: Option<String>,
 }
 
+/// A stored chunk's text and line span, as compared on a chunker change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSpan {
+    pub text: String,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: i64,
@@ -215,6 +223,62 @@ impl RepoDb {
                     r.get(0)
                 })?;
         Ok(id)
+    }
+
+    /// Every file's stored chunks as (text, start line, end line), in order,
+    /// keyed by file path. Read in one scan for a chunker-change pass, since
+    /// chunks.file_id has no index.
+    pub fn chunk_spans_by_file(&self) -> Result<std::collections::HashMap<String, Vec<ChunkSpan>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, c.chunk_text, c.start_line, c.end_line FROM chunks c
+             JOIN files f ON c.file_id = f.id
+             ORDER BY f.path, c.chunk_index",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ChunkSpan {
+                    text: r.get(1)?,
+                    start_line: r.get(2)?,
+                    end_line: r.get(3)?,
+                },
+            ))
+        })?;
+        let mut out: std::collections::HashMap<String, Vec<ChunkSpan>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (path, span) = row?;
+            out.entry(path).or_default().push(span);
+        }
+        Ok(out)
+    }
+
+    /// A file's stored vectors keyed by chunk text. Read before the file is
+    /// re-chunked so that chunks whose text did not change keep their vector
+    /// instead of waiting to be embedded again.
+    pub fn file_chunk_vectors(
+        &self,
+        file_id: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_text, embedding FROM chunks
+             WHERE file_id = ?1 AND embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![file_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (text, bytes) = row?;
+            let vector = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            out.insert(text, vector);
+        }
+        Ok(out)
     }
 
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
