@@ -29,8 +29,9 @@ fastembed = { version = "5", features = ["online"] }
 tokenizers = "0.22"
 # Same version and features fastembed's `online` feature already pulls in, so
 # no extra compile. Downloads pinned, hash-checked model files into sclerox's
-# own cache folder (see src/embed/download.rs).
-ureq = "3"
+# own cache folder (see src/embed/download.rs). `native-tls` verifies against
+# the OS certificate store, so TLS-inspecting corporate proxies work.
+ureq = { version = "3", features = ["native-tls"] }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"

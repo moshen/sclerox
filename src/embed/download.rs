@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 /// One file in a Hugging Face repo, pinned by content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +192,17 @@ fn agent() -> ureq::Agent {
         // one does not hang a session hook forever.
         .timeout_recv_body(Some(Duration::from_secs(60)))
         .user_agent(concat!("sclerox/", env!("CARGO_PKG_VERSION")))
+        // Trust the OS certificate store, not ureq's bundled Mozilla roots.
+        // Corporate networks that inspect TLS install their root CA in the OS
+        // store (e.g. the macOS Keychain); with bundled roots only, every
+        // download there fails with "invalid peer certificate: UnknownIssuer".
+        // The sha256 check still pins what we accept.
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
         .build()
         .new_agent()
 }
