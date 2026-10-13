@@ -151,10 +151,11 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     // real memory hits. `semantic` sits at the memory band's edge instead;
     // hits are still ranked and capped by `search.semantic_limit`.
     //
-    // Dedup, same probe on memory pairs: paraphrased duplicates 0.90-0.97,
-    // related-but-different facts up to 0.88. That margin is too thin to merge
-    // on, so `merge` stays off and `dedup_cosine` only flags for review. Both
-    // want calibrating on real pairs (`memory_conflicts`, `memory_distinct`).
+    // Dedup, on real memory pairs: unrelated pairs score median 0.770 (p99
+    // 0.851), so `dedup_cosine` at 0.90 is a safe near-duplicate floor. Real
+    // duplicates score 0.953-0.985 but some distinct pairs reach 0.961, so no
+    // cutoff is clean. `merge` at 0.97 merges only the most confident
+    // duplicates and leaves 0.90-0.97 to `sclerox memory conflicts`.
     //
     // The bands also overlap across queries: "Rust" scores an unrelated
     // "Python for scripts" memory 0.73, above some true matches elsewhere. What
@@ -163,7 +164,7 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     thresholds: Thresholds {
         semantic: 0.72,
         dedup_cosine: 0.90,
-        merge: None,
+        merge: Some(0.97),
         context: 0.70,
         top_margin: Some(0.05),
     },
