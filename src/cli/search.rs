@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::cli::format::{code_chunk_lines, code_location, symbol_line};
 use crate::db::Database;
 use crate::output::{print_output, OutputFormat};
 use crate::search::{global_search, SearchResult};
@@ -87,26 +88,28 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     println!("[repo] #{id} {name} ({path}) - {desc}");
                 }
                 SearchResult::Symbol {
-                    repo_name,
                     repo_path,
                     kind,
                     name,
                     signature,
                     file_path,
                     start_line,
+                    ..
                 } => {
                     let sig = signature.as_deref().unwrap_or(name);
-                    println!("[symbol] [{kind}] {sig} ({repo_path}/{file_path}:{start_line})  [{repo_name}]");
+                    let loc = code_location(repo_path, file_path, Some(*start_line));
+                    println!("[symbol] {}", symbol_line(kind, sig, &loc));
                 }
                 SearchResult::CodeChunk {
-                    repo_name,
+                    repo_path,
                     file_path,
                     start_line,
+                    score,
                     snippet,
+                    ..
                 } => {
-                    let line = start_line.map(|l| format!(":{l}")).unwrap_or_default();
-                    println!("[code] {file_path}{line}  [{repo_name}]");
-                    println!("       {snippet}");
+                    let loc = code_location(repo_path, file_path, *start_line);
+                    println!("[code] {}", code_chunk_lines(*score, &loc, snippet));
                 }
             }
         }

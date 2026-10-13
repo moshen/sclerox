@@ -3,6 +3,7 @@ use clap::Subcommand;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
+use crate::cli::format::{code_chunk_lines, code_location, symbol_line};
 use crate::db::Database;
 use crate::index::repo_db::RepoDb;
 
@@ -78,10 +79,8 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
 
                 for s in repo_db.search_symbols(&needle)? {
                     let sig = s.signature.as_deref().unwrap_or(&s.name);
-                    println!(
-                        "[{}] {} ({}/{}:{})",
-                        s.kind, sig, entry.name, s.file_path, s.start_line
-                    );
+                    let loc = code_location(&entry.path, &s.file_path, Some(s.start_line));
+                    println!("{}", symbol_line(&s.kind, sig, &loc));
                     any = true;
                 }
 
@@ -91,7 +90,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                         .unwrap_or_default()
                     {
                         if c.score >= floor {
-                            code_chunks.push((c.score, entry.name.clone(), c));
+                            code_chunks.push((c.score, entry.path.clone(), c));
                         }
                     }
                 }
@@ -112,11 +111,9 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             code_chunks.truncate(sem.semantic_limit);
             if !code_chunks.is_empty() {
                 println!("\nSemantic matches:");
-                for (score, rname, c) in code_chunks {
-                    let line = c.start_line.map(|l| format!(":{l}")).unwrap_or_default();
-                    let snippet: String = c.chunk_text.trim().chars().take(100).collect();
-                    println!("  ({score:.2}) {}/{}{}", rname, c.file_path, line);
-                    println!("        {snippet}");
+                for (score, root, c) in code_chunks {
+                    let loc = code_location(&root, &c.file_path, c.start_line);
+                    println!("  {}", code_chunk_lines(score, &loc, &c.chunk_text));
                     any = true;
                 }
             }
@@ -138,7 +135,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             }
 
             let mut any = false;
-            for (entry_name, repo_db) in &repos {
+            for (root, repo_db) in &repos {
                 // Find the symbol
                 let syms = repo_db.symbol_by_name(&symbol)?;
                 for sym in &syms {
@@ -147,10 +144,8 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                         continue;
                     }
                     let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                    println!(
-                        "{} ({}/{}:{})",
-                        sig, entry_name, sym.file_path, sym.start_line
-                    );
+                    let loc = code_location(root, &sym.file_path, Some(sym.start_line));
+                    println!("{sig} ({loc})");
                     for (to_name, kind, line, confidence) in &callees {
                         let resolved = repo_db
                             .symbol_by_name(to_name)
@@ -158,14 +153,9 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                             .and_then(|v| v.into_iter().next());
                         let conf_tag = confidence_tag(confidence);
                         if let Some(target) = resolved {
-                            println!(
-                                "  {} {}{} ({}:{})",
-                                kind_arrow(kind),
-                                to_name,
-                                conf_tag,
-                                target.file_path,
-                                target.start_line
-                            );
+                            let loc =
+                                code_location(root, &target.file_path, Some(target.start_line));
+                            println!("  {} {}{} ({loc})", kind_arrow(kind), to_name, conf_tag);
                         } else {
                             println!(
                                 "  {} {}{} [unresolved, line {}]",
@@ -194,20 +184,14 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             }
 
             let mut any = false;
-            for (entry_name, repo_db) in &repos {
+            for (root, repo_db) in &repos {
                 let callers = repo_db.callers(&symbol)?;
                 for (caller_sym, kind, _line, confidence) in &callers {
                     let sig = caller_sym.signature.as_deref().unwrap_or(&caller_sym.name);
                     let conf_tag = confidence_tag(confidence);
-                    println!(
-                        "  {} {}{} ({}/{}:{})",
-                        kind_arrow(kind),
-                        sig,
-                        conf_tag,
-                        entry_name,
-                        caller_sym.file_path,
-                        caller_sym.start_line
-                    );
+                    let loc =
+                        code_location(root, &caller_sym.file_path, Some(caller_sym.start_line));
+                    println!("  {} {}{} ({loc})", kind_arrow(kind), sig, conf_tag);
                     any = true;
                 }
             }
@@ -248,11 +232,9 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 let indent = "  ".repeat(depth);
                 if depth == 0 {
                     match sym_info.first() {
-                        Some((repo_name, sym)) => {
-                            println!(
-                                "{} [{}] ({}/{}:{})",
-                                sym.name, sym.kind, repo_name, sym.file_path, sym.start_line
-                            );
+                        Some((root, sym)) => {
+                            let loc = code_location(root, &sym.file_path, Some(sym.start_line));
+                            println!("{} [{}] ({loc})", sym.name, sym.kind);
                             found_seed = true;
                         }
                         None => {
@@ -262,16 +244,13 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                     }
                 } else {
                     match sym_info.first() {
-                        Some((repo_name, sym)) => {
+                        Some((root, sym)) => {
+                            let loc = code_location(root, &sym.file_path, Some(sym.start_line));
                             println!(
-                                "{}  {} {} [{}] ({}/{}:{})",
-                                indent,
+                                "{indent}  {} {} [{}] ({loc})",
                                 kind_arrow(&edge_kind),
                                 sym.name,
-                                sym.kind,
-                                repo_name,
-                                sym.file_path,
-                                sym.start_line
+                                sym.kind
                             );
                         }
                         None => {
@@ -313,7 +292,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
     Ok(())
 }
 
-/// Open all repo DBs, optionally filtered by name.
+/// Open all repo DBs, optionally filtered by name, with each repo's root path.
 fn open_matching_repos(db: &Database, repo_filter: Option<&str>) -> Result<Vec<(String, RepoDb)>> {
     db.repo_prune_gone()?;
     let entries = db.repo_list()?;
@@ -329,7 +308,7 @@ fn open_matching_repos(db: &Database, repo_filter: Option<&str>) -> Result<Vec<(
             continue;
         }
         if let Ok(rdb) = RepoDb::open(&db_path) {
-            result.push((entry.name, rdb));
+            result.push((entry.path, rdb));
         }
     }
     Ok(result)
@@ -341,10 +320,10 @@ fn find_across_repos<'a>(
     name: &str,
 ) -> Vec<(&'a str, crate::index::repo_db::Symbol)> {
     let mut results = Vec::new();
-    for (repo_name, rdb) in repos {
+    for (root, rdb) in repos {
         if let Ok(syms) = rdb.symbol_by_name(name) {
             for sym in syms {
-                results.push((repo_name.as_str(), sym));
+                results.push((root.as_str(), sym));
             }
         }
     }

@@ -59,8 +59,10 @@ pub enum SearchResult {
     /// misses.
     CodeChunk {
         repo_name: String,
+        repo_path: String,
         file_path: String,
         start_line: Option<i64>,
+        score: f32,
         snippet: String,
     },
 }
@@ -248,7 +250,11 @@ pub fn global_search(
     // Fan out to all registered repo DBs: FTS symbol search always, plus a
     // semantic code-chunk pass (ranked globally across repos) when embeddings
     // are available.
-    let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> = Vec::new();
+    let mut code_chunks: Vec<(
+        f32,
+        crate::db::repos::RepoEntry,
+        crate::index::repo_db::SimilarChunk,
+    )> = Vec::new();
     for repo in db.repo_list()? {
         let db_path = std::path::Path::new(&repo.db_path);
         if !db_path.exists() {
@@ -286,7 +292,7 @@ pub fn global_search(
                 .unwrap_or_default()
             {
                 if c.score >= semantic_threshold {
-                    code_chunks.push((c.score, repo.name.clone(), c));
+                    code_chunks.push((c.score, repo.clone(), c));
                 }
             }
         }
@@ -297,11 +303,13 @@ pub fn global_search(
     code_chunks.retain(|(s, _, _)| *s >= cut);
     code_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     code_chunks.truncate(semantic_limit);
-    for (_, repo_name, c) in code_chunks {
+    for (score, repo, c) in code_chunks {
         results.push(SearchResult::CodeChunk {
-            repo_name,
+            repo_name: repo.name,
+            repo_path: repo.path,
             file_path: c.file_path,
             start_line: c.start_line,
+            score,
             snippet: truncate(c.chunk_text.trim(), 120),
         });
     }

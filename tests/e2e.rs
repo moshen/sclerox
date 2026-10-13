@@ -672,6 +672,32 @@ fn repo_index_respects_sclerox_config_opt_out() {
     );
 }
 
+#[test]
+fn symbol_hits_print_the_same_full_path_everywhere() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn alpha_widget() {}\n").unwrap();
+    e.run(&["repo", "index", "--no-embed", dir.path().to_str().unwrap()]);
+
+    // The registry stores the canonical root (/private/var/... on macOS).
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let want = format!(
+        "[function_item] fn alpha_widget() {{}} ({}/lib.rs:1)",
+        root.display()
+    );
+    for args in [
+        &["code", "search", "alpha_widget"][..],
+        &["repo", "search-symbols", "alpha_widget"][..],
+        &["search", "alpha_widget"][..],
+    ] {
+        let out = e.run(args);
+        assert!(
+            out.contains(&want),
+            "{args:?} printed:\n{out}\nwanted: {want}"
+        );
+    }
+}
+
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
 #[test]

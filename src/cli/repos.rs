@@ -249,10 +249,12 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 let results = repo_db.search_symbols(&query)?;
                 for s in &results {
                     let sig = s.signature.as_deref().unwrap_or(&s.name);
-                    println!(
-                        "[{}] {} ({}/{}:{})",
-                        s.kind, sig, repo.name, s.file_path, s.start_line
+                    let loc = crate::cli::format::code_location(
+                        &repo.path,
+                        &s.file_path,
+                        Some(s.start_line),
                     );
+                    println!("{}", crate::cli::format::symbol_line(&s.kind, sig, &loc));
                     any = true;
                 }
             }
