@@ -381,7 +381,11 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
 
 /// Embed a repo's chunks that have no vector, in batches to bound memory.
 /// Each batch is kept as it goes; `embedded` counts them even on failure.
-fn backfill_chunks(repo_db: &RepoDb, embedder: &mut Embedder, embedded: &mut usize) -> Result<()> {
+pub(crate) fn backfill_chunks(
+    repo_db: &RepoDb,
+    embedder: &mut Embedder,
+    embedded: &mut usize,
+) -> Result<()> {
     let targets = repo_db.chunks_without_embedding()?;
     for batch in targets.chunks(64) {
         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();

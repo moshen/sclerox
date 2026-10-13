@@ -44,7 +44,8 @@ pub enum DbCommand {
     ///
     /// Also embeds main-database items saved without a vector (while the
     /// model was unavailable, or with --no-embed). Code chunks indexed without
-    /// vectors are left to `sclerox repo reembed`.
+    /// vectors are left to `sclerox repo reembed` and the session hooks'
+    /// background embed.
     ///
     /// Before switching the main database it waits (up to 5 minutes) for any
     /// running session distillation, which might be from the sclerox you just

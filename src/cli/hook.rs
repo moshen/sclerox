@@ -46,6 +46,16 @@ pub enum HookCommand {
         model: Option<String>,
     },
 
+    /// Background embedding worker spawned by the session hooks.
+    ///
+    /// Not intended to be called directly. Embeds the repo's chunks that have
+    /// no vector yet.
+    EmbedRepo {
+        /// Repo root (the folder holding .sclerox/repo.db)
+        #[arg(long)]
+        path: std::path::PathBuf,
+    },
+
     /// Run the OpenCode session.idle hook: index repo + distill session memories.
     ///
     /// Called by the sclerox-session OpenCode plugin with the session ID and directory.
@@ -75,6 +85,7 @@ pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
             via,
             model,
         } => run_distill_session(db, &session_id, via.as_deref(), model.as_deref()),
+        HookCommand::EmbedRepo { path } => run_embed_repo(&path),
         HookCommand::Stop {
             via,
             model,
@@ -118,6 +129,7 @@ fn run_start(db: &Database) -> Result<()> {
             let description = repo_name.as_ref().map(|n| format!("{n} repo"));
             let mut indexer = crate::index::RepoIndexer::new(None);
             let _ = indexer.index_repo(db, &git_root, description.as_deref());
+            spawn_background_embed(&git_root);
         }
     }
 
@@ -425,6 +437,7 @@ fn run_stop(db: &Database, via: Option<&str>, model: Option<&str>, no_distill: b
                 .and_then(|n| n.to_str())
                 .map(|n| format!("{n} repo"));
             let _ = indexer.index_repo(db, &git_root, description.as_deref());
+            spawn_background_embed(&git_root);
         }
     }
 
@@ -609,6 +622,7 @@ fn run_opencode(
             .and_then(|n| n.to_str())
             .map(|n| format!("{n} repo"));
         let _ = indexer.index_repo(db, &git_root, description.as_deref());
+        spawn_background_embed(&git_root);
     }
 
     if no_distill {
@@ -720,6 +734,103 @@ fn path_to_project_hash(path: &std::path::Path) -> String {
 /// Path to the per-session distillation marker: `<state_home>/sclerox/distilled/<session-id>`
 /// (`~/.local/state/sclerox/distilled/<session-id>` by default, on every
 /// platform). Contains the turn count at which we last distilled this session.
+/// Spawn a detached `hook embed-repo` worker if any chunk in the repo's index
+/// has no vector, so the hooks can index without loading the model.
+fn spawn_background_embed(repo_root: &std::path::Path) {
+    if !crate::embed::enabled() {
+        return;
+    }
+    let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let sclerox_dir = root.join(".sclerox");
+    let db_path = sclerox_dir.join("repo.db");
+    if !db_path.exists() {
+        return; // opted out, nothing indexable, or refused
+    }
+    let Ok(repo_db) = crate::index::repo_db::RepoDb::open(&db_path) else {
+        return;
+    };
+    // An index on another model takes no new vectors until `db reembed`
+    // rebuilds it; spawning would only load the model to be refused.
+    if !repo_db.semantic_ready() || !matches!(repo_db.has_chunks_without_embedding(), Ok(true)) {
+        return;
+    }
+    drop(repo_db);
+    // A worker already running picks up these chunks too (it re-checks
+    // before exiting), so don't start another.
+    let lock = sclerox_dir.join(format!("{EMBED_LOCK_NAME}.lock"));
+    if lock.exists() && !lock_is_stale(&lock, LOCK_STALE_SECS) {
+        return;
+    }
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let spawned = std::process::Command::new(&current_exe)
+        .args(["hook", "embed-repo", "--path"])
+        .arg(&root)
+        .env("SCLEROX_HOOK_RUNNING", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => log::debug!("spawned background embed for {}", root.display()),
+        Err(e) => log::warn!(
+            "could not spawn background embed for {}: {e}",
+            root.display()
+        ),
+    }
+}
+
+/// Lock name under `<repo>/.sclerox/`, one per repo, so overlapping turns or
+/// sessions in one clone share a single embedding worker.
+const EMBED_LOCK_NAME: &str = "embed";
+
+/// Passes over the repo before the worker exits. Chunks written by a hook
+/// while a pass runs are caught by the next one, or by the next hook's spawn.
+const EMBED_PASSES: usize = 3;
+
+/// Background worker: embed every chunk in `repo_root`'s index that has no
+/// vector. Spawned detached by `spawn_background_embed`.
+fn run_embed_repo(repo_root: &std::path::Path) -> Result<()> {
+    let sclerox_dir = repo_root.join(".sclerox");
+    let db_path = sclerox_dir.join("repo.db");
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let _lock = match try_lock_session_in(&sclerox_dir, EMBED_LOCK_NAME, LOCK_STALE_SECS) {
+        LockOutcome::Contended => {
+            log::debug!(
+                "{} is already being embedded, skipping",
+                repo_root.display()
+            );
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => Some(guard),
+        LockOutcome::NoLock => None,
+    };
+    let repo_db = crate::index::repo_db::RepoDb::open(&db_path)?;
+    if !repo_db.semantic_ready() {
+        return Ok(());
+    }
+    let Some(mut embedder) = crate::embed::optional(true) else {
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    let mut embedded = 0usize;
+    for _ in 0..EMBED_PASSES {
+        if !repo_db.has_chunks_without_embedding()? {
+            break;
+        }
+        crate::cli::repos::backfill_chunks(&repo_db, &mut embedder, &mut embedded)?;
+    }
+    log::info!(
+        "background embed: {embedded} chunks in {} ({:.1}s)",
+        repo_root.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn distill_marker_path(session_id: &str) -> std::path::PathBuf {
     crate::xdg::state_home()
         .join("sclerox")

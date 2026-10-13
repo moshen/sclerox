@@ -364,6 +364,16 @@ impl RepoDb {
     /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
     /// list for `sclerox repo reembed` - hook-indexed repos have chunks but no
     /// embeddings, since the auto-indexer runs without an embedder.
+    /// Whether any chunk is still waiting for a vector. Stops at the first one,
+    /// so it is cheap enough to ask on every session hook.
+    pub fn has_chunks_without_embedding(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE embedding IS NULL)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn chunks_without_embedding(&self) -> Result<Vec<(i64, String)>> {
         let mut stmt = self
             .conn
