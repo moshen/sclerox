@@ -331,7 +331,7 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
             let model_id = embedder.model().id;
             match repo_db.reembed_all(
                 model_id,
-                &mut |texts: &[&str]| embedder.embed_batch(texts),
+                &mut |texts: &[&str]| embedder.embed_each(texts),
                 &mut |_, _, _| {},
             ) {
                 Ok(n) => {
@@ -389,7 +389,7 @@ pub(crate) fn backfill_chunks(
     let targets = repo_db.chunks_without_embedding()?;
     for batch in targets.chunks(64) {
         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-        let vectors = embedder.embed_batch(&texts)?;
+        let vectors = embedder.embed_each(&texts)?;
         for ((chunk_id, _), vec) in batch.iter().zip(vectors) {
             if repo_db.set_chunk_embedding(*chunk_id, &vec)? {
                 *embedded += 1;

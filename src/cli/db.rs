@@ -275,7 +275,7 @@ fn rebuild_one(
     let model_id = embedder.model().id;
     let interactive = std::io::stdout().is_terminal();
     let started = std::time::Instant::now();
-    let mut embed = |texts: &[&str]| embedder.embed_batch(texts);
+    let mut embed = |texts: &[&str]| embedder.embed_each(texts);
     let mut progress = |label: &str, done: usize, total: usize| {
         if interactive {
             let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);

@@ -120,6 +120,20 @@ impl Embedder {
             .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
     }
 
+    /// Embed stored texts one at a time, for bulk work over many chunks.
+    ///
+    /// onnxruntime pads a batch to its longest text and keeps an arena sized
+    /// for the largest batch, so batching costs memory without saving time.
+    /// Batching also makes a vector depend on its neighbours, since the int8
+    /// graph quantizes over the whole padded batch; this matches `embed_one`.
+    pub fn embed_each(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let prefix = self.spec.document_prefix;
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
+        self.inner
+            .embed(&prefixed, Some(1))
+            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
+    }
+
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
