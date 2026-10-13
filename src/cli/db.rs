@@ -7,7 +7,7 @@ use crate::db::Database;
 
 #[derive(Subcommand)]
 pub enum DbCommand {
-    /// Show database schema version and pending migrations.
+    /// Show database schema version, pending migrations, and embedding model.
     Migrate {
         /// Also show migration status for all indexed repos.
         #[arg(long)]
@@ -29,13 +29,261 @@ pub enum DbCommand {
         /// Target directory (created if missing).
         dir: PathBuf,
     },
+
+    /// Re-embed stored vectors with the configured embedding model.
+    ///
+    /// Run after changing `embed.model`, or after upgrading from a version
+    /// that used MiniLM. Until then semantic search and dedup are off for any
+    /// database embedded with another model (keyword search still works).
+    ///
+    /// Covers the main database (memories, meetings, todos, research, repo
+    /// descriptions) and every indexed repo's code chunks, embedding the stored
+    /// text in place - nothing is re-parsed. Each database switches
+    /// all-or-nothing: an interrupted run leaves it on the old model, and
+    /// running again starts it over.
+    ///
+    /// Also embeds main-database items saved without a vector (while the
+    /// model was unavailable, or with --no-embed). Code chunks indexed without
+    /// vectors are left to `sclerox repo reembed`.
+    ///
+    /// Before switching the main database it waits (up to 5 minutes) for any
+    /// running session distillation, which might be from the sclerox you just
+    /// upgraded from and would write old-model vectors after the switch.
+    Reembed {
+        /// Re-embed databases already on the configured model too.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub fn run(db: &Database, cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate { repos } => migrate(db, repos),
         DbCommand::Export { dir } => export(db, &dir),
+        DbCommand::Reembed { force } => reembed(db, force),
     }
+}
+
+// ---------- reembed ----------
+
+/// Whether `reembed` has anything to do: a database (main or repo) holding
+/// vectors from another model, or main-database rows left without a vector.
+pub(crate) fn embeddings_need_work(db: &Database) -> bool {
+    use crate::embed::models::ModelCheck;
+    use crate::index::repo_db::RepoDb;
+
+    let mismatched = |c: Result<ModelCheck>| matches!(c, Ok(ModelCheck::Mismatch { .. }));
+    if mismatched(db.embedding_model_check()) || db.missing_vectors().unwrap_or(0) > 0 {
+        return true;
+    }
+    db.repo_list().unwrap_or_default().iter().any(|repo| {
+        let path = PathBuf::from(&repo.db_path);
+        path.exists() && RepoDb::open(&path).is_ok_and(|r| mismatched(r.embedding_model_check()))
+    })
+}
+
+/// Re-embed every database recorded under another model (all of them with
+/// `force`), and embed main-database rows left without a vector. Shared by
+/// `sclerox db reembed` and `sclerox install`.
+pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
+    use crate::index::repo_db::RepoDb;
+
+    let mut embedder = crate::embed::required()?;
+    let model = embedder.model();
+    println!("Embedding model: {} ({})", model.name, model.id);
+
+    let mut rebuilt = 0usize;
+    let mut failed = 0usize;
+
+    let main_state = db.embedding_model_check()?;
+    println!("\nMain database:");
+    let mut main_ok = true;
+    let mut main_done = false;
+    let rebuild_main = needs_rebuild(&main_state, force);
+    if rebuild_main && !wait_for_distillations() {
+        println!(
+            "  skipped: a session distillation is still running and could write \
+             vectors from the old model after the switch; run `sclerox db reembed` \
+             once it finishes"
+        );
+        main_ok = false;
+    } else if rebuild_main {
+        match rebuild_one(&mut embedder, |id, embed, progress| {
+            db.reembed_all(id, embed, progress)
+        }) {
+            Ok(n) => {
+                println!("  re-embedded: {n} vectors");
+                main_done = true;
+            }
+            Err(e) => {
+                println!("  failed, left on its previous model: {e:#}");
+                main_ok = false;
+            }
+        }
+    }
+    // Then any rows without a vector: saved while the model was unavailable
+    // or the database mismatched, with --no-embed, or during the rebuild.
+    let missing = if main_ok { db.missing_vectors()? } else { 0 };
+    if missing > 0 {
+        println!("  {missing} item(s) without a vector:");
+        match rebuild_one(&mut embedder, |id, embed, progress| {
+            db.fill_missing_vectors(id, embed, progress)
+        }) {
+            Ok(n) => {
+                println!("  filled: {n} vectors");
+                main_done = true;
+            }
+            Err(e) => {
+                println!("  could not embed them (run again to retry): {e:#}");
+                main_ok = false;
+            }
+        }
+    }
+    match (main_ok, main_done) {
+        (false, _) => failed += 1,
+        (true, true) => rebuilt += 1,
+        (true, false) => println!("  {}", describe_skip(&main_state)),
+    }
+
+    let repos = db.repo_list()?;
+    if !repos.is_empty() {
+        println!("\nRepo indexes:");
+    }
+    for repo in &repos {
+        let db_path = PathBuf::from(&repo.db_path);
+        if !db_path.exists() {
+            println!("  {}: index missing ({})", repo.name, repo.db_path);
+            continue;
+        }
+        let rdb = match RepoDb::open(&db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {}: could not open ({e})", repo.name);
+                failed += 1;
+                continue;
+            }
+        };
+        let state = match rdb.embedding_model_check() {
+            Ok(s) => s,
+            Err(e) => {
+                println!(
+                    "  {}: could not read its embedding model ({e:#})",
+                    repo.name
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        if !needs_rebuild(&state, force) {
+            println!("  {}: {}", repo.name, describe_skip(&state));
+            continue;
+        }
+        println!("  {}:", repo.name);
+        match rebuild_one(&mut embedder, |id, embed, progress| {
+            rdb.reembed_all(id, embed, progress)
+        }) {
+            Ok(n) => {
+                println!("    done: {n} vectors");
+                rebuilt += 1;
+            }
+            Err(e) => {
+                println!("    failed, left on its previous model: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    match (rebuilt, failed) {
+        (0, 0) => println!("Nothing to re-embed."),
+        (n, 0) => println!("Updated {n} database(s) with {}.", model.name),
+        (n, f) => {
+            println!("Updated {n} database(s); {f} failed. Run again to retry them.");
+            anyhow::bail!("{f} database(s) could not be re-embedded");
+        }
+    }
+    Ok(())
+}
+
+/// How long a rebuild of the main database waits for session distillations.
+const DISTILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Wait (up to [`DISTILL_WAIT`]) until no session distillation is running.
+/// A distiller started by the sclerox from before an upgrade has no model
+/// checks and would write old-model vectors into the rebuilt database, where
+/// nothing could tell them apart. Ones started since refuse to, but there is
+/// no telling which is which, so wait for all of them. False on timeout.
+fn wait_for_distillations() -> bool {
+    let started = std::time::Instant::now();
+    let mut told = false;
+    loop {
+        let running = super::hook::distillations_in_progress();
+        if running == 0 {
+            return true;
+        }
+        if started.elapsed() >= DISTILL_WAIT {
+            return false;
+        }
+        if !told {
+            println!(
+                "  waiting for {running} session distillation(s) to finish first \
+                 (up to {} min)...",
+                DISTILL_WAIT.as_secs() / 60
+            );
+            told = true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// A mismatch always needs a rebuild. A database with nothing recorded has
+/// no vectors to convert; `--force` redoes even a matching one.
+fn needs_rebuild(state: &crate::embed::models::ModelCheck, force: bool) -> bool {
+    use crate::embed::models::ModelCheck;
+    match state {
+        ModelCheck::Mismatch { .. } => true,
+        ModelCheck::Match => force,
+        ModelCheck::NotRecorded => false,
+    }
+}
+
+fn describe_skip(state: &crate::embed::models::ModelCheck) -> &'static str {
+    use crate::embed::models::ModelCheck;
+    match state {
+        ModelCheck::Match => "already on this model",
+        ModelCheck::NotRecorded => "no embeddings yet",
+        ModelCheck::Mismatch { .. } => "needs re-embedding",
+    }
+}
+
+/// Run one database's rebuild with `embedder`, printing per-table progress.
+fn rebuild_one(
+    embedder: &mut crate::embed::Embedder,
+    run: impl FnOnce(
+        &str,
+        &mut crate::db::reembed::EmbedFn<'_>,
+        &mut crate::db::reembed::ProgressFn<'_>,
+    ) -> Result<usize>,
+) -> Result<usize> {
+    use std::io::{IsTerminal, Write};
+
+    let model_id = embedder.model().id;
+    let interactive = std::io::stdout().is_terminal();
+    let started = std::time::Instant::now();
+    let mut embed = |texts: &[&str]| embedder.embed_batch(texts);
+    let mut progress = |label: &str, done: usize, total: usize| {
+        if interactive {
+            let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
+            print!("\r    {label}: {done}/{total} ({rate:.0}/s)   ");
+            if done == total {
+                println!();
+            }
+            let _ = std::io::stdout().flush();
+        } else if done == total {
+            println!("    {label}: {total}");
+        }
+    };
+    run(model_id, &mut embed, &mut progress)
 }
 
 // ---------- migrate ----------
@@ -51,6 +299,10 @@ fn migrate(db: &Database, show_repos: bool) -> Result<()> {
     } else {
         println!("  status         : {pending} migration(s) will apply on next open");
     }
+    println!(
+        "  embeddings     : {}",
+        describe_model(db.embedding_model().ok().flatten())
+    );
 
     if show_repos {
         use crate::index::repo_db::RepoDb;
@@ -74,7 +326,11 @@ fn migrate(db: &Database, show_repos: bool) -> Result<()> {
                             } else {
                                 format!("{pend} pending")
                             };
-                            println!("  {} v{cur}/{tgt} ({status})", repo.name);
+                            let model = describe_model(rdb.embedding_model().ok().flatten());
+                            println!(
+                                "  {} v{cur}/{tgt} ({status}; embeddings: {model})",
+                                repo.name
+                            );
                         }
                         Err(e) => println!("  {} - error: {e}", repo.name),
                     },
@@ -85,6 +341,23 @@ fn migrate(db: &Database, show_repos: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The recorded embedding model, and whether it matches the configured one.
+fn describe_model(recorded: Option<String>) -> String {
+    use crate::embed::models::{check, display_id, ModelCheck};
+    match check(recorded.as_deref()) {
+        ModelCheck::NotRecorded => "none yet".to_string(),
+        ModelCheck::Match => format!(
+            "{} (current)",
+            display_id(recorded.as_deref().unwrap_or(""))
+        ),
+        ModelCheck::Mismatch { recorded } => format!(
+            "{} - run `sclerox db reembed` to switch to {}",
+            display_id(&recorded),
+            display_id(crate::embed::models::configured_id())
+        ),
+    }
 }
 
 // ---------- export ----------

@@ -46,18 +46,24 @@ pub struct AiSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchSettings {
-    /// Cosine floor for a semantic hit to be shown. Stored as f64 for clean
-    /// TOML round-tripping; cast to f32 at the (f32) score comparison sites.
-    pub semantic_threshold: f64,
+    /// Cosine floor for a semantic hit to be shown. `None` = the embedding
+    /// model's own default (see `Settings::semantic_threshold`). Stored as f64
+    /// for clean TOML round-tripping; cast to f32 at the score comparison sites.
+    pub semantic_threshold: Option<f64>,
     /// Max semantic hits per entity type.
     pub semantic_limit: usize,
+    /// Drop semantic hits scoring more than this below the best hit for the
+    /// same query; 1.0 turns it off. `None` = the embedding model's own
+    /// default (see `Settings::semantic_margin`).
+    pub semantic_margin: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DedupSettings {
-    /// Cosine score at/above which a distilled memory supersedes an existing one.
-    pub cosine_threshold: f64,
+    /// Cosine score at/above which a distilled memory supersedes an existing
+    /// one. `None` = the embedding model's own default.
+    pub cosine_threshold: Option<f64>,
     /// Lexical token-overlap fallback threshold (used when no embedder).
     pub lexical_threshold: f64,
     /// Cosine score at/above which a distilled memory merges into the BEST
@@ -74,7 +80,11 @@ pub struct DedupSettings {
     /// sat in 0.85-0.90. 0.88 merges the clear cases and still leaves a
     /// reviewable band; 0.85 would merge everything flagged and make the
     /// conflict list dead code.
-    pub merge_threshold: f64,
+    ///
+    /// Those numbers are MiniLM's. `None` = the embedding model's own default,
+    /// which for Granite small is "never merge on score" until its memory-pair
+    /// scores have been measured the same way.
+    pub merge_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +131,10 @@ pub struct DistillSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedSettings {
+    /// Embedding model, by registry name (`embed::models`). Changing it means
+    /// running `sclerox db reembed`; until then semantic search and dedup are
+    /// off for databases embedded with the old model. Env: `SCLEROX_EMBED_MODEL`.
+    pub model: String,
     /// Entity-text chunk size for embeddings.
     pub chunk_size: usize,
     /// Overlap between adjacent chunks.
@@ -192,8 +206,9 @@ impl Default for Settings {
 impl Default for SearchSettings {
     fn default() -> Self {
         Self {
-            semantic_threshold: 0.45_f64,
+            semantic_threshold: None,
             semantic_limit: 5,
+            semantic_margin: None,
         }
     }
 }
@@ -201,9 +216,9 @@ impl Default for SearchSettings {
 impl Default for DedupSettings {
     fn default() -> Self {
         Self {
-            cosine_threshold: 0.85_f64,
+            cosine_threshold: None,
             lexical_threshold: 0.7_f64,
-            merge_threshold: 0.88_f64,
+            merge_threshold: None,
         }
     }
 }
@@ -245,6 +260,7 @@ impl Default for DistillSettings {
 impl Default for EmbedSettings {
     fn default() -> Self {
         Self {
+            model: crate::embed::models::DEFAULT_MODEL.to_string(),
             chunk_size: 800,
             chunk_overlap: 200,
         }
@@ -362,6 +378,11 @@ impl Settings {
                 self.index.max_files = n;
             }
         }
+        if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {
+            if !m.is_empty() {
+                self.embed.model = m;
+            }
+        }
         if let Ok(l) = std::env::var("SCLEROX_LOG") {
             if !l.is_empty() {
                 self.log.level = l;
@@ -371,13 +392,23 @@ impl Settings {
 
     /// Clamp/repair out-of-range values, warning once per bad key. Never aborts.
     fn validate(&mut self) {
-        clamp_unit(
+        clamp_unit_opt(
             "search.semantic_threshold",
             &mut self.search.semantic_threshold,
         );
-        clamp_unit("dedup.cosine_threshold", &mut self.dedup.cosine_threshold);
+        clamp_unit_opt("search.semantic_margin", &mut self.search.semantic_margin);
+        clamp_unit_opt("dedup.cosine_threshold", &mut self.dedup.cosine_threshold);
         clamp_unit("dedup.lexical_threshold", &mut self.dedup.lexical_threshold);
-        clamp_unit("dedup.merge_threshold", &mut self.dedup.merge_threshold);
+        clamp_unit_opt("dedup.merge_threshold", &mut self.dedup.merge_threshold);
+
+        // The embedding model must be one the registry knows.
+        if let Err(e) = crate::embed::models::lookup(&self.embed.model) {
+            eprintln!(
+                "warning: embed.model: {e}; using {}",
+                crate::embed::models::DEFAULT_MODEL
+            );
+            self.embed.model = crate::embed::models::DEFAULT_MODEL.to_string();
+        }
 
         require_positive("search.semantic_limit", &mut self.search.semantic_limit, 5);
         require_positive(
@@ -461,6 +492,12 @@ impl Settings {
     }
 }
 
+fn clamp_unit_opt(name: &str, v: &mut Option<f64>) {
+    if let Some(v) = v {
+        clamp_unit(name, v);
+    }
+}
+
 fn clamp_unit(name: &str, v: &mut f64) {
     if !(0.0..=1.0).contains(v) {
         eprintln!("warning: {name} = {v} out of range [0.0, 1.0]; clamping");
@@ -472,6 +509,51 @@ fn require_positive(name: &str, v: &mut usize, default: usize) {
     if *v == 0 {
         eprintln!("warning: {name} must be > 0; using default {default}");
         *v = default;
+    }
+}
+
+// ── Model-dependent thresholds ───────────────────────────────────────────────
+// Cosine scores mean different things under different models, so each
+// threshold is the user's explicit value if set, else the configured model's.
+
+impl Settings {
+    /// The configured embedding model's registry entry.
+    pub fn embed_model(&self) -> &'static crate::embed::ModelSpec {
+        crate::embed::models::lookup(&self.embed.model)
+            .unwrap_or_else(|_| crate::embed::models::default_model())
+    }
+
+    pub fn semantic_threshold(&self) -> f64 {
+        self.search
+            .semantic_threshold
+            .unwrap_or(self.embed_model().thresholds.semantic)
+    }
+
+    pub fn dedup_cosine_threshold(&self) -> f64 {
+        self.dedup
+            .cosine_threshold
+            .unwrap_or(self.embed_model().thresholds.dedup_cosine)
+    }
+
+    /// How far below the best semantic hit a hit may score and still be
+    /// shown; see `embed::models::Thresholds::top_margin`. `None` = no margin.
+    pub fn semantic_margin(&self) -> Option<f64> {
+        self.search
+            .semantic_margin
+            .or(self.embed_model().thresholds.top_margin)
+    }
+
+    /// `None` = never merge on score alone; matches are flagged for review.
+    pub fn merge_threshold(&self) -> Option<f64> {
+        self.dedup
+            .merge_threshold
+            .or(self.embed_model().thresholds.merge)
+    }
+
+    /// Loose floor for the related memories shown to the distiller. Not
+    /// user-tunable: it only selects context, it never gates a write.
+    pub fn context_threshold(&self) -> f64 {
+        self.embed_model().thresholds.context
     }
 }
 
@@ -502,6 +584,14 @@ pub fn init() {
             );
         }
     }
+    // The embedder (library code) reads the model name from the env var.
+    let model_is_default = s.embed.model == EmbedSettings::default().model;
+    if !model_is_default && std::env::var(crate::embed::models::MODEL_ENV).is_err() {
+        // SAFETY: single-threaded startup, before any thread is spawned.
+        unsafe {
+            std::env::set_var(crate::embed::models::MODEL_ENV, &s.embed.model);
+        }
+    }
     // Same bridge for the max-files cap: the library indexer reads it from the
     // env var, so surface a customized config value there.
     let files_is_default = s.index.max_files == IndexSettings::default().max_files;
@@ -520,9 +610,10 @@ mod tests {
     #[test]
     fn defaults_when_empty() {
         let s = Settings::from_toml_str("").unwrap();
-        assert_eq!(s.search.semantic_threshold, 0.45);
+        assert_eq!(s.search.semantic_threshold, None);
         assert_eq!(s.search.semantic_limit, 5);
-        assert_eq!(s.dedup.cosine_threshold, 0.85);
+        assert_eq!(s.dedup.cosine_threshold, None);
+        assert_eq!(s.embed.model, "granite-small-r2");
         assert_eq!(s.memory.max_value_chars, 800);
         assert_eq!(s.session_context.max_chars, 3000);
         assert_eq!(s.embed.chunk_size, 800);
@@ -537,10 +628,11 @@ mod tests {
 semantic_threshold = 0.7
 "#;
         let s = Settings::from_toml_str(toml).unwrap();
-        assert_eq!(s.search.semantic_threshold, 0.7);
+        assert_eq!(s.search.semantic_threshold, Some(0.7));
+        assert_eq!(s.semantic_threshold(), 0.7);
         // untouched keys keep defaults
         assert_eq!(s.search.semantic_limit, 5);
-        assert_eq!(s.dedup.cosine_threshold, 0.85);
+        assert_eq!(s.dedup.cosine_threshold, None);
     }
 
     #[test]
@@ -555,7 +647,66 @@ semantic_threshold = 0.7
     fn validate_clamps_out_of_range() {
         let mut s = Settings::from_toml_str("[search]\nsemantic_threshold = 5.0\n").unwrap();
         s.validate();
-        assert_eq!(s.search.semantic_threshold, 1.0);
+        assert_eq!(s.search.semantic_threshold, Some(1.0));
+    }
+
+    #[test]
+    fn thresholds_follow_the_model_unless_overridden() {
+        let granite = Settings::from_toml_str("").unwrap();
+        let t = crate::embed::models::GRANITE_SMALL_R2.thresholds;
+        assert_eq!(granite.semantic_threshold(), t.semantic);
+        assert_eq!(granite.dedup_cosine_threshold(), t.dedup_cosine);
+        // Unmeasured for Granite: no automatic merging.
+        assert_eq!(granite.merge_threshold(), None);
+
+        let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+        assert_eq!(minilm.semantic_threshold(), 0.45);
+        assert_eq!(minilm.dedup_cosine_threshold(), 0.85);
+        assert_eq!(minilm.merge_threshold(), Some(0.88));
+
+        // An explicit value wins over the model's default, and can turn
+        // merging back on for Granite.
+        let pinned = Settings::from_toml_str(
+            "[search]\nsemantic_threshold = 0.6\n[dedup]\nmerge_threshold = 0.97\n",
+        )
+        .unwrap();
+        assert_eq!(pinned.semantic_threshold(), 0.6);
+        assert_eq!(pinned.merge_threshold(), Some(0.97));
+    }
+
+    #[test]
+    fn semantic_margin_follows_the_model_unless_overridden() {
+        let granite = Settings::from_toml_str("").unwrap();
+        assert_eq!(granite.semantic_margin(), Some(0.05));
+        let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+        assert_eq!(minilm.semantic_margin(), None);
+
+        // An explicit value wins; 1.0 effectively turns the margin off, since
+        // no hit can sit more than 1.0 below a best hit that passed the floor.
+        let set = Settings::from_toml_str("[search]\nsemantic_margin = 0.1\n").unwrap();
+        assert_eq!(set.semantic_margin(), Some(0.1));
+        let off = Settings::from_toml_str("[search]\nsemantic_margin = 1.0\n").unwrap();
+        let cut = crate::embed::models::semantic_cutoff(
+            [0.9_f32, 0.73],
+            off.semantic_threshold() as f32,
+            off.semantic_margin().map(|m| m as f32),
+        );
+        assert_eq!(cut, off.semantic_threshold() as f32);
+
+        let mut wild = Settings::from_toml_str("[search]\nsemantic_margin = 3.0\n").unwrap();
+        wild.validate();
+        assert_eq!(wild.search.semantic_margin, Some(1.0));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_model() {
+        let mut s = Settings::from_toml_str("[embed]\nmodel = \"bert-giant\"\n").unwrap();
+        s.validate();
+        assert_eq!(s.embed.model, "granite-small-r2");
+
+        let mut ok = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+        ok.validate();
+        assert_eq!(ok.embed.model, "minilm-l6-v2");
     }
 
     #[test]

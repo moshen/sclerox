@@ -28,10 +28,7 @@ mod tests {
 
     #[test]
     fn test_hyphenated_identifier() {
-        assert_eq!(
-            sanitize("report-gen-worker"),
-            "\"report-gen-worker\"*"
-        );
+        assert_eq!(sanitize("report-gen-worker"), "\"report-gen-worker\"*");
     }
 
     #[test]

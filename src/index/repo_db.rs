@@ -108,7 +108,6 @@ impl RepoDb {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -118,6 +117,52 @@ impl RepoDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The stored ID of the model that produced this database's vectors.
+    pub fn embedding_model(&self) -> Result<Option<String>> {
+        self.get_meta(crate::embed::models::META_KEY)
+    }
+
+    pub fn embedding_model_check(&self) -> Result<crate::embed::models::ModelCheck> {
+        Ok(crate::embed::models::check(
+            self.embedding_model()?.as_deref(),
+        ))
+    }
+
+    /// Names this database in warnings.
+    fn label(&self) -> String {
+        match self.conn.path() {
+            Some(p) if !p.is_empty() => format!("the repo index {p}"),
+            _ => "a repo index".to_string(),
+        }
+    }
+
+    /// False when this database's vectors came from a different model than
+    /// the configured one: semantic search must then be skipped (symbol search
+    /// still works). Warns once per process.
+    pub fn semantic_ready(&self) -> bool {
+        crate::embed::models::semantic_allowed(&self.label(), self.embedding_model())
+    }
+
+    /// Call before writing vectors. False means store the row without them.
+    /// Records the configured model if this is the database's first vector.
+    /// Run a similarity `read` if this database's vectors match the configured
+    /// model, else return nothing; see `crate::db::snapshot_read`.
+    fn semantic_read<T: Default>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::db::snapshot_read(&self.conn, || self.semantic_ready(), read)
+    }
+
+    fn write_with_vectors<T>(
+        &self,
+        wants_vectors: bool,
+        write: impl FnOnce(bool) -> Result<T>,
+    ) -> Result<T> {
+        crate::db::claimed_write(&self.conn, wants_vectors, write, || {
+            crate::embed::models::claim_writes(&self.label(), self.embedding_model(), |id| {
+                self.set_meta(crate::embed::models::META_KEY, id)
+            })
+        })
     }
 
     pub fn file_hash(&self, path: &str) -> Result<Option<String>> {
@@ -298,20 +343,22 @@ impl RepoDb {
         end_line: Option<i64>,
         embedding: Option<&[f32]>,
     ) -> Result<()> {
-        let emb_bytes = embedding.map(embedding_to_bytes);
-        self.conn.execute(
-            "INSERT INTO chunks (file_id, chunk_index, chunk_text, start_line, end_line, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                file_id,
-                chunk_index,
-                chunk_text,
-                start_line,
-                end_line,
-                emb_bytes
-            ],
-        )?;
-        Ok(())
+        self.write_with_vectors(embedding.is_some(), |keep| {
+            let emb_bytes = embedding.filter(|_| keep).map(embedding_to_bytes);
+            self.conn.execute(
+                "INSERT INTO chunks (file_id, chunk_index, chunk_text, start_line, end_line, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    file_id,
+                    chunk_index,
+                    chunk_text,
+                    start_line,
+                    end_line,
+                    emb_bytes
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
@@ -325,20 +372,36 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// All chunks: (chunk_id, chunk_text). Used by `reembed --force`.
-    pub fn all_chunks(&self) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, chunk_text FROM chunks")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    /// Set (or replace) a chunk's embedding. Returns false, storing nothing,
+    /// if the database holds another model's vectors.
+    pub fn set_chunk_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<bool> {
+        self.write_with_vectors(true, |keep| {
+            if !keep {
+                return Ok(false);
+            }
+            self.conn.execute(
+                "UPDATE chunks SET embedding = ?1 WHERE id = ?2",
+                params![embedding_to_bytes(embedding), chunk_id],
+            )?;
+            Ok(true)
+        })
     }
 
-    /// Set (or replace) a chunk's embedding.
-    pub fn set_chunk_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
-        self.conn.execute(
-            "UPDATE chunks SET embedding = ?1 WHERE id = ?2",
-            params![embedding_to_bytes(embedding), chunk_id],
-        )?;
-        Ok(())
+    /// Re-embed every code chunk and record `model_id` as this database's
+    /// model, all-or-nothing; see `crate::db::reembed`.
+    pub fn reembed_all(
+        &self,
+        model_id: &str,
+        embed: &mut crate::db::reembed::EmbedFn<'_>,
+        progress: &mut crate::db::reembed::ProgressFn<'_>,
+    ) -> Result<usize> {
+        crate::db::reembed::rebuild(
+            &self.conn,
+            &crate::db::reembed::REPO,
+            model_id,
+            embed,
+            progress,
+        )
     }
 
     pub fn search_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
@@ -377,30 +440,32 @@ impl RepoDb {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarChunk>> {
-        let query = embedding_to_bytes(query_embedding);
-        let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_text, c.start_line, c.end_line, f.path, v.distance
+        self.semantic_read(|| {
+            let query = embedding_to_bytes(query_embedding);
+            let mut stmt = self.conn.prepare(
+                "SELECT c.chunk_text, c.start_line, c.end_line, f.path, v.distance
              FROM chunks_vec v
              JOIN chunks c ON c.id = v.rowid
              JOIN files f ON c.file_id = f.id
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let chunk_text: String = row.get(0)?;
-            let start_line: Option<i64> = row.get(1)?;
-            let end_line: Option<i64> = row.get(2)?;
-            let file_path: String = row.get(3)?;
-            let distance: f64 = row.get(4)?;
-            Ok(SimilarChunk {
-                file_path,
-                chunk_text,
-                start_line,
-                end_line,
-                score: 1.0 - distance as f32, // cosine distance -> similarity
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            )?;
+            let rows = stmt.query_map(params![query, limit as i64], |row| {
+                let chunk_text: String = row.get(0)?;
+                let start_line: Option<i64> = row.get(1)?;
+                let end_line: Option<i64> = row.get(2)?;
+                let file_path: String = row.get(3)?;
+                let distance: f64 = row.get(4)?;
+                Ok(SimilarChunk {
+                    file_path,
+                    chunk_text,
+                    start_line,
+                    end_line,
+                    score: 1.0 - distance as f32, // cosine distance -> similarity
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 
     pub fn list_files(&self) -> Result<Vec<IndexedFile>> {
@@ -486,7 +551,7 @@ mod tests {
         assert_eq!(by_mid[0].name, "ConfigBuilder");
     }
 
-    /// A 384-dim unit vector with 1.0 at index `i` (matches the AllMiniLM
+    /// A 384-dim unit vector with 1.0 at index `i` (matches the embedding
     /// dimension the vec0 index enforces).
     #[cfg(test)]
     fn v384(i: usize) -> Vec<f32> {
@@ -543,9 +608,6 @@ mod tests {
         // Backfill it.
         db.set_chunk_embedding(missing[0].0, &v384(1)).unwrap();
         assert!(db.chunks_without_embedding().unwrap().is_empty());
-
-        // --force sees all chunks regardless of embedding state.
-        assert_eq!(db.all_chunks().unwrap().len(), 2);
     }
 
     #[test]
@@ -558,6 +620,142 @@ mod tests {
             db.file_hash("src/main.rs").unwrap().as_deref(),
             Some("deadbeef")
         );
+    }
+
+    /// A repo database at v4 (before the model was recorded), with one chunk
+    /// whose embedding is `embedded` or NULL.
+    fn repo_db_at_v4(embedded: bool) -> RepoDb {
+        crate::db::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        // REPO_SCHEMA already holds every table; rewind the version so v5
+        // runs as it would on an upgraded database.
+        conn.execute_batch(REPO_SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4").unwrap();
+        let db = RepoDb { conn };
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h", None).unwrap();
+        let emb = embedded.then(|| v384(0));
+        db.conn
+            .execute(
+                "INSERT INTO chunks (file_id, chunk_index, chunk_text, embedding)
+                 VALUES (?1, 0, 'fn a() {}', ?2)",
+                params![file_id, emb.as_deref().map(embedding_to_bytes)],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn test_migration_v5_stamps_existing_embeddings_as_minilm() {
+        let db = repo_db_at_v4(true);
+        db.init().unwrap();
+        assert_eq!(db.user_version().unwrap(), REPO_VERSION);
+        assert_eq!(
+            db.embedding_model().unwrap().as_deref(),
+            Some(crate::embed::models::MINILM_L6_V2.id)
+        );
+    }
+
+    #[test]
+    fn test_migration_v5_leaves_unembedded_db_unrecorded() {
+        let db = repo_db_at_v4(false);
+        db.init().unwrap();
+        assert_eq!(db.embedding_model().unwrap(), None);
+    }
+
+    #[test]
+    fn test_migration_v5_is_harmless_twice() {
+        let db = repo_db_at_v4(true);
+        db.init().unwrap();
+        db.conn
+            .execute_batch(crate::db::schema::REPO_MIGRATION_V5)
+            .unwrap();
+        assert_eq!(
+            db.embedding_model().unwrap().as_deref(),
+            Some(crate::embed::models::MINILM_L6_V2.id)
+        );
+    }
+
+    #[test]
+    fn test_fresh_repo_db_has_no_embedding_model() {
+        // Fresh repo databases skip migrations entirely.
+        let db = RepoDb::open_in_memory().unwrap();
+        assert_eq!(db.embedding_model().unwrap(), None);
+    }
+
+    #[test]
+    fn test_first_vector_records_the_configured_model() {
+        let db = RepoDb::open_in_memory().unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h", None).unwrap();
+        // A chunk without a vector records nothing.
+        db.insert_chunk(file_id, 0, "text only", None, None, None)
+            .unwrap();
+        assert_eq!(db.embedding_model().unwrap(), None);
+        db.insert_chunk(file_id, 1, "fn a() {}", None, None, Some(&v384(0)))
+            .unwrap();
+        assert_eq!(
+            db.embedding_model().unwrap().as_deref(),
+            Some(crate::embed::models::configured_id())
+        );
+    }
+
+    #[test]
+    fn test_mismatch_skips_semantic_and_refuses_vectors() {
+        let db = repo_db_at_v4(true);
+        db.init().unwrap(); // recorded as MiniLM; the configured model is Granite
+        assert!(!db.semantic_ready());
+        assert!(db.similar_chunks(&v384(0), 5).unwrap().is_empty());
+
+        // New vectors are refused; the chunk text itself is still stored.
+        let file_id = db.upsert_file("b.rs", Some("rust"), "h2", None).unwrap();
+        db.insert_chunk(file_id, 0, "fn b() {}", None, None, Some(&v384(1)))
+            .unwrap();
+        assert_eq!(db.chunks_without_embedding().unwrap().len(), 1);
+        let (id, _) = db.chunks_without_embedding().unwrap()[0].clone();
+        assert!(!db.set_chunk_embedding(id, &v384(1)).unwrap());
+
+        // Symbol (keyword) search is unaffected.
+        db.insert_symbol(file_id, "function", "b", None, 1, 1)
+            .unwrap();
+        assert_eq!(db.search_symbols("b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_reembed_all_leaves_unembedded_chunks_alone() {
+        // Session hooks index without embedding; a rebuild converts what has
+        // vectors and doesn't take on embedding the rest.
+        let db = repo_db_at_v4(true);
+        db.init().unwrap();
+        let file_id = db.upsert_file("b.rs", Some("rust"), "h2", None).unwrap();
+        db.insert_chunk(file_id, 0, "fn b() {}", None, None, None)
+            .unwrap();
+        let n = db
+            .reembed_all(
+                crate::embed::models::GRANITE_SMALL_R2.id,
+                &mut |texts: &[&str]| Ok(texts.iter().map(|_| v384(1)).collect()),
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(db.chunks_without_embedding().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_reembed_all_switches_model_and_index() {
+        let db = repo_db_at_v4(true);
+        db.init().unwrap();
+        let granite = crate::embed::models::GRANITE_SMALL_R2.id;
+        let n = db
+            .reembed_all(
+                granite,
+                &mut |texts: &[&str]| Ok(texts.iter().map(|_| v384(1)).collect()),
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(db.embedding_model().unwrap().as_deref(), Some(granite));
+        let hits = db.similar_chunks(&v384(1), 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].score > 0.99, "chunks_vec holds the new vector");
     }
 
     #[test]

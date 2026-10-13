@@ -2600,6 +2600,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-sequel",
  "tree-sitter-typescript",
+ "ureq",
  "walkdir",
 ]
 

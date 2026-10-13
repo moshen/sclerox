@@ -54,6 +54,15 @@ fn show(format: OutputFormat) -> Result<()> {
         if !overrides.is_empty() {
             println!("# env overrides active: {}", overrides.join(", "));
         }
+        let off = |v: Option<f64>| v.map_or("off".to_string(), |v| v.to_string());
+        println!(
+            "# effective thresholds for {}: semantic {}, margin {}, dedup cosine {}, merge {}",
+            s.embed.model,
+            s.semantic_threshold(),
+            off(s.semantic_margin()),
+            s.dedup_cosine_threshold(),
+            off(s.merge_threshold()),
+        );
         match toml::to_string_pretty(s) {
             Ok(t) => print!("{t}"),
             Err(e) => eprintln!("could not render settings as TOML: {e}"),
@@ -68,6 +77,7 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_AI_COMMAND",
         "SCLEROX_AI_MODEL",
         "SCLEROX_MAX_INDEX_FILE_BYTES",
+        "SCLEROX_EMBED_MODEL",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]
@@ -80,6 +90,7 @@ fn active_env_overrides() -> Vec<&'static str> {
 /// `Settings::default()` so the template never drifts from the real defaults.
 pub fn config_template() -> String {
     let d = Settings::default();
+    let dm = d.embed_model().thresholds;
     format!(
         "# sclerox configuration - all keys optional; defaults shown.\n\
          # Precedence: CLI flag > env var > this file > built-in default.\n\
@@ -101,13 +112,17 @@ pub fn config_template() -> String {
          # model = \"\"     # appended to the DEFAULT command only; env: SCLEROX_AI_MODEL\n\
          \n\
          [search]\n\
+         # Unset thresholds here and in [dedup] follow embed.model, because each\n\
+         # model scores on its own scale:\n\
+         {model_thresholds}\
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
          # semantic_limit = {sem_lim}                 # max semantic hits per entity type\n\
+         # semantic_margin = {sem_margin}            # drop hits this far below the best one; 1.0 = off\n\
          \n\
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
          # lexical_threshold = {lex_thr}            # token-overlap fallback (no embedder)\n\
-         # merge_threshold = {merge_thr}              # merge into best match even when several match (calibrated: real dupes sit 0.85-0.93)\n\
+         # merge_threshold = {merge_thr}              # merge into best match even when several match; unset = the model's (off for granite-small-r2)\n\
          \n\
          [memory]\n\
          # max_value_chars = {max_val}              # warn (not reject) above this length\n\
@@ -129,6 +144,7 @@ pub fn config_template() -> String {
          # context_memories = {ctx_mem}               # related memories shown to the distiller for key reuse\n\
          \n\
          [embed]\n\
+         # model = \"{embed_model}\"   # {model_names}; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
          # chunk_size = {embed_size}                 # entity-text chunking for embeddings\n\
          # chunk_overlap = {embed_overlap}\n\
          \n\
@@ -147,11 +163,22 @@ pub fn config_template() -> String {
          [log]\n\
          # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.local/state/sclerox/logs/. env: SCLEROX_LOG\n\
          # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n",
-        sem_thr = d.search.semantic_threshold,
+        model_thresholds = model_thresholds_doc(),
+        sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
-        cos_thr = d.dedup.cosine_threshold,
+        // MiniLM has no margin; show Granite's as the example value.
+        sem_margin = dm
+            .top_margin
+            .or(crate::embed::models::GRANITE_SMALL_R2.thresholds.top_margin)
+            .unwrap_or(0.05),
+        cos_thr = dm.dedup_cosine,
         lex_thr = d.dedup.lexical_threshold,
-        merge_thr = d.dedup.merge_threshold,
+        // Granite has no merge default; show MiniLM's calibrated value as the
+        // example, since that is what an explicit value turns back on.
+        merge_thr = dm
+            .merge
+            .or(crate::embed::models::MINILM_L6_V2.thresholds.merge)
+            .unwrap_or(0.88),
         max_val = d.memory.max_value_chars,
         ctx_tokens = d.session_context.max_tokens,
         ctx_max = d.session_context.max_chars,
@@ -165,6 +192,8 @@ pub fn config_template() -> String {
         min_turns = d.distill.min_turns,
         min_new = d.distill.min_new_turns,
         ctx_mem = d.distill.context_memories,
+        embed_model = d.embed.model,
+        model_names = crate::embed::models::names().join("|"),
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
         max_bytes = d.index.max_file_bytes,
@@ -176,6 +205,26 @@ pub fn config_template() -> String {
         log_level = d.log.level,
         retain_days = d.log.retain_days,
     )
+}
+
+/// One indented, commented line per registry model listing its default
+/// thresholds. Indented so the upgrade path never mistakes it for a key.
+fn model_thresholds_doc() -> String {
+    crate::embed::models::MODELS
+        .iter()
+        .map(|m| {
+            let t = m.thresholds;
+            let off = |v: Option<f64>| v.map_or("off".to_string(), |v| v.to_string());
+            format!(
+                "#   {:<18} semantic {}, margin {}, cosine {}, merge {}\n",
+                format!("{}:", m.name),
+                t.semantic,
+                off(t.top_margin),
+                t.dedup_cosine,
+                off(t.merge)
+            )
+        })
+        .collect()
 }
 
 /// Write the template to `path`. If the file exists and `overwrite` is false,
@@ -410,8 +459,9 @@ mod tests {
         // Every line is commented, so the template parses as an empty config
         // and yields the built-in defaults.
         let parsed = Settings::from_toml_str(&config_template()).unwrap();
-        assert_eq!(parsed.search.semantic_threshold, 0.45);
-        assert_eq!(parsed.dedup.cosine_threshold, 0.85);
+        assert_eq!(parsed.search.semantic_threshold, None);
+        assert_eq!(parsed.dedup.cosine_threshold, None);
+        assert_eq!(parsed.embed.model, "granite-small-r2");
     }
 
     #[test]
@@ -445,13 +495,13 @@ mod tests {
         assert!(upgraded.contains("command = \"opencode run --pure\""));
         // Untouched keys remain commented at their defaults (docs refreshed).
         assert!(upgraded.contains("# semantic_limit = 5"));
-        assert!(upgraded.contains("# cosine_threshold = 0.85"));
+        assert!(upgraded.contains("# cosine_threshold = 0.9"));
         // A newer key absent from the old file now appears (commented).
         assert!(upgraded.contains("# max_file_bytes ="));
 
         // The result is valid TOML and round-trips to the user's values.
         let s = Settings::from_toml_str(&upgraded).unwrap();
-        assert_eq!(s.search.semantic_threshold, 0.9);
+        assert_eq!(s.search.semantic_threshold, Some(0.9));
         assert_eq!(s.ai.command.as_deref(), Some("opencode run --pure"));
         assert_eq!(s.search.semantic_limit, 5); // still default
     }

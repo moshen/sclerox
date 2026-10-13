@@ -793,6 +793,29 @@ fn try_lock_session_in(dir: &std::path::Path, session_id: &str, stale_secs: u64)
     }
 }
 
+/// Session distillations running right now, by their live per-session locks.
+/// Older sclerox versions take the same locks, so this also sees a background
+/// distiller started before an upgrade.
+pub(crate) fn distillations_in_progress() -> usize {
+    match distill_marker_path("x").parent() {
+        Some(dir) => count_live_locks(dir, LOCK_STALE_SECS),
+        None => 0,
+    }
+}
+
+/// Testable core: `.lock` files in `dir` not yet stale.
+fn count_live_locks(dir: &std::path::Path, stale_secs: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "lock"))
+        .filter(|p| !lock_is_stale(p, stale_secs))
+        .count()
+}
+
 fn lock_is_stale(path: &std::path::Path, stale_secs: u64) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -862,14 +885,19 @@ fn distill_chunked(
     turns: &[String],
     source: &str,
 ) -> Result<usize> {
-    let dedup = &crate::config::settings().dedup;
+    let settings = crate::config::settings();
+    let dedup = &settings.dedup;
+    let cosine_threshold = settings.dedup_cosine_threshold() as f32;
+    let merge_threshold = settings.merge_threshold();
     let chunk_chars = crate::config::settings().distill.chunk_chars;
     let ctx_limit = crate::config::settings().distill.context_memories;
     let mut stored = 0usize;
     let mut seen_keys = std::collections::HashSet::new();
     // Best-effort embedder, reused across all chunks. None if the model is
-    // unavailable - dedup then falls back to lexical and no vectors are stored.
-    let mut embedder = crate::embed::Embedder::new().ok();
+    // unavailable, or if this database's vectors came from a different model
+    // (their scores against ours would be meaningless) - dedup then falls back
+    // to lexical and no vectors are stored.
+    let mut embedder = crate::embed::optional(db.semantic_ready());
 
     for chunk in chunk_turns(turns, chunk_chars) {
         // Show the distiller the memories this chunk is topically near, so it
@@ -923,11 +951,7 @@ fn distill_chunked(
             const NEAR_DUP_LIMIT: usize = 8;
             let near_dups: Vec<_> = match &emb {
                 Some(v) => db
-                    .memory_find_near_duplicates_semantic(
-                        v,
-                        dedup.cosine_threshold as f32,
-                        NEAR_DUP_LIMIT,
-                    )
+                    .memory_find_near_duplicates_semantic(v, cosine_threshold, NEAR_DUP_LIMIT)
                     .unwrap_or_default(),
                 None => db
                     .memory_find_near_duplicates(&m.value, dedup.lexical_threshold)
@@ -1005,7 +1029,7 @@ fn distill_chunked(
                 })
                 .collect();
 
-            match decide_dedup_action(declared, &candidates, dedup.merge_threshold) {
+            match decide_dedup_action(declared, &candidates, merge_threshold) {
                 DedupAction::Insert => {
                     let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
                 }
@@ -1076,14 +1100,25 @@ struct Candidate<'a> {
 /// The `many` arm is the important one. Flagging every multi-match ratchets a
 /// cluster wider (once a topic has two entries, each later mention matches 2+
 /// and adds a third), so a match at or above `merge_threshold` merges instead.
+///
+/// `merge_threshold` of `None` means the embedding model's scores have not
+/// been calibrated for merging: nothing merges on score alone, single match or
+/// many, and every match is flagged for review instead.
 fn decide_dedup_action(
     declared: Option<&str>,
     candidates: &[Candidate<'_>],
-    merge_threshold: f64,
+    merge_threshold: Option<f64>,
 ) -> DedupAction {
     if let Some(key) = declared {
         return DedupAction::Merge(key.to_string());
     }
+    let Some(merge_threshold) = merge_threshold else {
+        return if candidates.is_empty() {
+            DedupAction::Insert
+        } else {
+            DedupAction::Flag
+        };
+    };
     match candidates {
         [] => DedupAction::Insert,
         [single] if single.source != "manual" => DedupAction::Merge(single.key.to_string()),
@@ -1119,8 +1154,6 @@ fn related_memories_for_chunk(
     chunk: &str,
     limit: usize,
 ) -> Vec<(String, String)> {
-    /// Below this the retrieved memories are noise rather than context.
-    const CONTEXT_COSINE_FLOOR: f32 = 0.30;
     /// Windows sampled evenly across the chunk, including its head and tail.
     const PROBES: usize = 8;
 
@@ -1130,6 +1163,9 @@ fn related_memories_for_chunk(
     let Some(embedder) = embedder else {
         return Vec::new();
     };
+    // Below this the retrieved memories are noise rather than context. Depends
+    // on the model: MiniLM puts unrelated text near 0.1, Granite near 0.75.
+    let context_floor = crate::config::settings().context_threshold() as f32;
 
     // Best score wins when several probes surface the same memory.
     let mut best: std::collections::HashMap<String, (f32, String)> =
@@ -1139,7 +1175,7 @@ fn related_memories_for_chunk(
             continue;
         };
         for sm in db
-            .memory_find_near_duplicates_semantic(&emb, CONTEXT_COSINE_FLOOR, limit)
+            .memory_find_near_duplicates_semantic(&emb, context_floor, limit)
             .unwrap_or_default()
         {
             let slot = best
@@ -1359,6 +1395,31 @@ mod tests {
     }
 
     #[test]
+    fn live_locks_are_counted_and_stale_ones_are_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(count_live_locks(dir.path(), LOCK_STALE_SECS), 0);
+        let a = match try_lock_session_in(dir.path(), "a", LOCK_STALE_SECS) {
+            LockOutcome::Acquired(g) => g,
+            _ => panic!("expected to acquire the lock"),
+        };
+        let _b = match try_lock_session_in(dir.path(), "b", LOCK_STALE_SECS) {
+            LockOutcome::Acquired(g) => g,
+            _ => panic!("expected to acquire the lock"),
+        };
+        // Done-markers sit beside the locks and are not distillations.
+        std::fs::write(dir.path().join("c"), "").unwrap();
+        assert_eq!(count_live_locks(dir.path(), LOCK_STALE_SECS), 2);
+        // A crashed distiller's lock past the staleness window doesn't count.
+        assert_eq!(count_live_locks(dir.path(), 0), 0);
+        drop(a);
+        assert_eq!(count_live_locks(dir.path(), LOCK_STALE_SECS), 1);
+        assert_eq!(
+            count_live_locks(&dir.path().join("missing"), LOCK_STALE_SECS),
+            0
+        );
+    }
+
+    #[test]
     fn test_path_to_project_hash() {
         // Plain path
         assert_eq!(
@@ -1446,14 +1507,17 @@ mod tests {
 
     #[test]
     fn dedup_inserts_when_nothing_matches() {
-        assert_eq!(decide_dedup_action(None, &[], 0.95), DedupAction::Insert);
+        assert_eq!(
+            decide_dedup_action(None, &[], Some(0.95)),
+            DedupAction::Insert
+        );
     }
 
     #[test]
     fn dedup_merges_single_distilled_match() {
         let c = [cand("existing", "session", 0.86)];
         assert_eq!(
-            decide_dedup_action(None, &c, 0.95),
+            decide_dedup_action(None, &c, Some(0.95)),
             DedupAction::Merge("existing".to_string())
         );
     }
@@ -1463,7 +1527,7 @@ mod tests {
         // The user wrote it deliberately; a distilled near-match must not
         // silently replace it, however high the score.
         let c = [cand("hand-written", "manual", 0.99)];
-        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
     }
 
     #[test]
@@ -1475,7 +1539,7 @@ mod tests {
             cand("closest", "session", 0.97),
         ];
         assert_eq!(
-            decide_dedup_action(None, &c, 0.95),
+            decide_dedup_action(None, &c, Some(0.95)),
             DedupAction::Merge("closest".to_string())
         );
     }
@@ -1483,7 +1547,7 @@ mod tests {
     #[test]
     fn dedup_flags_ambiguous_cluster_below_threshold() {
         let c = [cand("one", "session", 0.88), cand("two", "session", 0.90)];
-        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
     }
 
     #[test]
@@ -1495,7 +1559,7 @@ mod tests {
             cand("distilled", "session", 0.96),
         ];
         assert_eq!(
-            decide_dedup_action(None, &c, 0.95),
+            decide_dedup_action(None, &c, Some(0.95)),
             DedupAction::Merge("distilled".to_string())
         );
     }
@@ -1506,7 +1570,7 @@ mod tests {
             cand("hand-a", "manual", 0.99),
             cand("hand-b", "manual", 0.97),
         ];
-        assert_eq!(decide_dedup_action(None, &c, 0.95), DedupAction::Flag);
+        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
     }
 
     #[test]
@@ -1515,7 +1579,23 @@ mod tests {
         // says they are worded alike. Below-threshold matches must not override.
         let c = [cand("some-other", "session", 0.60)];
         assert_eq!(
-            decide_dedup_action(Some("declared-key"), &c, 0.95),
+            decide_dedup_action(Some("declared-key"), &c, Some(0.95)),
+            DedupAction::Merge("declared-key".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_without_merge_threshold_flags_instead_of_merging() {
+        // An uncalibrated model: even a lone, near-identical distilled match is
+        // flagged for review rather than merged on its score.
+        let single = [cand("existing", "session", 0.99)];
+        assert_eq!(decide_dedup_action(None, &single, None), DedupAction::Flag);
+        let many = [cand("a", "session", 0.99), cand("b", "session", 0.98)];
+        assert_eq!(decide_dedup_action(None, &many, None), DedupAction::Flag);
+        assert_eq!(decide_dedup_action(None, &[], None), DedupAction::Insert);
+        // The distiller's own judgement still applies: it is not a score.
+        assert_eq!(
+            decide_dedup_action(Some("declared-key"), &single, None),
             DedupAction::Merge("declared-key".to_string())
         );
     }
@@ -1523,7 +1603,7 @@ mod tests {
     #[test]
     fn dedup_declared_supersedes_applies_with_no_matches_at_all() {
         assert_eq!(
-            decide_dedup_action(Some("declared-key"), &[], 0.95),
+            decide_dedup_action(Some("declared-key"), &[], Some(0.95)),
             DedupAction::Merge("declared-key".to_string())
         );
     }

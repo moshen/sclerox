@@ -28,11 +28,13 @@ pub fn find_git_root(dir: &Path) -> std::path::PathBuf {
 }
 
 // Fallback line count for languages without a tree-sitter grammar.
-// ~15 lines × 50 chars/line ≈ 750 chars, within AllMiniLML6V2's 256-token window.
+// ~15 lines × 50 chars/line ≈ 750 chars, within every supported model's window.
 pub const CHUNK_SIZE_LINES: usize = 15;
 
 // Maximum chars per embedded chunk. Anything larger gets split by split_large_chunk().
-// AllMiniLML6V2 max tokens = 256 ≈ 1024 chars; 800 gives a safety margin.
+// MiniLM's window is 256 tokens ≈ 1024 chars, the smallest of the supported
+// models (Granite small takes 8,192); 800 gives a safety margin. Granite was
+// evaluated at 800 too, and larger chunks did not help it meaningfully.
 pub const MAX_EMBED_CHARS: usize = 800;
 
 // Overlap when splitting an oversized function chunk into sub-chunks.
@@ -196,6 +198,11 @@ impl<'a> RepoIndexer<'a> {
         let repo_db = RepoDb::open(&db_path)?;
 
         repo_db.set_meta("repo_root", &repo_root.to_string_lossy())?;
+        // An index embedded with a different model gets no new vectors (they
+        // would not be comparable) until `sclerox db reembed` rebuilds it. Index
+        // it as if there were no embedder; otherwise every run would see the
+        // vector-less chunks as "needs embedding" and re-index them again.
+        let embed_here = self.embedder.is_some() && repo_db.semantic_ready();
         repo_db.set_meta("name", &name)?;
 
         // Retract any nested child index this parent now covers: a subfolder was
@@ -250,9 +257,8 @@ impl<'a> RepoIndexer<'a> {
             // Skip unchanged files - but if --embed is active, also re-index
             // files whose chunks have no embeddings (previously indexed without --embed).
             let hash_matches = repo_db.file_hash(&rel_path)?.as_deref() == Some(&hash);
-            let needs_embed = self.embedder.is_some()
-                && hash_matches
-                && !repo_db.file_chunks_all_embedded(&rel_path)?;
+            let needs_embed =
+                embed_here && hash_matches && !repo_db.file_chunks_all_embedded(&rel_path)?;
 
             if hash_matches && !needs_embed {
                 result.skipped += 1;
@@ -302,11 +308,12 @@ impl<'a> RepoIndexer<'a> {
             }
 
             for (i, chunk) in chunks.iter().enumerate() {
-                let embedding = if let Some(ref mut emb) = self.embedder {
-                    emb.embed_one(&chunk.text).ok()
-                } else {
-                    None
-                };
+                let embedding =
+                    if let (true, Some(emb)) = (embed_here, self.embedder.as_deref_mut()) {
+                        emb.embed_one(&chunk.text).ok()
+                    } else {
+                        None
+                    };
                 repo_db.insert_chunk(
                     file_id,
                     i as i64,

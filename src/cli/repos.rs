@@ -56,7 +56,9 @@ pub enum RepoCommand {
     ///
     /// The auto-index hooks index without an embedder, so hook-indexed repos
     /// have code chunks but no embeddings (semantic code search skips them).
-    /// This embeds the stored chunk text in place - no re-parsing.
+    /// This embeds the stored chunk text in place - no re-parsing. A repo
+    /// embedded with a different model than `embed.model` is re-embedded in
+    /// full (see also `sclerox db reembed`, which covers every database).
     Reembed {
         /// Restrict to repos whose name contains this string
         #[arg(long)]
@@ -89,10 +91,11 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 );
                 return Ok(());
             }
+            // The repo DB checks its own recorded model while indexing.
             let mut embedder_opt: Option<Embedder> = if no_embed {
                 None
             } else {
-                Some(Embedder::new()?)
+                crate::embed::optional(true)
             };
             let mut indexer = RepoIndexer::new(embedder_opt.as_mut()).with_force(force);
             println!("Indexing {}...", canonical.display());
@@ -135,8 +138,9 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             }
 
             // Semantic results deduped against FTS
-            let mut embedder = Embedder::new()?;
-            if let Ok(query_emb) = embedder.embed_one(&query) {
+            let query_emb = crate::embed::optional(db.semantic_ready())
+                .and_then(|mut e| e.embed_query(&query).ok());
+            if let Some(query_emb) = query_emb {
                 let similar = db.repo_similar(&query_emb, 5).unwrap_or_default();
                 let semantic: Vec<_> = similar
                     .iter()
@@ -274,9 +278,10 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
         return Ok(());
     }
 
-    let mut embedder = Embedder::new()?;
+    let mut embedder = crate::embed::required()?;
     let mut total_embedded = 0usize;
     let mut touched_repos = 0usize;
+    let mut failed = 0usize;
 
     for entry in &repos {
         if let Some(f) = repo_filter {
@@ -292,38 +297,91 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
             Ok(r) => r,
             Err(e) => {
                 println!("  {}: could not open ({e})", entry.name);
+                failed += 1;
                 continue;
             }
         };
 
-        let targets = if force {
-            repo_db.all_chunks()?
-        } else {
-            repo_db.chunks_without_embedding()?
+        // A full re-embed (forced, or an index built with another model) goes
+        // through the all-or-nothing rebuild, which also records the model.
+        // It redoes the chunks that had vectors; the backfill below then
+        // embeds the rest.
+        let mismatched = match repo_db.embedding_model_check() {
+            Ok(state) => matches!(state, crate::embed::models::ModelCheck::Mismatch { .. }),
+            Err(e) => {
+                println!(
+                    "  {}: could not read its embedding model ({e:#})",
+                    entry.name
+                );
+                failed += 1;
+                continue;
+            }
         };
-        if targets.is_empty() {
-            continue;
-        }
-
-        // Embed in batches to bound memory.
-        let mut embedded = 0usize;
-        for batch in targets.chunks(64) {
-            let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-            let vectors = embedder.embed_batch(&texts)?;
-            for ((chunk_id, _), vec) in batch.iter().zip(vectors) {
-                repo_db.set_chunk_embedding(*chunk_id, &vec)?;
-                embedded += 1;
+        let mut touched = false;
+        if force || mismatched {
+            let model_id = embedder.model().id;
+            match repo_db.reembed_all(
+                model_id,
+                &mut |texts: &[&str]| embedder.embed_batch(texts),
+                &mut |_, _, _| {},
+            ) {
+                Ok(n) => {
+                    if n > 0 {
+                        println!("  {}: re-embedded {n} chunks", entry.name);
+                        total_embedded += n;
+                        touched = true;
+                    }
+                }
+                Err(e) => {
+                    // Still on its old model, so the backfill would be refused.
+                    println!(
+                        "  {}: failed, left on its previous model: {e:#}",
+                        entry.name
+                    );
+                    failed += 1;
+                    continue;
+                }
             }
         }
-        println!("  {}: embedded {embedded} chunks", entry.name);
-        total_embedded += embedded;
-        touched_repos += 1;
+
+        let mut embedded = 0usize;
+        if let Err(e) = backfill_chunks(&repo_db, &mut embedder, &mut embedded) {
+            // Batches embedded before the failure are kept and counted below.
+            println!("  {}: embedding chunks failed: {e:#}", entry.name);
+            failed += 1;
+        }
+        if embedded > 0 {
+            println!("  {}: embedded {embedded} chunks", entry.name);
+            total_embedded += embedded;
+            touched = true;
+        }
+        touched_repos += usize::from(touched);
     }
 
+    if failed > 0 {
+        println!("Embedded {total_embedded} chunks across {touched_repos} repos; {failed} failed.");
+        anyhow::bail!("{failed} repo(s) could not be embedded; run again to retry");
+    }
     if total_embedded == 0 {
         println!("All indexed chunks already have embeddings.");
     } else {
         println!("Embedded {total_embedded} chunks across {touched_repos} repos.");
+    }
+    Ok(())
+}
+
+/// Embed a repo's chunks that have no vector, in batches to bound memory.
+/// Each batch is kept as it goes; `embedded` counts them even on failure.
+fn backfill_chunks(repo_db: &RepoDb, embedder: &mut Embedder, embedded: &mut usize) -> Result<()> {
+    let targets = repo_db.chunks_without_embedding()?;
+    for batch in targets.chunks(64) {
+        let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
+        let vectors = embedder.embed_batch(&texts)?;
+        for ((chunk_id, _), vec) in batch.iter().zip(vectors) {
+            if repo_db.set_chunk_embedding(*chunk_id, &vec)? {
+                *embedded += 1;
+            }
+        }
     }
     Ok(())
 }

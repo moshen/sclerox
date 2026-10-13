@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::config::settings;
 use crate::db::Database;
-use crate::embed::{chunk_text, Embedder};
+use crate::embed::chunk_text;
 
 #[derive(Subcommand)]
 pub enum MeetingCommand {
@@ -151,8 +151,9 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             }
 
             // Semantic results - appended, deduped against FTS hits
-            let mut embedder = Embedder::new()?;
-            if let Ok(query_emb) = embedder.embed_one(&query) {
+            let query_emb = crate::embed::optional(db.semantic_ready())
+                .and_then(|mut e| e.embed_query(&query).ok());
+            if let Some(query_emb) = query_emb {
                 let similar = db.meeting_similar(&query_emb, 5).unwrap_or_default();
                 let semantic: Vec<_> = similar
                     .iter()
@@ -262,16 +263,22 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
     }
     let emb_cfg = &settings().embed;
     let raw_chunks = chunk_text(text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
-    let chunks: Vec<(String, Option<Vec<f32>>)> = if no_embed {
-        raw_chunks.into_iter().map(|c| (c, None)).collect()
+    // Without an embedder (--no-embed, model unavailable)
+    // the chunks are stored without vectors; `db reembed` can fill them later.
+    let embedder = if no_embed {
+        None
     } else {
-        let mut embedder = Embedder::new()?;
+        crate::embed::optional(db.semantic_ready())
+    };
+    let chunks: Vec<(String, Option<Vec<f32>>)> = if let Some(mut embedder) = embedder {
         let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();
         let embeddings = embedder.embed_batch(&texts)?;
         raw_chunks
             .into_iter()
             .zip(embeddings.into_iter().map(Some))
             .collect()
+    } else {
+        raw_chunks.into_iter().map(|c| (c, None)).collect()
     };
     db.meeting_store_chunks(meeting_id, &chunks)?;
     Ok(())

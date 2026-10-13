@@ -30,7 +30,10 @@ impl Database {
         db_path: &str,
         description_embedding: Option<&[f32]>,
     ) -> Result<i64> {
-        let emb_bytes = description_embedding.map(embedding_to_bytes);
+        // Another model's vectors in this database: keep the stored one (the
+        // COALESCE below) rather than mixing in ours.
+        self.write_with_vectors(description_embedding.is_some(), |keep| {
+        let emb_bytes = description_embedding.filter(|_| keep).map(embedding_to_bytes);
         self.conn.execute(
             "INSERT INTO repos (path, name, description, db_path, last_indexed, description_embedding)
              VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
@@ -43,6 +46,7 @@ impl Database {
             params![path, name, description, db_path, emb_bytes],
         )?;
         Ok(self.conn.last_insert_rowid())
+        })
     }
 
     pub fn repo_get_by_path(&self, path: &str) -> Result<Option<RepoEntry>> {
@@ -81,8 +85,9 @@ impl Database {
     /// Repos whose description is nearest to `query_embedding`, via the
     /// sqlite-vec KNN index (`repos_vec`, cosine). `score` = 1 - cosine distance.
     pub fn repo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarRepo>> {
-        let query = crate::db::embedding_to_bytes(query_embedding);
-        let mut stmt = self.conn.prepare(
+        self.semantic_read(|| {
+            let query = crate::db::embedding_to_bytes(query_embedding);
+            let mut stmt = self.conn.prepare(
             "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at,
                     v.distance
              FROM repos_vec v
@@ -90,23 +95,24 @@ impl Database {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let repo = RepoEntry {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                name: row.get(2)?,
-                description: row.get(3)?,
-                db_path: row.get(4)?,
-                last_indexed: row.get(5)?,
-                created_at: row.get(6)?,
-            };
-            let distance: f64 = row.get(7)?;
-            Ok(SimilarRepo {
-                repo,
-                score: 1.0 - distance as f32,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            let rows = stmt.query_map(params![query, limit as i64], |row| {
+                let repo = RepoEntry {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    name: row.get(2)?,
+                    description: row.get(3)?,
+                    db_path: row.get(4)?,
+                    last_indexed: row.get(5)?,
+                    created_at: row.get(6)?,
+                };
+                let distance: f64 = row.get(7)?;
+                Ok(SimilarRepo {
+                    repo,
+                    score: 1.0 - distance as f32,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 
     /// Point a registered repo at a new `repo.db` without re-indexing it.

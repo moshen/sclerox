@@ -224,19 +224,27 @@ impl Database {
         meeting_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM meeting_chunks WHERE meeting_id = ?1",
-            params![meeting_id],
-        )?;
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO meeting_chunks (meeting_id, chunk_index, chunk_text, embedding)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for (i, (text, emb)) in chunks.iter().enumerate() {
-            let emb_bytes = emb.as_ref().map(|e| embedding_to_bytes(e));
-            stmt.execute(params![meeting_id, i as i64, text, emb_bytes])?;
-        }
-        Ok(())
+        // Replacing the chunks and deciding whether their vectors may be kept
+        // happen in one transaction; see `write_with_vectors`.
+        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
+        self.write_with_vectors(wants_vectors, |keep_vectors| {
+            self.conn.execute(
+                "DELETE FROM meeting_chunks WHERE meeting_id = ?1",
+                params![meeting_id],
+            )?;
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO meeting_chunks (meeting_id, chunk_index, chunk_text, embedding)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (i, (text, emb)) in chunks.iter().enumerate() {
+                let emb_bytes = emb
+                    .as_ref()
+                    .filter(|_| keep_vectors)
+                    .map(|e| embedding_to_bytes(e));
+                stmt.execute(params![meeting_id, i as i64, text, emb_bytes])?;
+            }
+            Ok(())
+        })
     }
 
     /// Meetings whose chunks are nearest to `query_embedding`, via the
@@ -248,34 +256,36 @@ impl Database {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarMeeting>> {
-        let query = embedding_to_bytes(query_embedding);
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at,
+        self.semantic_read(|| {
+            let query = embedding_to_bytes(query_embedding);
+            let mut stmt = self.conn.prepare(
+                "SELECT m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at,
                     mc.chunk_text, v.distance
              FROM meeting_chunks_vec v
              JOIN meeting_chunks mc ON mc.id = v.rowid
              JOIN meetings m ON mc.meeting_id = m.id
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let meeting = Meeting {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                meeting_date: row.get(2)?,
-                transcript: row.get(3)?,
-                notes: row.get(4)?,
-                created_at: row.get(5)?,
-            };
-            let matched_chunk: String = row.get(6)?;
-            let distance: f64 = row.get(7)?;
-            Ok(SimilarMeeting {
-                meeting,
-                score: 1.0 - distance as f32,
-                matched_chunk,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            )?;
+            let rows = stmt.query_map(params![query, limit as i64], |row| {
+                let meeting = Meeting {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    meeting_date: row.get(2)?,
+                    transcript: row.get(3)?,
+                    notes: row.get(4)?,
+                    created_at: row.get(5)?,
+                };
+                let matched_chunk: String = row.get(6)?;
+                let distance: f64 = row.get(7)?;
+                Ok(SimilarMeeting {
+                    meeting,
+                    score: 1.0 - distance as f32,
+                    matched_chunk,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 }
 

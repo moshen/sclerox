@@ -1,51 +1,46 @@
-//! Exact token counting using the bundled MiniLM WordPiece tokenizer.
+//! Exact token counting using MiniLM's WordPiece tokenizer.
 //!
-//! The embedding model (AllMiniLML6V2) ships a `tokenizer.json`. When it is
-//! bundled at build time (see `build.rs`) we embed those bytes in the binary
-//! and count tokens exactly; the count then works on any machine the binary is
-//! copied to, with no disk path or network round-trip. When the model was not
-//! bundled we fall back to a coarse byte-based estimate so callers always get a
-//! usable number rather than a hard failure.
+//! The tokenizer is pinned and downloaded on first use into the model cache,
+//! like the models themselves (see [`super::models::TOKEN_COUNTER`]). When it
+//! cannot be had (offline on first run, say) we fall back to a coarse
+//! byte-based estimate so callers always get a usable number rather than a
+//! hard failure; the next process tries the download again.
+//!
+//! This is independent of the embedding model (`embed.model`): the budget it
+//! enforces is for the LLM's context window, so it does not need to match
+//! whichever model produces the vectors, and keeping MiniLM's tokenizer keeps
+//! budgets stable when the embedding model changes.
 
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 
-// Embedded at compile time only when the model was bundled. Embedding the bytes
-// (rather than reading `.model-cache/` at runtime, as the embedder does) is what
-// keeps counting working after the binary is moved off the build machine.
-#[cfg(bundled_model)]
-const TOKENIZER_JSON: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/.model-cache/tokenizer.json"
-));
-
-/// Process-wide tokenizer, loaded once. `None` means "unavailable" (a non-bundled
-/// build, or a malformed tokenizer file) and callers fall back to an estimate.
+/// Process-wide tokenizer, loaded once. `None` means "unavailable" (download
+/// failed, or a malformed file) and callers fall back to an estimate.
 fn tokenizer() -> Option<&'static Tokenizer> {
     static TOK: OnceLock<Option<Tokenizer>> = OnceLock::new();
-    TOK.get_or_init(load_tokenizer).as_ref()
+    TOK.get_or_init(|| match load_tokenizer() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("token counter unavailable, using estimate: {e:#}");
+            None
+        }
+    })
+    .as_ref()
 }
 
-#[cfg(bundled_model)]
-fn load_tokenizer() -> Option<Tokenizer> {
-    let mut tok = match Tokenizer::from_bytes(TOKENIZER_JSON) {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("failed to load bundled tokenizer, using estimate: {e}");
-            return None;
-        }
-    };
-    // The model's tokenizer.json enables padding (to a fixed length) and
-    // truncation for *embedding*. For *counting* we want the true token length,
-    // so disable both - otherwise every encoding comes back the padded length.
+/// Download (first use only) and load the token-counting tokenizer.
+pub fn load_tokenizer() -> anyhow::Result<Tokenizer> {
+    let paths = super::models::TOKEN_COUNTER.fetch("the token-counting tokenizer")?;
+    let path = paths
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no tokenizer file pinned"))?;
+    let mut tok = Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The model's tokenizer.json enables padding and truncation for
+    // *embedding*. For *counting* we want the true token length, so disable
+    // both - otherwise long texts come back truncated.
     tok.with_padding(None);
     let _ = tok.with_truncation(None);
-    Some(tok)
-}
-
-#[cfg(not(bundled_model))]
-fn load_tokenizer() -> Option<Tokenizer> {
-    None
+    Ok(tok)
 }
 
 /// Count the tokens in `text` with the MiniLM tokenizer, or a coarse estimate

@@ -324,19 +324,27 @@ impl Database {
         investigation_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM investigation_chunks WHERE investigation_id = ?1",
-            params![investigation_id],
-        )?;
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO investigation_chunks (investigation_id, chunk_index, chunk_text, embedding)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for (i, (text, emb)) in chunks.iter().enumerate() {
-            let emb_bytes = emb.as_ref().map(|e| crate::db::embedding_to_bytes(e));
-            stmt.execute(params![investigation_id, i as i64, text, emb_bytes])?;
-        }
-        Ok(())
+        // Replacing the chunks and deciding whether their vectors may be kept
+        // happen in one transaction; see `write_with_vectors`.
+        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
+        self.write_with_vectors(wants_vectors, |keep_vectors| {
+            self.conn.execute(
+                "DELETE FROM investigation_chunks WHERE investigation_id = ?1",
+                params![investigation_id],
+            )?;
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO investigation_chunks (investigation_id, chunk_index, chunk_text, embedding)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (i, (text, emb)) in chunks.iter().enumerate() {
+                let emb_bytes = emb
+                    .as_ref()
+                    .filter(|_| keep_vectors)
+                    .map(|e| crate::db::embedding_to_bytes(e));
+                stmt.execute(params![investigation_id, i as i64, text, emb_bytes])?;
+            }
+            Ok(())
+        })
     }
 
     /// Find investigations semantically similar to a query embedding.
@@ -348,9 +356,10 @@ impl Database {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<SimilarInvestigation>> {
-        let query = crate::db::embedding_to_bytes(query_embedding);
-        let mut stmt = self.conn.prepare(
-            "SELECT i.id, i.name, i.slug, i.status, i.plan, i.findings,
+        self.semantic_read(|| {
+            let query = crate::db::embedding_to_bytes(query_embedding);
+            let mut stmt = self.conn.prepare(
+                "SELECT i.id, i.name, i.slug, i.status, i.plan, i.findings,
                     i.created_at, i.concluded_at, i.updated_at,
                     ic.chunk_text, v.distance
              FROM investigation_chunks_vec v
@@ -358,28 +367,29 @@ impl Database {
              JOIN investigations i ON ic.investigation_id = i.id
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
-            let inv = Investigation {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                slug: row.get(2)?,
-                status: row.get(3)?,
-                plan: row.get(4)?,
-                findings: row.get(5)?,
-                created_at: row.get(6)?,
-                concluded_at: row.get(7)?,
-                updated_at: row.get(8)?,
-            };
-            let matched_chunk: String = row.get(9)?;
-            let distance: f64 = row.get(10)?;
-            Ok(SimilarInvestigation {
-                investigation: inv,
-                score: 1.0 - distance as f32,
-                matched_chunk,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            )?;
+            let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+                let inv = Investigation {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    status: row.get(3)?,
+                    plan: row.get(4)?,
+                    findings: row.get(5)?,
+                    created_at: row.get(6)?,
+                    concluded_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                };
+                let matched_chunk: String = row.get(9)?;
+                let distance: f64 = row.get(10)?;
+                Ok(SimilarInvestigation {
+                    investigation: inv,
+                    score: 1.0 - distance as f32,
+                    matched_chunk,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 }
 

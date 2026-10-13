@@ -186,7 +186,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             warn_if_long(&key, &value);
             db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
             if !no_embed {
-                if let Ok(mut embedder) = Embedder::new() {
+                if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &key, &value);
                 }
             }
@@ -293,15 +293,23 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             // active rows, so this is skipped for --all (which includes stale).
             if !all {
                 let seen: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
-                if let Ok(mut embedder) = Embedder::new() {
-                    if let Ok(qe) = embedder.embed_one(&query) {
+                if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
+                    if let Ok(qe) = embedder.embed_query(&query) {
                         let sem = &settings().search;
-                        let floor = sem.semantic_threshold as f32;
-                        for r in db
+                        let floor = crate::config::settings().semantic_threshold() as f32;
+                        let margin = crate::config::settings()
+                            .semantic_margin()
+                            .map(|m| m as f32);
+                        let hits = db
                             .memory_similar(&qe, sem.semantic_limit)
-                            .unwrap_or_default()
-                        {
-                            if !seen.contains(&r.entry.id) && r.score >= floor {
+                            .unwrap_or_default();
+                        let cut = crate::embed::models::semantic_cutoff(
+                            hits.iter().map(|r| r.score),
+                            floor,
+                            margin,
+                        );
+                        for r in hits {
+                            if !seen.contains(&r.entry.id) && r.score >= cut {
                                 results.push(r.entry);
                             }
                         }
@@ -344,7 +352,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         } => {
             warn_if_long(&new_key, &new_value);
             if db.memory_supersede(&old_key, &new_key, &new_value, &r#type, "manual")? {
-                if let Ok(mut embedder) = Embedder::new() {
+                if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &new_key, &new_value);
                 }
                 println!("Superseded '{old_key}' → '{new_key}'");
@@ -354,6 +362,18 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         }
 
         MemoryCommand::Reembed { force } => {
+            // Memories share one model with meetings, todos and repos, so a
+            // model switch has to convert the whole database at once.
+            if let crate::embed::models::ModelCheck::Mismatch { recorded } =
+                db.embedding_model_check()?
+            {
+                anyhow::bail!(
+                    "this database's vectors came from '{}', not the configured '{}'; \
+                     run `sclerox db reembed` to switch all of it",
+                    crate::embed::models::display_id(&recorded),
+                    crate::config::settings().embed.model
+                );
+            }
             let targets = if force {
                 db.memory_list(None, Some("active"))?
             } else {
@@ -363,7 +383,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 println!("All active memories already embedded.");
                 return Ok(());
             }
-            let mut embedder = Embedder::new()?;
+            let mut embedder = crate::embed::required()?;
             let mut done = 0usize;
             for m in &targets {
                 if embed_and_store(db, &mut embedder, &m.key, &m.value) {
@@ -475,7 +495,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             if dry_run {
                 println!("\n{} memories (dry-run: nothing written)", memories.len());
             } else {
-                let mut embedder = Embedder::new().ok();
+                let mut embedder = crate::embed::optional(db.semantic_ready());
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
                     match &existing_key {
@@ -768,7 +788,11 @@ fn import_memories(
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
-    let mut embedder = if dry_run { None } else { Embedder::new().ok() };
+    let mut embedder = if dry_run {
+        None
+    } else {
+        crate::embed::optional(db.semantic_ready())
+    };
 
     for path in &files {
         let Some((key, value, memory_type)) = parse_memory_file(path) else {

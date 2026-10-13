@@ -56,5 +56,12 @@ jobs:
             target
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: test-${{ runner.os }}-
+      # Embedding models download on first use (pinned and hash-checked);
+      # keep them between runs instead of fetching ~55 MB per job. The pins
+      # live in models.rs, so changing them starts a fresh cache.
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/sclerox/models
+          key: models-${{ runner.os }}-${{ hashFiles('src/embed/models.rs') }}
       - run: cargo build --locked
       - run: cargo test --locked --lib --bins --test e2e

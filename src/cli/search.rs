@@ -15,7 +15,8 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
     let results = global_search(
         db,
         &args.query,
-        s.search.semantic_threshold as f32,
+        s.semantic_threshold() as f32,
+        s.semantic_margin().map(|m| m as f32),
         s.search.semantic_limit,
     )?;
     print_output(format, &results, || {
