@@ -226,11 +226,6 @@ impl<'a> RepoIndexer<'a> {
         if rechunk && db_existed {
             log::info!("re-chunking every file in '{name}': it was cut by another chunker");
         }
-        let mut stored_spans = if rechunk && db_existed {
-            repo_db.chunk_spans_by_file()?
-        } else {
-            Default::default()
-        };
 
         // Retract any nested child index this parent now covers: a subfolder was
         // indexed on its own before the parent was, so its .sclerox/repo.db is now
@@ -313,7 +308,7 @@ impl<'a> RepoIndexer<'a> {
             // Here only for a chunker change: if the new chunker cuts this
             // unchanged file exactly as before, leave its rows (and vectors) be.
             if hash_matches && !needs_embed {
-                let stored = stored_spans.remove(&rel_path).unwrap_or_default();
+                let stored = repo_db.file_chunk_spans(&rel_path)?;
                 let same = stored.len() == chunks.len()
                     && stored.iter().zip(&chunks).all(|(s, c)| {
                         s.text == c.text

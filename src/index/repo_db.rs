@@ -225,32 +225,23 @@ impl RepoDb {
         Ok(id)
     }
 
-    /// Every file's stored chunks as (text, start line, end line), in order,
-    /// keyed by file path. Read in one scan for a chunker-change pass, since
-    /// chunks.file_id has no index.
-    pub fn chunk_spans_by_file(&self) -> Result<std::collections::HashMap<String, Vec<ChunkSpan>>> {
+    /// A file's stored chunks as (text, start line, end line), in order.
+    /// Compared on a chunker change, so that a file the new chunker cuts
+    /// identically can be left alone.
+    pub fn file_chunk_spans(&self, path: &str) -> Result<Vec<ChunkSpan>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, c.chunk_text, c.start_line, c.end_line FROM chunks c
+            "SELECT c.chunk_text, c.start_line, c.end_line FROM chunks c
              JOIN files f ON c.file_id = f.id
-             ORDER BY f.path, c.chunk_index",
+             WHERE f.path = ?1 ORDER BY c.chunk_index",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                ChunkSpan {
-                    text: r.get(1)?,
-                    start_line: r.get(2)?,
-                    end_line: r.get(3)?,
-                },
-            ))
+        let rows = stmt.query_map(params![path], |r| {
+            Ok(ChunkSpan {
+                text: r.get(0)?,
+                start_line: r.get(1)?,
+                end_line: r.get(2)?,
+            })
         })?;
-        let mut out: std::collections::HashMap<String, Vec<ChunkSpan>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let (path, span) = row?;
-            out.entry(path).or_default().push(span);
-        }
-        Ok(out)
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// A file's stored vectors keyed by chunk text. Read before the file is
@@ -747,6 +738,34 @@ mod tests {
             db.embedding_model().unwrap().as_deref(),
             Some(crate::embed::models::MINILM_L6_V2.id)
         );
+    }
+
+    /// Index names on `table`, for checking a migration created them.
+    fn index_names(db: &RepoDb, table: &str) -> Vec<String> {
+        db.conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
+            .unwrap()
+            .query_map(params![table], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn chunks_and_symbols_are_indexed_by_file_fresh_and_migrated() {
+        let fresh = RepoDb::open_in_memory().unwrap();
+        // An upgraded database: REPO_SCHEMA minus the v6 indexes, at v5.
+        let migrated = repo_db_at_v4(false);
+        migrated
+            .conn
+            .execute_batch("DROP INDEX idx_chunks_file; DROP INDEX idx_symbols_file;")
+            .unwrap();
+        migrated.init().unwrap();
+        assert_eq!(migrated.user_version().unwrap(), REPO_VERSION);
+        for db in [&fresh, &migrated] {
+            assert!(index_names(db, "chunks").contains(&"idx_chunks_file".to_string()));
+            assert!(index_names(db, "symbols").contains(&"idx_symbols_file".to_string()));
+        }
     }
 
     #[test]
