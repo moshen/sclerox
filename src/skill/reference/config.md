@@ -32,8 +32,11 @@ or during `sclerox install`, into `$XDG_CACHE_HOME/sclerox/models/`
 token budgets. Every file is pinned to a commit and hash-checked before use;
 `HF_ENDPOINT` points the download at a mirror.
 
-If the model can't load, commands carry on keyword-only with a warning; only
-the `reembed` commands fail.
+`embed.enabled = false` (env `SCLEROX_EMBED_ENABLED=false`) turns embeddings
+off: the model never loads, nothing gets a vector, and searches are
+keyword-only. After turning them back on, `sclerox db reembed --force` fills in
+vectors for what was stored meanwhile. If the model can't load, commands carry
+on keyword-only with a warning; only the `reembed` commands fail.
 
 Each database records the model its vectors came from. Vectors from different
 models can't be compared, so when the recorded model differs from `embed.model`

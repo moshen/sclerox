@@ -229,9 +229,12 @@ version that used MiniLM - sclerox warns, and semantic search and dedup are off
 for that database until you run `sclerox db reembed`. Keyword search keeps
 working throughout.
 
-If the model can't be loaded (offline on first use, say) commands carry on
-keyword-only with a warning, except `db reembed`, `memory reembed` and
-`repo reembed`, which fail.
+`[embed] enabled = false` turns embeddings off entirely: the model is never
+downloaded or loaded, nothing gets a vector, and every search is keyword-only.
+Turning them back on needs no re-embed for new rows; `sclerox db reembed --force`
+fills in the vectors for what was stored meanwhile. If the model can't be
+loaded (offline on first use, say) commands carry on keyword-only with a
+warning, except `db reembed`, `memory reembed` and `repo reembed`, which fail.
 
 `sclerox install` (and re-running it after an upgrade) re-embeds any database
 still on another model automatically, and embeds items saved without a vector;
@@ -259,6 +262,7 @@ Environment variables still work and override the file:
 | `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
 | `SCLEROX_EMBED_MODEL` | `granite-small-r2` | Embedding model (`granite-small-r2\|minilm-l6-v2`) |
+| `SCLEROX_EMBED_ENABLED` | `true` | `false` turns embeddings off (`[embed] enabled`) |
 | `XDG_CACHE_HOME` | `~/.cache` | Downloaded models live in `$XDG_CACHE_HOME/sclerox/models/` |
 | `HF_ENDPOINT` | `https://huggingface.co` | Where models download from (a mirror); files are still hash-checked |
 

@@ -263,7 +263,7 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
     }
     let emb_cfg = &settings().embed;
     let raw_chunks = chunk_text(text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
-    // Without an embedder (--no-embed, model unavailable)
+    // Without an embedder (--no-embed, embeddings off, model unavailable)
     // the chunks are stored without vectors; `db reembed` can fill them later.
     let embedder = if no_embed {
         None

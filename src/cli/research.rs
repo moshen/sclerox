@@ -389,7 +389,7 @@ fn embed_investigation(
     }
     let emb_cfg = &settings().embed;
     let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
-    // Without an embedder (model unavailable) the chunks are
+    // Without an embedder (embeddings off, model unavailable) the chunks are
     // stored without vectors; `db reembed` can fill them later.
     let chunks: Vec<(String, Option<Vec<f32>>)> =
         if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {

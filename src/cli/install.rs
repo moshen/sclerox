@@ -52,7 +52,12 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     // Never overwrites an existing file; every key ships commented, so this
     // changes no behaviour.
     super::config_cmd::install_default_config(args.dry_run)?;
-    if args.no_model_download {
+    if !crate::embed::enabled() {
+        // No model, no re-embedding; token budgets still want the tokenizer.
+        if !args.no_model_download {
+            prefetch_tokenizer(args.dry_run);
+        }
+    } else if args.no_model_download {
         if !args.dry_run {
             report_reembed_needed();
         }
@@ -103,6 +108,21 @@ fn prefetch_embedding_model(dry_run: bool) {
             ),
             Err(e) => println!("embedding model: download failed, will retry on first use ({e:#})"),
         }
+    }
+}
+
+/// With embeddings off only the token-counting tokenizer is needed.
+fn prefetch_tokenizer(dry_run: bool) {
+    let tokenizer = crate::embed::models::TOKEN_COUNTER;
+    let dir = crate::embed::model_cache_dir();
+    println!("embedding model: skipped (embed.enabled = false)");
+    if tokenizer.is_cached() {
+        return;
+    }
+    if dry_run {
+        println!("  would download the tokenizer to {}", dir.display());
+    } else if let Err(e) = tokenizer.fetch("the token-counting tokenizer") {
+        println!("tokenizer: download failed, will retry on first use ({e:#})");
     }
 }
 
