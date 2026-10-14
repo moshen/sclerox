@@ -133,7 +133,7 @@ impl Database {
 
     pub fn todo_search(&self, query: &str) -> Result<Vec<Todo>> {
         let fts_query = fts::sanitize(query);
-        let like_pat = format!("%{query}%");
+        let like_pat = fts::like_contains(query);
 
         // Tier 1: FTS prefix matches (fast, word-boundary aware)
         let mut stmt = self.conn.prepare(
