@@ -23,6 +23,14 @@ pub struct IndexedFile {
     pub last_modified: Option<String>,
 }
 
+/// A stored chunk's text and line span, as compared on a chunker change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSpan {
+    pub text: String,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: i64,
@@ -217,6 +225,53 @@ impl RepoDb {
         Ok(id)
     }
 
+    /// A file's stored chunks as (text, start line, end line), in order.
+    /// Compared on a chunker change, so that a file the new chunker cuts
+    /// identically can be left alone.
+    pub fn file_chunk_spans(&self, path: &str) -> Result<Vec<ChunkSpan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_text, c.start_line, c.end_line FROM chunks c
+             JOIN files f ON c.file_id = f.id
+             WHERE f.path = ?1 ORDER BY c.chunk_index",
+        )?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok(ChunkSpan {
+                text: r.get(0)?,
+                start_line: r.get(1)?,
+                end_line: r.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// A file's stored vectors keyed by chunk text. Read before the file is
+    /// re-chunked so that chunks whose text did not change keep their vector
+    /// instead of waiting to be embedded again.
+    pub fn file_chunk_vectors(
+        &self,
+        file_id: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_text, embedding FROM chunks
+             WHERE file_id = ?1 AND embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![file_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (text, bytes) = row?;
+            let vector = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            out.insert(text, vector);
+        }
+        Ok(out)
+    }
+
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
@@ -364,6 +419,16 @@ impl RepoDb {
     /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
     /// list for `sclerox repo reembed` - hook-indexed repos have chunks but no
     /// embeddings, since the auto-indexer runs without an embedder.
+    /// Whether any chunk is still waiting for a vector. Stops at the first one,
+    /// so it is cheap enough to ask on every session hook.
+    pub fn has_chunks_without_embedding(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE embedding IS NULL)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn chunks_without_embedding(&self) -> Result<Vec<(i64, String)>> {
         let mut stmt = self
             .conn
@@ -673,6 +738,34 @@ mod tests {
             db.embedding_model().unwrap().as_deref(),
             Some(crate::embed::models::MINILM_L6_V2.id)
         );
+    }
+
+    /// Index names on `table`, for checking a migration created them.
+    fn index_names(db: &RepoDb, table: &str) -> Vec<String> {
+        db.conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
+            .unwrap()
+            .query_map(params![table], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn chunks_and_symbols_are_indexed_by_file_fresh_and_migrated() {
+        let fresh = RepoDb::open_in_memory().unwrap();
+        // An upgraded database: REPO_SCHEMA minus the v6 indexes, at v5.
+        let migrated = repo_db_at_v4(false);
+        migrated
+            .conn
+            .execute_batch("DROP INDEX idx_chunks_file; DROP INDEX idx_symbols_file;")
+            .unwrap();
+        migrated.init().unwrap();
+        assert_eq!(migrated.user_version().unwrap(), REPO_VERSION);
+        for db in [&fresh, &migrated] {
+            assert!(index_names(db, "chunks").contains(&"idx_chunks_file".to_string()));
+            assert!(index_names(db, "symbols").contains(&"idx_symbols_file".to_string()));
+        }
     }
 
     #[test]

@@ -249,10 +249,12 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 let results = repo_db.search_symbols(&query)?;
                 for s in &results {
                     let sig = s.signature.as_deref().unwrap_or(&s.name);
-                    println!(
-                        "[{}] {} ({}/{}:{})",
-                        s.kind, sig, repo.name, s.file_path, s.start_line
+                    let loc = crate::cli::format::code_location(
+                        &repo.path,
+                        &s.file_path,
+                        Some(s.start_line),
                     );
+                    println!("{}", crate::cli::format::symbol_line(&s.kind, sig, &loc));
                     any = true;
                 }
             }
@@ -329,7 +331,7 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
             let model_id = embedder.model().id;
             match repo_db.reembed_all(
                 model_id,
-                &mut |texts: &[&str]| embedder.embed_batch(texts),
+                &mut |texts: &[&str]| embedder.embed_each(texts),
                 &mut |_, _, _| {},
             ) {
                 Ok(n) => {
@@ -379,11 +381,15 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
 
 /// Embed a repo's chunks that have no vector, in batches to bound memory.
 /// Each batch is kept as it goes; `embedded` counts them even on failure.
-fn backfill_chunks(repo_db: &RepoDb, embedder: &mut Embedder, embedded: &mut usize) -> Result<()> {
+pub(crate) fn backfill_chunks(
+    repo_db: &RepoDb,
+    embedder: &mut Embedder,
+    embedded: &mut usize,
+) -> Result<()> {
     let targets = repo_db.chunks_without_embedding()?;
     for batch in targets.chunks(64) {
         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-        let vectors = embedder.embed_batch(&texts)?;
+        let vectors = embedder.embed_each(&texts)?;
         for ((chunk_id, _), vec) in batch.iter().zip(vectors) {
             if repo_db.set_chunk_embedding(*chunk_id, &vec)? {
                 *embedded += 1;

@@ -11,7 +11,7 @@ pub struct Migration {
 pub const PRIMARY_VERSION: u32 = 14;
 
 /// Current target schema version for per-repo databases.
-pub const REPO_VERSION: u32 = 5;
+pub const REPO_VERSION: u32 = 6;
 
 /// Migrations for the primary database (~/.local/share/sclerox/sclerox.db).
 ///
@@ -114,6 +114,11 @@ pub const REPO_MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "record the embedding model of existing chunk vectors",
         sql: crate::db::schema::REPO_MIGRATION_V5,
+    },
+    Migration {
+        version: 6,
+        description: "index chunks and symbols by file",
+        sql: crate::db::schema::REPO_MIGRATION_V6,
     },
 ];
 

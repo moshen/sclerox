@@ -672,6 +672,92 @@ fn repo_index_respects_sclerox_config_opt_out() {
     );
 }
 
+#[test]
+fn symbol_hits_print_the_same_full_path_everywhere() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn alpha_widget() {}\n").unwrap();
+    e.run(&["repo", "index", "--no-embed", dir.path().to_str().unwrap()]);
+
+    // The registry stores the canonical root (/private/var/... on macOS).
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let want = format!(
+        "[function_item] fn alpha_widget() {{}} ({}/lib.rs:1)",
+        root.display()
+    );
+    for args in [
+        &["code", "search", "alpha_widget"][..],
+        &["repo", "search-symbols", "alpha_widget"][..],
+        &["search", "alpha_widget"][..],
+    ] {
+        let out = e.run(args);
+        assert!(
+            out.contains(&want),
+            "{args:?} printed:\n{out}\nwanted: {want}"
+        );
+    }
+}
+
+/// (chunks, chunks without a vector) in a repo's index.
+fn chunk_counts(repo: &std::path::Path) -> (i64, i64) {
+    let conn = rusqlite::Connection::open(repo.join(".sclerox/repo.db")).unwrap();
+    conn.query_row(
+        "SELECT count(*), coalesce(sum(embedding IS NULL), 0) FROM chunks",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn hook_embed_repo_fills_missing_vectors() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+    e.run(&["repo", "index", "--no-embed", dir.path().to_str().unwrap()]);
+    let (chunks, missing) = chunk_counts(dir.path());
+    assert!(
+        chunks > 0 && missing == chunks,
+        "{missing}/{chunks} missing"
+    );
+
+    e.run(&["hook", "embed-repo", "--path", dir.path().to_str().unwrap()]);
+    assert_eq!(chunk_counts(dir.path()).1, 0, "all chunks embedded");
+    assert!(
+        !dir.path().join(".sclerox/embed.lock").exists(),
+        "lock released"
+    );
+}
+
+#[test]
+fn session_start_hook_embeds_in_the_background() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn alpha() {}\n").unwrap();
+
+    // The hook itself indexes without vectors and returns; a detached worker
+    // embeds. Wait for it rather than assuming how long the model takes.
+    e.cmd()
+        .args(["hook", "start"])
+        .current_dir(dir.path())
+        .write_stdin("{}")
+        .assert()
+        .success();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (chunks, missing) = chunk_counts(dir.path());
+        if chunks > 0 && missing == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background embed did not finish: {missing}/{chunks} missing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
 #[test]

@@ -765,6 +765,13 @@ SELECT 'embedding_model', 'Qdrant/all-MiniLM-L6-v2-onnx:model'
 WHERE EXISTS (SELECT 1 FROM chunks WHERE embedding IS NOT NULL);
 ";
 
+/// Migration v6: index chunks and symbols by file, so per-file lookups and
+/// ON DELETE CASCADE from files don't scan the whole table.
+pub const REPO_MIGRATION_V6: &str = "
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+";
+
 pub const REPO_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -819,6 +826,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     end_line INTEGER,
     embedding BLOB
 );
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 
 -- sqlite-vec KNN index over chunk embeddings (chunks.embedding stays source of
 -- truth; triggers keep this in sync). Requires the sqlite-vec extension to be

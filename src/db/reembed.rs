@@ -34,8 +34,8 @@ pub struct ReembedTable {
     /// Truncate text to `MAX_EMBED_CHARS` first, as the write path does.
     pub cap: bool,
     /// Whether rows without a vector should get one. False for code chunks:
-    /// session hooks index code without embedding it, so most chunks have no
-    /// vector by design until `repo index` or `repo reembed` adds them.
+    /// those are filled by `repo reembed`, `repo index`, and the session
+    /// hooks' background `hook embed-repo` worker.
     pub fill: bool,
 }
 

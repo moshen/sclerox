@@ -277,6 +277,12 @@ After `sclerox install`, two Claude Code lifecycle hooks are active:
 
 Distillation is tracked per-session: re-runs only when the session has grown by 50+ new turns.
 
+Both hooks index without the embedding model so they return at once. If the
+repo's index then has any chunk without a vector (new or edited files, or gaps
+from before), the hook spawns a detached `sclerox hook embed-repo` that embeds
+them in the background. One runs per repo at a time (`.sclerox/embed.lock`);
+when nothing is missing, nothing is spawned and the model is not loaded.
+
 ## Supported languages
 
 Tree-sitter parsing (full symbol extraction): Rust, Python, TypeScript,

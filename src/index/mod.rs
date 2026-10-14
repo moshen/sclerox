@@ -40,6 +40,22 @@ pub const MAX_EMBED_CHARS: usize = 800;
 // Overlap when splitting an oversized function chunk into sub-chunks.
 const SPLIT_OVERLAP_LINES: usize = 3;
 
+// Bump when the chunking logic (parse_file, split_large_chunk) changes in a way
+// that cuts files differently. The size constants above are part of the
+// signature already, so tuning one of them needs no bump.
+const CHUNKER_VERSION: u32 = 1;
+
+/// repo_meta key recording which chunker cut a repo's index.
+const CHUNKER_META_KEY: &str = "chunker";
+
+/// The chunker an index was cut with. An index recording a different value,
+/// or none, is re-chunked in full on its next index run.
+fn chunker_signature() -> String {
+    format!(
+        "v{CHUNKER_VERSION}:lines={CHUNK_SIZE_LINES}:max_chars={MAX_EMBED_CHARS}:overlap={SPLIT_OVERLAP_LINES}"
+    )
+}
+
 // Directories always excluded regardless of .gitignore.
 // .gitignore is the primary source of truth (via the ignore crate), but these
 // cover universal build/cache dirs that repos commonly omit from .gitignore,
@@ -205,12 +221,19 @@ impl<'a> RepoIndexer<'a> {
         let embed_here = self.embedder.is_some() && repo_db.semantic_ready();
         repo_db.set_meta("name", &name)?;
 
+        let chunker = chunker_signature();
+        let rechunk = repo_db.get_meta(CHUNKER_META_KEY)?.as_deref() != Some(chunker.as_str());
+        if rechunk && db_existed {
+            log::info!("re-chunking every file in '{name}': it was cut by another chunker");
+        }
+
         // Retract any nested child index this parent now covers: a subfolder was
         // indexed on its own before the parent was, so its .sclerox/repo.db is now
         // redundant. A subfolder that explicitly opted out keeps its own index.
         retract_nested_child_indexes(db, repo_root)?;
 
         let mut result = IndexResult::default();
+        let mut rechunk_complete = true;
 
         for path in &files {
             let path = path.as_path();
@@ -235,7 +258,15 @@ impl<'a> RepoIndexer<'a> {
 
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(_) => {
+                    // A file the old chunker cut that can't be read now keeps
+                    // its old chunks, so leave the chunker unrecorded and
+                    // retry the pass next run.
+                    if rechunk && repo_db.file_hash(&rel_path)?.is_some() {
+                        rechunk_complete = false;
+                    }
+                    continue;
+                }
             };
 
             // For very large files, skip tree-sitter to avoid unbounded memory
@@ -260,13 +291,10 @@ impl<'a> RepoIndexer<'a> {
             let needs_embed =
                 embed_here && hash_matches && !repo_db.file_chunks_all_embedded(&rel_path)?;
 
-            if hash_matches && !needs_embed {
+            if hash_matches && !needs_embed && !rechunk {
                 result.skipped += 1;
                 continue;
             }
-
-            let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
-            repo_db.delete_file_data(file_id)?;
 
             let (symbols, raw_chunks, edges) =
                 parse_file(&source, effective_lang, CHUNK_SIZE_LINES);
@@ -276,6 +304,28 @@ impl<'a> RepoIndexer<'a> {
                 .into_iter()
                 .flat_map(|c| parser::split_large_chunk(c, MAX_EMBED_CHARS, SPLIT_OVERLAP_LINES))
                 .collect();
+
+            // Here only for a chunker change: if the new chunker cuts this
+            // unchanged file exactly as before, leave its rows (and vectors) be.
+            if hash_matches && !needs_embed {
+                let stored = repo_db.file_chunk_spans(&rel_path)?;
+                let same = stored.len() == chunks.len()
+                    && stored.iter().zip(&chunks).all(|(s, c)| {
+                        s.text == c.text
+                            && s.start_line == Some(c.start_line as i64)
+                            && s.end_line == Some(c.end_line as i64)
+                    });
+                if same {
+                    result.skipped += 1;
+                    continue;
+                }
+            }
+
+            let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
+            // Keep the vectors of chunks whose text survives the re-chunk, so
+            // an edit costs only the chunks it actually changed.
+            let kept_vectors = repo_db.file_chunk_vectors(file_id)?;
+            repo_db.delete_file_data(file_id)?;
 
             // Insert symbols and build a name→id map for resolving call edges.
             let mut name_to_id: std::collections::HashMap<String, i64> =
@@ -308,12 +358,13 @@ impl<'a> RepoIndexer<'a> {
             }
 
             for (i, chunk) in chunks.iter().enumerate() {
-                let embedding =
-                    if let (true, Some(emb)) = (embed_here, self.embedder.as_deref_mut()) {
-                        emb.embed_one(&chunk.text).ok()
-                    } else {
-                        None
-                    };
+                let embedding = match kept_vectors.get(&chunk.text) {
+                    Some(v) => Some(v.clone()),
+                    None => match (embed_here, self.embedder.as_deref_mut()) {
+                        (true, Some(emb)) => emb.embed_one(&chunk.text).ok(),
+                        _ => None,
+                    },
+                };
                 repo_db.insert_chunk(
                     file_id,
                     i as i64,
@@ -334,6 +385,10 @@ impl<'a> RepoIndexer<'a> {
                 chunks.len(),
                 edges.len(),
             );
+        }
+
+        if rechunk && rechunk_complete {
+            repo_db.set_meta(CHUNKER_META_KEY, &chunker)?;
         }
 
         log::info!(
@@ -757,6 +812,146 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Give every chunk in `repo`'s index a distinct vector; returns how many.
+    fn embed_all(repo: &Path) -> usize {
+        let rdb = RepoDb::open(&repo.join(".sclerox").join("repo.db")).unwrap();
+        let missing = rdb.chunks_without_embedding().unwrap();
+        for (i, (id, _)) in missing.iter().enumerate() {
+            let mut v = vec![0.0f32; 384];
+            v[i % 384] = 1.0;
+            assert!(rdb.set_chunk_embedding(*id, &v).unwrap());
+        }
+        missing.len()
+    }
+
+    /// (chunk text, has a vector) for every chunk, ordered by text.
+    fn chunk_state(repo: &Path) -> Vec<(String, bool)> {
+        let rdb = RepoDb::open(&repo.join(".sclerox").join("repo.db")).unwrap();
+        let mut out: Vec<(String, bool)> = rdb
+            .conn
+            .prepare("SELECT chunk_text, embedding IS NOT NULL FROM chunks")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn an_edit_keeps_the_vectors_of_chunks_it_did_not_change() {
+        let repo = TempDir::new().unwrap();
+        let file = repo.path().join("lib.rs");
+        std::fs::write(&file, "fn alpha() {\n    1\n}\n\nfn beta() {\n    2\n}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert!(embed_all(repo.path()) >= 2);
+
+        // Change beta only; alpha's chunk text is identical after re-chunking.
+        std::fs::write(&file, "fn alpha() {\n    1\n}\n\nfn beta() {\n    3\n}\n").unwrap();
+        let result = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(result.files_indexed, 1, "the edited file was re-chunked");
+
+        let state = chunk_state(repo.path());
+        let alpha = state.iter().find(|(t, _)| t.contains("alpha")).unwrap();
+        let beta = state.iter().find(|(t, _)| t.contains("beta")).unwrap();
+        assert!(alpha.1, "unchanged chunk kept its vector: {state:?}");
+        assert!(!beta.1, "changed chunk waits for a new vector: {state:?}");
+    }
+
+    #[test]
+    fn a_chunker_change_rechunks_unchanged_files_once() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("lib.rs"), "fn alpha() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        embed_all(repo.path());
+
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap(),
+            Some(chunker_signature()),
+            "a fresh index records its chunker"
+        );
+        let unchanged = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(
+            unchanged.files_indexed, 0,
+            "same chunker: hash skip applies"
+        );
+
+        // An index cut by an older chunker: every file is re-checked once. A
+        // file the new chunker cuts identically is left as it is.
+        rdb.set_meta(CHUNKER_META_KEY, "v0").unwrap();
+        let same_cut = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(same_cut.files_indexed, 0, "identical cut is not rewritten");
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap(),
+            Some(chunker_signature())
+        );
+
+        // One the new chunker cuts differently (simulated by a stale chunk
+        // row) is re-chunked, keeping the vectors of chunks that match.
+        rdb.set_meta(CHUNKER_META_KEY, "v0").unwrap();
+        rdb.conn
+            .execute("UPDATE chunks SET start_line = start_line + 100", [])
+            .unwrap();
+        let rechunked = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(
+            rechunked.files_indexed, 1,
+            "differently cut file re-chunked"
+        );
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap(),
+            Some(chunker_signature())
+        );
+        assert!(
+            chunk_state(repo.path()).iter().all(|(_, v)| *v),
+            "vectors kept"
+        );
+        let again = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(again.files_indexed, 0, "only once");
+    }
+
+    #[test]
+    fn an_unreadable_indexed_file_holds_the_chunker_pass_open() {
+        let repo = TempDir::new().unwrap();
+        let lib = repo.path().join("lib.rs");
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+
+        // A file that was never indexed and can't be read has nothing stale.
+        std::fs::write(repo.path().join("latin1.rs"), b"// caf\xe9\n").unwrap();
+        rdb.set_meta(CHUNKER_META_KEY, "v0").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap(),
+            Some(chunker_signature())
+        );
+
+        // An indexed file that can't be read keeps the old chunker's chunks,
+        // so the pass is not recorded until it can be.
+        rdb.set_meta(CHUNKER_META_KEY, "v0").unwrap();
+        std::fs::write(&lib, b"fn caf\xe9() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap().as_deref(),
+            Some("v0")
+        );
+
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(
+            rdb.get_meta(CHUNKER_META_KEY).unwrap(),
+            Some(chunker_signature())
+        );
+    }
 
     #[test]
     fn repo_config_prefers_current_path() {
