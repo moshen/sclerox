@@ -230,6 +230,79 @@ fn memory_json_output() {
     assert_eq!(parsed[0]["memory_type"], "project");
 }
 
+#[test]
+fn session_distill_never_overwrites_hand_written_memory() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "auth-approach",
+        "Use JWT for stateless auth. Why: horizontal scaling.",
+        "--type",
+        "project",
+    ]);
+
+    // A Claude Code transcript under a throwaway HOME, and a stub distiller
+    // that reuses the hand-written key alongside a genuinely new memory.
+    let home = e._dir.path().join("home");
+    let proj = home.join(".claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let turns = [
+        ("user", "ok"),
+        ("user", "ok"),
+        ("user", "ok"),
+        ("assistant", "noted the auth approach discussion"),
+        ("user", "b"),
+        ("assistant", "c"),
+    ];
+    let transcript: String = turns
+        .iter()
+        .map(|(role, text)| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": role, "message": {"content": text}})
+            )
+        })
+        .collect();
+    std::fs::write(proj.join("S.jsonl"), transcript).unwrap();
+    let resp = e._dir.path().join("resp.json");
+    std::fs::write(
+        &resp,
+        serde_json::json!([
+            {"key": "auth-approach", "value": "Use session cookies, not JWT.",
+             "type": "project", "supersedes": null},
+            {"key": "cookie-domain", "value": "Session cookies are scoped to the API host.",
+             "type": "project", "supersedes": null}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    e.cmd()
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".state"))
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "hook",
+            "distill-session",
+            "--session-id",
+            "S",
+            "--via",
+            &format!("sh -c 'cat \"{}\"' sh", resp.display()),
+        ])
+        .assert()
+        .success();
+
+    let out = e.run(&["memory", "get", "auth-approach", "--history"]);
+    assert!(out.contains("horizontal scaling"), "{out}");
+    assert!(!out.contains("session cookies"), "{out}");
+    assert!(out.contains("1 rows in history"), "{out}");
+    // The rest of the session still distills.
+    let out = e.run(&["memory", "get", "cookie-domain"]);
+    assert!(out.contains("API host"), "{out}");
+}
+
 // ─── People ──────────────────────────────────────────────────────────────────
 
 #[test]

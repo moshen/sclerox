@@ -986,7 +986,9 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// values supersede the existing entry so re-learning a fact under a new slug
 /// doesn't create drift. Superseding is automatic only when the best match
 /// scores at or above `dedup.merge_threshold` and was not written by hand (a
-/// human wrote it, so a background job must not silently replace it).
+/// human wrote it, so a background job must not silently replace it). For the
+/// same reason a distilled memory reusing a hand-written key is dropped rather
+/// than upserted over it.
 /// Otherwise the new memory is stored and the matches are flagged in
 /// memory_conflicts for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
@@ -1045,6 +1047,23 @@ fn distill_chunked(
         };
         for m in &memories {
             if !seen_keys.insert(m.key.clone()) {
+                continue;
+            }
+
+            // Reusing a hand-written memory's key would upsert over it in
+            // place (and the row would still claim source = manual). The same
+            // rule as for declared supersedes applies: a background job never
+            // replaces what a human wrote.
+            if db
+                .memory_get(&m.key)
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.status == "active" && e.source == "manual")
+            {
+                log::info!(
+                    "memory '{}' is hand-written; distilled rewrite not applied",
+                    m.key
+                );
                 continue;
             }
 
