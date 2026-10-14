@@ -4,7 +4,7 @@ use clap::Subcommand;
 use crate::config::settings;
 use crate::db::Database;
 use crate::embed::chunk_text;
-use crate::output::{print_output, OutputFormat};
+use crate::output::{print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum ResearchCommand {
@@ -403,12 +403,4 @@ fn embed_investigation(
         };
     db.investigation_store_chunks(id, &chunks)?;
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
 }

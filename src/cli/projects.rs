@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::db::{projects::ProjectLink, Database};
+use crate::output::truncate;
 
 #[derive(Subcommand)]
 pub enum ProjectCommand {
@@ -330,13 +331,5 @@ fn parse_link(s: &str) -> ProjectLink {
             url: s.to_string(),
             label: None,
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
     }
 }

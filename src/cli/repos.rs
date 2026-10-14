@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::db::Database;
 use crate::embed::Embedder;
 use crate::index::{find_git_root, repo_db::RepoDb, RepoIndexer};
+use crate::output::truncate;
 
 #[derive(Subcommand)]
 pub enum RepoCommand {
@@ -459,12 +460,4 @@ fn heal_repos(db: &Database, force: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
 }

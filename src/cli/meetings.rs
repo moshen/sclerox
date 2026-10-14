@@ -4,6 +4,7 @@ use clap::Subcommand;
 use crate::config::settings;
 use crate::db::Database;
 use crate::embed::chunk_text;
+use crate::output::truncate;
 
 #[derive(Subcommand)]
 pub enum MeetingCommand {
@@ -282,12 +283,4 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
     };
     db.meeting_store_chunks(meeting_id, &chunks)?;
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
 }
