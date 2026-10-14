@@ -570,8 +570,11 @@ fn run_distill_session(
             log::info!("session {session_id} is already being distilled, skipping");
             return Ok(());
         }
-        LockOutcome::Acquired(guard) => Some(guard),
-        LockOutcome::NoLock => None,
+        LockOutcome::Unavailable(e) => {
+            log::warn!("could not lock session {session_id}, skipping distillation: {e}");
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => guard,
     };
 
     log::debug!(
@@ -653,8 +656,11 @@ fn run_opencode(
             log::info!("session {session_id} is already being distilled, skipping");
             return Ok(());
         }
-        LockOutcome::Acquired(guard) => Some(guard),
-        LockOutcome::NoLock => None,
+        LockOutcome::Unavailable(e) => {
+            log::warn!("could not lock session {session_id}, skipping distillation: {e}");
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => guard,
     };
 
     let total = distill_chunked(db, &argv, &turns, "session")?;
@@ -805,8 +811,14 @@ fn run_embed_repo(repo_root: &std::path::Path) -> Result<()> {
             );
             return Ok(());
         }
-        LockOutcome::Acquired(guard) => Some(guard),
-        LockOutcome::NoLock => None,
+        LockOutcome::Unavailable(e) => {
+            log::warn!(
+                "could not lock {} for embedding, skipping: {e}",
+                repo_root.display()
+            );
+            return Ok(());
+        }
+        LockOutcome::Acquired(guard) => guard,
     };
     let repo_db = crate::index::repo_db::RepoDb::open(&db_path)?;
     if !repo_db.semantic_ready() {
@@ -854,15 +866,14 @@ impl Drop for SessionLock {
     }
 }
 
-/// Outcome of trying to acquire the per-session distillation lock.
+/// Outcome of trying to acquire a lock. Callers run only with `Acquired`.
 enum LockOutcome {
-    /// Acquired - hold the guard for the duration of distillation.
+    /// Acquired - hold the guard for the duration of the work.
     Acquired(SessionLock),
-    /// Another live process is already distilling this session - skip.
+    /// Another live process holds the lock - skip.
     Contended,
-    /// Locking infrastructure is unavailable - proceed WITHOUT a lock rather
-    /// than skip (a broken lock dir must never stop distillation entirely).
-    NoLock,
+    /// The lock file could not be created - skip rather than run unguarded.
+    Unavailable(std::io::Error),
 }
 
 /// Acquire the per-session lock under `<state_home>/sclerox/distilled/<id>.lock`.
@@ -870,15 +881,15 @@ fn try_lock_session(session_id: &str) -> LockOutcome {
     let marker = distill_marker_path(session_id);
     match marker.parent() {
         Some(dir) => try_lock_session_in(dir, session_id, LOCK_STALE_SECS),
-        None => LockOutcome::NoLock,
+        None => LockOutcome::Unavailable(std::io::Error::other("no lock directory")),
     }
 }
 
 /// Testable core: create an exclusive lockfile in `dir`. An existing lock older
 /// than `stale_secs` is stolen.
 fn try_lock_session_in(dir: &std::path::Path, session_id: &str, stale_secs: u64) -> LockOutcome {
-    if std::fs::create_dir_all(dir).is_err() {
-        return LockOutcome::NoLock;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return LockOutcome::Unavailable(e);
     }
     let path = dir.join(format!("{session_id}.lock"));
     loop {
@@ -900,8 +911,7 @@ fn try_lock_session_in(dir: &std::path::Path, session_id: &str, stale_secs: u64)
                 }
                 return LockOutcome::Contended;
             }
-            // Any other error: don't block distillation on lock trouble.
-            Err(_) => return LockOutcome::NoLock,
+            Err(e) => return LockOutcome::Unavailable(e),
         }
     }
 }
@@ -1504,6 +1514,18 @@ mod tests {
         assert!(matches!(
             try_lock_session_in(dir.path(), "sess", 0),
             LockOutcome::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn unusable_lock_dir_is_unavailable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A file where the lock directory should be: it cannot be created.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(matches!(
+            try_lock_session_in(&blocked, "sess", LOCK_STALE_SECS),
+            LockOutcome::Unavailable(_)
         ));
     }
 
