@@ -81,9 +81,9 @@ pub struct DedupSettings {
     /// reviewable band; 0.85 would merge everything flagged and make the
     /// conflict list dead code.
     ///
-    /// Those numbers are MiniLM's. `None` = the embedding model's own default,
-    /// which for Granite small is "never merge on score" until its memory-pair
-    /// scores have been measured the same way.
+    /// Those numbers are MiniLM's and do not transfer: Granite small scores
+    /// unrelated memories near 0.77 where MiniLM scores them near 0.10. Each
+    /// model's defaults live in `embed::models`. `None` = that model's default.
     pub merge_threshold: Option<f64>,
 }
 
@@ -695,22 +695,22 @@ semantic_threshold = 0.7
         let t = crate::embed::models::GRANITE_SMALL_R2.thresholds;
         assert_eq!(granite.semantic_threshold(), t.semantic);
         assert_eq!(granite.dedup_cosine_threshold(), t.dedup_cosine);
-        // Unmeasured for Granite: no automatic merging.
-        assert_eq!(granite.merge_threshold(), None);
+        // Granite's own default; see `embed::models`.
+        assert_eq!(granite.merge_threshold(), Some(0.97));
 
         let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         assert_eq!(minilm.semantic_threshold(), 0.45);
         assert_eq!(minilm.dedup_cosine_threshold(), 0.85);
         assert_eq!(minilm.merge_threshold(), Some(0.88));
 
-        // An explicit value wins over the model's default, and can turn
-        // merging back on for Granite.
+        // An explicit value wins over the model's default. 0.93 is deliberately
+        // not any model's default, so this fails if the override is ignored.
         let pinned = Settings::from_toml_str(
-            "[search]\nsemantic_threshold = 0.6\n[dedup]\nmerge_threshold = 0.97\n",
+            "[search]\nsemantic_threshold = 0.6\n[dedup]\nmerge_threshold = 0.93\n",
         )
         .unwrap();
         assert_eq!(pinned.semantic_threshold(), 0.6);
-        assert_eq!(pinned.merge_threshold(), Some(0.97));
+        assert_eq!(pinned.merge_threshold(), Some(0.93));
     }
 
     #[test]

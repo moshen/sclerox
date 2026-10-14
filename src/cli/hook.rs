@@ -996,12 +996,11 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// Dedup happens at two levels: exact-key collisions upsert the ACTIVE row
 /// (via `memory_set_full`'s partial-index ON CONFLICT), and near-duplicate
 /// values supersede the existing entry so re-learning a fact under a new slug
-/// doesn't create drift. Superseding is only automatic when it is safe:
-/// exactly one match, and not a manually written memory (a human wrote it, so
-/// a background job must not silently replace it). Several matches mean a
-/// similarity score can't tell restated-same-fact from similar-distinct-facts.
-/// The new memory is stored and the cluster is flagged in memory_conflicts
-/// for content-aware review (`sclerox memory conflicts`).
+/// doesn't create drift. Superseding is automatic only when the best match
+/// scores at or above `dedup.merge_threshold` and was not written by hand (a
+/// human wrote it, so a background job must not silently replace it).
+/// Otherwise the new memory is stored and the matches are flagged in
+/// memory_conflicts for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
     db: &Database,
     argv: &[String],
@@ -1220,9 +1219,12 @@ struct Candidate<'a> {
 /// Hand-written memories are never merged into automatically: the user wrote
 /// them deliberately, so a cluster whose only matches are manual is flagged.
 ///
-/// The `many` arm is the important one. Flagging every multi-match ratchets a
-/// cluster wider (once a topic has two entries, each later mention matches 2+
-/// and adds a third), so a match at or above `merge_threshold` merges instead.
+/// The best non-manual match merges when it scores at or above
+/// `merge_threshold`, whether it is the only match or one of several; below
+/// that, a score can't tell a restated fact from a similar but distinct one,
+/// so it is flagged. Merging the best of several matters most: flagging every
+/// multi-match ratchets a cluster wider (once a topic has two entries, each
+/// later mention matches 2+ and adds a third).
 ///
 /// `merge_threshold` of `None` means the embedding model's scores have not
 /// been calibrated for merging: nothing merges on score alone, single match or
@@ -1242,17 +1244,16 @@ fn decide_dedup_action(
             DedupAction::Flag
         };
     };
-    match candidates {
-        [] => DedupAction::Insert,
-        [single] if single.source != "manual" => DedupAction::Merge(single.key.to_string()),
-        many => many
-            .iter()
-            .filter(|c| c.source != "manual")
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
-            .filter(|c| c.score as f64 >= merge_threshold)
-            .map(|c| DedupAction::Merge(c.key.to_string()))
-            .unwrap_or(DedupAction::Flag),
+    if candidates.is_empty() {
+        return DedupAction::Insert;
     }
+    candidates
+        .iter()
+        .filter(|c| c.source != "manual")
+        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
+        .filter(|c| c.score as f64 >= merge_threshold)
+        .map(|c| DedupAction::Merge(c.key.to_string()))
+        .unwrap_or(DedupAction::Flag)
 }
 
 /// Existing active memories topically near `chunk`, as (key, value) pairs for
@@ -1649,12 +1650,15 @@ mod tests {
     }
 
     #[test]
-    fn dedup_merges_single_distilled_match() {
-        let c = [cand("existing", "session", 0.86)];
+    fn dedup_merges_single_distilled_match_only_at_threshold() {
+        let c = [cand("existing", "session", 0.96)];
         assert_eq!(
             decide_dedup_action(None, &c, Some(0.95)),
             DedupAction::Merge("existing".to_string())
         );
+        // A lone match below the threshold may be a similar but distinct fact.
+        let c = [cand("existing", "session", 0.86)];
+        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
     }
 
     #[test]
