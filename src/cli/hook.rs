@@ -1421,14 +1421,13 @@ fn strip_private_sections(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     loop {
-        let lower = rest.to_lowercase();
-        let Some(open) = lower.find("<private>") else {
+        let Some(open) = find_ascii_ci(rest, "<private>") else {
             out.push_str(rest);
             break;
         };
         out.push_str(&rest[..open]);
         let after_open = open + "<private>".len();
-        match lower[after_open..].find("</private>") {
+        match find_ascii_ci(&rest[after_open..], "</private>") {
             Some(close_rel) => {
                 let close_abs = after_open + close_rel + "</private>".len();
                 rest = &rest[close_abs..];
@@ -1437,6 +1436,17 @@ fn strip_private_sections(input: &str) -> String {
         }
     }
     out
+}
+
+/// Byte offset of `needle` (ASCII) in `hay`, ignoring ASCII case. Searching the
+/// original bytes keeps offsets valid for slicing `hay`; offsets taken from a
+/// `to_lowercase()` copy drift wherever lowercasing changes a char's byte
+/// length (e.g. U+212A KELVIN SIGN, 3 bytes, lowercases to ASCII `k`), which
+/// shifted the cut and leaked the tail of a private region to the distiller.
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    hay.as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[cfg(test)]
@@ -1766,6 +1776,19 @@ mod tests {
     fn test_strip_private_unclosed_drops_to_end() {
         let input = "before <private>oh no";
         assert_eq!(strip_private_sections(input), "before ");
+    }
+
+    #[test]
+    fn test_strip_private_after_length_changing_lowercase() {
+        // Each U+212A lowercases from 3 bytes to 1; offsets taken from a
+        // lowercased copy landed 28 bytes early and leaked the secret.
+        let input = format!(
+            "{} token <private>AKIASECRET</private> rotate",
+            "\u{212A}".repeat(14)
+        );
+        let out = strip_private_sections(&input);
+        assert!(!out.contains("SECRET"), "secret leaked: {out}");
+        assert_eq!(out, format!("{} token  rotate", "\u{212A}".repeat(14)));
     }
 
     #[test]
