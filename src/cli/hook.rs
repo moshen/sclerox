@@ -987,8 +987,8 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 /// doesn't create drift. Superseding is automatic only when the best match
 /// scores at or above `dedup.merge_threshold` and was not written by hand (a
 /// human wrote it, so a background job must not silently replace it). For the
-/// same reason a distilled memory reusing a hand-written key is dropped rather
-/// than upserted over it.
+/// same reason a distilled memory reusing a hand-written key is stored under a
+/// sibling key (see [`distilled_sibling_key`]) and flagged, not upserted over it.
 /// Otherwise the new memory is stored and the matches are flagged in
 /// memory_conflicts for content-aware review (`sclerox memory conflicts`).
 fn distill_chunked(
@@ -1050,23 +1050,6 @@ fn distill_chunked(
                 continue;
             }
 
-            // Reusing a hand-written memory's key would upsert over it in
-            // place (and the row would still claim source = manual). The same
-            // rule as for declared supersedes applies: a background job never
-            // replaces what a human wrote.
-            if db
-                .memory_get(&m.key)
-                .ok()
-                .flatten()
-                .is_some_and(|e| e.status == "active" && e.source == "manual")
-            {
-                log::info!(
-                    "memory '{}' is hand-written; distilled rewrite not applied",
-                    m.key
-                );
-                continue;
-            }
-
             // Embed the value once (if possible); reused for dedup and storage.
             let capped: String = m
                 .value
@@ -1074,6 +1057,42 @@ fn distill_chunked(
                 .take(crate::index::MAX_EMBED_CHARS)
                 .collect();
             let emb = embedder.as_mut().and_then(|e| e.embed_one(&capped).ok());
+
+            // Reusing a hand-written memory's key would upsert over it in
+            // place (and the row would still claim source = manual). The same
+            // rule as for declared supersedes applies: a background job never
+            // replaces what a human wrote. The rewrite may still be a real
+            // correction, so keep it under a sibling key and flag the pair for
+            // review, as for any match too risky to merge automatically.
+            let hand_written = db
+                .memory_get(&m.key)
+                .ok()
+                .flatten()
+                .filter(|e| e.status == "active" && e.source == "manual");
+            if let Some(hand) = hand_written {
+                if hand.value.trim() == m.value.trim() {
+                    continue;
+                }
+                let alt = distilled_sibling_key(db, &m.key);
+                match db.memory_set_full(&alt, &m.value, &m.memory_type, None, source) {
+                    Ok(new_id) => {
+                        if !db.memory_is_distinct(new_id, hand.id).unwrap_or(false) {
+                            let _ = db.memory_conflict_add(new_id, hand.id, None);
+                        }
+                        if let Some(v) = &emb {
+                            let _ = db.memory_set_embedding(&alt, v);
+                        }
+                        log::info!(
+                            "memory '{}' is hand-written; distilled rewrite stored as '{alt}' \
+                             and flagged in memory_conflicts for review",
+                            m.key
+                        );
+                        stored += 1;
+                    }
+                    Err(e) => log::warn!("storing distilled rewrite of '{}' failed: {e:#}", m.key),
+                }
+                continue;
+            }
 
             // Existing active memories this value closely matches, under other
             // keys. Prefer semantic (cosine) matching; fall back to lexical.
@@ -1406,6 +1425,27 @@ fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
     }
 
     Ok(turns)
+}
+
+/// Key for a distilled rewrite of the hand-written memory `key`:
+/// `<key>-distilled`, or `-distilled-2`, `-3`, ... when that is itself
+/// hand-written. A sibling the distiller wrote earlier is reused, so repeated
+/// rewrites of one fact update a single entry instead of piling up.
+fn distilled_sibling_key(db: &Database, key: &str) -> String {
+    let is_hand_written = |k: &str| {
+        db.memory_get(k)
+            .ok()
+            .flatten()
+            .is_some_and(|e| e.status == "active" && e.source == "manual")
+    };
+    let base = format!("{key}-distilled");
+    if !is_hand_written(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|k| !is_hand_written(k))
+        .expect("unbounded range always yields a free key")
 }
 
 /// Extract plain text from a Claude message content field (string or array of blocks).
@@ -1771,6 +1811,24 @@ mod tests {
         for i in 0..10 {
             assert!(all.contains(&format!("turn{i}")));
         }
+    }
+
+    #[test]
+    fn test_distilled_sibling_key_skips_hand_written_keys() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled");
+        // The distiller's own earlier sibling is reused.
+        db.memory_set_full("k-distilled", "v", "project", None, "session")
+            .unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled");
+        // A hand-written one is not.
+        db.conn
+            .execute(
+                "UPDATE memory SET source = 'manual' WHERE key = 'k-distilled'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled-2");
     }
 
     #[test]

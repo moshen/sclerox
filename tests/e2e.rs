@@ -231,7 +231,7 @@ fn memory_json_output() {
 }
 
 #[test]
-fn session_distill_never_overwrites_hand_written_memory() {
+fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
     let e = Env::new();
     e.run(&[
         "memory",
@@ -241,9 +241,18 @@ fn session_distill_never_overwrites_hand_written_memory() {
         "--type",
         "project",
     ]);
+    e.run(&[
+        "memory",
+        "set",
+        "db-choice",
+        "Use Postgres.",
+        "--type",
+        "project",
+    ]);
 
     // A Claude Code transcript under a throwaway HOME, and a stub distiller
-    // that reuses the hand-written key alongside a genuinely new memory.
+    // that reuses the hand-written keys (one rewritten, one restated as-is)
+    // alongside a genuinely new memory.
     let home = e._dir.path().join("home");
     let proj = home.join(".claude/projects/-tmp-x");
     std::fs::create_dir_all(&proj).unwrap();
@@ -270,6 +279,8 @@ fn session_distill_never_overwrites_hand_written_memory() {
         &resp,
         serde_json::json!([
             {"key": "auth-approach", "value": "Use session cookies, not JWT.",
+             "type": "project", "supersedes": null},
+            {"key": "db-choice", "value": "Use Postgres. ",
              "type": "project", "supersedes": null},
             {"key": "cookie-domain", "value": "Session cookies are scoped to the API host.",
              "type": "project", "supersedes": null}
@@ -298,6 +309,17 @@ fn session_distill_never_overwrites_hand_written_memory() {
     assert!(out.contains("horizontal scaling"), "{out}");
     assert!(!out.contains("session cookies"), "{out}");
     assert!(out.contains("1 rows in history"), "{out}");
+    // The rewrite is kept beside it and flagged for review, not dropped.
+    let out = e.run(&["memory", "get", "auth-approach-distilled"]);
+    assert!(out.contains("session cookies"), "{out}");
+    let out = e.run(&["memory", "conflicts"]);
+    assert!(
+        out.contains("auth-approach-distilled") && out.contains("horizontal scaling"),
+        "{out}"
+    );
+    // Restating a hand-written memory unchanged creates nothing.
+    let out = e.run(&["memory", "list"]);
+    assert!(!out.contains("db-choice-distilled"), "{out}");
     // The rest of the session still distills.
     let out = e.run(&["memory", "get", "cookie-domain"]);
     assert!(out.contains("API host"), "{out}");
