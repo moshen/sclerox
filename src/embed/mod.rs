@@ -219,7 +219,11 @@ pub fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Str
     let mut current = String::new();
     let mut last_para = "";
 
-    for para in text.split("\n\n").flat_map(|p| split_long(p, max_chars)) {
+    let paras = text
+        .split("\n\n")
+        .filter(|p| !p.trim().is_empty())
+        .flat_map(|p| split_long(p, max_chars));
+    for para in paras {
         let para_len = para.chars().count();
         if !current.is_empty() && current.chars().count() + 2 + para_len > max_chars {
             chunks.push(current.trim().to_string());
@@ -248,7 +252,7 @@ fn split_long(para: &str, max_chars: usize) -> Vec<&str> {
     let mut rest = para;
     while let Some((end, _)) = rest.char_indices().nth(max_chars) {
         let window = &rest[..end];
-        let cut = match window.rfind('\n').or_else(|| window.rfind(' ')) {
+        let cut = match window.rfind(['\n', ' ']) {
             Some(i) if i > 0 => i + 1,
             _ => end,
         };
@@ -432,6 +436,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_chunk_skips_blank_paragraphs() {
+        let chunks = chunk_text(" \n\nabcdefgh", 5, 0);
+        assert_eq!(chunks, ["abcde", "fgh"]);
+    }
+
+    #[test]
+    fn test_chunk_cuts_at_the_last_separator() {
+        // The space after "dd" is later than the line break, so the first
+        // piece keeps as much as fits.
+        let chunks = chunk_text("a\nbb cc dd ee ff", 12, 0);
+        assert_eq!(chunks, ["a\nbb cc dd", "ee ff"]);
     }
 
     #[test]
