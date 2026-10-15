@@ -85,7 +85,7 @@ impl Database {
 
     pub fn investigation_search(&self, query: &str) -> Result<Vec<Investigation>> {
         let fts_query = fts::sanitize(query);
-        let like_pat = format!("%{query}%");
+        let like_pat = fts::like_contains(query);
 
         let mut stmt = self.conn.prepare(
             "SELECT id, name, slug, status, plan, findings, created_at, concluded_at, updated_at

@@ -65,11 +65,11 @@ impl Database {
     /// Search people by name/notes (FTS) or by identifier value (LIKE).
     pub fn people_search(&self, query: &str) -> Result<Vec<Person>> {
         let fts_query = fts::sanitize(query);
-        let like_pat = format!("%{query}%");
+        let like_pat = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
             "SELECT id, name, notes, created_at, updated_at FROM people
              WHERE id IN (SELECT rowid FROM people_fts WHERE people_fts MATCH ?1)
-                OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?2)
+                OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?2 ESCAPE '\\')
              ORDER BY name",
         )?;
         let rows = stmt.query_map(params![fts_query, like_pat], row_to_person)?;

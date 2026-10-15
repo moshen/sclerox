@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::db::{
-    embedding_to_bytes,
+    embedding_to_bytes, fts,
     migrations::{REPO_MIGRATIONS, REPO_VERSION},
     run_migrations,
     schema::REPO_SCHEMA,
@@ -473,7 +473,7 @@ impl RepoDb {
         // Use LIKE for substring matching so "Sumo" finds "SumoClient" and
         // "SearchJob" finds "CreateSearchJobRequest". Symbol tables are small
         // (hundreds to low thousands), so a full scan is fast enough.
-        let pattern = format!("%{query}%");
+        let pattern = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line
              FROM symbols s

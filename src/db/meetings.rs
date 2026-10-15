@@ -96,7 +96,7 @@ impl Database {
 
     pub fn meeting_search(&self, query: &str) -> Result<Vec<Meeting>> {
         let fts_query = fts::sanitize(query);
-        let like_pat = format!("%{query}%");
+        let like_pat = fts::like_contains(query);
 
         let mut stmt = self.conn.prepare(
             "SELECT id, title, meeting_date, transcript, notes, created_at

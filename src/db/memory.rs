@@ -185,7 +185,7 @@ impl Database {
 
     pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
         let fts_query = fts::sanitize(query);
-        let like_pat = format!("%{query}%");
+        let like_pat = fts::like_contains(query);
         let filter_status = status != "all";
 
         // Tier 1: FTS prefix matches
@@ -776,6 +776,27 @@ mod tests {
 
         let all = db.memory_list(None, None).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_memory_search_treats_like_wildcards_literally() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("a", "retry budget is 3", "project", None)
+            .unwrap();
+        db.memory_set("b", "cpu at 95% for an hour", "project", None)
+            .unwrap();
+        db.memory_set("c", "use snake_case names", "project", None)
+            .unwrap();
+
+        let keys = |q: &str| -> Vec<String> {
+            db.memory_search(q)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.key)
+                .collect()
+        };
+        assert_eq!(keys("_"), ["c"]);
+        assert_eq!(keys("%"), ["b"]);
     }
 
     #[test]
