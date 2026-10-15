@@ -5,6 +5,7 @@ use std::io::Read;
 
 use crate::db::Database;
 use crate::index::find_git_root;
+use crate::output::{floor_char_boundary, truncate};
 
 #[derive(Subcommand)]
 pub enum HookCommand {
@@ -380,19 +381,6 @@ fn push_if_fits(out: &mut String, section: &str, budget_tokens: usize) {
     }
 }
 
-/// Largest byte index `<= max` that lands on a UTF-8 char boundary (stable-Rust
-/// stand-in for the unstable `str::floor_char_boundary`).
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
-    }
-    let mut i = max;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 /// Truncate a value string to a single short line for use in the index.
 fn truncate_for_index(s: &str, max: usize) -> String {
     let single_line = s.lines().next().unwrap_or("").trim();
@@ -715,7 +703,7 @@ fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
             "assistant" => ("Assistant", 1000usize),
             _ => continue,
         };
-        turns.push(format!("{label}: {}\n", truncate_content(&content, limit)));
+        turns.push(format!("{label}: {}\n", truncate(&content, limit)));
     }
 
     Ok(turns)
@@ -1383,14 +1371,14 @@ fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
             Some("user") => {
                 if let Some(content) = extract_text_content(&obj["message"]["content"]) {
                     if !content.trim().is_empty() {
-                        turns.push(format!("User: {}\n", truncate_content(&content, 500)));
+                        turns.push(format!("User: {}\n", truncate(&content, 500)));
                     }
                 }
             }
             Some("assistant") => {
                 if let Some(content) = extract_text_content(&obj["message"]["content"]) {
                     if !content.trim().is_empty() {
-                        turns.push(format!("Assistant: {}\n", truncate_content(&content, 1000)));
+                        turns.push(format!("Assistant: {}\n", truncate(&content, 1000)));
                     }
                 }
             }
@@ -1449,14 +1437,6 @@ fn strip_private_sections(input: &str) -> String {
         }
     }
     out
-}
-
-fn truncate_content(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
 }
 
 #[cfg(test)]
