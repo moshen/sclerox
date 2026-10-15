@@ -203,29 +203,35 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Chunk text into overlapping windows of ~`max_chars` characters,
-/// splitting on paragraph boundaries where possible.
+/// Chunk text into overlapping windows of at most `max_chars` characters,
+/// splitting on paragraph boundaries where possible. A paragraph longer than
+/// `max_chars` is cut at a line break or space near the limit (mid-word only
+/// when it has neither). Each chunk after the first opens with up to
+/// `overlap_chars` of the previous paragraph's tail, shortened when the next
+/// paragraph leaves less room.
 pub fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<String> {
-    if text.len() <= max_chars {
+    let max_chars = max_chars.max(1);
+    if text.chars().count() <= max_chars {
         return vec![text.to_string()];
     }
 
-    let paragraphs: Vec<&str> = text.split("\n\n").collect();
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut last_para = String::new();
+    let mut last_para = "";
 
-    for para in &paragraphs {
-        if current.len() + para.len() + 2 > max_chars && !current.is_empty() {
+    let paras = text
+        .split("\n\n")
+        .filter(|p| !p.trim().is_empty())
+        .flat_map(|p| split_long(p, max_chars));
+    for para in paras {
+        let para_len = para.chars().count();
+        if !current.is_empty() && current.chars().count() + 2 + para_len > max_chars {
             chunks.push(current.trim().to_string());
-            current = if last_para.len() <= overlap_chars {
-                format!("{}\n\n", last_para)
-            } else {
-                let start = last_para.len().saturating_sub(overlap_chars);
-                format!("...{}\n\n", &last_para[start..])
-            };
+            // Room left beside this paragraph, less the separator.
+            let room = max_chars.saturating_sub(para_len + 2);
+            current = overlap_tail(last_para, overlap_chars, room);
         }
-        last_para = para.to_string();
+        last_para = para;
         if !current.is_empty() {
             current.push_str("\n\n");
         }
@@ -237,6 +243,52 @@ pub fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Str
     }
 
     chunks
+}
+
+/// Cut `para` into pieces of at most `max_chars` characters, each ending at
+/// the last line break or space inside the limit when there is one.
+fn split_long(para: &str, max_chars: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = para;
+    while let Some((end, _)) = rest.char_indices().nth(max_chars) {
+        let window = &rest[..end];
+        let cut = match window.rfind(['\n', ' ']) {
+            Some(i) if i > 0 => i + 1,
+            _ => end,
+        };
+        let piece = rest[..cut].trim_end();
+        if !piece.is_empty() {
+            pieces.push(piece);
+        }
+        rest = rest[cut..].trim_start();
+    }
+    if !rest.is_empty() {
+        pieces.push(rest);
+    }
+    pieces
+}
+
+/// The tail of `para` carried into the next chunk: all of it when it fits in
+/// `overlap_chars`, otherwise its last `overlap_chars` characters after "...".
+/// Nothing when that would not fit in `room` characters.
+fn overlap_tail(para: &str, overlap_chars: usize, room: usize) -> String {
+    let len = para.chars().count();
+    if overlap_chars == 0 || len == 0 {
+        return String::new();
+    }
+    if len <= overlap_chars && len <= room {
+        return para.to_string();
+    }
+    // "..." plus the kept characters must fit in `room`.
+    let keep = overlap_chars.min(len).min(room.saturating_sub(3));
+    if keep == 0 {
+        return String::new();
+    }
+    let start = para
+        .char_indices()
+        .nth(len - keep)
+        .map_or(para.len(), |(i, _)| i);
+    format!("...{}", &para[start..])
 }
 
 #[cfg(test)]
@@ -323,7 +375,7 @@ mod tests {
         let chunks = chunk_text(&text, 500, 100);
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= 700, "chunk too large: {}", chunk.len());
+            assert!(chunk.len() <= 500, "chunk too large: {}", chunk.len());
         }
     }
 
@@ -334,5 +386,75 @@ mod tests {
         let joined = chunks.join(" ");
         assert!(joined.contains("Para one"));
         assert!(joined.contains("Para four"));
+    }
+
+    #[test]
+    fn test_chunk_overlap_cuts_on_char_boundaries() {
+        // The overlap cut used to slice bytes and panic inside "é".
+        let text = format!("{}\n\n{}", "é".repeat(300), "b".repeat(700));
+        let chunks = chunk_text(&text, 800, 201);
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 800, "{}", chunk.chars().count());
+        }
+        assert!(chunks[1].starts_with("...é"));
+    }
+
+    #[test]
+    fn test_chunk_splits_one_long_paragraph() {
+        let text = "word ".repeat(2000);
+        let chunks = chunk_text(text.trim_end(), 800, 200);
+        assert!(chunks.len() >= 13, "{} chunks", chunks.len());
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 800, "{}", chunk.chars().count());
+            // Cut at spaces, so every word survives whole.
+            let body = chunk.trim_start_matches("...");
+            assert!(body
+                .split_whitespace()
+                .all(|w| w == "word" || "word".ends_with(w)));
+        }
+    }
+
+    #[test]
+    fn test_chunk_cuts_mid_word_only_without_spaces() {
+        let text = "x".repeat(2500);
+        let chunks = chunk_text(&text, 1000, 0);
+        let lens: Vec<usize> = chunks.iter().map(String::len).collect();
+        assert_eq!(lens, [1000, 1000, 500]);
+    }
+
+    #[test]
+    fn test_chunk_never_exceeds_max_with_overlap() {
+        let paras: Vec<String> = (1..40).map(|i| "ab ".repeat(i * 7)).collect();
+        let text = paras.join("\n\n");
+        for (max, overlap) in [(100, 30), (300, 200), (800, 200), (50, 100)] {
+            for chunk in chunk_text(&text, max, overlap) {
+                assert!(
+                    chunk.chars().count() <= max,
+                    "{max}/{overlap}: {}",
+                    chunk.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_skips_blank_paragraphs() {
+        let chunks = chunk_text(" \n\nabcdefgh", 5, 0);
+        assert_eq!(chunks, ["abcde", "fgh"]);
+    }
+
+    #[test]
+    fn test_chunk_cuts_at_the_last_separator() {
+        // The space after "dd" is later than the line break, so the first
+        // piece keeps as much as fits.
+        let chunks = chunk_text("a\nbb cc dd ee ff", 12, 0);
+        assert_eq!(chunks, ["a\nbb cc dd", "ee ff"]);
+    }
+
+    #[test]
+    fn test_chunk_zero_overlap_carries_nothing() {
+        let text = format!("{}\n\n{}", "a".repeat(30), "b".repeat(30));
+        assert_eq!(chunk_text(&text, 40, 0), ["a".repeat(30), "b".repeat(30)]);
     }
 }
