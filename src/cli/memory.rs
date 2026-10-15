@@ -25,7 +25,8 @@ pub enum MemoryCommand {
     #[command(alias = "show")]
     Get {
         key: String,
-        /// Show every row that ever bore this key plus its supersession chain
+        /// Show every row that ever bore this key (including values replaced
+        /// by `memory set`) plus its supersession chain
         #[arg(long)]
         history: bool,
     },

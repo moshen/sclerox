@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use super::{embedding_to_bytes, fts, Database};
@@ -62,7 +62,9 @@ impl Database {
     /// The upsert targets the active-only partial unique index: an existing
     /// ACTIVE row with this key is updated in place, while retired (superseded
     /// or stale) rows never conflict - reusing their key creates a fresh row
-    /// instead of resurrecting history. Returns the active row's id.
+    /// instead of resurrecting history. A value the update replaces is kept
+    /// as a retired row first (see [`snapshot_active`]). Returns the active
+    /// row's id.
     pub fn memory_set_full(
         &self,
         key: &str,
@@ -136,6 +138,7 @@ impl Database {
                              WHERE d.lo_id = MIN(memory.id, ?6) AND d.hi_id = MAX(memory.id, ?6))",
             );
         }
+        let guard = guards.join(" AND ");
         let sql = format!(
             "INSERT INTO memory (key, value, memory_type, tags, source)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -145,30 +148,48 @@ impl Database {
                tags       = excluded.tags,
                updated_at = datetime('now')
              {}",
-            if guards.is_empty() {
+            if guard.is_empty() {
                 String::new()
             } else {
-                format!("WHERE {}", guards.join(" AND "))
+                format!("WHERE {guard}")
             }
         );
-        let written = match distinct_from {
-            Some(original) => self.conn.execute(
-                &sql,
-                params![key, value, memory_type, tags_json, source, original],
-            )?,
-            None => self
-                .conn
-                .execute(&sql, params![key, value, memory_type, tags_json, source])?,
+        let write = |conn: &Connection| -> Result<Option<i64>> {
+            // Same guard as the update, so a refused write keeps no copy.
+            snapshot_active(
+                conn,
+                key,
+                value,
+                memory_type,
+                Some(tags_json.as_deref()),
+                &guard,
+                distinct_from,
+            )?;
+            let written = match distinct_from {
+                Some(original) => conn.execute(
+                    &sql,
+                    params![key, value, memory_type, tags_json, source, original],
+                )?,
+                None => conn.execute(&sql, params![key, value, memory_type, tags_json, source])?,
+            };
+            if written == 0 {
+                return Ok(None);
+            }
+            // last_insert_rowid is stale on the DO UPDATE path; look the row up.
+            Ok(Some(conn.query_row(
+                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+                params![key],
+                |r| r.get(0),
+            )?))
         };
-        if written == 0 {
-            return Ok(None);
+        // The snapshot and the update land together or not at all.
+        if !self.conn.is_autocommit() {
+            return write(&self.conn);
         }
-        // last_insert_rowid is stale on the DO UPDATE path; look the row up.
-        Ok(Some(self.conn.query_row(
-            "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
-            params![key],
-            |r| r.get(0),
-        )?))
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let id = write(&tx)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Fetch by key: the active row if one exists, else the newest historical
@@ -197,12 +218,15 @@ impl Database {
         }
     }
 
-    /// Full history for a key: every row that ever bore it (any status) plus
-    /// the forward supersession chain those rows point into, newest first.
+    /// Full history for a key: every row that ever bore it (any status),
+    /// including values replaced in place, plus the forward supersession
+    /// chain those rows point into. The active row comes first, then the rest
+    /// newest first: a replaced value is dated when it was written, which can
+    /// be after the active row's own `created_at`.
     pub fn memory_history(&self, key: &str) -> Result<Vec<MemoryEntry>> {
         let sql = format!(
             "SELECT {MEMORY_COLS} FROM memory WHERE key = ?1
-             ORDER BY created_at DESC, id DESC"
+             ORDER BY (status = 'active') DESC, created_at DESC, id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut entries: Vec<MemoryEntry> = stmt
@@ -222,7 +246,13 @@ impl Database {
                 entries.push(e);
             }
         }
-        entries.sort_by(|a, b| (&b.created_at, b.id).cmp(&(&a.created_at, a.id)));
+        entries.sort_by(|a, b| {
+            (b.status == "active", &b.created_at, b.id).cmp(&(
+                a.status == "active",
+                &a.created_at,
+                a.id,
+            ))
+        });
         Ok(entries)
     }
 
@@ -545,6 +575,9 @@ impl Database {
             return Ok(false);
         };
 
+        // Superseding into an existing active key replaces its value; keep it.
+        // A refused write returns before commit, which rolls the copy back too.
+        snapshot_active(&tx, new_key, new_value, memory_type, None, "", None)?;
         let written = tx.execute(
             &format!(
                 "INSERT INTO memory (key, value, memory_type, source)
@@ -860,6 +893,52 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     })
 }
 
+/// Before `key`'s active row is updated in place, copy its current version
+/// into a retired (`superseded`) row pointing at it, so `memory get --history`
+/// still shows what it said. The copy is dated when that version was written
+/// (the active row's `updated_at`) and retired now.
+///
+/// The active row keeps its id rather than being replaced by a new one:
+/// people links, conflicts, distinct marks and its vector all hang off that
+/// id. No-op when there is no active row or the update changes nothing.
+/// `tags` is `None` for writes that leave tags alone.
+fn snapshot_active(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    memory_type: &str,
+    tags: Option<Option<&str>>,
+    guard: &str,
+    distinct_from: Option<i64>,
+) -> Result<()> {
+    // `guard` is the upsert's `DO UPDATE ... WHERE` condition (over `memory.*`,
+    // with the distinct-from id as ?6): copy only a row the update will change.
+    let sql = format!(
+        "INSERT INTO memory (key, value, memory_type, tags, created_at, updated_at,
+                             status, source, superseded_by, reviewed_at)
+         SELECT key, value, memory_type, tags, updated_at, datetime('now'),
+                'superseded', source, id, reviewed_at
+         FROM memory
+         WHERE key = ?1 AND status = 'active'
+           AND (value IS NOT ?2 OR memory_type IS NOT ?3 OR (?4 AND tags IS NOT ?5))
+           {}",
+        if guard.is_empty() {
+            String::new()
+        } else {
+            format!("AND ({guard})")
+        }
+    );
+    let (is_set, tags) = (tags.is_some(), tags.flatten());
+    match distinct_from {
+        Some(original) => conn.execute(
+            &sql,
+            params![key, value, memory_type, is_set, tags, original],
+        )?,
+        None => conn.execute(&sql, params![key, value, memory_type, is_set, tags])?,
+    };
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1109,116 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn test_memory_set_keeps_replaced_value_in_history() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .memory_set("db-choice", "Use Postgres. Why: JSONB.", "project", None)
+            .unwrap();
+        // Rewriting the same value is not a new version.
+        db.memory_set("db-choice", "Use Postgres. Why: JSONB.", "project", None)
+            .unwrap();
+        assert_eq!(db.memory_history("db-choice").unwrap().len(), 1);
+
+        let id2 = db
+            .memory_set("db-choice", "Use SQLite.", "project", None)
+            .unwrap();
+        // Updated in place: links keyed by id (people, conflicts, distinct
+        // marks, the vector) stay attached.
+        assert_eq!(id2, id);
+
+        let hist = db.memory_history("db-choice").unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!((hist[0].id, hist[0].status.as_str()), (id, "active"));
+        assert_eq!(hist[0].value, "Use SQLite.");
+        assert_eq!(hist[1].status, "superseded");
+        assert_eq!(hist[1].value, "Use Postgres. Why: JSONB.");
+        assert_eq!(hist[1].superseded_by, Some(id));
+
+        // Only the current value is searchable by default.
+        assert!(db.memory_search("Postgres").unwrap().is_empty());
+        assert_eq!(
+            db.memory_search_filtered("Postgres", "all").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.memory_get("db-choice").unwrap().unwrap().value,
+            "Use SQLite."
+        );
+    }
+
+    #[test]
+    fn test_memory_set_type_or_tag_change_is_a_new_version() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("k", "v", "project", None).unwrap();
+        db.memory_set("k", "v", "feedback", None).unwrap();
+        db.memory_set("k", "v", "feedback", Some(&["x".to_string()]))
+            .unwrap();
+        db.memory_set("k", "v", "feedback", Some(&["x".to_string()]))
+            .unwrap();
+        assert_eq!(db.memory_history("k").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_supersede_into_existing_key_keeps_its_value() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("canonical", "first wording", "project", None)
+            .unwrap();
+        db.memory_set("dup", "second wording", "project", None)
+            .unwrap();
+        db.memory_supersede("dup", "canonical", "merged wording", "project", "manual")
+            .unwrap();
+
+        let values: Vec<String> = db
+            .memory_history("canonical")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.value)
+            .collect();
+        assert_eq!(values[0], "merged wording");
+        assert!(values.contains(&"first wording".to_string()), "{values:?}");
+    }
+
+    #[test]
+    fn test_refused_guarded_write_keeps_no_history_copy() {
+        let db = Database::open_in_memory().unwrap();
+        let hand = db
+            .memory_set("hand", "written by a human", "project", None)
+            .unwrap();
+        let sib = db
+            .memory_set_full("hand-distilled", "curated", "project", None, "session")
+            .unwrap();
+        db.memory_distinct_add(hand, sib, None).unwrap();
+
+        // Refused: hand-written, then marked distinct from the original.
+        assert!(db
+            .memory_set_unless_manual("hand", "distilled", "project", None, "session")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .memory_set_unless_manual_or_distinct(
+                "hand-distilled",
+                "v2",
+                "project",
+                "session",
+                hand
+            )
+            .unwrap()
+            .is_none());
+        assert!(!db
+            .memory_supersede_unless_manual("hand-distilled", "hand", "v3", "project", "session")
+            .unwrap());
+        assert_eq!(db.memory_history("hand").unwrap().len(), 1);
+        assert_eq!(db.memory_history("hand-distilled").unwrap().len(), 1);
+
+        // An accepted guarded write keeps the copy as usual.
+        db.memory_set_full("auto", "v1", "project", None, "session")
+            .unwrap();
+        db.memory_set_unless_manual("auto", "v2", "project", None, "session")
+            .unwrap();
+        assert_eq!(db.memory_history("auto").unwrap().len(), 2);
     }
 
     #[test]
