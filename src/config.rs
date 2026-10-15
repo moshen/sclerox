@@ -715,7 +715,12 @@ pub fn init() {
         ),
     ];
     for (var, n, default) in size_bridges {
-        if n != default && std::env::var(var).is_err() {
+        // An env value that didn't parse was ignored above, so the library
+        // must not read it either.
+        let env_value = std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if n != default && env_value != Some(n) {
             // SAFETY: single-threaded startup, before any thread is spawned.
             unsafe {
                 std::env::set_var(var, n.to_string());
