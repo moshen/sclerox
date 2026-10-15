@@ -397,15 +397,20 @@ impl Settings {
                 self.index.max_files = n;
             }
         }
-        for (var, slot) in [
-            (crate::index::CHUNK_CHARS_ENV, &mut self.index.chunk_chars),
-            (crate::index::CHUNK_LINES_ENV, &mut self.index.chunk_lines),
-        ] {
-            if let Ok(Ok(n)) = std::env::var(var).map(|v| v.parse()) {
-                *slot = n;
-            }
+        // A size that isn't a positive number is ignored, leaving the file's.
+        let size_env = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        };
+        if let Some(n) = size_env(crate::index::CHUNK_CHARS_ENV) {
+            self.index.chunk_chars = n;
         }
-        if let Ok(Ok(n)) = std::env::var(crate::embed::MEMORY_CHARS_ENV).map(|v| v.parse()) {
+        if let Some(n) = size_env(crate::index::CHUNK_LINES_ENV) {
+            self.index.chunk_lines = n;
+        }
+        if let Some(n) = size_env(crate::embed::MEMORY_CHARS_ENV) {
             self.embed.memory_chars = Some(n);
         }
         if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {

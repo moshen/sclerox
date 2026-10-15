@@ -863,35 +863,37 @@ fn code_chunk_sizes_come_from_config_and_rechunk() {
         file_chunks("notes.md")
     );
 
-    // An env value that doesn't parse is ignored, by the indexer too: the
-    // config's size still applies.
-    let fresh = TempDir::new().unwrap();
-    std::fs::write(
-        fresh.path().join("lib.rs"),
-        format!("fn big() {{\n{body}}}\n"),
-    )
-    .unwrap();
-    let out = e
-        .cmd()
-        .env("SCLEROX_CODE_CHUNK_CHARS", "lots")
-        .args([
-            "repo",
-            "index",
-            "--no-embed",
-            fresh.path().to_str().unwrap(),
-        ])
-        .output()
+    // An env value that isn't a positive number is ignored, by the indexer
+    // too: the config's size still applies.
+    for bad in ["lots", "0"] {
+        let fresh = TempDir::new().unwrap();
+        std::fs::write(
+            fresh.path().join("lib.rs"),
+            format!("fn big() {{\n{body}}}\n"),
+        )
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let conn = rusqlite::Connection::open(fresh.path().join(".sclerox/repo.db")).unwrap();
-    let chunks: i64 = conn
-        .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(chunks, 1, "config's chunk_chars = 4000 applies");
+        let out = e
+            .cmd()
+            .env("SCLEROX_CODE_CHUNK_CHARS", bad)
+            .args([
+                "repo",
+                "index",
+                "--no-embed",
+                fresh.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let conn = rusqlite::Connection::open(fresh.path().join(".sclerox/repo.db")).unwrap();
+        let chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 1, "{bad:?}: config's chunk_chars = 4000 applies");
+    }
 }
 
 #[test]
