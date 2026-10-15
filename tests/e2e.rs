@@ -230,6 +230,108 @@ fn memory_json_output() {
     assert_eq!(parsed[0]["memory_type"], "project");
 }
 
+#[test]
+fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "auth-approach",
+        "Use JWT for stateless auth. Why: horizontal scaling.",
+        "--type",
+        "project",
+    ]);
+    e.run(&[
+        "memory",
+        "set",
+        "db-choice",
+        "Use Postgres.",
+        "--type",
+        "project",
+    ]);
+
+    // A Claude Code transcript under a throwaway HOME, and a stub distiller
+    // that reuses the hand-written keys (one rewritten, one restated as-is)
+    // alongside a genuinely new memory.
+    let home = e._dir.path().join("home");
+    let proj = home.join(".claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let turns = [
+        ("user", "ok"),
+        ("user", "ok"),
+        ("user", "ok"),
+        ("assistant", "noted the auth approach discussion"),
+        ("user", "b"),
+        ("assistant", "c"),
+    ];
+    let transcript: String = turns
+        .iter()
+        .map(|(role, text)| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": role, "message": {"content": text}})
+            )
+        })
+        .collect();
+    std::fs::write(proj.join("S.jsonl"), transcript).unwrap();
+    let resp = e._dir.path().join("resp.json");
+    std::fs::write(
+        &resp,
+        serde_json::json!([
+            {"key": "auth-approach", "value": "Use session cookies, not JWT.",
+             "type": "project", "supersedes": null},
+            {"key": "db-choice", "value": "Use Postgres. ",
+             "type": "project", "supersedes": null},
+            {"key": "cookie-domain", "value": "Session cookies are scoped to the API host.",
+             "type": "project", "supersedes": null}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    // USERPROFILE is the home variable on Windows, where HOME alone is
+    // ignored and the transcript under the temp home would never be found.
+    // The response path goes through shlex and then sh, so give it forward
+    // slashes: Git's sh on Windows accepts them, and no backslash is read as
+    // an escape on the way.
+    let resp_arg = resp.display().to_string().replace('\\', "/");
+    e.cmd()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".state"))
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "hook",
+            "distill-session",
+            "--session-id",
+            "S",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .assert()
+        .success();
+
+    let out = e.run(&["memory", "get", "auth-approach", "--history"]);
+    assert!(out.contains("horizontal scaling"), "{out}");
+    assert!(!out.contains("session cookies"), "{out}");
+    assert!(out.contains("1 rows in history"), "{out}");
+    // The rewrite is kept beside it and flagged for review, not dropped.
+    let out = e.run(&["memory", "get", "auth-approach-distilled"]);
+    assert!(out.contains("session cookies"), "{out}");
+    let out = e.run(&["memory", "conflicts"]);
+    assert!(
+        out.contains("auth-approach-distilled") && out.contains("horizontal scaling"),
+        "{out}"
+    );
+    // Restating a hand-written memory unchanged creates nothing.
+    let out = e.run(&["memory", "list"]);
+    assert!(!out.contains("db-choice-distilled"), "{out}");
+    // The rest of the session still distills.
+    let out = e.run(&["memory", "get", "cookie-domain"]);
+    assert!(out.contains("API host"), "{out}");
+}
+
 // ─── People ──────────────────────────────────────────────────────────────────
 
 #[test]

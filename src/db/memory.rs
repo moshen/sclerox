@@ -71,23 +71,104 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
     ) -> Result<i64> {
+        self.memory_upsert(key, value, memory_type, tags, source, false, None)
+            .map(|id| id.expect("an unguarded upsert always writes"))
+    }
+
+    /// [`memory_set_full`](Self::memory_set_full) for background writers: an
+    /// active hand-written row under `key` is left untouched and `None` is
+    /// returned. The check is part of the upsert itself, so a `memory set`
+    /// landing after the caller looked can't be overwritten either.
+    pub fn memory_set_unless_manual(
+        &self,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        tags: Option<&[String]>,
+        source: &str,
+    ) -> Result<Option<i64>> {
+        self.memory_upsert(key, value, memory_type, tags, source, true, None)
+    }
+
+    /// [`memory_set_unless_manual`](Self::memory_set_unless_manual) that also
+    /// leaves `key` alone when its active row has been marked distinct from
+    /// row `original_id`. Used for a distilled rewrite's sibling key: a sibling
+    /// a human called a separate fact must not be overwritten, even by a mark
+    /// committed after the caller picked the key.
+    pub fn memory_set_unless_manual_or_distinct(
+        &self,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        source: &str,
+        original_id: i64,
+    ) -> Result<Option<i64>> {
+        self.memory_upsert(
+            key,
+            value,
+            memory_type,
+            None,
+            source,
+            true,
+            Some(original_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn memory_upsert(
+        &self,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        tags: Option<&[String]>,
+        source: &str,
+        protect_manual: bool,
+        distinct_from: Option<i64>,
+    ) -> Result<Option<i64>> {
         let tags_json = tags.map(|t| serde_json::to_string(t).unwrap());
-        self.conn.execute(
+        let mut guards = Vec::new();
+        if protect_manual {
+            guards.push("memory.source != 'manual'");
+        }
+        if distinct_from.is_some() {
+            guards.push(
+                "NOT EXISTS (SELECT 1 FROM memory_distinct d
+                             WHERE d.lo_id = MIN(memory.id, ?6) AND d.hi_id = MAX(memory.id, ?6))",
+            );
+        }
+        let sql = format!(
             "INSERT INTO memory (key, value, memory_type, tags, source)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                value      = excluded.value,
                memory_type = excluded.memory_type,
                tags       = excluded.tags,
-               updated_at = datetime('now')",
-            params![key, value, memory_type, tags_json, source],
-        )?;
+               updated_at = datetime('now')
+             {}",
+            if guards.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", guards.join(" AND "))
+            }
+        );
+        let written = match distinct_from {
+            Some(original) => self.conn.execute(
+                &sql,
+                params![key, value, memory_type, tags_json, source, original],
+            )?,
+            None => self
+                .conn
+                .execute(&sql, params![key, value, memory_type, tags_json, source])?,
+        };
+        if written == 0 {
+            return Ok(None);
+        }
         // last_insert_rowid is stale on the DO UPDATE path; look the row up.
-        Ok(self.conn.query_row(
+        Ok(Some(self.conn.query_row(
             "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
             params![key],
             |r| r.get(0),
-        )?)
+        )?))
     }
 
     /// Fetch by key: the active row if one exists, else the newest historical
@@ -420,6 +501,32 @@ impl Database {
         memory_type: &str,
         source: &str,
     ) -> Result<bool> {
+        self.memory_supersede_impl(old_key, new_key, new_value, memory_type, source, false)
+    }
+
+    /// [`memory_supersede`](Self::memory_supersede) for background writers:
+    /// also returns false, changing nothing, when `new_key` is an active
+    /// hand-written row. See [`memory_set_unless_manual`](Self::memory_set_unless_manual).
+    pub fn memory_supersede_unless_manual(
+        &self,
+        old_key: &str,
+        new_key: &str,
+        new_value: &str,
+        memory_type: &str,
+        source: &str,
+    ) -> Result<bool> {
+        self.memory_supersede_impl(old_key, new_key, new_value, memory_type, source, true)
+    }
+
+    fn memory_supersede_impl(
+        &self,
+        old_key: &str,
+        new_key: &str,
+        new_value: &str,
+        memory_type: &str,
+        source: &str,
+        protect_manual: bool,
+    ) -> Result<bool> {
         if old_key == new_key {
             anyhow::bail!(
                 "old and new keys are both '{old_key}'; use `sclerox memory set` to update in place"
@@ -438,15 +545,27 @@ impl Database {
             return Ok(false);
         };
 
-        tx.execute(
-            "INSERT INTO memory (key, value, memory_type, source)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
-               value = excluded.value,
-               memory_type = excluded.memory_type,
-               updated_at = datetime('now')",
+        let written = tx.execute(
+            &format!(
+                "INSERT INTO memory (key, value, memory_type, source)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
+                   value = excluded.value,
+                   memory_type = excluded.memory_type,
+                   updated_at = datetime('now')
+                 {}",
+                if protect_manual {
+                    "WHERE memory.source != 'manual'"
+                } else {
+                    ""
+                }
+            ),
             params![new_key, new_value, memory_type, source],
         )?;
+        if written == 0 {
+            // Dropping the transaction rolls back; the old row stays active.
+            return Ok(false);
+        }
         let new_id: i64 = tx.query_row(
             "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
             params![new_key],
@@ -831,6 +950,86 @@ mod tests {
         let results = db.memory_search("rollback").unwrap();
         assert_eq!(results.len(), 4);
         assert_eq!(results[0].key, "deploy-rollback");
+    }
+
+    #[test]
+    fn test_unless_manual_writes_leave_hand_written_rows_alone() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("hand", "written by a human", "project", None)
+            .unwrap();
+        db.memory_set_full("auto", "v1", "project", None, "session")
+            .unwrap();
+
+        assert!(db
+            .memory_set_unless_manual("hand", "distilled", "project", None, "session")
+            .unwrap()
+            .is_none());
+        assert!(!db
+            .memory_supersede_unless_manual("auto", "hand", "distilled", "project", "session")
+            .unwrap());
+        assert_eq!(
+            db.memory_get("hand").unwrap().unwrap().value,
+            "written by a human"
+        );
+        // The rolled-back supersede left the old side active too.
+        assert_eq!(db.memory_get("auto").unwrap().unwrap().status, "active");
+
+        // Non-manual and new keys are written as usual.
+        assert!(db
+            .memory_set_unless_manual("auto", "v2", "project", None, "session")
+            .unwrap()
+            .is_some());
+        assert_eq!(db.memory_get("auto").unwrap().unwrap().value, "v2");
+        assert!(db
+            .memory_set_unless_manual("fresh", "v", "project", None, "session")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_sibling_write_leaves_a_distinct_marked_row_alone() {
+        let db = Database::open_in_memory().unwrap();
+        let original = db.memory_set("k", "original", "project", None).unwrap();
+        let sib = db
+            .memory_set_full("k-distilled", "curated", "project", None, "session")
+            .unwrap();
+
+        // Not marked: the sibling is updated as usual.
+        assert_eq!(
+            db.memory_set_unless_manual_or_distinct(
+                "k-distilled",
+                "v2",
+                "project",
+                "session",
+                original
+            )
+            .unwrap(),
+            Some(sib)
+        );
+        // Marked distinct (in either order): left alone.
+        db.memory_distinct_add(original, sib, None).unwrap();
+        assert!(db
+            .memory_set_unless_manual_or_distinct(
+                "k-distilled",
+                "v3",
+                "project",
+                "session",
+                original
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(db.memory_get("k-distilled").unwrap().unwrap().value, "v2");
+        // A new key has no row to protect.
+        assert!(db
+            .memory_set_unless_manual_or_distinct(
+                "k-distilled-2",
+                "v",
+                "project",
+                "session",
+                original
+            )
+            .unwrap()
+            .is_some());
     }
 
     #[test]
