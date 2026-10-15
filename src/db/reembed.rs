@@ -556,7 +556,10 @@ mod tests {
         assert_eq!(
             vector_count(
                 &db,
-                "SELECT count(*) FROM memory WHERE key = 'kept' AND embedding IS NULL"
+                // Active row only: the edit also kept the old text as a
+                // retired row, which is never embedded.
+                "SELECT count(*) FROM memory
+                 WHERE key = 'kept' AND status = 'active' AND embedding IS NULL"
             ),
             1
         );

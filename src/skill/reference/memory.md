@@ -6,7 +6,7 @@ SKILL.md; do it immediately and unprompted.
 ```bash
 sclerox memory set <key> "<value>" --type user|feedback|project|reference|session
 sclerox memory get <key>
-sclerox memory get <key> --history        # every row the key ever had + supersession chain
+sclerox memory get <key> --history        # current value, every earlier value + supersession chain
 sclerox memory search "<query>"           # active only by default
 sclerox memory search "<query>" --all     # include stale/superseded
 sclerox memory stale <key> [--reason "why it's no longer valid"]
@@ -26,10 +26,11 @@ sclerox memory people add|remove|list <key> <person_id>
 ```
 
 Supersede requires an ACTIVE old key and a DIFFERENT new key (a same-key
-update is `sclerox memory set`). To merge several duplicates, supersede each
-into ONE canonical key - repeated supersedes converge on it. Retired keys
-never block reuse: setting a superseded key creates a fresh entry instead
-of resurrecting the old row.
+update is `sclerox memory set`, which keeps the value it replaces in
+`--history`). To merge several duplicates, supersede each into ONE
+canonical key - repeated supersedes converge on it. Retired keys never
+block reuse: setting a superseded key creates a fresh entry instead of
+resurrecting the old row.
 
 A conflict is a near-duplicate cluster distillation refused to auto-merge:
 the matches were too far apart to be confidently the same fact, or the only
