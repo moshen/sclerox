@@ -31,7 +31,7 @@ pub struct ReembedTable {
     pub vector: &'static str,
     /// Which rows should carry a vector.
     pub filter: &'static str,
-    /// Truncate text to `MAX_EMBED_CHARS` first, as the write path does.
+    /// Cut a memory value to `embed::memory_chars` first, as the write path does.
     pub cap: bool,
     /// Whether rows without a vector should get one. False for code chunks:
     /// those are filled by `repo reembed`, `repo index`, and the session
@@ -216,7 +216,7 @@ fn embed_rows(
             .map(|(_, b)| {
                 let s = String::from_utf8_lossy(b.as_deref().unwrap_or_default());
                 if t.cap {
-                    s.chars().take(crate::index::MAX_EMBED_CHARS).collect()
+                    crate::embed::memory_embed_text(&s)
                 } else {
                     s.into_owned()
                 }

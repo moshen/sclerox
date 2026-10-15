@@ -395,7 +395,7 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
         let emb_cfg = &settings().embed;
         let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
         if let Ok(embeddings) =
-            embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {
             let chunks: Vec<(String, Option<Vec<f32>>)> = raw
                 .into_iter()
@@ -426,7 +426,7 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
         let emb_cfg = &settings().embed;
         let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
         if let Ok(embeddings) =
-            embedder.embed_batch(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {
             let chunks: Vec<(String, Option<Vec<f32>>)> = raw
                 .into_iter()

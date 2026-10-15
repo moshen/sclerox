@@ -812,6 +812,51 @@ fn chunk_counts(repo: &std::path::Path) -> (i64, i64) {
 }
 
 #[test]
+fn code_chunk_sizes_come_from_config_and_rechunk() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    // One 60-line function (~2,400 chars) and a 60-line Markdown file, which
+    // has no tree-sitter grammar and is cut by line count.
+    let body: String = (0..60)
+        .map(|i| format!("    let value_{i:02} = compute({i}) + 1;\n"))
+        .collect();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        format!("fn big() {{\n{body}}}\n"),
+    )
+    .unwrap();
+    let notes: String = (0..60).map(|i| format!("note line {i}\n")).collect();
+    std::fs::write(dir.path().join("notes.md"), notes).unwrap();
+    let repo = dir.path().to_str().unwrap();
+
+    let file_chunks = |file: &str| -> i64 {
+        let conn = rusqlite::Connection::open(dir.path().join(".sclerox/repo.db")).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ?1",
+            [file],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    e.run(&["repo", "index", "--no-embed", repo]);
+    let (rs_default, md_default) = (file_chunks("lib.rs"), file_chunks("notes.md"));
+    assert!(
+        rs_default >= 3,
+        "800-char chunks split the function: {rs_default}"
+    );
+
+    std::fs::write(&e.config, "[index]\nchunk_chars = 4000\nchunk_lines = 5\n").unwrap();
+    e.run(&["repo", "index", "--no-embed", repo]);
+    assert_eq!(file_chunks("lib.rs"), 1, "the function now fits one chunk");
+    assert!(
+        file_chunks("notes.md") > md_default,
+        "5-line chunks: {} vs {md_default}",
+        file_chunks("notes.md")
+    );
+}
+
+#[test]
 fn hook_embed_repo_fills_missing_vectors() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();

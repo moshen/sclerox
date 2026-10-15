@@ -210,7 +210,8 @@ sclerox config path          # where the file lives
 Configurable sections include `[ai]` (distillation command/model), `[search]`
 (`semantic_threshold`, `semantic_limit`), `[dedup]` thresholds, `[memory]`
 (`max_value_chars`), `[session_context]` sizes, `[distill]` chunking, `[embed]`
-model and chunk size, `[index]` (`max_file_bytes`, `max_files`, `auto`), `[install]`
+model and sizes (`chunk_size`, `chunk_overlap`, `memory_chars`), `[index]`
+(`max_file_bytes`, `max_files`, `auto`, `chunk_chars`, `chunk_lines`), `[install]`
 (which managed artifacts get refreshed on reinstall), and `[log] level`. Run
 `sclerox config init` to see every key with its default.
 
@@ -263,6 +264,9 @@ Environment variables still work and override the file:
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
 | `SCLEROX_EMBED_MODEL` | `granite-small-r2` | Embedding model (`granite-small-r2\|minilm-l6-v2`) |
 | `SCLEROX_EMBED_ENABLED` | `true` | `false` turns embeddings off (`[embed] enabled`) |
+| `SCLEROX_EMBED_MEMORY_CHARS` | per model | Characters of each memory embedded (`[embed] memory_chars`) |
+| `SCLEROX_CODE_CHUNK_CHARS` | `800` | Characters per embedded code chunk (`[index] chunk_chars`) |
+| `SCLEROX_CODE_CHUNK_LINES` | `15` | Lines per chunk without a tree-sitter grammar (`[index] chunk_lines`) |
 | `XDG_CACHE_HOME` | `~/.cache` | Downloaded models live in `$XDG_CACHE_HOME/sclerox/models/` |
 | `HF_ENDPOINT` | `https://huggingface.co` | Where models download from (a mirror); files are still hash-checked |
 

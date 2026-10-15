@@ -1402,18 +1402,18 @@ fn bar() {}
     fn test_repo_indexer_uses_correct_chunk_size() {
         let max_safe_chars = 1024usize;
 
-        let max_fallback_chars = super::super::CHUNK_SIZE_LINES * 60;
+        let max_fallback_chars = super::super::DEFAULT_CHUNK_LINES * 60;
         assert!(
             max_fallback_chars <= max_safe_chars,
-            "CHUNK_SIZE_LINES ({}) produces chunks up to {max_fallback_chars} chars, \
+            "DEFAULT_CHUNK_LINES ({}) produces chunks up to {max_fallback_chars} chars, \
              exceeding model limit of {max_safe_chars}",
-            super::super::CHUNK_SIZE_LINES,
+            super::super::DEFAULT_CHUNK_LINES,
         );
 
         assert!(
-            super::super::MAX_EMBED_CHARS <= max_safe_chars,
-            "MAX_EMBED_CHARS ({}) exceeds model limit",
-            super::super::MAX_EMBED_CHARS,
+            super::super::DEFAULT_CHUNK_CHARS <= max_safe_chars,
+            "DEFAULT_CHUNK_CHARS ({}) exceeds model limit",
+            super::super::DEFAULT_CHUNK_CHARS,
         );
     }
 

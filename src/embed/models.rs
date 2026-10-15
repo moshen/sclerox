@@ -90,6 +90,12 @@ pub struct ModelSpec {
     /// Graph output to pool over; `None` lets fastembed pick.
     pub output_name: Option<&'static str>,
     pub dim: usize,
+    /// Longest input, in tokens, the model is given. Text past it is dropped
+    /// before embedding, so it can't influence the vector.
+    pub max_tokens: usize,
+    /// How many characters of a memory's value get embedded unless
+    /// `embed.memory_chars` says otherwise.
+    pub memory_chars: usize,
     /// Prepended to search queries before embedding.
     pub query_prefix: &'static str,
     /// Prepended to stored text before embedding.
@@ -141,6 +147,12 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     pooling: Pooling::Cls,
     output_name: Some("last_hidden_state"),
     dim: 384,
+    // The model takes 8,192, but attention cost grows with the square of the
+    // input. On one CPU core: 750 tokens took 0.2 s and 0.3 GB, 2,000 took
+    // 1.2 s and 1.2 GB, 6,000 took 9 s and 6.6 GB. 2,048 bounds one input.
+    max_tokens: 2048,
+    // Covers the whole of nearly every memory (~750 tokens, 0.2 s).
+    memory_chars: 4000,
     query_prefix: "",
     document_prefix: "",
     // Granite's scores sit high and close together, and where the bands fall
@@ -208,6 +220,10 @@ pub const MINILM_L6_V2: ModelSpec = ModelSpec {
     pooling: Pooling::Mean,
     output_name: None,
     dim: 384,
+    // The position table holds 512, and fastembed has always truncated there;
+    // the model was trained on 256, so text past that embeds less faithfully.
+    max_tokens: 512,
+    memory_chars: 800,
     query_prefix: "",
     document_prefix: "",
     // Calibrated against real MiniLM scores; see `DedupSettings` in config.rs.
@@ -386,6 +402,13 @@ impl ModelSpec {
         Ok(())
     }
 
+    /// Roughly the most characters the model reads before `max_tokens` cuts
+    /// the rest off. Assumes 3 characters per token, the low end for code, so
+    /// for prose it errs short.
+    pub fn max_chars(&self) -> usize {
+        self.max_tokens * 3
+    }
+
     /// The model's files, pinned, for download.
     pub fn pinned(&self) -> Pinned<'static> {
         Pinned {
@@ -405,6 +428,18 @@ mod tests {
         assert_eq!(DEFAULT_MODEL, "granite-small-r2");
         assert_eq!(default_model().name, DEFAULT_MODEL);
         assert_eq!(lookup(DEFAULT_MODEL).unwrap(), &GRANITE_SMALL_R2);
+    }
+
+    #[test]
+    fn default_sizes_fit_every_model() {
+        for m in MODELS {
+            assert!(m.memory_chars <= m.max_chars(), "{}", m.name);
+            assert!(
+                crate::index::DEFAULT_CHUNK_CHARS <= m.max_chars(),
+                "{}",
+                m.name
+            );
+        }
     }
 
     #[test]

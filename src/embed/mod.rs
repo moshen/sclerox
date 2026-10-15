@@ -134,6 +134,9 @@ impl Embedder {
             .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
     }
 
+    /// Embed several texts as one padded batch. Only the reference parity
+    /// test uses it; see [`Self::embed_each`] for why nothing else should.
+    #[cfg(test)]
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
@@ -144,6 +147,30 @@ impl Embedder {
 }
 
 pub use download::cache_dir as model_cache_dir;
+
+/// Env var carrying `embed.memory_chars` from `config::init()` into this
+/// settings-free module. Unset means the configured model's
+/// [`ModelSpec::memory_chars`].
+pub const MEMORY_CHARS_ENV: &str = "SCLEROX_EMBED_MEMORY_CHARS";
+
+/// How many characters of a memory's value get embedded.
+pub fn memory_chars() -> usize {
+    std::env::var(MEMORY_CHARS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            models::configured()
+                .unwrap_or_else(|_| models::default_model())
+                .memory_chars
+        })
+}
+
+/// The part of a memory's value that gets embedded: its first
+/// [`memory_chars`] characters.
+pub fn memory_embed_text(value: &str) -> String {
+    value.chars().take(memory_chars()).collect()
+}
 
 /// Whether every file `spec` needs is already in the model cache.
 pub fn is_downloaded(spec: &ModelSpec) -> bool {
@@ -199,7 +226,8 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         model_def = model_def.with_external_initializer(graph_name.to_string(), read(data)?);
     }
 
-    fastembed::TextEmbedding::try_new_from_user_defined(model_def, InitOptionsUserDefined::new())
+    let options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    fastembed::TextEmbedding::try_new_from_user_defined(model_def, options)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -358,6 +386,15 @@ mod tests {
             assert_eq!(parse_switch(off), Some(false), "{off}");
         }
         assert_eq!(parse_switch("maybe"), None);
+    }
+
+    #[test]
+    fn memory_embed_text_keeps_the_model_default_in_chars() {
+        // Unset env: the configured (default) model's size, counted in chars.
+        let value = "é".repeat(5000);
+        let text = memory_embed_text(&value);
+        assert_eq!(text.chars().count(), models::GRANITE_SMALL_R2.memory_chars);
+        assert_eq!(memory_embed_text("short"), "short");
     }
 
     #[test]
