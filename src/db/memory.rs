@@ -188,19 +188,21 @@ impl Database {
         let like_pat = fts::like_contains(query);
         let filter_status = status != "all";
 
-        // Tier 1: FTS prefix matches
+        // Tier 1: FTS prefix matches, most relevant (bm25) first. Recency only
+        // breaks ties: ordering by it alone put any later passing mention ahead
+        // of the memory that is actually about the term.
         let fts_sql = if filter_status {
             format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                     WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
-                       AND status = ?2
-                     ORDER BY updated_at DESC"
+                "WITH hits AS (SELECT rowid AS hit_id, rank FROM memory_fts WHERE memory_fts MATCH ?1)
+                 SELECT {MEMORY_COLS} FROM memory JOIN hits ON hits.hit_id = memory.id
+                     WHERE status = ?2
+                     ORDER BY hits.rank, updated_at DESC"
             )
         } else {
             format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                     WHERE id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1)
-                     ORDER BY updated_at DESC"
+                "WITH hits AS (SELECT rowid AS hit_id, rank FROM memory_fts WHERE memory_fts MATCH ?1)
+                 SELECT {MEMORY_COLS} FROM memory JOIN hits ON hits.hit_id = memory.id
+                     ORDER BY hits.rank, updated_at DESC"
             )
         };
         let mut stmt = self.conn.prepare(&fts_sql)?;
@@ -797,6 +799,38 @@ mod tests {
         };
         assert_eq!(keys("_"), ["c"]);
         assert_eq!(keys("%"), ["b"]);
+    }
+
+    #[test]
+    fn test_memory_search_ranks_by_relevance_not_recency() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set(
+            "deploy-rollback",
+            "Rollback procedure: rollback via deploy tool; rollback window 5 min.",
+            "project",
+            None,
+        )
+        .unwrap();
+        // Written later, so a recency sort would list them first.
+        for n in 0..3 {
+            db.memory_set(
+                &format!("misc-{n}"),
+                &format!("Unrelated note {n} that mentions rollback in passing."),
+                "project",
+                None,
+            )
+            .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE memory SET updated_at = datetime('now', '+1 hour') WHERE key = ?1",
+                    params![format!("misc-{n}")],
+                )
+                .unwrap();
+        }
+
+        let results = db.memory_search("rollback").unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].key, "deploy-rollback");
     }
 
     #[test]
