@@ -36,8 +36,8 @@ How much text each vector covers:
   `index.chunk_lines` (15): lines per chunk for files without a tree-sitter
   grammar. Changing either re-chunks each repo on its next index run.
 
-A model only reads so much of one input: Granite 2048 tokens (about 6000
-characters), MiniLM 512. A size past that warns, and the excess is not embedded.
+A model only reads so much of one input: Granite 2048 tokens (about 8000
+characters of prose), MiniLM 256 (about 1000). A size past that warns, and the excess is not embedded.
 Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
 4000 characters and over 1 s near its limit.
 

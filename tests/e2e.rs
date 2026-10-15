@@ -34,6 +34,14 @@ impl Env {
         // Never write test noise into the developer's real ~/.local/state/sclerox/logs/ (an
         // exported SCLEROX_LOG=debug once made a day's log 100x normal size).
         c.env("SCLEROX_LOG", "off");
+        // Sizes come from the temp config unless a test sets one itself.
+        for var in [
+            "SCLEROX_CODE_CHUNK_CHARS",
+            "SCLEROX_CODE_CHUNK_LINES",
+            "SCLEROX_EMBED_MEMORY_CHARS",
+        ] {
+            c.env_remove(var);
+        }
         c
     }
 

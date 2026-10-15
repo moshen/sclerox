@@ -220,9 +220,9 @@ pub const MINILM_L6_V2: ModelSpec = ModelSpec {
     pooling: Pooling::Mean,
     output_name: None,
     dim: 384,
-    // The position table holds 512, and fastembed has always truncated there;
-    // the model was trained on 256, so text past that embeds less faithfully.
-    max_tokens: 512,
+    // The pinned tokenizer_config.json sets model_max_length to 256, and
+    // fastembed truncates at the smaller of that and the limit it is given.
+    max_tokens: 256,
     memory_chars: 800,
     query_prefix: "",
     document_prefix: "",
@@ -403,10 +403,10 @@ impl ModelSpec {
     }
 
     /// Roughly the most characters the model reads before `max_tokens` cuts
-    /// the rest off. Assumes 3 characters per token, the low end for code, so
-    /// for prose it errs short.
+    /// the rest off, at about 4 characters per token. English prose runs near
+    /// that; code tokenizes denser, so for code it errs long.
     pub fn max_chars(&self) -> usize {
-        self.max_tokens * 3
+        self.max_tokens * 4
     }
 
     /// The model's files, pinned, for download.
