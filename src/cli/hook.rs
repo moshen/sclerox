@@ -1064,21 +1064,34 @@ fn distill_chunked(
             // replaces what a human wrote. The rewrite may still be a real
             // correction, so keep it under a sibling key and flag the pair for
             // review, as for any match too risky to merge automatically.
-            let hand_written = db
-                .memory_get(&m.key)
-                .ok()
-                .flatten()
-                .filter(|e| e.status == "active" && e.source == "manual");
+            // Every write below is also guarded (`*_unless_manual`), so a
+            // `memory set` racing this lookup can't be overwritten either.
+            let existing = match db.memory_get(&m.key) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!(
+                        "memory '{}' skipped: looking up its key failed: {e:#}",
+                        m.key
+                    );
+                    continue;
+                }
+            };
+            let hand_written = existing.filter(|e| e.status == "active" && e.source == "manual");
             if let Some(hand) = hand_written {
                 if hand.value.trim() == m.value.trim() {
                     continue;
                 }
-                let alt = distilled_sibling_key(db, &m.key);
-                match db.memory_set_full(&alt, &m.value, &m.memory_type, None, source) {
-                    Ok(new_id) => {
-                        if !db.memory_is_distinct(new_id, hand.id).unwrap_or(false) {
-                            let _ = db.memory_conflict_add(new_id, hand.id, None);
-                        }
+                let alt = distilled_sibling_key(db, &m.key, hand.id);
+                match db.memory_set_unless_manual(&alt, &m.value, &m.memory_type, None, source) {
+                    Ok(None) => log::info!(
+                        "memory '{}' is hand-written and so is '{alt}' now; distilled rewrite \
+                         not applied",
+                        m.key
+                    ),
+                    Ok(Some(new_id)) => {
+                        // Never distinct from the original: the sibling pick
+                        // skips any key marked so.
+                        let _ = db.memory_conflict_add(new_id, hand.id, None);
                         if let Some(v) = &emb {
                             let _ = db.memory_set_embedding(&alt, v);
                         }
@@ -1132,12 +1145,15 @@ fn distill_chunked(
             // existed, which is the whole signal `supersedes` carries.
             let claims_self = m.supersedes.as_deref() == Some(m.key.as_str());
             if claims_self {
-                log::info!("memory '{}' rewritten in place (declared itself)", m.key);
-                let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
-                if let Some(v) = &emb {
-                    let _ = db.memory_set_embedding(&m.key, v);
+                if let Ok(Some(_)) =
+                    db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
+                {
+                    log::info!("memory '{}' rewritten in place (declared itself)", m.key);
+                    if let Some(v) = &emb {
+                        let _ = db.memory_set_embedding(&m.key, v);
+                    }
+                    stored += 1;
                 }
-                stored += 1;
                 continue;
             }
 
@@ -1177,19 +1193,31 @@ fn distill_chunked(
                 })
                 .collect();
 
-            match decide_dedup_action(declared, &candidates, merge_threshold) {
-                DedupAction::Insert => {
-                    let _ = db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source);
-                }
+            let written = match decide_dedup_action(declared, &candidates, merge_threshold) {
+                DedupAction::Insert => matches!(
+                    db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source),
+                    Ok(Some(_))
+                ),
                 DedupAction::Merge(old_key) => {
-                    let _ = db.memory_supersede(&old_key, &m.key, &m.value, &m.memory_type, source);
-                    log::info!("memory '{}' merged into '{old_key}'", m.key);
+                    let merged = db
+                        .memory_supersede_unless_manual(
+                            &old_key,
+                            &m.key,
+                            &m.value,
+                            &m.memory_type,
+                            source,
+                        )
+                        .unwrap_or(false);
+                    if merged {
+                        log::info!("memory '{}' merged into '{old_key}'", m.key);
+                    }
+                    merged
                 }
                 DedupAction::Flag => {
                     // Genuinely ambiguous, or the only matches are hand-written:
                     // store and flag rather than guess which side should win.
-                    if let Ok(new_id) =
-                        db.memory_set_full(&m.key, &m.value, &m.memory_type, None, source)
+                    if let Ok(Some(new_id)) =
+                        db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
                     {
                         for sm in near_dups.iter().filter(|sm| {
                             !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
@@ -1203,8 +1231,17 @@ fn distill_chunked(
                             m.key,
                             near_dups.len()
                         );
+                        true
+                    } else {
+                        false
                     }
                 }
+            };
+            // A guarded write that found a hand-written row stored nothing, so
+            // its vector must not land on that row either.
+            if !written {
+                log::info!("memory '{}' not stored (key is hand-written)", m.key);
+                continue;
             }
             // Persist the embedding for the (possibly new) key.
             if let Some(v) = &emb {
@@ -1427,24 +1464,27 @@ fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(turns)
 }
 
-/// Key for a distilled rewrite of the hand-written memory `key`:
-/// `<key>-distilled`, or `-distilled-2`, `-3`, ... when that is itself
-/// hand-written. A sibling the distiller wrote earlier is reused, so repeated
-/// rewrites of one fact update a single entry instead of piling up.
-fn distilled_sibling_key(db: &Database, key: &str) -> String {
-    let is_hand_written = |k: &str| {
-        db.memory_get(k)
-            .ok()
-            .flatten()
-            .is_some_and(|e| e.status == "active" && e.source == "manual")
+/// Key for a distilled rewrite of the hand-written memory `key` (row
+/// `hand_id`): `<key>-distilled`, or `-distilled-2`, `-3`, ... when that one
+/// is taken. A sibling the distiller wrote earlier is reused, so repeated
+/// rewrites of one fact update a single entry instead of piling up. Taken
+/// means hand-written, or marked distinct from the original: that judgement
+/// says the sibling is a separate fact, which a rewrite must not replace.
+fn distilled_sibling_key(db: &Database, key: &str, hand_id: i64) -> String {
+    let usable = |k: &str| match db.memory_get(k) {
+        Ok(Some(e)) if e.status == "active" => {
+            e.source != "manual" && !db.memory_is_distinct(e.id, hand_id).unwrap_or(true)
+        }
+        Ok(_) => true,
+        Err(_) => false,
     };
     let base = format!("{key}-distilled");
-    if !is_hand_written(&base) {
+    if usable(&base) {
         return base;
     }
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|k| !is_hand_written(k))
+        .find(|k| usable(k))
         .expect("unbounded range always yields a free key")
 }
 
@@ -1814,13 +1854,20 @@ mod tests {
     }
 
     #[test]
-    fn test_distilled_sibling_key_skips_hand_written_keys() {
+    fn test_distilled_sibling_key_skips_hand_written_and_distinct_keys() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled");
+        let hand = db.memory_set("k", "original", "project", None).unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled");
         // The distiller's own earlier sibling is reused.
-        db.memory_set_full("k-distilled", "v", "project", None, "session")
+        let sib = db
+            .memory_set_full("k-distilled", "v", "project", None, "session")
             .unwrap();
-        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled");
+        assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled");
+        // Unless a human said it is a different fact from the original.
+        db.memory_distinct_add(sib, hand, None).unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled-2");
+        db.memory_distinct_remove(sib, hand).unwrap();
+        assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled");
         // A hand-written one is not.
         db.conn
             .execute(
@@ -1828,7 +1875,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(distilled_sibling_key(&db, "k"), "k-distilled-2");
+        assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled-2");
     }
 
     #[test]

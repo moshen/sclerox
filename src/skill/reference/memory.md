@@ -39,9 +39,11 @@ winner or staling it; the pair leaves the list as soon as either side is
 not active.
 
 When a session restates a hand-written memory differently, distillation
-never rewrites it: the new wording goes to `<key>-distilled` and is flagged
-against the original. If it is a real correction, `memory set` the original
-with the corrected value; either way, then stale the `-distilled` entry.
+never rewrites it: the new wording goes to a sibling key, usually
+`<key>-distilled` (`-distilled-2` and so on when that key is hand-written
+or marked distinct), and is flagged against the original. Take the sibling's
+exact key from `memory conflicts`. If it is a real correction, `memory set`
+the original with the corrected value; either way, then stale that sibling.
 
 Resolving by merging or staling assumes the pair IS a duplicate. When it is
 not - two genuinely different facts that happen to read alike - say so instead:
