@@ -1082,15 +1082,24 @@ fn distill_chunked(
                     continue;
                 }
                 let alt = distilled_sibling_key(db, &m.key, hand.id);
-                match db.memory_set_unless_manual(&alt, &m.value, &m.memory_type, None, source) {
+                // The pick already skips hand-written and distinct siblings;
+                // the write re-checks both, so a `memory set` or `memory
+                // distinct add` landing in between still wins. No retry on a
+                // lost race: the next session's distillation tries again.
+                match db.memory_set_unless_manual_or_distinct(
+                    &alt,
+                    &m.value,
+                    &m.memory_type,
+                    source,
+                    hand.id,
+                ) {
                     Ok(None) => log::info!(
-                        "memory '{}' is hand-written and so is '{alt}' now; distilled rewrite \
-                         not applied",
+                        "memory '{}' is hand-written; its sibling '{alt}' became hand-written \
+                         or was marked distinct meanwhile, so the distilled rewrite was not applied",
                         m.key
                     ),
                     Ok(Some(new_id)) => {
-                        // Never distinct from the original: the sibling pick
-                        // skips any key marked so.
+                        // Not distinct from the original: the write checked.
                         let _ = db.memory_conflict_add(new_id, hand.id, None);
                         if let Some(v) = &emb {
                             let _ = db.memory_set_embedding(&alt, v);
@@ -1145,14 +1154,16 @@ fn distill_chunked(
             // existed, which is the whole signal `supersedes` carries.
             let claims_self = m.supersedes.as_deref() == Some(m.key.as_str());
             if claims_self {
-                if let Ok(Some(_)) =
-                    db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
-                {
-                    log::info!("memory '{}' rewritten in place (declared itself)", m.key);
-                    if let Some(v) = &emb {
-                        let _ = db.memory_set_embedding(&m.key, v);
+                match db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source) {
+                    Ok(Some(_)) => {
+                        log::info!("memory '{}' rewritten in place (declared itself)", m.key);
+                        if let Some(v) = &emb {
+                            let _ = db.memory_set_embedding(&m.key, v);
+                        }
+                        stored += 1;
                     }
-                    stored += 1;
+                    Ok(None) => log::info!("memory '{}' not stored: key is hand-written", m.key),
+                    Err(e) => log::warn!("storing memory '{}' failed: {e:#}", m.key),
                 }
                 continue;
             }
@@ -1193,55 +1204,73 @@ fn distill_chunked(
                 })
                 .collect();
 
-            let written = match decide_dedup_action(declared, &candidates, merge_threshold) {
-                DedupAction::Insert => matches!(
-                    db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source),
-                    Ok(Some(_))
-                ),
-                DedupAction::Merge(old_key) => {
-                    let merged = db
-                        .memory_supersede_unless_manual(
+            // Ok(None): stored. Ok(Some(why)): a guarded write refused and
+            // stored nothing. Err: the write failed.
+            let outcome: Result<Option<&str>> =
+                match decide_dedup_action(declared, &candidates, merge_threshold) {
+                    DedupAction::Insert => db
+                        .memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
+                        .map(|id| id.is_none().then_some("key is hand-written")),
+                    DedupAction::Merge(old_key) => {
+                        let merged = db.memory_supersede_unless_manual(
                             &old_key,
                             &m.key,
                             &m.value,
                             &m.memory_type,
                             source,
-                        )
-                        .unwrap_or(false);
-                    if merged {
-                        log::info!("memory '{}' merged into '{old_key}'", m.key);
-                    }
-                    merged
-                }
-                DedupAction::Flag => {
-                    // Genuinely ambiguous, or the only matches are hand-written:
-                    // store and flag rather than guess which side should win.
-                    if let Ok(Some(new_id)) =
-                        db.memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
-                    {
-                        for sm in near_dups.iter().filter(|sm| {
-                            !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
-                        }) {
-                            let _ =
-                                db.memory_conflict_add(new_id, sm.entry.id, Some(sm.score as f64));
-                        }
-                        log::info!(
-                            "memory '{}' near-duplicates {} existing entries; flagged in \
-                             memory_conflicts for review",
-                            m.key,
-                            near_dups.len()
                         );
-                        true
-                    } else {
-                        false
+                        if let Ok(true) = merged {
+                            log::info!("memory '{}' merged into '{old_key}'", m.key);
+                        }
+                        merged.map(|ok| {
+                            (!ok).then_some("merge target no longer active, or key is hand-written")
+                        })
                     }
+                    DedupAction::Flag => {
+                        // Genuinely ambiguous, or the only matches are hand-written:
+                        // store and flag rather than guess which side should win.
+                        match db.memory_set_unless_manual(
+                            &m.key,
+                            &m.value,
+                            &m.memory_type,
+                            None,
+                            source,
+                        ) {
+                            Ok(Some(new_id)) => {
+                                for sm in near_dups.iter().filter(|sm| {
+                                    !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
+                                }) {
+                                    let _ = db.memory_conflict_add(
+                                        new_id,
+                                        sm.entry.id,
+                                        Some(sm.score as f64),
+                                    );
+                                }
+                                log::info!(
+                                    "memory '{}' near-duplicates {} existing entries; flagged \
+                                     in memory_conflicts for review",
+                                    m.key,
+                                    near_dups.len()
+                                );
+                                Ok(None)
+                            }
+                            Ok(None) => Ok(Some("key is hand-written")),
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+            // Nothing stored means no vector either: on a refused write the
+            // active row is someone else's, and must not get this value's.
+            match outcome {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    log::info!("memory '{}' not stored: {why}", m.key);
+                    continue;
                 }
-            };
-            // A guarded write that found a hand-written row stored nothing, so
-            // its vector must not land on that row either.
-            if !written {
-                log::info!("memory '{}' not stored (key is hand-written)", m.key);
-                continue;
+                Err(e) => {
+                    log::warn!("storing memory '{}' failed: {e:#}", m.key);
+                    continue;
+                }
             }
             // Persist the embedding for the (possibly new) key.
             if let Some(v) = &emb {

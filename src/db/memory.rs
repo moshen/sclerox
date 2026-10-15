@@ -71,7 +71,7 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
     ) -> Result<i64> {
-        self.memory_upsert(key, value, memory_type, tags, source, false)
+        self.memory_upsert(key, value, memory_type, tags, source, false, None)
             .map(|id| id.expect("an unguarded upsert always writes"))
     }
 
@@ -87,9 +87,34 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
     ) -> Result<Option<i64>> {
-        self.memory_upsert(key, value, memory_type, tags, source, true)
+        self.memory_upsert(key, value, memory_type, tags, source, true, None)
     }
 
+    /// [`memory_set_unless_manual`](Self::memory_set_unless_manual) that also
+    /// leaves `key` alone when its active row has been marked distinct from
+    /// row `original_id`. Used for a distilled rewrite's sibling key: a sibling
+    /// a human called a separate fact must not be overwritten, even by a mark
+    /// committed after the caller picked the key.
+    pub fn memory_set_unless_manual_or_distinct(
+        &self,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        source: &str,
+        original_id: i64,
+    ) -> Result<Option<i64>> {
+        self.memory_upsert(
+            key,
+            value,
+            memory_type,
+            None,
+            source,
+            true,
+            Some(original_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn memory_upsert(
         &self,
         key: &str,
@@ -98,26 +123,43 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
         protect_manual: bool,
+        distinct_from: Option<i64>,
     ) -> Result<Option<i64>> {
         let tags_json = tags.map(|t| serde_json::to_string(t).unwrap());
-        let written = self.conn.execute(
-            &format!(
-                "INSERT INTO memory (key, value, memory_type, tags, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
-                   value      = excluded.value,
-                   memory_type = excluded.memory_type,
-                   tags       = excluded.tags,
-                   updated_at = datetime('now')
-                 {}",
-                if protect_manual {
-                    "WHERE memory.source != 'manual'"
-                } else {
-                    ""
-                }
-            ),
-            params![key, value, memory_type, tags_json, source],
-        )?;
+        let mut guards = Vec::new();
+        if protect_manual {
+            guards.push("memory.source != 'manual'");
+        }
+        if distinct_from.is_some() {
+            guards.push(
+                "NOT EXISTS (SELECT 1 FROM memory_distinct d
+                             WHERE d.lo_id = MIN(memory.id, ?6) AND d.hi_id = MAX(memory.id, ?6))",
+            );
+        }
+        let sql = format!(
+            "INSERT INTO memory (key, value, memory_type, tags, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
+               value      = excluded.value,
+               memory_type = excluded.memory_type,
+               tags       = excluded.tags,
+               updated_at = datetime('now')
+             {}",
+            if guards.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", guards.join(" AND "))
+            }
+        );
+        let written = match distinct_from {
+            Some(original) => self.conn.execute(
+                &sql,
+                params![key, value, memory_type, tags_json, source, original],
+            )?,
+            None => self
+                .conn
+                .execute(&sql, params![key, value, memory_type, tags_json, source])?,
+        };
         if written == 0 {
             return Ok(None);
         }
@@ -940,6 +982,52 @@ mod tests {
         assert_eq!(db.memory_get("auto").unwrap().unwrap().value, "v2");
         assert!(db
             .memory_set_unless_manual("fresh", "v", "project", None, "session")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_sibling_write_leaves_a_distinct_marked_row_alone() {
+        let db = Database::open_in_memory().unwrap();
+        let original = db.memory_set("k", "original", "project", None).unwrap();
+        let sib = db
+            .memory_set_full("k-distilled", "curated", "project", None, "session")
+            .unwrap();
+
+        // Not marked: the sibling is updated as usual.
+        assert_eq!(
+            db.memory_set_unless_manual_or_distinct(
+                "k-distilled",
+                "v2",
+                "project",
+                "session",
+                original
+            )
+            .unwrap(),
+            Some(sib)
+        );
+        // Marked distinct (in either order): left alone.
+        db.memory_distinct_add(original, sib, None).unwrap();
+        assert!(db
+            .memory_set_unless_manual_or_distinct(
+                "k-distilled",
+                "v3",
+                "project",
+                "session",
+                original
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(db.memory_get("k-distilled").unwrap().unwrap().value, "v2");
+        // A new key has no row to protect.
+        assert!(db
+            .memory_set_unless_manual_or_distinct(
+                "k-distilled-2",
+                "v",
+                "project",
+                "session",
+                original
+            )
             .unwrap()
             .is_some());
     }

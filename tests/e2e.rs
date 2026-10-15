@@ -289,8 +289,15 @@ fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
     )
     .unwrap();
 
+    // USERPROFILE is the home variable on Windows, where HOME alone is
+    // ignored and the transcript under the temp home would never be found.
+    // The response path goes through shlex and then sh, so give it forward
+    // slashes: Git's sh on Windows accepts them, and no backslash is read as
+    // an escape on the way.
+    let resp_arg = resp.display().to_string().replace('\\', "/");
     e.cmd()
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("XDG_STATE_HOME", home.join(".state"))
         .env("SCLEROX_EMBED_ENABLED", "false")
@@ -300,7 +307,7 @@ fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
             "--session-id",
             "S",
             "--via",
-            &format!("sh -c 'cat \"{}\"' sh", resp.display()),
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
         ])
         .assert()
         .success();
