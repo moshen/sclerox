@@ -64,6 +64,15 @@ pub fn serve(
     }
     runs.prune()?;
 
+    // Before loading the model, so a server that couldn't listen fails fast.
+    let name = match socket_name(spec) {
+        Ok(name) => name,
+        Err(e) => {
+            let e = anyhow::Error::new(e).context("no usable model server socket");
+            let _ = runs.failed(run_id, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
     let model = match crate::embed::load_model(spec) {
         Ok(m) => m,
         Err(e) => {
@@ -74,7 +83,6 @@ pub fn serve(
     let loaded_mb = rss_mb();
     runs.loaded(run_id, loaded_mb)?;
 
-    let name = socket_name(spec)?;
     // The lock says no live server owns the name, so a socket file left by
     // one that crashed can go.
     let listener = ListenerOptions::new()

@@ -7,9 +7,10 @@
 //! running, another build, a dropped connection - falls back to loading the
 //! model in-process, as every command did before the server existed.
 //!
-//! Each model gets its own socket and lock in the state directory
-//! (`server-<model>.sock` / `.lock`), so sessions configured for different
-//! models never replace each other's server.
+//! Each model gets its own socket (see `socket_path`; a named pipe on
+//! Windows) and its own lock, `server-<model>.lock` in the state directory,
+//! so sessions configured for different models never replace each other's
+//! server.
 
 pub mod protocol;
 pub mod runs;
@@ -58,8 +59,11 @@ pub fn mode() -> Mode {
 
 /// How long a command waits for a server it started to load the model.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a command waits for a reply before giving up on the server.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a command waits for the server to answer an embed request
+/// before giving up on it and embedding in-process.
+const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a command waits for anything else: the handshake, status, stop.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Texts per embed request, so a long bulk job doesn't hold the model for
 /// minutes while other commands wait to embed a query.
 const TEXTS_PER_REQUEST: usize = 16;
@@ -68,7 +72,7 @@ const TEXTS_PER_REQUEST: usize = 16;
 const MAX_RECENT_FAILURES: usize = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// `$XDG_STATE_HOME/sclerox`: the socket, lock and `server.db` live here.
+/// `$XDG_STATE_HOME/sclerox`: the locks and `server.db` live here.
 fn state_dir() -> PathBuf {
     crate::xdg::state_home().join("sclerox")
 }
@@ -82,59 +86,52 @@ fn lock_path(spec: &ModelSpec) -> PathBuf {
     state_dir().join(format!("server-{}.lock", spec.name))
 }
 
-/// Whether this OS lets a listener create its socket owner-only. Linux
-/// does; where it doesn't (macOS), the socket goes in a private directory
-/// instead, which keeps other users out the same way.
+/// Whether this OS lets a listener create its socket owner-only (macOS
+/// doesn't). Either way the socket's directory is private; this is a second
+/// lock on the door where it's available.
 #[cfg(unix)]
 pub(super) const SOCKET_MODE_SUPPORTED: bool =
     cfg!(any(target_os = "linux", target_os = "android"));
 
-/// A Unix socket file: in the state directory when the socket itself can be
-/// owner-only and the path fits (about 100 bytes), else in
-/// [`private_socket_dir`].
+/// The Unix socket file, `$XDG_STATE_HOME/sclerox/run/<model>.sock`, in a
+/// directory only this user can enter.
 #[cfg(unix)]
 fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
     // sun_path is 104 bytes on macOS and 108 on Linux, including the NUL.
     const MAX_PATH: usize = 103;
-    let dir = state_dir();
-    let path = dir.join(format!("server-{}.sock", spec.name));
-    if SOCKET_MODE_SUPPORTED && path.as_os_str().len() <= MAX_PATH {
-        return Ok(path);
-    }
-    let path = private_socket_dir()?.join(format!("{}-{}.sock", dir_hash(&dir), spec.name));
+    let path = private_dir(&state_dir().join("run"))?.join(format!("{}.sock", spec.name));
     if path.as_os_str().len() > MAX_PATH {
         return Err(std::io::Error::other(format!(
-            "no socket path short enough for {}",
+            "socket path {} is over the {MAX_PATH}-byte limit",
             path.display()
         )));
     }
     Ok(path)
 }
 
-/// `$XDG_RUNTIME_DIR/sclerox`, else `sclerox-<uid>` in the temp directory,
-/// created owner-only. An existing directory must be ours and private.
+/// Create `dir` owner-only if it's missing, and check that it is a
+/// directory of this user's that no one else can enter.
 #[cfg(unix)]
-fn private_socket_dir() -> std::io::Result<PathBuf> {
+fn private_dir(dir: &std::path::Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    // SAFETY: getuid cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d).join("sclerox"),
-        _ => std::env::temp_dir().join(format!("sclerox-{uid}")),
-    };
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    let meta = std::fs::symlink_metadata(&dir)?;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err(std::io::Error::other(format!(
             "{} is not a private directory of this user",
             dir.display()
         )));
     }
-    Ok(dir)
+    Ok(dir.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -146,6 +143,7 @@ fn socket_name(spec: &ModelSpec) -> std::io::Result<Name<'static>> {
 }
 
 /// A short stand-in for a directory path in names that can't hold the path.
+#[cfg(windows)]
 fn dir_hash(dir: &std::path::Path) -> String {
     use sha2::Digest;
     let hash = hex::encode(sha2::Sha256::digest(dir.to_string_lossy().as_bytes()));
@@ -164,8 +162,23 @@ fn socket_name(spec: &ModelSpec) -> std::io::Result<Name<'static>> {
 
 /// A connection to a running server, past the handshake.
 pub struct Client {
-    stream: Stream,
+    /// `None` once a call has timed out: its thread still owns the stream.
+    stream: Option<Stream>,
 }
+
+/// A server that didn't reply in time. Unlike a closed connection, this
+/// means a server is there but stuck, so starting another would only wait
+/// on its lock.
+#[derive(Debug)]
+struct TimedOut(Duration);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model server didn't reply within {}s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for TimedOut {}
 
 /// What a connection attempt found.
 enum Found {
@@ -178,27 +191,31 @@ enum Found {
 
 impl Client {
     fn connect(spec: &ModelSpec) -> Result<Found> {
-        let stream = match Stream::connect(socket_name(spec)?) {
+        // No usable socket path means no server could have started either.
+        let name = match socket_name(spec) {
+            Ok(name) => name,
+            Err(e) => {
+                log::debug!("no model server socket for {}: {e}", spec.name);
+                return Ok(Found::Absent);
+            }
+        };
+        let stream = match Stream::connect(name) {
             Ok(s) => s,
             Err(e) => {
                 log::trace!("no model server for {}: {e}", spec.name);
                 return Ok(Found::Absent);
             }
         };
-        // Windows named pipes have no timeouts; there a hung server hangs
-        // the command, as a hung in-process model would.
-        if let Err(e) = stream.set_recv_timeout(Some(REPLY_TIMEOUT)) {
-            if e.kind() != std::io::ErrorKind::Unsupported || !cfg!(windows) {
-                return Err(e.into());
-            }
-        }
-        let mut client = Client { stream };
+        let mut client = Client {
+            stream: Some(stream),
+        };
         let hello = Request::Hello {
             build: Build::current(),
             model_id: spec.id.to_string(),
         };
-        let reply = match client.call(&hello) {
+        let reply = match client.call(&hello, REPLY_TIMEOUT) {
             Ok(reply) => reply,
+            Err(e) if e.is::<TimedOut>() => return Err(e),
             // Accepted and dropped: the server is on its way out.
             Err(e) => {
                 log::debug!(
@@ -223,9 +240,32 @@ impl Client {
         }
     }
 
-    fn call(&mut self, req: &Request) -> Result<Response> {
-        write_msg(&mut self.stream, req).context("model server write failed")?;
-        read_msg(&mut self.stream).context("model server read failed")
+    /// Send `req` and wait up to `timeout` for the reply. The exchange runs on
+    /// its own thread because Windows named pipes have no read timeout; on
+    /// timeout that thread is left blocked and the connection abandoned.
+    fn call(&mut self, req: &Request, timeout: Duration) -> Result<Response> {
+        let mut stream = self
+            .stream
+            .take()
+            .context("model server connection was abandoned after a timeout")?;
+        let mut frame = Vec::new();
+        write_msg(&mut frame, req)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reply = std::io::Write::write_all(&mut stream, &frame)
+                .and_then(|()| read_msg::<Response>(&mut stream));
+            let _ = tx.send((stream, reply));
+        });
+        match rx.recv_timeout(timeout) {
+            Ok((stream, reply)) => {
+                self.stream = Some(stream);
+                reply.context("model server connection failed")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TimedOut(timeout).into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("model server call ended without a reply")
+            }
+        }
     }
 
     /// Embed texts exactly as given, in requests of at most
@@ -236,7 +276,7 @@ impl Client {
             let req = Request::Embed {
                 texts: batch.to_vec(),
             };
-            match self.call(&req)? {
+            match self.call(&req, EMBED_TIMEOUT)? {
                 Response::Vectors(v) if v.len() == batch.len() => vectors.extend(v),
                 Response::Vectors(v) => {
                     bail!(
@@ -253,14 +293,14 @@ impl Client {
     }
 
     pub fn status(&mut self) -> Result<ServerStatus> {
-        match self.call(&Request::Status)? {
+        match self.call(&Request::Status, REPLY_TIMEOUT)? {
             Response::Status(s) => Ok(s),
             other => bail!("unexpected reply to status: {other:?}"),
         }
     }
 
     fn shutdown(mut self, reason: ExitReason) -> Result<()> {
-        match self.call(&Request::Shutdown { reason })? {
+        match self.call(&Request::Shutdown { reason }, REPLY_TIMEOUT)? {
             Response::Stopping => Ok(()),
             other => bail!("unexpected reply to shutdown: {other:?}"),
         }
@@ -309,6 +349,13 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
 fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
     if !super::is_downloaded(spec) {
         log::debug!("{} not downloaded yet; not starting a server", spec.name);
+        return Ok(None);
+    }
+    if let Err(e) = socket_name(spec) {
+        if explicit {
+            return Err(e).context("can't start a model server");
+        }
+        log::debug!("no model server socket for {}: {e}", spec.name);
         return Ok(None);
     }
     let failures = runs::Runs::open(&runs_path())?.recent_failures(spec.name, FAILURE_WINDOW)?;
