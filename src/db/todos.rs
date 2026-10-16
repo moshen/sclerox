@@ -354,15 +354,6 @@ impl Database {
 
     // ---------- embeddings ----------
 
-    /// Every todo's (id, title, notes), the text its chunks are cut from.
-    pub fn todo_chunk_inputs(&self) -> Result<Vec<(i64, String, Option<String>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, title, notes FROM todos ORDER BY id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     pub fn todo_store_chunks(
         &self,
         todo_id: i64,

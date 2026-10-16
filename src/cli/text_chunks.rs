@@ -5,7 +5,7 @@
 
 use crate::config::settings;
 use crate::db::reembed::{EmbedFn, ProgressFn};
-use crate::db::{Database, ItemChunks, TextChunkKind};
+use crate::db::{Database, ItemChunks, ReplacedTextChunks, TextChunkKind};
 use crate::embed::chunk_text;
 use anyhow::Result;
 
@@ -30,45 +30,45 @@ pub fn note(db: &Database) {
 }
 
 /// A meeting's chunks come from its transcript, or its notes without one.
-pub fn meeting_source<'a>(transcript: Option<&'a str>, notes: Option<&'a str>) -> &'a str {
-    transcript.filter(|t| !t.is_empty()).or(notes).unwrap_or("")
+pub fn meeting_source(transcript: Option<&str>, notes: Option<&str>) -> String {
+    TextChunkKind::Meeting.source_text(transcript, notes)
 }
 
 /// A todo's chunks come from its title, then its notes.
 pub fn todo_source(title: &str, notes: Option<&str>) -> String {
-    match notes {
-        Some(n) if !n.trim().is_empty() => format!("{title}\n\n{n}"),
-        _ => title.to_string(),
-    }
+    TextChunkKind::Todo.source_text(Some(title), notes)
 }
 
 /// An investigation's chunks come from its plan, then its findings.
 pub fn research_source(plan: Option<&str>, findings: Option<&str>) -> String {
-    [plan, findings]
-        .into_iter()
-        .flatten()
-        .filter(|t| !t.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    TextChunkKind::Research.source_text(plan, findings)
 }
 
 /// Whether stored chunks were cut by another chunker than the configured one.
-/// A database without chunks has nothing recorded and nothing to re-cut.
+/// Chunks with no record count as stale (recording after a write can fail);
+/// a database without chunks has nothing to re-cut.
 pub fn stale(db: &Database) -> bool {
-    matches!(db.text_chunker(), Ok(Some(recorded)) if recorded != signature())
+    match db.text_chunker() {
+        Ok(Some(recorded)) => recorded != signature(),
+        Ok(None) => db.has_text_chunks().unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
-/// How many items of each kind [`rechunk_all`] re-cut, and into how many chunks.
+/// How many items of each kind [`rechunk_all`] re-cut, into how many chunks,
+/// and what changed under it.
 pub struct Rechunked {
     pub meetings: usize,
     pub todos: usize,
     pub research: usize,
     pub chunks: usize,
+    pub replaced: ReplacedTextChunks,
 }
 
 /// Re-cut every meeting, todo and investigation from its stored text, then
 /// swap the new chunks and the chunker record in with one transaction, so a
-/// failure changes nothing.
+/// failure changes nothing. An item edited or deleted meanwhile is handled in
+/// the swap; see [`Database::replace_text_chunks`].
 ///
 /// With `embed`, the new chunks are embedded before the swap and search never
 /// sees them without a vector. Without it (the database is on another model
@@ -79,31 +79,22 @@ pub fn rechunk_all(
     progress: &mut ProgressFn<'_>,
 ) -> Result<Rechunked> {
     let mut items = Vec::new();
-    let mut push = |kind, id, text: &str| {
-        let chunks = if text.trim().is_empty() {
-            Vec::new()
-        } else {
-            chunk(text).into_iter().map(|c| (c, None)).collect()
-        };
-        items.push(ItemChunks { kind, id, chunks });
-    };
-    let meetings = db.meeting_chunk_inputs()?;
-    for (id, transcript, notes) in &meetings {
-        let text = meeting_source(transcript.as_deref(), notes.as_deref());
-        push(TextChunkKind::Meeting, *id, text);
-    }
-    let todos = db.todo_chunk_inputs()?;
-    for (id, title, notes) in &todos {
-        push(
-            TextChunkKind::Todo,
-            *id,
-            &todo_source(title, notes.as_deref()),
-        );
-    }
-    let research = db.investigation_chunk_inputs()?;
-    for (id, plan, findings) in &research {
-        let text = research_source(plan.as_deref(), findings.as_deref());
-        push(TextChunkKind::Research, *id, &text);
+    let mut counts = [0usize; 3];
+    for (n, kind) in counts.iter_mut().zip(TextChunkKind::ALL) {
+        for (id, source) in db.text_chunk_sources(kind)? {
+            let chunks = if source.trim().is_empty() {
+                Vec::new()
+            } else {
+                chunk(&source).into_iter().map(|c| (c, None)).collect()
+            };
+            items.push(ItemChunks {
+                kind,
+                id,
+                source,
+                chunks,
+            });
+            *n += 1;
+        }
     }
 
     let total: usize = items.iter().map(|i| i.chunks.len()).sum();
@@ -131,12 +122,14 @@ pub fn rechunk_all(
         }
     }
 
-    db.replace_text_chunks(&items, &signature())?;
+    let replaced = db.replace_text_chunks(&items, &signature(), &chunk)?;
+    let [meetings, todos, research] = counts;
     Ok(Rechunked {
-        meetings: meetings.len(),
-        todos: todos.len(),
-        research: research.len(),
+        meetings,
+        todos,
+        research,
         chunks: total,
+        replaced,
     })
 }
 
@@ -218,6 +211,28 @@ mod tests {
         assert_eq!(calls, 1, "one call per item");
     }
 
+    fn item(kind: TextChunkKind, id: i64, source: &str) -> ItemChunks {
+        ItemChunks {
+            kind,
+            id,
+            source: source.to_string(),
+            chunks: vec![(format!("new {source}"), None)],
+        }
+    }
+
+    #[test]
+    fn unrecorded_chunks_are_stale_and_no_chunks_are_not() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(!stale(&db));
+        let id = db.meeting_add("M", None, Some("text"), None).unwrap();
+        // Stored, but the record after it failed.
+        db.meeting_store_chunks(id, &[("text".into(), None)])
+            .unwrap();
+        assert!(stale(&db));
+        note(&db);
+        assert!(!stale(&db));
+    }
+
     #[test]
     fn a_failed_swap_keeps_every_old_chunk() {
         let db = Database::open_in_memory().unwrap();
@@ -226,23 +241,68 @@ mod tests {
             .unwrap();
         db.meeting_store_chunks(id, &[("old text".into(), None)])
             .unwrap();
-        db.set_meta(crate::embed::TEXT_CHUNKER_KEY, "v0").unwrap();
-        // The second item names a meeting that doesn't exist, so its insert
-        // fails after the first item was already replaced.
-        let items = [
-            ItemChunks {
-                kind: TextChunkKind::Meeting,
-                id,
-                chunks: vec![("new text".into(), None)],
-            },
-            ItemChunks {
-                kind: TextChunkKind::Meeting,
-                id: 999,
-                chunks: vec![("orphan".into(), None)],
-            },
-        ];
-        assert!(db.replace_text_chunks(&items, &signature()).is_err());
+        // Every item is replaced before the chunker record is written last;
+        // without the meta table that write fails.
+        db.conn.execute_batch("DROP TABLE meta").unwrap();
+        let items = [item(TextChunkKind::Meeting, id, "old text")];
+        assert!(db
+            .replace_text_chunks(&items, &signature(), &chunk)
+            .is_err());
         assert_eq!(meeting_chunks(&db, id), [("old text".to_string(), false)]);
-        assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
+    }
+
+    #[test]
+    fn the_swap_recuts_edited_items_and_skips_deleted_ones() {
+        let db = Database::open_in_memory().unwrap();
+        let edited = db
+            .meeting_add("Edited", None, Some("before"), None)
+            .unwrap();
+        let deleted = db.meeting_add("Deleted", None, Some("gone"), None).unwrap();
+        let same = db.meeting_add("Same", None, Some("same"), None).unwrap();
+        let items = [
+            item(TextChunkKind::Meeting, edited, "before"),
+            item(TextChunkKind::Meeting, deleted, "gone"),
+            item(TextChunkKind::Meeting, same, "same"),
+        ];
+        // Changed while the new chunks were being embedded.
+        db.conn
+            .execute(
+                "UPDATE meetings SET transcript = 'after' WHERE id = ?1",
+                [edited],
+            )
+            .unwrap();
+        db.meeting_delete(deleted).unwrap();
+
+        let replaced = db
+            .replace_text_chunks(&items, &signature(), &chunk)
+            .unwrap();
+        assert_eq!(replaced, ReplacedTextChunks { recut: 1, gone: 1 });
+        // Cut from the new text, left for the missing-vector fill.
+        assert_eq!(meeting_chunks(&db, edited), [("after".to_string(), false)]);
+        assert_eq!(meeting_chunks(&db, same), [("new same".to_string(), false)]);
+        assert_eq!(db.text_chunker().unwrap(), Some(signature()));
+    }
+
+    #[test]
+    fn an_edit_during_embedding_wins_over_the_old_text() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .meeting_add("Plan", None, Some("first draft"), None)
+            .unwrap();
+        db.set_meta(crate::embed::TEXT_CHUNKER_KEY, "v0").unwrap();
+        // The meeting is edited (as by another sclerox) while rechunk_all is
+        // embedding the chunks it cut from the first draft.
+        let mut embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            db.conn
+                .execute(
+                    "UPDATE meetings SET transcript = 'final text' WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+            Ok(texts.iter().map(|_| vec![0.5f32; 384]).collect())
+        };
+        let r = rechunk_all(&db, Some(&mut embed), &mut |_, _, _| {}).unwrap();
+        assert_eq!(r.replaced.recut, 1);
+        assert_eq!(meeting_chunks(&db, id), [("final text".to_string(), false)]);
     }
 }

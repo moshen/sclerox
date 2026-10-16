@@ -96,7 +96,7 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             // Chunk and optionally embed the combined text (transcript preferred).
             let text_to_chunk =
                 text_chunks::meeting_source(transcript.as_deref(), notes.as_deref());
-            store_chunks(db, id, text_to_chunk, no_embed)?;
+            store_chunks(db, id, &text_to_chunk, no_embed)?;
 
             println!("Added meeting #{id}: {title}");
         }

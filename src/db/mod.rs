@@ -37,9 +37,6 @@ pub fn register_vec_extension() {
     });
 }
 
-/// Rows of (id, first text, second text) that an item's chunks are cut from.
-pub type ChunkSources = Vec<(i64, Option<String>, Option<String>)>;
-
 /// Which table an item's text chunks live in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextChunkKind {
@@ -49,6 +46,8 @@ pub enum TextChunkKind {
 }
 
 impl TextChunkKind {
+    pub const ALL: [Self; 3] = [Self::Meeting, Self::Todo, Self::Research];
+
     /// (chunk table, column naming the item)
     fn table(self) -> (&'static str, &'static str) {
         match self {
@@ -57,16 +56,60 @@ impl TextChunkKind {
             Self::Research => ("investigation_chunks", "investigation_id"),
         }
     }
+
+    /// (item table, first source column, second source column)
+    fn source_columns(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Meeting => ("meetings", "transcript", "notes"),
+            Self::Todo => ("todos", "title", "notes"),
+            Self::Research => ("investigations", "plan", "findings"),
+        }
+    }
+
+    /// The text an item's chunks are cut from, given its two source columns:
+    /// a meeting's transcript, or its notes without one; a todo's title, then
+    /// its notes; an investigation's plan, then its findings.
+    pub fn source_text(self, first: Option<&str>, second: Option<&str>) -> String {
+        let present = |t: &Option<&str>| t.is_some_and(|t| !t.trim().is_empty());
+        match self {
+            Self::Meeting => {
+                let text = if first.is_some_and(|t| !t.is_empty()) {
+                    first
+                } else {
+                    second
+                };
+                text.unwrap_or("").to_string()
+            }
+            Self::Todo | Self::Research => [first, second]
+                .into_iter()
+                .filter(present)
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
 }
 
 /// The tables holding meeting, todo and research chunks.
 pub const TEXT_CHUNK_TABLES: [&str; 3] = ["meeting_chunks", "todo_chunks", "investigation_chunks"];
 
-/// One item's new text chunks, each with its vector when it has one.
+/// One item's new text chunks, each with its vector when it has one, and the
+/// source text they were cut from.
 pub struct ItemChunks {
     pub kind: TextChunkKind,
     pub id: i64,
+    pub source: String,
     pub chunks: Vec<(String, Option<Vec<f32>>)>,
+}
+
+/// What [`Database::replace_text_chunks`] did besides the planned swap.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReplacedTextChunks {
+    /// Items edited since their chunks were cut, re-cut from the new text
+    /// (without vectors).
+    pub recut: usize,
+    /// Items deleted since, skipped.
+    pub gone: usize,
 }
 
 pub struct Database {
@@ -167,11 +210,66 @@ impl Database {
         Ok(())
     }
 
+    /// Whether any meeting, todo or research chunk is stored.
+    pub fn has_text_chunks(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meeting_chunks)
+                 OR EXISTS (SELECT 1 FROM todo_chunks)
+                 OR EXISTS (SELECT 1 FROM investigation_chunks)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every item of `kind` with the text its chunks are cut from.
+    pub fn text_chunk_sources(&self, kind: TextChunkKind) -> Result<Vec<(i64, String)>> {
+        let (table, first, second) = kind.source_columns();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, {first}, {second} FROM {table} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            let (a, b): (Option<String>, Option<String>) = (r.get(1)?, r.get(2)?);
+            Ok((r.get(0)?, kind.source_text(a.as_deref(), b.as_deref())))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The text item `id`'s chunks are cut from now; `None` once it is deleted.
+    fn text_chunk_source(&self, kind: TextChunkKind, id: i64) -> Result<Option<String>> {
+        let (table, first, second) = kind.source_columns();
+        let row = self.conn.query_row(
+            &format!("SELECT {first}, {second} FROM {table} WHERE id = ?1"),
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        match row {
+            Ok((a, b)) => Ok(Some(kind.source_text(a.as_deref(), b.as_deref()))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Replace the text chunks of every item in `items` and record `signature`
     /// as the text chunker, all in one transaction: a failure leaves every
     /// item's old chunks, and the old record, in place. Vectors are kept only
     /// when the database may take them; see `write_with_vectors`.
-    pub fn replace_text_chunks(&self, items: &[ItemChunks], signature: &str) -> Result<()> {
+    ///
+    /// Items can change while their new chunks are embedded. Inside the
+    /// transaction, which holds off other writers, each item's source is read
+    /// again: one edited since is re-cut from its new text with `cut`, stored
+    /// without vectors for the missing-vector fill, and one deleted since is
+    /// skipped.
+    pub fn replace_text_chunks(
+        &self,
+        items: &[ItemChunks],
+        signature: &str,
+        cut: &dyn Fn(&str) -> Vec<String>,
+    ) -> Result<ReplacedTextChunks> {
         let wants_vectors = items
             .iter()
             .any(|item| item.chunks.iter().any(|(_, e)| e.is_some()));
@@ -181,8 +279,26 @@ impl Database {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        let mut replaced = ReplacedTextChunks::default();
         self.write_with_vectors(wants_vectors, |keep_vectors| {
             for item in items {
+                let recut;
+                let chunks = match self.text_chunk_source(item.kind, item.id)? {
+                    None => {
+                        replaced.gone += 1;
+                        continue;
+                    }
+                    Some(now) if now != item.source => {
+                        replaced.recut += 1;
+                        recut = if now.trim().is_empty() {
+                            Vec::new()
+                        } else {
+                            cut(&now).into_iter().map(|c| (c, None)).collect()
+                        };
+                        &recut
+                    }
+                    Some(_) => &item.chunks,
+                };
                 let (table, column) = item.kind.table();
                 self.conn.execute(
                     &format!("DELETE FROM {table} WHERE {column} = ?1"),
@@ -192,7 +308,7 @@ impl Database {
                     "INSERT INTO {table} ({column}, chunk_index, chunk_text, embedding)
                      VALUES (?1, ?2, ?3, ?4)"
                 ))?;
-                for (i, (text, emb)) in item.chunks.iter().enumerate() {
+                for (i, (text, emb)) in chunks.iter().enumerate() {
                     let emb_bytes = emb
                         .as_deref()
                         .filter(|_| keep_vectors)
@@ -203,7 +319,7 @@ impl Database {
             self.set_meta(crate::embed::TEXT_CHUNKER_KEY, signature)
         })?;
         tx.commit()?;
-        Ok(())
+        Ok(replaced)
     }
 
     /// The stored ID of the model that produced this database's vectors.
@@ -559,34 +675,8 @@ mod tests {
         assert_eq!(Database { conn }.embedding_model().unwrap(), None);
     }
 
-    fn db_at_v14(setup: &str) -> Connection {
-        let conn = db_at_v13("");
-        run_migrations(&conn, 13, PRIMARY_MIGRATIONS, 14).unwrap();
-        conn.execute_batch(setup).unwrap();
-        conn
-    }
-
-    #[test]
-    fn test_migration_v15_marks_existing_text_chunks() {
-        for setup in [
-            "INSERT INTO meetings (title, transcript) VALUES ('m', 't');
-             INSERT INTO meeting_chunks (meeting_id, chunk_index, chunk_text) VALUES (1, 0, 't');",
-            "INSERT INTO todos (title) VALUES ('t');
-             INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text) VALUES (1, 0, 't');",
-        ] {
-            let conn = db_at_v14(setup);
-            run_migrations(&conn, 14, PRIMARY_MIGRATIONS, 15).unwrap();
-            let db = Database { conn };
-            assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
-            // Recording at write time never replaces the mark.
-            db.note_text_chunker("v1:size=800:overlap=200").unwrap();
-            assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
-        }
-    }
-
     #[test]
     fn test_fresh_db_records_text_chunker_on_first_write() {
-        // A fresh database runs v15 too, and has no chunks to mark.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(db.text_chunker().unwrap(), None);
         db.note_text_chunker("v1:size=800:overlap=200").unwrap();

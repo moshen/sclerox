@@ -137,6 +137,18 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
                      at chunk_size {}, overlap {}",
                     r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
                 );
+                if r.replaced.recut > 0 {
+                    println!(
+                        "  {} item(s) edited meanwhile were cut from their new text",
+                        r.replaced.recut
+                    );
+                }
+                if r.replaced.gone > 0 {
+                    println!(
+                        "  {} item(s) deleted meanwhile were skipped",
+                        r.replaced.gone
+                    );
+                }
                 main_done = true;
                 text_chunks_embedded = !mismatched;
             }

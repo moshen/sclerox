@@ -240,7 +240,7 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
 const TEXT_CHUNKER_VERSION: u32 = 1;
 
 /// Meta key recording which chunker cut a database's meeting, todo and
-/// research chunks. Absent: no chunks yet. `v0`: cut before it was recorded.
+/// research chunks. Absent with chunks stored: cut before it was recorded.
 pub const TEXT_CHUNKER_KEY: &str = "text_chunker";
 
 /// The signature of [`chunk_text`] at these sizes, as recorded under
