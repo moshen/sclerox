@@ -125,6 +125,52 @@ fn memory_set_warns_but_stores_long_value() {
 }
 
 #[test]
+fn config_show_lists_only_real_env_overrides() {
+    let e = Env::new();
+    // Every one of these is copied into an env var at startup for library code.
+    std::fs::write(
+        &e.config,
+        "[embed]\nmodel = \"minilm-l6-v2\"\nenabled = false\nmemory_chars = 600\n\
+         [index]\nmax_file_bytes = 5000\nmax_files = 10\nchunk_chars = 1200\nchunk_lines = 20\n",
+    )
+    .unwrap();
+    let overrides = |out: &str| -> String {
+        out.lines()
+            .find(|l| l.starts_with("# env overrides active:"))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let out = e.run(&["config", "show"]);
+    assert!(out.contains("model = \"minilm-l6-v2\""), "got: {out}");
+    let line = overrides(&out);
+    for var in [
+        "SCLEROX_EMBED_MODEL",
+        "SCLEROX_EMBED_ENABLED",
+        "SCLEROX_EMBED_MEMORY_CHARS",
+        "SCLEROX_MAX_INDEX_FILE_BYTES",
+        "SCLEROX_MAX_INDEX_FILES",
+        "SCLEROX_CODE_CHUNK_CHARS",
+        "SCLEROX_CODE_CHUNK_LINES",
+    ] {
+        assert!(!line.contains(var), "{var} came from config.toml: {line}");
+    }
+
+    // A real env var is still reported.
+    let out = e
+        .cmd()
+        .env("SCLEROX_CODE_CHUNK_CHARS", "900")
+        .env("SCLEROX_MAX_INDEX_FILES", "20")
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    let line = overrides(&String::from_utf8_lossy(&out.stdout));
+    assert!(line.contains("SCLEROX_CODE_CHUNK_CHARS"), "{line}");
+    assert!(line.contains("SCLEROX_MAX_INDEX_FILES"), "{line}");
+    assert!(!line.contains("SCLEROX_EMBED_MODEL"), "{line}");
+}
+
+#[test]
 fn config_show_reflects_defaults_and_edits() {
     let e = Env::new();
 
