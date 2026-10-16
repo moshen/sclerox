@@ -384,6 +384,7 @@ fn spawn_detached(spec: &ModelSpec) -> Result<std::process::Child> {
         const ACCESS_DENIED: i32 = 5;
         let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
         cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+        let _held = windows_std::NotInherited::new();
         match cmd.spawn() {
             // The job doesn't allow breaking away; the server then ends with
             // it, and the next command starts another.
@@ -392,8 +393,73 @@ fn spawn_detached(spec: &ModelSpec) -> Result<std::process::Child> {
             }
             other => return other.context("failed to start the model server"),
         }
+        cmd.spawn().context("failed to start the model server")
     }
-    cmd.spawn().context("failed to start the model server")
+    #[cfg(not(windows))]
+    {
+        cmd.spawn().context("failed to start the model server")
+    }
+}
+
+/// Windows hands a child every inheritable handle of its parent, not just
+/// the stdio it is given. This command's own stdin, stdout and stderr are
+/// usually inheritable (it inherited them), so without this the server
+/// would hold the caller's pipes open, and whoever reads this command's
+/// output would wait until the server exits.
+#[cfg(windows)]
+mod windows_std {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE: -10, -11, -12.
+    const STD_HANDLES: [u32; 3] = [-10i32 as u32, -11i32 as u32, -12i32 as u32];
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetHandleInformation(handle: Handle, flags: *mut u32) -> i32;
+        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+    }
+
+    /// This process's inheritable std handles, made uninheritable until
+    /// dropped.
+    pub struct NotInherited(Vec<Handle>);
+
+    impl NotInherited {
+        pub fn new() -> Self {
+            let mut cleared = Vec::new();
+            for which in STD_HANDLES {
+                // SAFETY: plain Win32 calls on this process's own std
+                // handles; a missing or invalid handle just fails the call.
+                unsafe {
+                    let handle = GetStdHandle(which);
+                    if handle.is_null() || handle as isize == -1 {
+                        continue;
+                    }
+                    let mut flags = 0;
+                    if GetHandleInformation(handle, &mut flags) != 0
+                        && flags & HANDLE_FLAG_INHERIT != 0
+                        && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+                    {
+                        cleared.push(handle);
+                    }
+                }
+            }
+            Self(cleared)
+        }
+    }
+
+    impl Drop for NotInherited {
+        fn drop(&mut self) {
+            for &handle in &self.0 {
+                // SAFETY: as above; restores the flag cleared in `new`.
+                unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+                }
+            }
+        }
+    }
 }
 
 /// Wait for `spec`'s server to exit, which is when it releases its lock.
