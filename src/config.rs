@@ -587,6 +587,12 @@ impl Settings {
         if self.server.idle_minutes == 0 {
             eprintln!("warning: server.idle_minutes must be > 0; using default 15");
             self.server.idle_minutes = 15;
+        } else if self.server.idle_minutes > MAX_IDLE_MINUTES {
+            eprintln!(
+                "warning: server.idle_minutes = {} is over a week; using {MAX_IDLE_MINUTES}",
+                self.server.idle_minutes
+            );
+            self.server.idle_minutes = MAX_IDLE_MINUTES;
         }
 
         // Auto-index policy must be a recognised value; otherwise warn and use "git".
@@ -718,6 +724,10 @@ fn enabled_bridge(resolved: bool, env: Option<&str>) -> Option<&'static str> {
 /// Env var for `server.idle_minutes`. Only the binary reads it, so it is not
 /// bridged.
 pub const IDLE_MINUTES_ENV: &str = "SCLEROX_SERVER_IDLE_MINUTES";
+
+/// A week. Longer is pointless, and keeps the conversion to seconds far from
+/// overflowing.
+const MAX_IDLE_MINUTES: u64 = 7 * 24 * 60;
 
 /// Env vars [`init`] set itself to carry config values into library code.
 static BRIDGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
@@ -988,6 +998,11 @@ semantic_threshold = 0.7
         bad.validate();
         assert_eq!(bad.embed.server, "auto");
         assert_eq!(bad.server.idle_minutes, 15);
+
+        let mut huge =
+            Settings::from_toml_str(&format!("[server]\nidle_minutes = {}\n", i64::MAX)).unwrap();
+        huge.validate();
+        assert_eq!(huge.server.idle_minutes, MAX_IDLE_MINUTES);
     }
 
     #[test]

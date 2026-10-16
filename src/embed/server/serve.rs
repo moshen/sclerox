@@ -228,7 +228,7 @@ impl State {
     }
 
     fn embed(&self, texts: Vec<String>) -> Response {
-        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = Counted::new(&self.busy);
         let result = {
             let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
             // Batches of one, as the in-process embedder runs them, so the
@@ -239,7 +239,6 @@ impl State {
         self.peak_mb.fetch_max(rss_mb(), Ordering::Relaxed);
         *self.last_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         self.touch();
-        self.busy.fetch_sub(1, Ordering::SeqCst);
         match result {
             Ok(vectors) => Response::Vectors(vectors),
             Err(e) => {
@@ -274,7 +273,7 @@ impl State {
 
 /// Answer one client until it disconnects.
 fn handle(state: &State, mut stream: Stream) {
-    state.connections.fetch_add(1, Ordering::SeqCst);
+    let _connection = Counted::new(&state.connections);
     let mut greeted = false;
     loop {
         let req = match read_msg::<Request>(&mut stream) {
@@ -314,7 +313,23 @@ fn handle(state: &State, mut stream: Stream) {
         }
     }
     state.touch();
-    state.connections.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// One more in `count` while alive, including while unwinding from a panic
+/// in the model, so a failed request never keeps the server from idling out.
+struct Counted<'a>(&'a AtomicUsize);
+
+impl<'a> Counted<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Exit when idle, and save the run's figures now and then.
