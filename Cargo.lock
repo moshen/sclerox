@@ -2686,7 +2686,6 @@ dependencies = [
  "clap_complete",
  "dirs 5.0.1",
  "fastembed",
- "getrandom 0.3.4",
  "hex",
  "ignore",
  "interprocess",

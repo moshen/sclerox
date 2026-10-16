@@ -65,7 +65,7 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
         ServerCommand::Status => {
             let running = match server::status() {
                 Ok(status) => status,
-                // There, but stuck or not provably this user's.
+                // There, but stuck.
                 Err(e) => {
                     eprintln!("warning: model server: {e:#}");
                     None

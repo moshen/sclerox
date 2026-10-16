@@ -8,7 +8,7 @@
 //! the model in-process, as every command did before the server existed.
 //!
 //! There is one socket (see `socket_path`; a named pipe on Windows) and one
-//! lock, `server.lock` in the state directory. The server loads the model it
+//! lock, `run/server.lock` in the state directory. The server loads the model it
 //! was started for, and any other a request names on first use, so sessions
 //! configured for different models share it.
 
@@ -82,8 +82,10 @@ pub fn runs_path() -> PathBuf {
     state_dir().join("server.db")
 }
 
-fn lock_path() -> PathBuf {
-    state_dir().join("server.lock")
+/// The lock only a running server holds, beside its socket, so no other
+/// user can open it and hold it.
+fn lock_path() -> std::io::Result<PathBuf> {
+    Ok(run_dir()?.join("server.lock"))
 }
 
 /// Whether this OS lets a listener create its socket owner-only (macOS
@@ -109,8 +111,8 @@ fn socket_path() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// `$XDG_STATE_HOME/sclerox/run`: the socket (on Unix) and the server's
-/// token. Only this user can read it: on Unix it is made owner-only; on
+/// `$XDG_STATE_HOME/sclerox/run`: the server's lock, its socket (on Unix)
+/// Only this user can read it: on Unix it is made owner-only; on
 /// Windows it inherits the user profile's ACL, which `~/.local/state` sits
 /// under unless `XDG_STATE_HOME` points elsewhere.
 fn run_dir() -> std::io::Result<PathBuf> {
@@ -122,12 +124,6 @@ fn run_dir() -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
-}
-
-/// Where the server keeps the token it proves itself with; see
-/// [`protocol::Response::Ready`].
-fn token_path() -> std::io::Result<PathBuf> {
-    Ok(run_dir()?.join("server.token"))
 }
 
 /// Create `dir` owner-only if it's missing, and check that it is a
@@ -204,10 +200,6 @@ enum Found {
     Ready(Client),
     /// A server from another build.
     Mismatch(Client, Build),
-    /// A server that couldn't prove it is this user's (see
-    /// [`protocol::Response::Ready`]). It gets no texts, but `stop` may still
-    /// ask it to exit.
-    Unproven(Client),
     /// Nothing listening.
     Absent,
 }
@@ -245,15 +237,7 @@ impl Client {
             }
         };
         match reply {
-            Response::Ready { token } => {
-                // Anyone can create a Windows pipe with our name first. Only a
-                // server of this user's can have written the token file.
-                let expected = token_path().and_then(std::fs::read_to_string);
-                if expected.ok().as_deref() != Some(token.as_str()) {
-                    return Ok(Found::Unproven(client));
-                }
-                Ok(Found::Ready(client))
-            }
+            Response::Ready => Ok(Found::Ready(client)),
             Response::Mismatch { build } => {
                 log::debug!(
                     "model server is {}, not {}",
@@ -346,8 +330,6 @@ impl Client {
     }
 }
 
-const UNPROVEN: &str = "the model server couldn't prove it is this user's, so it gets no texts";
-
 /// A client of the server, to embed with `spec`, starting the server when
 /// none is running. `None` means embed in-process: `spec` isn't downloaded
 /// yet (loading it in-process shows the download), or the server couldn't
@@ -387,7 +369,6 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
             client.shutdown(ExitReason::Version)?;
             wait_until_stopped(Duration::from_secs(10))?;
         }
-        Found::Unproven(_) => bail!(UNPROVEN),
         Found::Absent => {}
     }
     start(spec, explicit)
@@ -419,7 +400,6 @@ fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
             Found::Ready(client) => return Ok(Some(client)),
             // Another build won the race to start one.
             Found::Mismatch(..) => return Ok(None),
-            Found::Unproven(_) => bail!(UNPROVEN),
             Found::Absent => {}
         }
         // Success means another server already held the lock; keep waiting
@@ -569,7 +549,7 @@ fn wait_until_stopped(timeout: Duration) -> Result<()> {
 /// Whether a server is running (holds the lock), whether or not it has
 /// finished loading.
 fn is_running() -> bool {
-    let Ok(file) = std::fs::File::open(lock_path()) else {
+    let Ok(file) = lock_path().and_then(std::fs::File::open) else {
         return false;
     };
     match file.try_lock() {
@@ -585,7 +565,6 @@ fn is_running() -> bool {
 pub fn status() -> Result<Option<ServerStatus>> {
     match Client::connect()? {
         Found::Ready(mut c) | Found::Mismatch(mut c, _) => Ok(Some(c.status()?)),
-        Found::Unproven(_) => bail!(UNPROVEN),
         Found::Absent => Ok(None),
     }
 }
@@ -593,7 +572,7 @@ pub fn status() -> Result<Option<ServerStatus>> {
 /// Stop the server and wait for it to exit. `false` when none was running.
 pub fn stop() -> Result<bool> {
     match Client::connect()? {
-        Found::Ready(c) | Found::Mismatch(c, _) | Found::Unproven(c) => {
+        Found::Ready(c) | Found::Mismatch(c, _) => {
             c.shutdown(ExitReason::Stopped)?;
             wait_until_stopped(Duration::from_secs(30))?;
             Ok(true)

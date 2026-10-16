@@ -13,7 +13,7 @@ use super::protocol::{
     read_msg, write_msg, Build, ExitReason, ModelStatus, Request, Response, ServerStatus,
 };
 use super::runs::{Load, Runs};
-use super::{lock_path, runs_path, socket_name, state_dir, token_path, Client, Found};
+use super::{lock_path, runs_path, socket_name, state_dir, Client, Found};
 use crate::embed::{models, ModelSpec};
 
 /// What `sclerox server start --foreground` reads from its settings.
@@ -44,11 +44,15 @@ const DEVICE: &str = "cpu";
 /// loaded and the socket is listening.
 pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Result<Served> {
     std::fs::create_dir_all(state_dir())?;
-    let lock_file = lock_path();
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
+    let lock_file = lock_path().context("no private directory for the model server")?;
+    let mut open = File::options();
+    open.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let lock = open
         .open(&lock_file)
         .with_context(|| format!("failed to open {}", lock_file.display()))?;
     if !acquire(&lock)? {
@@ -74,18 +78,9 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
             return Err(e);
         }
     };
-    let (token, token_file) = match write_token() {
-        Ok(t) => t,
-        Err(e) => {
-            let e = e.context("failed to write the model server token");
-            let _ = runs.failed(run_id, &format!("{e:#}"));
-            return Err(e);
-        }
-    };
 
     let state = Arc::new(State {
         build,
-        token,
         name,
         run_id,
         runs: Mutex::new(runs),
@@ -103,7 +98,6 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
     });
     let failed = |e: anyhow::Error| -> Result<Served> {
         let _ = state.runs().failed(run_id, &format!("{e:#}"));
-        let _ = std::fs::remove_file(&token_file);
         Err(e)
     };
     if let Err(e) = state.with_model(options.preload, |_| ()) {
@@ -160,32 +154,8 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
     state.save_progress()?;
     state.runs().end(run_id, reason)?;
     log::info!("model server exiting: {}", reason.as_str());
-    let _ = std::fs::remove_file(&token_file);
     drop(lock);
     Ok(Served::Exited(reason))
-}
-
-/// Make a random token and write it where only this user can read it,
-/// replacing any left by an earlier server. Returns it and its file.
-fn write_token() -> Result<(String, std::path::PathBuf)> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-    let token = hex::encode(bytes);
-    let path = token_path()?;
-    let tmp = path.with_extension("token.tmp");
-    // The directory is already private; the file is too, in case it moves.
-    // A mode applies only on creation, so clear any leftover first.
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    std::io::Write::write_all(&mut options.open(&tmp)?, token.as_bytes())?;
-    std::fs::rename(&tmp, &path)?;
-    Ok((token, path))
 }
 
 /// Take the server lock. `false` when another server holds it and answers
@@ -199,10 +169,7 @@ fn acquire(lock: &File) -> Result<bool> {
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(e)) => return Err(e).context("failed to lock"),
         }
-        if matches!(
-            Client::connect(),
-            Ok(Found::Ready(_) | Found::Mismatch(..) | Found::Unproven(_))
-        ) {
+        if matches!(Client::connect(), Ok(Found::Ready(_) | Found::Mismatch(..))) {
             return Ok(false);
         }
         if Instant::now() >= deadline {
@@ -214,7 +181,6 @@ fn acquire(lock: &File) -> Result<bool> {
 
 struct State {
     build: Build,
-    token: String,
     name: Name<'static>,
     run_id: i64,
     runs: Mutex<Runs>,
@@ -484,9 +450,7 @@ fn handle(state: &State, mut stream: Stream) {
             Request::Hello { build } => {
                 greeted = build == state.build;
                 if greeted {
-                    Response::Ready {
-                        token: state.token.clone(),
-                    }
+                    Response::Ready
                 } else {
                     Response::Mismatch {
                         build: state.build.clone(),
