@@ -13,6 +13,7 @@ pub mod projects;
 pub mod repos;
 pub mod research;
 pub mod search;
+pub mod server;
 pub mod text_chunks;
 pub mod todos;
 
@@ -92,6 +93,11 @@ pub enum Commands {
     /// Full-text search across all tables
     Search(search::SearchArgs),
 
+    /// Manage the model server, which keeps the embedding model loaded
+    /// between commands
+    #[command(subcommand)]
+    Server(server::ServerCommand),
+
     /// Generate shell completions
     Completions(completions::CompletionsArgs),
 
@@ -122,6 +128,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Migrate(args) => migrate::run_migrate(args),
         Commands::Completions(args) => completions::run(args),
         Commands::Config(cmd) => config_cmd::run(cmd, format),
+        Commands::Server(cmd) => server::run(cmd, format),
         Commands::Hook(cmd) => {
             let db = Database::open(&settings().db_path)?;
             hook::run(&db, cmd)
@@ -149,6 +156,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 | Commands::Migrate(_)
                 | Commands::Completions(_)
                 | Commands::Config(_)
+                | Commands::Server(_)
                 | Commands::Hook(_) => unreachable!(),
             }
         }

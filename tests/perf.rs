@@ -25,6 +25,7 @@ impl Env {
         let out = Command::cargo_bin("sclerox")
             .unwrap()
             .env("SCLEROX_DB", &self.db)
+            .env("SCLEROX_EMBED_SERVER", "off")
             .args(args)
             .output()
             .unwrap();

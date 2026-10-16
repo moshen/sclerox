@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 pub mod download;
 pub mod models;
+pub mod server;
 pub mod tokens;
 pub use models::ModelSpec;
 pub use tokens::count_tokens;
@@ -32,7 +33,8 @@ pub fn enabled() -> bool {
 
 /// The embedder for a command whose whole job is embedding (`db reembed`,
 /// `memory reembed`, `repo reembed`). Fails when embeddings are off or the
-/// model cannot be loaded.
+/// model cannot be loaded. Always loads the model in-process: a long re-embed
+/// through the server would hold it away from other commands' queries.
 pub fn required() -> Result<Embedder> {
     if !enabled() {
         anyhow::bail!(
@@ -40,7 +42,7 @@ pub fn required() -> Result<Embedder> {
              turn them on to embed"
         );
     }
-    Embedder::new()
+    Embedder::with_model(models::configured()?)
 }
 
 /// The embedder for everything else, where vectors are a bonus on top of
@@ -48,6 +50,9 @@ pub fn required() -> Result<Embedder> {
 /// database being used is `!ready` (its vectors came from another model, see
 /// `Database::semantic_ready`), or when the model fails to load - in which
 /// case the caller carries on without vectors and the user is told once.
+///
+/// Uses the model server when `embed.server` allows it (see [`server`]),
+/// starting one if needed; otherwise loads the model in-process.
 pub fn optional(ready: bool) -> Option<Embedder> {
     if !enabled() || !ready {
         return None;
@@ -63,28 +68,45 @@ pub fn optional(ready: bool) -> Option<Embedder> {
     }
 }
 
+/// Where an [`Embedder`] runs the model.
+enum Backend {
+    Local(Box<fastembed::TextEmbedding>),
+    Server(server::Client),
+}
+
 /// Generate embeddings with the configured model (see [`models`]). Obtained
 /// through [`required`] or [`optional`], which apply `embed.enabled`.
 pub struct Embedder {
-    inner: fastembed::TextEmbedding,
+    backend: Backend,
     spec: &'static ModelSpec,
 }
 
 impl Embedder {
-    /// Load the model selected by `embed.model` (bridged through
-    /// `SCLEROX_EMBED_MODEL`), downloading it on first use.
+    /// The model selected by `embed.model` (bridged through
+    /// `SCLEROX_EMBED_MODEL`): through the model server when it is on and
+    /// running (or can be started), else loaded here, downloading it on
+    /// first use.
     fn new() -> Result<Self> {
-        Self::with_model(models::configured()?)
+        let spec = models::configured()?;
+        spec.check_supported()?;
+        if server::mode() == server::Mode::Auto {
+            if let Some(client) = server::connect_or_start(spec) {
+                return Ok(Self {
+                    backend: Backend::Server(client),
+                    spec,
+                });
+            }
+        }
+        Self::with_model(spec)
     }
 
-    /// Load `spec`, downloading its files into the sclerox model cache
-    /// (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
+    /// Load `spec` in-process, downloading its files into the sclerox model
+    /// cache (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
     pub fn with_model(spec: &'static ModelSpec) -> Result<Self> {
-        spec.check_supported()?;
-        let files = ensure_downloaded(spec)?;
-        let inner = load(spec, &files)
-            .with_context(|| format!("failed to load embedding model '{}'", spec.name))?;
-        Ok(Self { inner, spec })
+        Ok(Self {
+            backend: Backend::Local(Box::new(load_model(spec)?)),
+            spec,
+        })
     }
 
     /// The model this embedder runs.
@@ -96,7 +118,7 @@ impl Embedder {
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         log::debug!("embedding {} chars", text.len());
         let prefixed = format!("{}{text}", self.spec.document_prefix);
-        self.embed_single(&prefixed)
+        self.embed_single(prefixed)
     }
 
     /// Embed a search query. Differs from [`Self::embed_one`] only for models
@@ -104,17 +126,14 @@ impl Embedder {
     pub fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
         log::debug!("embedding query of {} chars", text.len());
         let prefixed = format!("{}{text}", self.spec.query_prefix);
-        self.embed_single(&prefixed)
+        self.embed_single(prefixed)
     }
 
-    fn embed_single(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut results = self
-            .inner
-            .embed(std::slice::from_ref(&text), None)
-            .map_err(|e| {
-                log::error!("embedding failed: {e}");
-                anyhow::anyhow!("embedding failed: {e}")
-            })?;
+    fn embed_single(&mut self, text: String) -> Result<Vec<f32>> {
+        let mut results = self.run(vec![text]).map_err(|e| {
+            log::error!("embedding failed: {e:#}");
+            e
+        })?;
         results
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
@@ -129,8 +148,26 @@ impl Embedder {
     pub fn embed_each(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        self.inner
-            .embed(&prefixed, Some(1))
+        self.run(prefixed)
+    }
+
+    /// Embed prefixed texts one at a time. When the server fails, load the
+    /// model here and carry on without it.
+    fn run(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if let Backend::Server(client) = &mut self.backend {
+            match client.embed(&texts) {
+                Ok(vectors) => return Ok(vectors),
+                Err(e) => {
+                    log::warn!("model server failed, loading the model in-process: {e:#}");
+                    self.backend = Backend::Local(Box::new(load_model(self.spec)?));
+                }
+            }
+        }
+        let Backend::Local(model) = &mut self.backend else {
+            unreachable!("the server backend was just replaced");
+        };
+        model
+            .embed(&texts, Some(1))
             .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
     }
 
@@ -140,7 +177,10 @@ impl Embedder {
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        self.inner
+        let Backend::Local(model) = &mut self.backend else {
+            anyhow::bail!("batch embedding needs the model in-process");
+        };
+        model
             .embed(&prefixed, None)
             .map_err(|e| anyhow::anyhow!("batch embedding failed: {e}"))
     }
@@ -189,6 +229,13 @@ pub fn ensure_downloaded(spec: &ModelSpec) -> Result<Vec<(&'static str, PathBuf)
         .pinned()
         .fetch(&format!("embedding model '{}'", spec.name))?;
     Ok(spec.files.iter().map(|f| f.path).zip(paths).collect())
+}
+
+/// Load `spec` in this process, downloading its files first if needed.
+pub(crate) fn load_model(spec: &'static ModelSpec) -> Result<fastembed::TextEmbedding> {
+    spec.check_supported()?;
+    let files = ensure_downloaded(spec)?;
+    load(spec, &files).with_context(|| format!("failed to load embedding model '{}'", spec.name))
 }
 
 fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed::TextEmbedding> {

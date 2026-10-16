@@ -27,6 +27,7 @@ pub struct Settings {
     pub distill: DistillSettings,
     pub embed: EmbedSettings,
     pub index: IndexSettings,
+    pub server: ServerSettings,
     pub install: InstallSettings,
     pub log: LogSettings,
 }
@@ -147,6 +148,19 @@ pub struct EmbedSettings {
     /// stored and keyword-searchable. `None` = the model's default (see
     /// `embed::models`). Env: `SCLEROX_EMBED_MEMORY_CHARS`.
     pub memory_chars: Option<usize>,
+    /// `auto`: commands get vectors from a background model server
+    /// (`sclerox server`), starting it when needed, so the model loads once
+    /// rather than in every command. `off`: each command loads the model
+    /// itself. Env: `SCLEROX_EMBED_SERVER`.
+    pub server: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSettings {
+    /// The model server exits after this many minutes without requests.
+    /// Env: `SCLEROX_SERVER_IDLE_MINUTES`.
+    pub idle_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +226,7 @@ impl Default for Settings {
             distill: DistillSettings::default(),
             embed: EmbedSettings::default(),
             index: IndexSettings::default(),
+            server: ServerSettings::default(),
             install: InstallSettings::default(),
             log: LogSettings::default(),
         }
@@ -280,7 +295,14 @@ impl Default for EmbedSettings {
             chunk_size: 800,
             chunk_overlap: 200,
             memory_chars: None,
+            server: "auto".to_string(),
         }
+    }
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self { idle_minutes: 15 }
     }
 }
 
@@ -428,6 +450,16 @@ impl Settings {
                 ),
             }
         }
+        if let Ok(v) = std::env::var(crate::embed::server::MODE_ENV) {
+            if !v.is_empty() {
+                self.embed.server = v;
+            }
+        }
+        if let Ok(v) = std::env::var(IDLE_MINUTES_ENV) {
+            if let Ok(n) = v.parse::<u64>() {
+                self.server.idle_minutes = n;
+            }
+        }
         if let Ok(l) = std::env::var("SCLEROX_LOG") {
             if !l.is_empty() {
                 self.log.level = l;
@@ -540,6 +572,22 @@ impl Settings {
             1_000_000,
         );
         require_positive("index.max_files", &mut self.index.max_files, 50_000);
+
+        match crate::embed::server::parse_mode(&self.embed.server) {
+            Some(crate::embed::server::Mode::Auto) => self.embed.server = "auto".to_string(),
+            Some(crate::embed::server::Mode::Off) => self.embed.server = "off".to_string(),
+            None => {
+                eprintln!(
+                    "warning: embed.server = \"{}\" is not valid (auto|off); using auto",
+                    self.embed.server
+                );
+                self.embed.server = "auto".to_string();
+            }
+        }
+        if self.server.idle_minutes == 0 {
+            eprintln!("warning: server.idle_minutes must be > 0; using default 15");
+            self.server.idle_minutes = 15;
+        }
 
         // Auto-index policy must be a recognised value; otherwise warn and use "git".
         if !matches!(self.index.auto.as_str(), "git" | "off") {
@@ -667,6 +715,10 @@ fn enabled_bridge(resolved: bool, env: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Env var for `server.idle_minutes`. Only the binary reads it, so it is not
+/// bridged.
+pub const IDLE_MINUTES_ENV: &str = "SCLEROX_SERVER_IDLE_MINUTES";
+
 /// Env vars [`init`] set itself to carry config values into library code.
 static BRIDGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
@@ -713,6 +765,15 @@ pub fn init() {
     let env = std::env::var(crate::embed::ENABLED_ENV).ok();
     if let Some(v) = enabled_bridge(s.embed.enabled, env.as_deref()) {
         bridge(crate::embed::ENABLED_ENV, v);
+    }
+    // ...and whether to use the model server. Unset reads as off in the
+    // library, so `auto` is always bridged.
+    let server_env = std::env::var(crate::embed::server::MODE_ENV)
+        .ok()
+        .and_then(|v| crate::embed::server::parse_mode(&v));
+    let server = crate::embed::server::parse_mode(&s.embed.server);
+    if server_env != server {
+        bridge(crate::embed::server::MODE_ENV, &s.embed.server);
     }
     // Sizes the library reads from env vars: the memory embedding cap and the
     // code chunker's.
@@ -906,6 +967,27 @@ semantic_threshold = 0.7
         assert_eq!(enabled_bridge(true, None), None);
         assert_eq!(enabled_bridge(true, Some("yes")), None);
         assert_eq!(enabled_bridge(true, Some("maybe")), None);
+    }
+
+    #[test]
+    fn server_settings_default_and_validate() {
+        let s = Settings::from_toml_str("").unwrap();
+        assert_eq!(s.embed.server, "auto");
+        assert_eq!(s.server.idle_minutes, 15);
+
+        let mut off =
+            Settings::from_toml_str("[embed]\nserver = \"OFF\"\n[server]\nidle_minutes = 5\n")
+                .unwrap();
+        off.validate();
+        assert_eq!(off.embed.server, "off");
+        assert_eq!(off.server.idle_minutes, 5);
+
+        let mut bad =
+            Settings::from_toml_str("[embed]\nserver = \"maybe\"\n[server]\nidle_minutes = 0\n")
+                .unwrap();
+        bad.validate();
+        assert_eq!(bad.embed.server, "auto");
+        assert_eq!(bad.server.idle_minutes, 15);
     }
 
     #[test]

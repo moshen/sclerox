@@ -34,6 +34,10 @@ impl Env {
         // Never write test noise into the developer's real ~/.local/state/sclerox/logs/ (an
         // exported SCLEROX_LOG=debug once made a day's log 100x normal size).
         c.env("SCLEROX_LOG", "off");
+        // Load the model in each command, as before the model server: a test
+        // must not leave a server running in the developer's state directory.
+        // Server tests turn it back on with their own state directory.
+        c.env("SCLEROX_EMBED_SERVER", "off");
         // Sizes come from the temp config unless a test sets one itself.
         for var in [
             "SCLEROX_CODE_CHUNK_CHARS",
@@ -1377,6 +1381,7 @@ fn install_adopts_a_pre_rename_config() {
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
         .env_remove("SCLEROX_CONFIG")
         .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
@@ -1414,6 +1419,7 @@ fn install_never_overwrites_an_edited_config() {
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
         .env_remove("SCLEROX_CONFIG")
         .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
@@ -1424,4 +1430,125 @@ fn install_never_overwrites_an_edited_config() {
         "the edited value is untouched, got:\n{contents}"
     );
     assert!(legacy.exists(), "legacy config kept for a manual merge");
+}
+
+// ─── Model server ────────────────────────────────────────────────────────────
+
+/// A test's own state directory with the model server turned on. Stops the
+/// server when dropped, so a failing test doesn't leave one running.
+struct ServerEnv {
+    env: Env,
+    state: TempDir,
+}
+
+impl ServerEnv {
+    fn new() -> Self {
+        Self {
+            env: Env::new(),
+            state: TempDir::new().unwrap(),
+        }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = self.env.cmd();
+        c.env("XDG_STATE_HOME", self.state.path())
+            .env("SCLEROX_EMBED_SERVER", "auto")
+            // Gone soon even if the drop below never runs.
+            .env("SCLEROX_SERVER_IDLE_MINUTES", "1");
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> String {
+        let out = self.cmd().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "sclerox {} failed:\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::from_str(&self.run(&["server", "status", "--output", "json"])).unwrap()
+    }
+}
+
+impl Drop for ServerEnv {
+    fn drop(&mut self) {
+        let _ = self.cmd().args(["server", "stop"]).output();
+    }
+}
+
+#[test]
+fn model_server_starts_on_first_use_and_serves_later_commands() {
+    let s = ServerEnv::new();
+    assert_eq!(s.run(&["server", "status"]), "no model server running");
+
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let status = s.status();
+    let running = status["running"].as_array().unwrap();
+    assert_eq!(running.len(), 1, "{status}");
+    let pid = running[0]["pid"].as_u64().unwrap();
+    let served = running[0]["requests"].as_u64().unwrap();
+    assert!(served >= 1, "{status}");
+
+    // A later command uses the same server rather than starting another.
+    let out = s.run(&["search", "database connection pooling"]);
+    assert!(out.contains("pool"), "{out}");
+    let status = s.status();
+    assert_eq!(status["running"][0]["pid"].as_u64(), Some(pid));
+    assert!(status["running"][0]["requests"].as_u64().unwrap() > served);
+
+    assert_eq!(
+        s.run(&["server", "stop"]),
+        "stopped the model server for granite-small-r2"
+    );
+    let status = s.status();
+    assert_eq!(status["running"].as_array().unwrap().len(), 0);
+    assert_eq!(status["recent_runs"][0]["exit_reason"], "stopped");
+}
+
+#[test]
+fn model_server_matches_in_process_search() {
+    let s = ServerEnv::new();
+    s.run(&[
+        "memory",
+        "set",
+        "ci",
+        "the CI cache is keyed on the lockfile hash",
+    ]);
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let served = s.run(&["search", "build caching", "--output", "json"]);
+    let local = s.env.run(&["search", "build caching", "--output", "json"]);
+    assert_eq!(served, local);
+}
+
+#[test]
+fn model_server_off_never_starts_one() {
+    let s = ServerEnv::new();
+    let out = s
+        .cmd()
+        .env("SCLEROX_EMBED_SERVER", "off")
+        .args(["memory", "set", "k", "a value worth embedding"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(s.run(&["server", "status"]), "no model server running");
+    assert!(!s.state.path().join("sclerox/server.db").exists());
+}
+
+#[test]
+fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
+    let s = ServerEnv::new();
+    assert_eq!(s.run(&["server", "stop"]), "no model server running");
+    let first = s.run(&["server", "start"]);
+    let second = s.run(&["server", "start"]);
+    let pid = |out: &str| out.lines().next().unwrap().to_string();
+    assert_eq!(pid(&first), pid(&second));
+    assert!(
+        first.starts_with("granite-small-r2: running, pid "),
+        "{first}"
+    );
 }
