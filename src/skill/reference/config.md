@@ -33,7 +33,8 @@ How much text each vector covers:
   until rewritten; `sclerox db reembed --force` re-embeds them all at the new
   size.
 - `embed.chunk_size` / `embed.chunk_overlap` (800 / 200): chunks of meeting,
-  todo and research text. New sizes apply to text saved from then on.
+  todo and research text. New sizes apply to text saved from then on;
+  `sclerox db reembed` (or `sclerox install`) re-cuts stored text at them.
 - `index.chunk_chars` (800): code chunks; longer functions are split.
   `index.chunk_lines` (15): lines per chunk for files without a tree-sitter
   grammar. Changing either re-chunks each repo on its next index run.
@@ -78,7 +79,9 @@ It first waits (up to 5 minutes) for running session distillations, which may
 be from the version you upgraded from.
 It also embeds main-database items saved without a vector (model unavailable,
 or `--no-embed`); code chunks indexed without vectors are left to
-`sclerox repo reembed`.
+`sclerox repo reembed`. Meeting, todo and research text cut at other
+`embed.chunk_size` / `chunk_overlap` values (or before sclerox recorded them) is
+re-chunked from its stored text first, and always with `--force`.
 
 `sclerox install` runs the same re-embed for you when it finds a database on
 another model or items without a vector (skipped with `--no-model-download`).

@@ -235,6 +235,20 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Bump when [`chunk_text`] changes how it cuts text, so databases re-chunk
+/// their stored text on the next `sclerox db reembed`.
+const TEXT_CHUNKER_VERSION: u32 = 1;
+
+/// Meta key recording which chunker cut a database's meeting, todo and
+/// research chunks. Absent: no chunks yet. `v0`: cut before it was recorded.
+pub const TEXT_CHUNKER_KEY: &str = "text_chunker";
+
+/// The signature of [`chunk_text`] at these sizes, as recorded under
+/// [`TEXT_CHUNKER_KEY`].
+pub fn text_chunker_signature(max_chars: usize, overlap_chars: usize) -> String {
+    format!("v{TEXT_CHUNKER_VERSION}:size={max_chars}:overlap={overlap_chars}")
+}
+
 /// Chunk text into overlapping windows of at most `max_chars` characters,
 /// splitting on paragraph boundaries where possible. A paragraph longer than
 /// `max_chars` is cut at a line break or space near the limit (mid-word only

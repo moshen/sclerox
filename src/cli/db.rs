@@ -42,6 +42,10 @@ pub enum DbCommand {
     /// all-or-nothing: an interrupted run leaves it on the old model, and
     /// running again starts it over.
     ///
+    /// Meeting, todo and research text is first re-cut into chunks when it was
+    /// cut at other `embed.chunk_size` / `chunk_overlap` values (always with
+    /// --force).
+    ///
     /// Also embeds main-database items saved without a vector (while the
     /// model was unavailable, or with --no-embed). Code chunks indexed without
     /// vectors are left to `sclerox repo reembed` and the session hooks'
@@ -74,7 +78,10 @@ pub(crate) fn embeddings_need_work(db: &Database) -> bool {
     use crate::index::repo_db::RepoDb;
 
     let mismatched = |c: Result<ModelCheck>| matches!(c, Ok(ModelCheck::Mismatch { .. }));
-    if mismatched(db.embedding_model_check()) || db.missing_vectors().unwrap_or(0) > 0 {
+    if mismatched(db.embedding_model_check())
+        || db.missing_vectors().unwrap_or(0) > 0
+        || super::text_chunks::stale(db)
+    {
         return true;
     }
     db.repo_list().unwrap_or_default().iter().any(|repo| {
@@ -100,6 +107,25 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     println!("\nMain database:");
     let mut main_ok = true;
     let mut main_done = false;
+    // Re-cut text chunks first. The new chunks have no vector yet, so the
+    // rebuild or the missing-vector fill below embeds each of them once.
+    if force || super::text_chunks::stale(db) {
+        match super::text_chunks::rechunk_all(db) {
+            Ok(r) => {
+                let cfg = &crate::config::settings().embed;
+                println!(
+                    "  re-chunked {} meeting(s), {} todo(s) and {} research item(s) \
+                     at chunk_size {}, overlap {}",
+                    r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
+                );
+                main_done = true;
+            }
+            Err(e) => {
+                println!("  could not re-chunk text (run again to retry): {e:#}");
+                main_ok = false;
+            }
+        }
+    }
     let rebuild_main = needs_rebuild(&main_state, force);
     if rebuild_main && !wait_for_distillations() {
         println!(

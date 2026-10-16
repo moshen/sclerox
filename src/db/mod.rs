@@ -37,6 +37,9 @@ pub fn register_vec_extension() {
     });
 }
 
+/// Rows of (id, first text, second text) that an item's chunks are cut from.
+pub type ChunkSources = Vec<(i64, Option<String>, Option<String>)>;
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -115,6 +118,24 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The chunker that cut this database's meeting, todo and research chunks;
+    /// see [`crate::embed::TEXT_CHUNKER_KEY`].
+    pub fn text_chunker(&self) -> Result<Option<String>> {
+        self.get_meta(crate::embed::TEXT_CHUNKER_KEY)
+    }
+
+    /// Record `signature` as the text chunker unless one is recorded already.
+    /// Called after storing chunks: the first chunks of a database set it, and
+    /// later ones cut with other sizes leave the older value, so `db reembed`
+    /// still sees that some chunks need re-cutting.
+    pub fn note_text_chunker(&self, signature: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+            params![crate::embed::TEXT_CHUNKER_KEY, signature],
+        )?;
+        Ok(())
     }
 
     /// The stored ID of the model that produced this database's vectors.
@@ -468,6 +489,44 @@ mod tests {
         let conn = db_at_v13("INSERT INTO memory (key, value) VALUES ('k', 'v');");
         run_migrations(&conn, 13, PRIMARY_MIGRATIONS, 14).unwrap();
         assert_eq!(Database { conn }.embedding_model().unwrap(), None);
+    }
+
+    fn db_at_v14(setup: &str) -> Connection {
+        let conn = db_at_v13("");
+        run_migrations(&conn, 13, PRIMARY_MIGRATIONS, 14).unwrap();
+        conn.execute_batch(setup).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_migration_v15_marks_existing_text_chunks() {
+        for setup in [
+            "INSERT INTO meetings (title, transcript) VALUES ('m', 't');
+             INSERT INTO meeting_chunks (meeting_id, chunk_index, chunk_text) VALUES (1, 0, 't');",
+            "INSERT INTO todos (title) VALUES ('t');
+             INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text) VALUES (1, 0, 't');",
+        ] {
+            let conn = db_at_v14(setup);
+            run_migrations(&conn, 14, PRIMARY_MIGRATIONS, 15).unwrap();
+            let db = Database { conn };
+            assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
+            // Recording at write time never replaces the mark.
+            db.note_text_chunker("v1:size=800:overlap=200").unwrap();
+            assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
+        }
+    }
+
+    #[test]
+    fn test_fresh_db_records_text_chunker_on_first_write() {
+        // A fresh database runs v15 too, and has no chunks to mark.
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.text_chunker().unwrap(), None);
+        db.note_text_chunker("v1:size=800:overlap=200").unwrap();
+        db.note_text_chunker("v1:size=300:overlap=50").unwrap();
+        assert_eq!(
+            db.text_chunker().unwrap().as_deref(),
+            Some("v1:size=800:overlap=200")
+        );
     }
 
     #[test]

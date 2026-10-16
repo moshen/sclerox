@@ -180,6 +180,12 @@ fn report_reembed_needed() {
             crate::config::settings().embed.model
         );
     }
+    if super::text_chunks::stale(&db) {
+        println!(
+            "\nMeeting, todo and research text was chunked at other sizes than \
+             [embed] sets. Run `sclerox db reembed` to re-chunk it."
+        );
+    }
 }
 
 pub fn run_uninstall(args: InstallArgs) -> Result<()> {

@@ -218,6 +218,15 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every meeting's (id, transcript, notes), the text its chunks are cut from.
+    pub fn meeting_chunk_inputs(&self) -> Result<super::ChunkSources> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, transcript, notes FROM meetings ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Store pre-chunked text with optional embedding for a meeting.
     pub fn meeting_store_chunks(
         &self,

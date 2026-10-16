@@ -318,6 +318,16 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every investigation's (id, plan, findings), the text its chunks are cut
+    /// from.
+    pub fn investigation_chunk_inputs(&self) -> Result<super::ChunkSources> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, plan, findings FROM investigations ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Store pre-chunked text with optional embeddings for an investigation.
     pub fn investigation_store_chunks(
         &self,

@@ -702,6 +702,18 @@ WHERE EXISTS (SELECT 1 FROM memory               WHERE embedding IS NOT NULL)
    OR EXISTS (SELECT 1 FROM repos                WHERE description_embedding IS NOT NULL);
 ";
 
+/// Migration v15: mark meeting, todo and research chunks cut before the text
+/// chunker was recorded, so `sclerox db reembed` re-cuts them with the current
+/// one. Like v14, only databases that already have chunks are marked; a fresh
+/// one records the chunker that cuts its first chunks.
+pub const MIGRATION_V15: &str = "
+INSERT OR IGNORE INTO meta (key, value)
+SELECT 'text_chunker', 'v0'
+WHERE EXISTS (SELECT 1 FROM meeting_chunks)
+   OR EXISTS (SELECT 1 FROM todo_chunks)
+   OR EXISTS (SELECT 1 FROM investigation_chunks);
+";
+
 pub const REPO_MIGRATION_V2: &str = "
 CREATE TABLE IF NOT EXISTS symbol_edges (
     id INTEGER PRIMARY KEY,
