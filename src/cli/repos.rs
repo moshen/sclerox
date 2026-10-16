@@ -96,7 +96,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let mut embedder_opt: Option<Embedder> = if no_embed {
                 None
             } else {
-                crate::embed::optional(true)
+                crate::embed::optional(true).map(Embedder::bulk)
             };
             let mut indexer = RepoIndexer::new(embedder_opt.as_mut()).with_force(force);
             println!("Indexing {}...", canonical.display());

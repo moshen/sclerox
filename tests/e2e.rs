@@ -1639,3 +1639,105 @@ fn model_server_serves_concurrent_commands() {
     let after = status["server"]["requests"].as_u64().unwrap();
     assert!(after >= before + COMMANDS, "{before} -> {after}");
 }
+
+/// Every active memory's vector, in id order.
+fn memory_vectors(db: &std::path::Path) -> Vec<Vec<u8>> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT embedding FROM memory WHERE status = 'active' ORDER BY id")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
+    rows.collect::<Result<_, _>>().unwrap()
+}
+
+/// Memories long enough that embedding them grows the server's memory.
+fn add_long_memories(s: &ServerEnv, n: usize) {
+    for i in 0..n {
+        let value: Vec<String> = (0..1200).map(|j| format!("n{i} w{j} gamma")).collect();
+        s.run(&[
+            "memory",
+            "set",
+            &format!("long{i}"),
+            &value.join(" "),
+            "--no-embed",
+        ]);
+    }
+}
+
+#[test]
+fn model_server_runs_bulk_work_with_the_same_vectors() {
+    let s = ServerEnv::new();
+    add_long_memories(&s, 3);
+    s.run(&[
+        "memory",
+        "set",
+        "pool",
+        "postgres pooling runs pgbouncer",
+        "--no-embed",
+    ]);
+
+    // In-process first...
+    let out = s
+        .cmd()
+        .env("SCLEROX_EMBED_SERVER", "off")
+        .args(["db", "reembed", "--force"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let in_process = memory_vectors(&s.env.db);
+    assert_eq!(in_process.len(), 4);
+    assert!(s.status()["server"].is_null(), "off started a server");
+
+    // ...then through the server, which writes the same bytes.
+    s.run(&["db", "reembed", "--force"]);
+    let status = s.status();
+    assert!(
+        status["server"]["models"][0]["requests"].as_u64().unwrap() >= 1,
+        "{status}"
+    );
+    assert_eq!(memory_vectors(&s.env.db), in_process);
+}
+
+#[test]
+fn model_server_restarts_over_its_hard_memory_limit() {
+    let s = ServerEnv::new();
+    add_long_memories(&s, 20);
+
+    // A limit the loaded model already fills can't be met by restarting,
+    // so the server ignores it.
+    let out = s
+        .cmd()
+        .env("SCLEROX_SERVER_HARD_MEMORY_MB", "1")
+        .env("SCLEROX_SERVER_MAX_MEMORY_MB", "1")
+        .args(["server", "start", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let started: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(started["hard_limit_mb"].is_null(), "{started}");
+    assert!(started["soft_limit_mb"].is_null(), "{started}");
+    let loaded = started["rss_mb"].as_u64().unwrap();
+    s.run(&["server", "stop"]);
+
+    // Each long text grows the server by far more than this, so every
+    // server exits after its first request and the re-embed carries on
+    // with the next one from where it stopped.
+    let limit = (loaded + 40).to_string();
+    let out = s
+        .cmd()
+        .env("SCLEROX_SERVER_HARD_MEMORY_MB", &limit)
+        .args(["db", "reembed", "--force"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(memory_vectors(&s.env.db).len(), 20);
+
+    let runs = s.status()["recent_runs"].clone();
+    let restarts = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["exit_reason"] == "hard_memory")
+        .count();
+    assert!(restarts >= 1, "{runs}");
+}

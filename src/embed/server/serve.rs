@@ -1,16 +1,21 @@
 //! The server process: take the lock, load the model it was started for,
 //! answer requests on the socket with a thread per connection, loading other
-//! models as they are asked for, and exit when idle or asked to.
+//! models as they are asked for, and exit when idle, over its memory limits,
+//! or asked to.
+//!
+//! Requests take turns on the CPU one text at a time (see [`Gate`]): queries
+//! go before bulk work, and clients doing bulk work alternate.
 
 use anyhow::{bail, Context, Result};
 use interprocess::local_socket::{prelude::*, ListenerOptions, Name, Stream};
+use std::collections::VecDeque;
 use std::fs::{File, TryLockError};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use super::protocol::{
-    read_msg, write_msg, Build, ExitReason, ModelStatus, Request, Response, ServerStatus,
+    read_msg, write_msg, Build, ExitReason, Lane, ModelStatus, Request, Response, ServerStatus,
 };
 use super::runs::{Load, Runs};
 use super::{lock_path, runs_path, socket_name, state_dir, Client, Found};
@@ -22,6 +27,10 @@ pub struct ServeOptions {
     pub idle: Duration,
     /// Loaded before the server listens; it fails to start without it.
     pub preload: &'static ModelSpec,
+    /// `server.max_memory_mb`: over it, exit once nothing is using the server.
+    pub soft_limit_mb: Option<u64>,
+    /// `server.hard_memory_mb`: over it, exit after the request in progress.
+    pub hard_limit_mb: Option<u64>,
 }
 
 /// How [`serve`] ended.
@@ -39,6 +48,14 @@ const SAVE_EVERY: Duration = Duration::from_secs(30);
 const RETRY_LOAD: Duration = Duration::from_secs(5 * 60);
 /// Where models run, until `embed.device` exists.
 const DEVICE: &str = "cpu";
+/// How long a server over its soft memory limit waits with no connections
+/// and no requests before exiting.
+const RESTART_QUIET: Duration = Duration::from_secs(60);
+/// With this many memory exits within [`MEMORY_EXIT_WINDOW`], a new server
+/// ignores the soft limit, so a workload that keeps crossing it doesn't
+/// reload the models over and over.
+const MAX_MEMORY_EXITS: usize = 3;
+const MEMORY_EXIT_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Serve until idle or stopped. `on_ready` runs once the preloaded model has
 /// loaded and the socket is listening.
@@ -68,6 +85,17 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
         log::warn!("{crashed} earlier model server run(s) ended without recording why");
     }
     runs.prune()?;
+    let mut soft_limit_mb = options.soft_limit_mb;
+    if soft_limit_mb.is_some()
+        && runs.recent_exits(&[ExitReason::Memory], MEMORY_EXIT_WINDOW)? >= MAX_MEMORY_EXITS
+    {
+        log::warn!(
+            "the model server went over server.max_memory_mb {MAX_MEMORY_EXITS} times in \
+             {} min; ignoring that limit for this run",
+            MEMORY_EXIT_WINDOW.as_secs() / 60
+        );
+        soft_limit_mb = None;
+    }
 
     // Before loading the model, so a server that couldn't listen fails fast.
     let name = match socket_name() {
@@ -95,6 +123,11 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
         last_activity: Mutex::new(Instant::now()),
         last_request: Mutex::new(None),
         stop: Mutex::new(None),
+        gate: Gate::default(),
+        base_mb: rss_mb(),
+        soft_limit_mb: AtomicU64::new(soft_limit_mb.unwrap_or(0)),
+        hard_limit_mb: AtomicU64::new(options.hard_limit_mb.unwrap_or(0)),
+        restart_due: AtomicBool::new(false),
     });
     let failed = |e: anyhow::Error| -> Result<Served> {
         let _ = state.runs().failed(run_id, &format!("{e:#}"));
@@ -199,13 +232,85 @@ struct State {
     last_activity: Mutex<Instant>,
     last_request: Mutex<Option<Instant>>,
     stop: Mutex<Option<ExitReason>>,
+    gate: Gate,
+    /// Resident memory before any model loaded.
+    base_mb: u64,
+    /// The memory limits in MB, 0 when off or ignored for this run.
+    soft_limit_mb: AtomicU64,
+    hard_limit_mb: AtomicU64,
+    /// Over the soft limit: exit after [`RESTART_QUIET`] unused.
+    restart_due: AtomicBool,
+}
+
+/// Turns on the CPU: one text at a time across all models, since each
+/// already uses every core. Waiting queries go first; bulk requests go in
+/// the order they asked, so two clients doing bulk work alternate.
+#[derive(Default)]
+struct Gate {
+    turns: Mutex<Turns>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Turns {
+    busy: bool,
+    queries: usize,
+    /// Tickets of waiting bulk requests, oldest first.
+    bulk: VecDeque<u64>,
+    next_ticket: u64,
+}
+
+impl Gate {
+    /// Wait for a turn in `lane`; it lasts until the [`Turn`] is dropped.
+    fn enter(&self, lane: Lane) -> Turn<'_> {
+        let mut turns = lock(&self.turns);
+        match lane {
+            Lane::Query => {
+                turns.queries += 1;
+                while turns.busy {
+                    turns = self.wait(turns);
+                }
+                turns.queries -= 1;
+            }
+            Lane::Bulk => {
+                let ticket = turns.next_ticket;
+                turns.next_ticket += 1;
+                turns.bulk.push_back(ticket);
+                while turns.busy || turns.queries > 0 || turns.bulk.front() != Some(&ticket) {
+                    turns = self.wait(turns);
+                }
+                turns.bulk.pop_front();
+            }
+        }
+        turns.busy = true;
+        Turn(self)
+    }
+
+    fn wait<'a>(&self, turns: MutexGuard<'a, Turns>) -> MutexGuard<'a, Turns> {
+        self.changed.wait(turns).unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Requests waiting: queries, bulk.
+    fn waiting(&self) -> (usize, usize) {
+        let turns = lock(&self.turns);
+        (turns.queries, turns.bulk.len())
+    }
+}
+
+/// A turn on the CPU; ends when dropped, including during a panic.
+struct Turn<'a>(&'a Gate);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.turns).busy = false;
+        self.0.changed.notify_all();
+    }
 }
 
 /// One model: loaded on first use, then kept until the server exits.
 struct Slot {
     spec: &'static ModelSpec,
-    /// Held while loading and while embedding, so requests for one model run
-    /// one at a time while other models' run alongside.
+    /// Held while loading and during a turn embedding with it.
     model: Mutex<Loaded>,
     // The figures below are kept outside `model` so status never waits on
     // an embedding.
@@ -318,6 +423,7 @@ impl State {
                 *lock(&slot.last_used) = Instant::now();
                 slot.loaded.store(true, Ordering::Relaxed);
                 self.peak_mb.fetch_max(rss_mb(), Ordering::Relaxed);
+                self.check_limits_reachable();
                 Loaded::Yes(Box::new(model))
             }
             Err(e) => {
@@ -327,6 +433,52 @@ impl State {
                 *lock(&slot.error) = Some(error);
                 Loaded::Failed(Instant::now())
             }
+        }
+    }
+
+    /// Ignore a memory limit that the models loaded so far already fill:
+    /// restarting would load them again and land over it again.
+    fn check_limits_reachable(&self) {
+        let loaded: u64 = lock(&self.models)
+            .iter()
+            .map(|s| s.loaded_mb.load(Ordering::Relaxed))
+            .sum();
+        let needed = self.base_mb + loaded;
+        for (limit, setting) in [
+            (&self.soft_limit_mb, "server.max_memory_mb"),
+            (&self.hard_limit_mb, "server.hard_memory_mb"),
+        ] {
+            let mb = limit.load(Ordering::Relaxed);
+            if mb != 0 && needed >= mb {
+                log::warn!(
+                    "the model server needs {needed} MB with its models loaded, over \
+                     {setting} ({mb}); ignoring that limit for this run"
+                );
+                limit.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// After a request: exit after it when over the hard limit, and once
+    /// unused when over the soft one.
+    fn check_memory(&self) {
+        let mb = rss_mb();
+        self.peak_mb.fetch_max(mb, Ordering::Relaxed);
+        let hard = self.hard_limit_mb.load(Ordering::Relaxed);
+        if hard != 0 && mb > hard {
+            log::warn!(
+                "model server is using {mb} MB, over server.hard_memory_mb ({hard}); exiting"
+            );
+            self.request_stop(ExitReason::HardMemory);
+            return;
+        }
+        let soft = self.soft_limit_mb.load(Ordering::Relaxed);
+        if soft != 0 && mb > soft && !self.restart_due.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "model server is using {mb} MB, over server.max_memory_mb ({soft}); \
+                 exiting once unused for {}s",
+                RESTART_QUIET.as_secs()
+            );
         }
     }
 
@@ -345,24 +497,42 @@ impl State {
             Err(e) => Response::Error(format!("{e:#}")),
         };
         self.requests.fetch_add(1, Ordering::Relaxed);
-        self.peak_mb.fetch_max(rss_mb(), Ordering::Relaxed);
+        self.check_memory();
         *lock(&self.last_request) = Some(Instant::now());
         self.touch();
         reply
     }
 
-    fn embed(&self, model: &str, texts: Vec<String>) -> Response {
+    fn embed(&self, model: &str, texts: Vec<String>, lane: Lane) -> Response {
         self.request(model, |spec| {
-            // Batches of one, as the in-process embedder runs them, so the
-            // vectors come out identical.
-            match self.with_model(spec, |m| m.embed(&texts, Some(1))) {
-                Ok(Ok(vectors)) => Response::Vectors(vectors),
-                Ok(Err(e)) => {
-                    log::error!("model server embedding failed: {e}");
-                    Response::Error(format!("embedding failed: {e}"))
+            // Load it before taking turns, so a load doesn't hold up others.
+            // Only then: the model's lock is taken during others' turns, and
+            // waiting on it here, outside the queue, could wait for many.
+            if !self.slot(spec).loaded.load(Ordering::Relaxed) {
+                if let Err(e) = self.with_model(spec, |_| ()) {
+                    return Response::Error(e);
                 }
-                Err(e) => Response::Error(e),
             }
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in &texts {
+                // Bulk work stops between texts; the client sends what's
+                // left to the next server.
+                if let Some(reason) = self.stopping().filter(|_| lane == Lane::Bulk) {
+                    return Response::Stopping { reason };
+                }
+                let _turn = self.gate.enter(lane);
+                // One at a time, as the in-process embedder runs them, so
+                // the vectors come out identical.
+                match self.with_model(spec, |m| m.embed(std::slice::from_ref(text), Some(1))) {
+                    Ok(Ok(v)) => vectors.extend(v),
+                    Ok(Err(e)) => {
+                        log::error!("model server embedding failed: {e}");
+                        return Response::Error(format!("embedding failed: {e}"));
+                    }
+                    Err(e) => return Response::Error(e),
+                }
+            }
+            Response::Vectors(vectors)
         })
     }
 
@@ -382,6 +552,8 @@ impl State {
 
     fn status(&self) -> ServerStatus {
         let last = lock(&self.last_request).unwrap_or(self.started);
+        let (waiting_queries, waiting_bulk) = self.gate.waiting();
+        let limit = |mb: &AtomicU64| Some(mb.load(Ordering::Relaxed)).filter(|&mb| mb != 0);
         let models = lock(&self.models)
             .iter()
             .filter_map(|slot| {
@@ -410,6 +582,11 @@ impl State {
             connections: self.connections.load(Ordering::SeqCst),
             idle_secs: last.elapsed().as_secs(),
             idle_limit_secs: self.idle.as_secs(),
+            soft_limit_mb: limit(&self.soft_limit_mb),
+            hard_limit_mb: limit(&self.hard_limit_mb),
+            restart_due: self.restart_due.load(Ordering::Relaxed),
+            waiting_queries,
+            waiting_bulk,
             models,
         }
     }
@@ -460,17 +637,20 @@ fn handle(state: &State, mut stream: Stream) {
             Request::Embed { .. } | Request::Load { .. } if !greeted => {
                 Response::Error("model request before a matching hello".to_string())
             }
-            // Refused so the client embeds in-process and the server can exit
-            // instead of serving a bulk client's next batch, and the next.
+            // Refused so the server can exit instead of serving a bulk
+            // client's next batch, and the next.
             Request::Embed { .. } | Request::Load { .. } if state.stopping().is_some() => {
-                Response::Error("model server is stopping".to_string())
+                Response::Stopping {
+                    reason: state.stopping().unwrap_or(ExitReason::Stopped),
+                }
             }
-            Request::Embed { model, texts } => state.embed(&model, texts),
+            Request::Embed { model, texts, lane } => state.embed(&model, texts, lane),
             Request::Load { model } => state.load_only(&model),
             Request::Status => Response::Status(state.status()),
             Request::Shutdown { reason } => {
-                let _ = write_msg(&mut stream, &Response::Stopping);
                 state.request_stop(reason);
+                let reason = state.stopping().unwrap_or(reason);
+                let _ = write_msg(&mut stream, &Response::Stopping { reason });
                 break;
             }
         };
@@ -509,8 +689,13 @@ fn housekeeping(state: &State) {
         }
         let quiet =
             state.connections.load(Ordering::SeqCst) == 0 && state.busy.load(Ordering::SeqCst) == 0;
-        if quiet && lock(&state.last_activity).elapsed() >= state.idle {
+        let unused = lock(&state.last_activity).elapsed();
+        if quiet && unused >= state.idle {
             state.request_stop(ExitReason::Idle);
+            return;
+        }
+        if quiet && unused >= RESTART_QUIET && state.restart_due.load(Ordering::Relaxed) {
+            state.request_stop(ExitReason::Memory);
             return;
         }
         let now = (
@@ -530,4 +715,85 @@ fn housekeeping(state: &State) {
 /// Resident memory in MB, or 0 when unavailable.
 fn rss_mb() -> u64 {
     memory_stats::memory_stats().map_or(0, |s| (s.physical_mem / (1024 * 1024)) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait until `gate` has `queries` and `bulk` requests waiting.
+    fn until_waiting(gate: &Gate, queries: usize, bulk: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.waiting() != (queries, bulk) {
+            assert!(Instant::now() < deadline, "waiting: {:?}", gate.waiting());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_waiting_query_goes_before_waiting_bulk_work() {
+        let gate = Arc::new(Gate::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let turn = gate.enter(Lane::Bulk);
+        let take = |lane, name| {
+            let (gate, order) = (Arc::clone(&gate), Arc::clone(&order));
+            std::thread::spawn(move || {
+                let _turn = gate.enter(lane);
+                lock(&order).push(name);
+            })
+        };
+        let bulk = take(Lane::Bulk, "bulk");
+        until_waiting(&gate, 0, 1);
+        let query = take(Lane::Query, "query");
+        until_waiting(&gate, 1, 1);
+        drop(turn);
+        bulk.join().unwrap();
+        query.join().unwrap();
+        assert_eq!(*lock(&order), ["query", "bulk"]);
+    }
+
+    #[test]
+    fn bulk_clients_take_turns() {
+        let gate = Arc::new(Gate::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let turn = gate.enter(Lane::Query);
+        let client = |name| {
+            let (gate, order) = (Arc::clone(&gate), Arc::clone(&order));
+            std::thread::spawn(move || {
+                for _ in 0..3 {
+                    let _turn = gate.enter(Lane::Bulk);
+                    lock(&order).push(name);
+                }
+            })
+        };
+        let a = client("a");
+        until_waiting(&gate, 0, 1);
+        let b = client("b");
+        until_waiting(&gate, 0, 2);
+        drop(turn);
+        a.join().unwrap();
+        b.join().unwrap();
+        // b was waiting when a finished its first turn, so a asked again
+        // behind it. (Later turns alternate too unless a thread is
+        // descheduled between two of its turns, which a busy machine does.)
+        let order = lock(&order);
+        assert_eq!(order[..2], ["a", "b"]);
+        assert_eq!(order.len(), 6);
+    }
+
+    #[test]
+    fn a_panic_mid_turn_gives_the_turn_back() {
+        let gate = Arc::new(Gate::default());
+        let panicked = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let _turn = gate.enter(Lane::Bulk);
+                panic!("inside the model");
+            })
+            .join()
+        };
+        assert!(panicked.is_err());
+        // Would wait forever if the turn were still held.
+        drop(gate.enter(Lane::Query));
+    }
 }
