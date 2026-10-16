@@ -651,12 +651,6 @@ pub fn settings() -> &'static Settings {
     SETTINGS.get_or_init(Settings::load)
 }
 
-/// Eagerly load settings and bridge config-only values into the mechanisms that
-/// can't read `settings()` directly (the library indexer reads an env var).
-/// Call once at startup. Bridging respects precedence: it only sets the env var
-/// when the user hasn't already set it AND has actually customized the value
-/// (setting it unconditionally would make `config show` report a phantom env
-/// override, and is unnecessary since the indexer's own default matches ours).
 /// The value to put in `SCLEROX_EMBED_ENABLED` so the embed module (which
 /// reads only the env var) agrees with the resolved `embed.enabled`, or `None`
 /// when it already does. An env value that isn't a switch was ignored when
@@ -673,33 +667,52 @@ fn enabled_bridge(resolved: bool, env: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Env vars [`init`] set itself to carry config values into library code.
+static BRIDGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// Set `var` for library code and remember that config, not the user, set it.
+fn bridge(var: &'static str, value: &str) {
+    // SAFETY: called only from `init`, at single-threaded startup, before any
+    // thread is spawned.
+    unsafe {
+        std::env::set_var(var, value);
+    }
+    BRIDGED.lock().unwrap_or_else(|e| e.into_inner()).push(var);
+}
+
+/// Whether `var` holds a value [`init`] bridged from config rather than one
+/// the user set.
+pub fn is_bridged(var: &str) -> bool {
+    BRIDGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&var)
+}
+
+/// Eagerly load settings and bridge config-only values into the mechanisms that
+/// can't read `settings()` directly (the library indexer reads an env var).
+/// Call once at startup. Bridging respects precedence: it only sets the env var
+/// when the user hasn't already set it AND has actually customized the value
+/// (unnecessary, since the library's own defaults match ours). `config show`
+/// leaves bridged vars out of the env overrides it reports.
 pub fn init() {
     let s = settings();
     let is_default = s.index.max_file_bytes == IndexSettings::default().max_file_bytes;
     if !is_default && std::env::var("SCLEROX_MAX_INDEX_FILE_BYTES").is_err() {
-        // SAFETY: single-threaded startup, before any indexing thread is spawned.
-        unsafe {
-            std::env::set_var(
-                "SCLEROX_MAX_INDEX_FILE_BYTES",
-                s.index.max_file_bytes.to_string(),
-            );
-        }
+        bridge(
+            "SCLEROX_MAX_INDEX_FILE_BYTES",
+            &s.index.max_file_bytes.to_string(),
+        );
     }
     // The embedder (library code) reads the model name from the env var.
     let model_is_default = s.embed.model == EmbedSettings::default().model;
     if !model_is_default && std::env::var(crate::embed::models::MODEL_ENV).is_err() {
-        // SAFETY: single-threaded startup, before any thread is spawned.
-        unsafe {
-            std::env::set_var(crate::embed::models::MODEL_ENV, &s.embed.model);
-        }
+        bridge(crate::embed::models::MODEL_ENV, &s.embed.model);
     }
     // ...and whether embeddings are on at all.
     let env = std::env::var(crate::embed::ENABLED_ENV).ok();
     if let Some(v) = enabled_bridge(s.embed.enabled, env.as_deref()) {
-        // SAFETY: single-threaded startup, before any thread is spawned.
-        unsafe {
-            std::env::set_var(crate::embed::ENABLED_ENV, v);
-        }
+        bridge(crate::embed::ENABLED_ENV, v);
     }
     // Sizes the library reads from env vars: the memory embedding cap and the
     // code chunker's.
@@ -728,20 +741,14 @@ pub fn init() {
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         if n != default && env_value != Some(n) {
-            // SAFETY: single-threaded startup, before any thread is spawned.
-            unsafe {
-                std::env::set_var(var, n.to_string());
-            }
+            bridge(var, &n.to_string());
         }
     }
     // Same bridge for the max-files cap: the library indexer reads it from the
     // env var, so surface a customized config value there.
     let files_is_default = s.index.max_files == IndexSettings::default().max_files;
     if !files_is_default && std::env::var("SCLEROX_MAX_INDEX_FILES").is_err() {
-        // SAFETY: single-threaded startup, before any indexing thread is spawned.
-        unsafe {
-            std::env::set_var("SCLEROX_MAX_INDEX_FILES", s.index.max_files.to_string());
-        }
+        bridge("SCLEROX_MAX_INDEX_FILES", &s.index.max_files.to_string());
     }
 }
 

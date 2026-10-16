@@ -80,6 +80,7 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_AI_COMMAND",
         "SCLEROX_AI_MODEL",
         "SCLEROX_MAX_INDEX_FILE_BYTES",
+        "SCLEROX_MAX_INDEX_FILES",
         "SCLEROX_EMBED_MODEL",
         "SCLEROX_EMBED_ENABLED",
         "SCLEROX_EMBED_MEMORY_CHARS",
@@ -90,6 +91,8 @@ fn active_env_overrides() -> Vec<&'static str> {
     ]
     .into_iter()
     .filter(|v| std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false))
+    // Values startup copied from config.toml for library code aren't overrides.
+    .filter(|v| !crate::config::is_bridged(v))
     .collect()
 }
 
