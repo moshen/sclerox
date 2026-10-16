@@ -245,6 +245,13 @@ fn db_reembed_rechunks_text_cut_at_other_sizes() {
 
     let out = e.run(&["db", "reembed"]);
     assert!(!out.contains("re-chunked"), "got: {out}");
+
+    // --force re-chunks too, and embeds each text chunk once: during the
+    // re-chunk, not again in the rebuild of everything else.
+    let out = e.run(&["db", "reembed", "--force"]);
+    assert!(out.contains("new text chunks:"), "got: {out}");
+    assert!(!out.contains("meeting chunks:"), "re-embedded twice: {out}");
+    assert!(!out.contains("todo chunks:"), "re-embedded twice: {out}");
 }
 
 #[test]

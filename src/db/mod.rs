@@ -59,6 +59,9 @@ impl TextChunkKind {
     }
 }
 
+/// The tables holding meeting, todo and research chunks.
+pub const TEXT_CHUNK_TABLES: [&str; 3] = ["meeting_chunks", "todo_chunks", "investigation_chunks"];
+
 /// One item's new text chunks, each with its vector when it has one.
 pub struct ItemChunks {
     pub kind: TextChunkKind,

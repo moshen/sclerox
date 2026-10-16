@@ -107,15 +107,17 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     println!("\nMain database:");
     let mut main_ok = true;
     let mut main_done = false;
-    // Re-cut text chunks first. The new chunks have no vector yet, so the
-    // rebuild or the missing-vector fill below embeds each of them once.
+    // Re-cut text chunks first. On the configured model the new chunks are
+    // embedded before they are swapped in, and the rebuild below leaves them
+    // alone; on another model they go in without vectors and the rebuild
+    // embeds them. Either way each is embedded once.
+    let mut text_chunks_embedded = false;
     if force || super::text_chunks::stale(db) {
-        // On the configured model, embed the new chunks before swapping them
-        // in. On another one the rebuild below embeds them.
-        let rechunked = if matches!(
+        let mismatched = matches!(
             main_state,
             crate::embed::models::ModelCheck::Mismatch { .. }
-        ) {
+        );
+        let rechunked = if mismatched {
             super::text_chunks::rechunk_all(db, None, &mut |_, _, _| {})
         } else {
             let mut out = None;
@@ -136,6 +138,7 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
                     r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
                 );
                 main_done = true;
+                text_chunks_embedded = !mismatched;
             }
             Err(e) => {
                 println!("  could not re-chunk text (run again to retry): {e:#}");
@@ -154,8 +157,13 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
         );
         main_ok = false;
     } else if rebuild_main {
+        let skip: &[&str] = if text_chunks_embedded {
+            &crate::db::TEXT_CHUNK_TABLES
+        } else {
+            &[]
+        };
         match rebuild_one(&mut embedder, |id, embed, progress| {
-            db.reembed_all(id, embed, progress)
+            db.reembed_all_except(id, skip, embed, progress)
         }) {
             Ok(n) => {
                 println!("  re-embedded: {n} vectors");
