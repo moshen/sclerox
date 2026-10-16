@@ -186,7 +186,17 @@ fn write_token(spec: &ModelSpec) -> Result<(String, std::path::PathBuf)> {
     let token = hex::encode(bytes);
     let path = token_path(spec)?;
     let tmp = path.with_extension("token.tmp");
-    std::fs::write(&tmp, &token)?;
+    // The directory is already private; the file is too, in case it moves.
+    // A mode applies only on creation, so clear any leftover first.
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(&tmp)?, token.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
     Ok((token, path))
 }
