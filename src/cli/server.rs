@@ -64,10 +64,15 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
             Ok(())
         }
         ServerCommand::Status => {
-            let running: Vec<ServerStatus> = models::MODELS
-                .iter()
-                .filter_map(|spec| server::status(spec).ok().flatten())
-                .collect();
+            let mut running: Vec<ServerStatus> = Vec::new();
+            for spec in models::MODELS {
+                match server::status(spec) {
+                    Ok(Some(status)) => running.push(status),
+                    Ok(None) => {}
+                    // There, but stuck or not provably this user's.
+                    Err(e) => eprintln!("warning: model server for {}: {e:#}", spec.name),
+                }
+            }
             let recent = recent_runs()?;
             let value = serde_json::json!({ "running": running, "recent_runs": recent });
             print_output(format, &value, || {

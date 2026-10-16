@@ -1552,3 +1552,26 @@ fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
         "{first}"
     );
 }
+
+/// A server that can't show the token only this user can read gets no texts:
+/// commands embed in-process, `status` warns, and `stop` still stops it.
+#[test]
+fn model_server_that_cannot_prove_itself_gets_no_texts() {
+    let s = ServerEnv::new();
+    s.run(&["server", "start"]);
+    let token = s.state.path().join("sclerox/run/granite-small-r2.token");
+    assert!(token.exists());
+    std::fs::write(&token, "not the server's").unwrap();
+
+    s.run(&["memory", "set", "k", "still embedded, just in-process"]);
+    let out = s.cmd().args(["server", "status"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("couldn't prove"), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no model server running"));
+
+    assert_eq!(
+        s.run(&["server", "stop"]),
+        "stopped the model server for granite-small-r2"
+    );
+    assert!(!token.exists(), "the server removes its token on exit");
+}

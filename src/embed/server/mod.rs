@@ -99,7 +99,7 @@ pub(super) const SOCKET_MODE_SUPPORTED: bool =
 fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
     // sun_path is 104 bytes on macOS and 108 on Linux, including the NUL.
     const MAX_PATH: usize = 103;
-    let path = private_dir(&state_dir().join("run"))?.join(format!("{}.sock", spec.name));
+    let path = run_dir()?.join(format!("{}.sock", spec.name));
     if path.as_os_str().len() > MAX_PATH {
         return Err(std::io::Error::other(format!(
             "socket path {} is over the {MAX_PATH}-byte limit",
@@ -107,6 +107,27 @@ fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
         )));
     }
     Ok(path)
+}
+
+/// `$XDG_STATE_HOME/sclerox/run`: the socket (on Unix) and the server's
+/// token. Only this user can read it: on Unix it is made owner-only; on
+/// Windows it inherits the user profile's ACL, which `~/.local/state` sits
+/// under unless `XDG_STATE_HOME` points elsewhere.
+fn run_dir() -> std::io::Result<PathBuf> {
+    let dir = state_dir().join("run");
+    #[cfg(unix)]
+    return private_dir(&dir);
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+}
+
+/// Where the server keeps the token it proves itself with; see
+/// [`protocol::Response::Ready`].
+fn token_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
+    Ok(run_dir()?.join(format!("{}.token", spec.name)))
 }
 
 /// Create `dir` owner-only if it's missing, and check that it is a
@@ -185,6 +206,10 @@ enum Found {
     Ready(Client),
     /// A server from another build, or for another model.
     Mismatch(Client, Build),
+    /// A server that couldn't prove it is this user's (see
+    /// [`protocol::Response::Ready`]). It gets no texts, but `stop` may still
+    /// ask it to exit.
+    Unproven(Client),
     /// Nothing listening.
     Absent,
 }
@@ -226,7 +251,15 @@ impl Client {
             }
         };
         match reply {
-            Response::Ready => Ok(Found::Ready(client)),
+            Response::Ready { token } => {
+                // Anyone can create a Windows pipe with our name first. Only a
+                // server of this user's can have written the token file.
+                let expected = token_path(spec).and_then(std::fs::read_to_string);
+                if expected.ok().as_deref() != Some(token.as_str()) {
+                    return Ok(Found::Unproven(client));
+                }
+                Ok(Found::Ready(client))
+            }
             Response::Mismatch { build, model_id } => {
                 log::debug!(
                     "model server runs {model_id} from {}, not {} from {}",
@@ -307,6 +340,13 @@ impl Client {
     }
 }
 
+fn unproven(spec: &ModelSpec) -> String {
+    format!(
+        "the model server for {} couldn't prove it is this user's, so it gets no texts",
+        spec.name
+    )
+}
+
 /// A client for `spec`'s server, starting the server when none is running.
 /// `None` means embed in-process: the server is off, couldn't start, or
 /// belongs to an older build that this one doesn't replace. Why is logged.
@@ -337,6 +377,7 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
             client.shutdown(ExitReason::Version)?;
             wait_until_stopped(spec, Duration::from_secs(10))?;
         }
+        Found::Unproven(_) => bail!("{}", unproven(spec)),
         Found::Absent => {}
     }
     start(spec, explicit)
@@ -375,6 +416,7 @@ fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
             Found::Ready(client) => return Ok(Some(client)),
             // Another build won the race to start one.
             Found::Mismatch(..) => return Ok(None),
+            Found::Unproven(_) => bail!("{}", unproven(spec)),
             Found::Absent => {}
         }
         // Success means another server already held the lock; keep waiting
@@ -544,6 +586,7 @@ fn is_running(spec: &ModelSpec) -> bool {
 pub fn status(spec: &ModelSpec) -> Result<Option<ServerStatus>> {
     match Client::connect(spec)? {
         Found::Ready(mut c) | Found::Mismatch(mut c, _) => Ok(Some(c.status()?)),
+        Found::Unproven(_) => bail!("{}", unproven(spec)),
         Found::Absent => Ok(None),
     }
 }
@@ -552,7 +595,7 @@ pub fn status(spec: &ModelSpec) -> Result<Option<ServerStatus>> {
 /// running.
 pub fn stop(spec: &ModelSpec) -> Result<bool> {
     match Client::connect(spec)? {
-        Found::Ready(c) | Found::Mismatch(c, _) => {
+        Found::Ready(c) | Found::Mismatch(c, _) | Found::Unproven(c) => {
             c.shutdown(ExitReason::Stopped)?;
             wait_until_stopped(spec, Duration::from_secs(30))?;
             Ok(true)

@@ -106,7 +106,12 @@ pub enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Ready,
+    /// Matching build and model. `token` is the contents of the server's
+    /// token file, which only this user can read: a client sends texts only
+    /// to a server that knows it, not to whatever took the socket name.
+    Ready {
+        token: String,
+    },
     /// The server is another build or runs another model; it has nothing
     /// for this client.
     Mismatch {

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::protocol::{read_msg, write_msg, Build, ExitReason, Request, Response, ServerStatus};
 use super::runs::Runs;
-use super::{lock_path, runs_path, socket_name, state_dir, Client, Found};
+use super::{lock_path, runs_path, socket_name, state_dir, token_path, Client, Found};
 use crate::embed::ModelSpec;
 
 /// What `sclerox server start --foreground` reads from its settings.
@@ -85,6 +85,14 @@ pub fn serve(
 
     // The lock says no live server owns the name, so a socket file left by
     // one that crashed can go.
+    let (token, token_file) = match write_token(spec) {
+        Ok(t) => t,
+        Err(e) => {
+            let e = e.context("failed to write the model server token");
+            let _ = runs.failed(run_id, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
     let listener = ListenerOptions::new()
         .name(name.clone())
         .try_overwrite(true);
@@ -107,6 +115,7 @@ pub fn serve(
     let state = Arc::new(State {
         spec,
         build,
+        token,
         name,
         model: Mutex::new(model),
         idle: options.idle,
@@ -164,8 +173,22 @@ pub fn serve(
         spec.name,
         reason.as_str()
     );
+    let _ = std::fs::remove_file(&token_file);
     drop(lock);
     Ok(Served::Exited(reason))
+}
+
+/// Make a random token and write it where only this user can read it,
+/// replacing any left by an earlier server. Returns it and its file.
+fn write_token(spec: &ModelSpec) -> Result<(String, std::path::PathBuf)> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+    let token = hex::encode(bytes);
+    let path = token_path(spec)?;
+    let tmp = path.with_extension("token.tmp");
+    std::fs::write(&tmp, &token)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok((token, path))
 }
 
 /// Take the model's lock. `false` when another server holds it and answers
@@ -181,7 +204,7 @@ fn acquire(lock: &File, spec: &ModelSpec) -> Result<bool> {
         }
         if matches!(
             Client::connect(spec),
-            Ok(Found::Ready(_) | Found::Mismatch(..))
+            Ok(Found::Ready(_) | Found::Mismatch(..) | Found::Unproven(_))
         ) {
             return Ok(false);
         }
@@ -198,6 +221,7 @@ fn acquire(lock: &File, spec: &ModelSpec) -> Result<bool> {
 struct State {
     spec: &'static ModelSpec,
     build: Build,
+    token: String,
     name: Name<'static>,
     model: Mutex<fastembed::TextEmbedding>,
     idle: Duration,
@@ -297,7 +321,9 @@ fn handle(state: &State, mut stream: Stream) {
             Request::Hello { build, model_id } => {
                 greeted = build == state.build && model_id == state.spec.id;
                 if greeted {
-                    Response::Ready
+                    Response::Ready {
+                        token: state.token.clone(),
+                    }
                 } else {
                     Response::Mismatch {
                         build: state.build.clone(),
