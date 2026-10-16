@@ -127,13 +127,26 @@ pub type ProgressFn<'a> = dyn FnMut(&str, usize, usize) + 'a;
 impl Database {
     /// Re-embed every vector in this database and record `model_id` as its
     /// model. Returns the vectors written; see [`rebuild`].
+    #[cfg(test)]
     pub fn reembed_all(
         &self,
         model_id: &str,
         embed: &mut EmbedFn<'_>,
         progress: &mut ProgressFn<'_>,
     ) -> Result<usize> {
-        rebuild(&self.conn, &PRIMARY, model_id, embed, progress)
+        self.reembed_all_except(model_id, &[], embed, progress)
+    }
+
+    /// [`Self::reembed_all`], leaving the tables named in `skip` as they are.
+    /// For tables whose vectors were just written with `model_id`.
+    pub fn reembed_all_except(
+        &self,
+        model_id: &str,
+        skip: &[&str],
+        embed: &mut EmbedFn<'_>,
+        progress: &mut ProgressFn<'_>,
+    ) -> Result<usize> {
+        rebuild_except(&self.conn, &PRIMARY, model_id, skip, embed, progress)
     }
 
     /// Embed the rows that should have a vector but don't. Refuses a database
@@ -249,6 +262,18 @@ pub fn rebuild(
     embed: &mut EmbedFn<'_>,
     progress: &mut ProgressFn<'_>,
 ) -> Result<usize> {
+    rebuild_except(conn, layout, model_id, &[], embed, progress)
+}
+
+/// [`rebuild`], leaving the tables named in `skip` as they are.
+pub fn rebuild_except(
+    conn: &Connection,
+    layout: &Layout,
+    model_id: &str,
+    skip: &[&str],
+    embed: &mut EmbedFn<'_>,
+    progress: &mut ProgressFn<'_>,
+) -> Result<usize> {
     // Stage on disk, not in memory: a large repo has hundreds of MB of vectors.
     conn.execute_batch(
         "PRAGMA temp_store = FILE;
@@ -261,7 +286,7 @@ pub fn rebuild(
              PRIMARY KEY (tbl, id)
          );",
     )?;
-    let result = stage_and_apply(conn, layout, model_id, embed, progress);
+    let result = stage_and_apply(conn, layout, model_id, skip, embed, progress);
     let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.reembed_staging;");
     result
 }
@@ -270,11 +295,15 @@ fn stage_and_apply(
     conn: &Connection,
     layout: &Layout,
     model_id: &str,
+    skip: &[&str],
     embed: &mut EmbedFn<'_>,
     progress: &mut ProgressFn<'_>,
 ) -> Result<usize> {
     // Embedding writes only to the temp database: no lock on the real one.
     for (i, t) in layout.tables.iter().enumerate() {
+        if skip.contains(&t.table) {
+            continue;
+        }
         let i = i as i64;
         // Fill tables: every row that should have a vector. Code chunks: only
         // those that had one.
@@ -297,6 +326,9 @@ fn stage_and_apply(
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut written = 0usize;
     for (i, t) in layout.tables.iter().enumerate() {
+        if skip.contains(&t.table) {
+            continue;
+        }
         let i = i as i64;
         let mut apply = tx.prepare(&apply_sql(t))?;
         let mut staged =
@@ -524,6 +556,40 @@ mod tests {
 
     fn vector_count(db: &Database, sql: &str) -> i64 {
         db.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rebuild_leaves_skipped_tables_alone() {
+        // On the configured model already, as with `db reembed --force`.
+        let db = minilm_db();
+        db.set_meta(crate::embed::models::META_KEY, GRANITE_SMALL_R2.id)
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            seen.extend(texts.iter().map(|t| t.to_string()));
+            Ok(texts.iter().map(|_| unit(1)).collect())
+        };
+        db.reembed_all_except(
+            GRANITE_SMALL_R2.id,
+            &crate::db::TEXT_CHUNK_TABLES,
+            &mut embed,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        assert!(
+            !seen.iter().any(|t| t == "notes"),
+            "meeting chunk re-embedded"
+        );
+        let vector = |sql: &str| -> Vec<u8> { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            vector("SELECT embedding FROM meeting_chunks"),
+            crate::db::embedding_to_bytes(&unit(0)),
+            "skipped table keeps its vector"
+        );
+        assert_eq!(
+            vector("SELECT embedding FROM memory WHERE key = 'kept' AND status = 'active'"),
+            crate::db::embedding_to_bytes(&unit(1))
+        );
     }
 
     #[test]

@@ -1,9 +1,8 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::config::settings;
+use crate::cli::text_chunks;
 use crate::db::Database;
-use crate::embed::chunk_text;
 use crate::output::truncate;
 
 #[derive(Subcommand)]
@@ -95,8 +94,9 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             )?;
 
             // Chunk and optionally embed the combined text (transcript preferred).
-            let text_to_chunk = transcript.as_deref().or(notes.as_deref()).unwrap_or("");
-            store_chunks(db, id, text_to_chunk, no_embed)?;
+            let text_to_chunk =
+                text_chunks::meeting_source(transcript.as_deref(), notes.as_deref());
+            store_chunks(db, id, &text_to_chunk, no_embed)?;
 
             println!("Added meeting #{id}: {title}");
         }
@@ -262,8 +262,7 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
     if text.is_empty() {
         return Ok(());
     }
-    let emb_cfg = &settings().embed;
-    let raw_chunks = chunk_text(text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
+    let raw_chunks = text_chunks::chunk(text);
     // Without an embedder (--no-embed, embeddings off, model unavailable)
     // the chunks are stored without vectors; `db reembed` can fill them later.
     let embedder = if no_embed {
@@ -282,5 +281,6 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
         raw_chunks.into_iter().map(|c| (c, None)).collect()
     };
     db.meeting_store_chunks(meeting_id, &chunks)?;
+    text_chunks::note(db);
     Ok(())
 }

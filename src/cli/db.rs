@@ -42,6 +42,10 @@ pub enum DbCommand {
     /// all-or-nothing: an interrupted run leaves it on the old model, and
     /// running again starts it over.
     ///
+    /// Meeting, todo and research text is first re-cut into chunks when it was
+    /// cut at other `embed.chunk_size` / `chunk_overlap` values (always with
+    /// --force).
+    ///
     /// Also embeds main-database items saved without a vector (while the
     /// model was unavailable, or with --no-embed). Code chunks indexed without
     /// vectors are left to `sclerox repo reembed` and the session hooks'
@@ -74,7 +78,10 @@ pub(crate) fn embeddings_need_work(db: &Database) -> bool {
     use crate::index::repo_db::RepoDb;
 
     let mismatched = |c: Result<ModelCheck>| matches!(c, Ok(ModelCheck::Mismatch { .. }));
-    if mismatched(db.embedding_model_check()) || db.missing_vectors().unwrap_or(0) > 0 {
+    if mismatched(db.embedding_model_check())
+        || db.missing_vectors().unwrap_or(0) > 0
+        || super::text_chunks::stale(db)
+    {
         return true;
     }
     db.repo_list().unwrap_or_default().iter().any(|repo| {
@@ -100,7 +107,60 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     println!("\nMain database:");
     let mut main_ok = true;
     let mut main_done = false;
-    let rebuild_main = needs_rebuild(&main_state, force);
+    // Re-cut text chunks first. On the configured model the new chunks are
+    // embedded before they are swapped in, and the rebuild below leaves them
+    // alone; on another model they go in without vectors and the rebuild
+    // embeds them. Either way each is embedded once.
+    let mut text_chunks_embedded = false;
+    if force || super::text_chunks::stale(db) {
+        let mismatched = matches!(
+            main_state,
+            crate::embed::models::ModelCheck::Mismatch { .. }
+        );
+        let rechunked = if mismatched {
+            super::text_chunks::rechunk_all(db, None, &mut |_, _, _| {})
+        } else {
+            let mut out = None;
+            rebuild_one(&mut embedder, |_, embed, progress| {
+                let r = super::text_chunks::rechunk_all(db, Some(embed), progress)?;
+                let n = r.chunks;
+                out = Some(r);
+                Ok(n)
+            })
+            .and_then(|_| out.ok_or_else(|| anyhow::anyhow!("re-chunk returned nothing")))
+        };
+        match rechunked {
+            Ok(r) => {
+                let cfg = &crate::config::settings().embed;
+                println!(
+                    "  re-chunked {} meeting(s), {} todo(s) and {} research item(s) \
+                     at chunk_size {}, overlap {}",
+                    r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
+                );
+                if r.replaced.recut > 0 {
+                    println!(
+                        "  {} item(s) edited meanwhile were cut from their new text",
+                        r.replaced.recut
+                    );
+                }
+                if r.replaced.gone > 0 {
+                    println!(
+                        "  {} item(s) deleted meanwhile were skipped",
+                        r.replaced.gone
+                    );
+                }
+                main_done = true;
+                text_chunks_embedded = !mismatched;
+            }
+            Err(e) => {
+                println!("  could not re-chunk text (run again to retry): {e:#}");
+                main_ok = false;
+            }
+        }
+    }
+    // A failed re-chunk leaves the database as it was; don't switch its model
+    // on top of that.
+    let rebuild_main = main_ok && needs_rebuild(&main_state, force);
     if rebuild_main && !wait_for_distillations() {
         println!(
             "  skipped: a session distillation is still running and could write \
@@ -109,8 +169,13 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
         );
         main_ok = false;
     } else if rebuild_main {
+        let skip: &[&str] = if text_chunks_embedded {
+            &crate::db::TEXT_CHUNK_TABLES
+        } else {
+            &[]
+        };
         match rebuild_one(&mut embedder, |id, embed, progress| {
-            db.reembed_all(id, embed, progress)
+            db.reembed_all_except(id, skip, embed, progress)
         }) {
             Ok(n) => {
                 println!("  re-embedded: {n} vectors");

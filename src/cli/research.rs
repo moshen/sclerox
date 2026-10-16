@@ -1,9 +1,8 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::config::settings;
+use crate::cli::text_chunks;
 use crate::db::Database;
-use crate::embed::chunk_text;
 use crate::output::{print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
@@ -379,16 +378,11 @@ fn embed_investigation(
     plan: Option<&str>,
     findings: Option<&str>,
 ) -> Result<()> {
-    let text = [plan, findings]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = text_chunks::research_source(plan, findings);
     if text.trim().is_empty() {
         return Ok(());
     }
-    let emb_cfg = &settings().embed;
-    let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
+    let raw = text_chunks::chunk(&text);
     // Without an embedder (embeddings off, model unavailable) the chunks are
     // stored without vectors; `db reembed` can fill them later.
     let chunks: Vec<(String, Option<Vec<f32>>)> =
@@ -402,5 +396,6 @@ fn embed_investigation(
             raw.into_iter().map(|c| (c, None)).collect()
         };
     db.investigation_store_chunks(id, &chunks)?;
+    text_chunks::note(db);
     Ok(())
 }

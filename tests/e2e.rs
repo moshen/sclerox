@@ -230,6 +230,77 @@ fn memory_reembed_backfills_missing() {
 }
 
 #[test]
+fn db_reembed_rechunks_text_cut_at_other_sizes() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    let transcript = dir.path().join("t.txt");
+    let paras: Vec<String> = (0..12)
+        .map(|i| format!("Paragraph {i} covers the rollout plan for region {i}. ").repeat(4))
+        .collect();
+    std::fs::write(&transcript, paras.join("\n\n")).unwrap();
+    e.run(&[
+        "meeting",
+        "add",
+        "--title",
+        "Rollout",
+        "--transcript-file",
+        transcript.to_str().unwrap(),
+        "--no-embed",
+    ]);
+    e.run(&["todo", "add", "--title", "Write the rollout runbook"]);
+
+    let conn = || rusqlite::Connection::open(&e.db).unwrap();
+    let chunker = || -> Option<String> {
+        conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'text_chunker'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    };
+    // (chunks, longest in chars, chunks without a vector)
+    let meeting_chunks = || -> (i64, i64, i64) {
+        conn()
+            .query_row(
+                "SELECT count(*), max(length(chunk_text)), coalesce(sum(embedding IS NULL), 0)
+                 FROM meeting_chunks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(chunker().as_deref(), Some("v1:size=800:overlap=200"));
+    let (before, _, _) = meeting_chunks();
+
+    // Same sizes: nothing to re-cut.
+    let out = e.run(&["db", "reembed"]);
+    assert!(!out.contains("re-chunked"), "got: {out}");
+
+    std::fs::write(&e.config, "[embed]\nchunk_size = 300\nchunk_overlap = 50\n").unwrap();
+    let out = e.run(&["db", "reembed"]);
+    assert!(
+        out.contains("re-chunked 1 meeting(s), 1 todo(s) and 0 research item(s)"),
+        "got: {out}"
+    );
+    let (after, longest, missing) = meeting_chunks();
+    assert!(after > before, "{after} chunks vs {before}");
+    assert!(longest <= 300, "longest chunk {longest}");
+    assert_eq!(missing, 0, "every new chunk embedded");
+    assert_eq!(chunker().as_deref(), Some("v1:size=300:overlap=50"));
+
+    let out = e.run(&["db", "reembed"]);
+    assert!(!out.contains("re-chunked"), "got: {out}");
+
+    // --force re-chunks too, and embeds each text chunk once: during the
+    // re-chunk, not again in the rebuild of everything else.
+    let out = e.run(&["db", "reembed", "--force"]);
+    assert!(out.contains("new text chunks:"), "got: {out}");
+    assert!(!out.contains("meeting chunks:"), "re-embedded twice: {out}");
+    assert!(!out.contains("todo chunks:"), "re-embedded twice: {out}");
+}
+
+#[test]
 fn memory_list_filters_by_type() {
     let e = Env::new();
     e.run(&["memory", "set", "a", "val", "--type", "user"]);

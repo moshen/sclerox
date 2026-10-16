@@ -13,6 +13,7 @@ pub mod projects;
 pub mod repos;
 pub mod research;
 pub mod search;
+pub mod text_chunks;
 pub mod todos;
 
 use anyhow::Result;

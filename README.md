@@ -116,7 +116,7 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | Command | Description |
 |---------|-------------|
 | `sclerox db migrate [--repos]` | Schema version, pending migrations, and each database's embedding model |
-| `sclerox db reembed [--force]` | Re-embed every database recorded under a different embedding model, and embed items saved without a vector |
+| `sclerox db reembed [--force]` | Re-embed every database recorded under a different embedding model, re-chunk text cut at other `[embed]` chunk sizes, and embed items saved without a vector |
 | `sclerox db export <dir>` | Export the knowledge base as plaintext markdown |
 
 ### `sclerox memory`

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::cli::text_chunks;
 use crate::config::settings;
 use crate::db::{todos::TodoStatus, Database};
-use crate::embed::chunk_text;
 use crate::output::{print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
@@ -387,13 +387,9 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
 
 /// Embed a single todo's title+notes and store the chunks. Silent on error.
 fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
-    let text = match notes {
-        Some(n) if !n.trim().is_empty() => format!("{title}\n\n{n}"),
-        _ => title.to_string(),
-    };
+    let text = text_chunks::todo_source(title, notes);
     if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
-        let emb_cfg = &settings().embed;
-        let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
+        let raw = text_chunks::chunk(&text);
         if let Ok(embeddings) =
             embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {
@@ -401,7 +397,9 @@ fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
                 .into_iter()
                 .zip(embeddings.into_iter().map(Some))
                 .collect();
-            let _ = db.todo_store_chunks(id, &chunks);
+            if db.todo_store_chunks(id, &chunks).is_ok() {
+                text_chunks::note(db);
+            }
         }
     }
 }
@@ -419,12 +417,8 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
     };
     log::debug!("backfilling embeddings for {} todos", pending.len());
     for t in pending {
-        let text = match &t.notes {
-            Some(n) if !n.trim().is_empty() => format!("{}\n\n{n}", t.title),
-            _ => t.title.clone(),
-        };
-        let emb_cfg = &settings().embed;
-        let raw = chunk_text(&text, emb_cfg.chunk_size, emb_cfg.chunk_overlap);
+        let text = text_chunks::todo_source(&t.title, t.notes.as_deref());
+        let raw = text_chunks::chunk(&text);
         if let Ok(embeddings) =
             embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         {
@@ -432,7 +426,9 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
                 .into_iter()
                 .zip(embeddings.into_iter().map(Some))
                 .collect();
-            let _ = db.todo_store_chunks(t.id, &chunks);
+            if db.todo_store_chunks(t.id, &chunks).is_ok() {
+                text_chunks::note(db);
+            }
         }
     }
 }
