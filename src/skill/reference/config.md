@@ -14,7 +14,7 @@ Tunables include `embed.model` (see below), `search.semantic_threshold`, dedup t
 `session_context.max_tokens` (real MiniLM-token budget for injected context),
 `index.auto` (git|off) and `index.max_files` (reject folders over this; `--force`
 overrides), `install.overwrite_*` (protect customizations on upgrade), distill
-chunking, and embed chunk size.
+chunking, and embedding sizes (below).
 
 Two settings govern how hard distillation works to avoid duplicate memories:
 `dedup.merge_threshold` (cosine at/above which a new fact merges into its best
@@ -22,6 +22,28 @@ match instead of being flagged) and
 `distill.context_memories` (how many related existing memories the distiller is
 shown so it can reuse a key rather than invent a near-identical one). Set
 `distill.context_memories = 0` to distill without that context.
+
+## Embedding sizes
+
+How much text each vector covers:
+
+- `embed.memory_chars`: characters of a memory's value that get embedded
+  (default per model: 4000 for Granite, 800 for MiniLM). The full value is
+  always stored and keyword-searchable. Existing memories keep their vectors
+  until rewritten; `sclerox db reembed --force` re-embeds them all at the new
+  size.
+- `embed.chunk_size` / `embed.chunk_overlap` (800 / 200): chunks of meeting,
+  todo and research text. New sizes apply to text saved from then on.
+- `index.chunk_chars` (800): code chunks; longer functions are split.
+  `index.chunk_lines` (15): lines per chunk for files without a tree-sitter
+  grammar. Changing either re-chunks each repo on its next index run.
+
+A model only reads so much of one input: Granite 2048 tokens (about 8000
+characters of prose), MiniLM 256 (about 1000). Text past the token limit is
+not embedded. Characters per token vary with the text, so a size past the
+character estimate warns rather than fails.
+Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
+4000 characters and over 1 s near its limit.
 
 ## Embedding model
 

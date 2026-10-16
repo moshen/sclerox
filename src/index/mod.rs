@@ -27,15 +27,36 @@ pub fn find_git_root(dir: &Path) -> std::path::PathBuf {
     }
 }
 
-// Fallback line count for languages without a tree-sitter grammar.
-// ~15 lines × 50 chars/line ≈ 750 chars, within every supported model's window.
-pub const CHUNK_SIZE_LINES: usize = 15;
+// Default `index.chunk_lines`: lines per chunk for languages without a
+// tree-sitter grammar. ~15 lines × 50 chars/line ≈ 750 chars.
+pub const DEFAULT_CHUNK_LINES: usize = 15;
 
-// Maximum chars per embedded chunk. Anything larger gets split by split_large_chunk().
-// MiniLM's window is 256 tokens ≈ 1024 chars, the smallest of the supported
-// models (Granite small takes 8,192); 800 gives a safety margin. Granite was
-// evaluated at 800 too, and larger chunks did not help it meaningfully.
-pub const MAX_EMBED_CHARS: usize = 800;
+// Default `index.chunk_chars`: most chars per embedded code chunk; anything
+// larger gets split by split_large_chunk(). It fits MiniLM's 256-token
+// training window, the smallest of the supported models. Granite was evaluated
+// at 800 too, and larger chunks did not help it meaningfully.
+pub const DEFAULT_CHUNK_CHARS: usize = 800;
+
+/// Env vars carrying `index.chunk_chars` and `index.chunk_lines` from
+/// `config::init()`.
+pub const CHUNK_CHARS_ENV: &str = "SCLEROX_CODE_CHUNK_CHARS";
+pub const CHUNK_LINES_ENV: &str = "SCLEROX_CODE_CHUNK_LINES";
+
+fn positive_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn chunk_chars() -> usize {
+    positive_env(CHUNK_CHARS_ENV, DEFAULT_CHUNK_CHARS)
+}
+
+fn chunk_lines() -> usize {
+    positive_env(CHUNK_LINES_ENV, DEFAULT_CHUNK_LINES)
+}
 
 // Overlap when splitting an oversized function chunk into sub-chunks.
 const SPLIT_OVERLAP_LINES: usize = 3;
@@ -52,7 +73,9 @@ const CHUNKER_META_KEY: &str = "chunker";
 /// or none, is re-chunked in full on its next index run.
 fn chunker_signature() -> String {
     format!(
-        "v{CHUNKER_VERSION}:lines={CHUNK_SIZE_LINES}:max_chars={MAX_EMBED_CHARS}:overlap={SPLIT_OVERLAP_LINES}"
+        "v{CHUNKER_VERSION}:lines={}:max_chars={}:overlap={SPLIT_OVERLAP_LINES}",
+        chunk_lines(),
+        chunk_chars()
     )
 }
 
@@ -296,13 +319,12 @@ impl<'a> RepoIndexer<'a> {
                 continue;
             }
 
-            let (symbols, raw_chunks, edges) =
-                parse_file(&source, effective_lang, CHUNK_SIZE_LINES);
+            let (symbols, raw_chunks, edges) = parse_file(&source, effective_lang, chunk_lines());
 
             // Split any chunk that exceeds the embedding model's context window.
             let chunks: Vec<parser::CodeChunk> = raw_chunks
                 .into_iter()
-                .flat_map(|c| parser::split_large_chunk(c, MAX_EMBED_CHARS, SPLIT_OVERLAP_LINES))
+                .flat_map(|c| parser::split_large_chunk(c, chunk_chars(), SPLIT_OVERLAP_LINES))
                 .collect();
 
             // Here only for a chunker change: if the new chunker cuts this

@@ -394,7 +394,7 @@ fn embed_investigation(
     let chunks: Vec<(String, Option<Vec<f32>>)> =
         if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
             let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
-            let embeddings = embedder.embed_batch(&texts)?;
+            let embeddings = embedder.embed_each(&texts)?;
             raw.into_iter()
                 .zip(embeddings.into_iter().map(Some))
                 .collect()

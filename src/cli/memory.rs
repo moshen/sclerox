@@ -655,8 +655,7 @@ pub(crate) fn embed_and_store(
     key: &str,
     value: &str,
 ) -> bool {
-    let capped: String = value.chars().take(crate::index::MAX_EMBED_CHARS).collect();
-    match embedder.embed_one(&capped) {
+    match embedder.embed_one(&crate::embed::memory_embed_text(value)) {
         Ok(emb) => db.memory_set_embedding(key, &emb).unwrap_or(false),
         Err(_) => false,
     }
@@ -841,6 +840,11 @@ pub struct DistilledMemory {
     pub supersedes: Option<String>,
 }
 
+/// [`DISTILL_PROMPT`] with the configured memory length filled in.
+fn distill_instructions(max_value_chars: usize) -> String {
+    DISTILL_PROMPT.replace("{max_value_chars}", &max_value_chars.to_string())
+}
+
 const DISTILL_PROMPT: &str = r#"You are extracting structured memory entries from the provided text.
 
 Extract 0-8 concise, factual memory entries. Each entry should capture a single
@@ -866,11 +870,11 @@ DO NOT record:
     in every transcript, so recording it produces one near-identical memory per
     session forever.
 
-Keep each "value" concise: 1-3 sentences and UNDER 800 characters.
+Keep each "value" concise: 1-3 sentences and UNDER {max_value_chars} characters.
 
 Keep ONE topic in ONE entry. Do not split a single finding across several
 entries (a fact entry, a source entry, a detail entry). If a coherent fact does
-not fit in 800 characters, tighten the wording; only split when the text really
+not fit in {max_value_chars} characters, tighten the wording; only split when the text really
 does contain two unrelated facts.
 
 Output ONLY a JSON array with no surrounding text or markdown fences:
@@ -1065,7 +1069,10 @@ fn distill_with_ai(
     text: &str,
     existing: &str,
 ) -> anyhow::Result<Vec<DistilledMemory>> {
-    let prompt = format!("{DISTILL_PROMPT}{existing}\nText to distill:\n{text}");
+    let prompt = format!(
+        "{}{existing}\nText to distill:\n{text}",
+        distill_instructions(settings().memory.max_value_chars)
+    );
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("AI command is empty"))?;
@@ -1148,6 +1155,14 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distill_instructions_use_the_configured_length() {
+        let text = distill_instructions(1500);
+        assert!(text.contains("UNDER 1500 characters"), "{text}");
+        assert!(text.contains("fit in 1500 characters"), "{text}");
+        assert!(!text.contains("{max_value_chars}"));
+    }
 
     #[test]
     fn parse_distilled_reads_supersedes() {

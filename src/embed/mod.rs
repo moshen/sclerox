@@ -134,6 +134,9 @@ impl Embedder {
             .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
     }
 
+    /// Embed several texts as one padded batch. Only the reference parity
+    /// test uses it; see [`Self::embed_each`] for why nothing else should.
+    #[cfg(test)]
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
@@ -144,6 +147,34 @@ impl Embedder {
 }
 
 pub use download::cache_dir as model_cache_dir;
+
+/// Env var carrying `embed.memory_chars` from `config::init()` into this
+/// settings-free module. Unset means the configured model's
+/// [`ModelSpec::memory_chars`].
+pub const MEMORY_CHARS_ENV: &str = "SCLEROX_EMBED_MEMORY_CHARS";
+
+/// How many characters of a memory's value get embedded.
+pub fn memory_chars() -> usize {
+    let model = models::configured().unwrap_or_else(|_| models::default_model());
+    resolve_memory_chars(std::env::var(MEMORY_CHARS_ENV).ok().as_deref(), model)
+}
+
+/// The env value when it is a positive number, else `model`'s default.
+fn resolve_memory_chars(env: Option<&str>, model: &ModelSpec) -> usize {
+    env.and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(model.memory_chars)
+}
+
+/// The part of a memory's value that gets embedded: its first
+/// [`memory_chars`] characters.
+pub fn memory_embed_text(value: &str) -> String {
+    first_chars(value, memory_chars())
+}
+
+fn first_chars(value: &str, n: usize) -> String {
+    value.chars().take(n).collect()
+}
 
 /// Whether every file `spec` needs is already in the model cache.
 pub fn is_downloaded(spec: &ModelSpec) -> bool {
@@ -199,7 +230,8 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         model_def = model_def.with_external_initializer(graph_name.to_string(), read(data)?);
     }
 
-    fastembed::TextEmbedding::try_new_from_user_defined(model_def, InitOptionsUserDefined::new())
+    let options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    fastembed::TextEmbedding::try_new_from_user_defined(model_def, options)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -358,6 +390,24 @@ mod tests {
             assert_eq!(parse_switch(off), Some(false), "{off}");
         }
         assert_eq!(parse_switch("maybe"), None);
+    }
+
+    #[test]
+    fn memory_chars_take_a_positive_env_value_else_the_model_default() {
+        let (granite, minilm) = (&models::GRANITE_SMALL_R2, &models::MINILM_L6_V2);
+        assert_eq!(resolve_memory_chars(None, granite), 4000);
+        assert_eq!(resolve_memory_chars(None, minilm), 800);
+        assert_eq!(resolve_memory_chars(Some("1500"), granite), 1500);
+        for bad in ["0", "lots", ""] {
+            assert_eq!(resolve_memory_chars(Some(bad), granite), 4000, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn memory_text_is_cut_in_chars() {
+        let text = first_chars(&"é".repeat(5000), 4000);
+        assert_eq!(text.chars().count(), 4000);
+        assert_eq!(first_chars("short", 4000), "short");
     }
 
     #[test]

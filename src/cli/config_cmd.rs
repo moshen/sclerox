@@ -82,6 +82,9 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_MAX_INDEX_FILE_BYTES",
         "SCLEROX_EMBED_MODEL",
         "SCLEROX_EMBED_ENABLED",
+        "SCLEROX_EMBED_MEMORY_CHARS",
+        "SCLEROX_CODE_CHUNK_CHARS",
+        "SCLEROX_CODE_CHUNK_LINES",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]
@@ -150,13 +153,19 @@ pub fn config_template() -> String {
          [embed]\n\
          # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
          # model = \"{embed_model}\"   # {model_names}; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
-         # chunk_size = {embed_size}                 # entity-text chunking for embeddings\n\
-         # chunk_overlap = {embed_overlap}\n\
+         # Text past a model's token limit is not embedded; sizes past its\n\
+         # estimated char limit warn. Larger inputs cost more time and memory.\n\
+         {model_limits}\
+         # chunk_size = {embed_size}                 # chars per embedded chunk of meeting/todo/research text\n\
+         # chunk_overlap = {embed_overlap}               # chars repeated from the previous chunk\n\
+         # memory_chars = {mem_chars}               # chars of each memory embedded; unset = the model's. env: SCLEROX_EMBED_MEMORY_CHARS\n\
          \n\
          [index]\n\
          # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
          # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
          # max_files = {max_files}                    # reject folders over this many files (--force to override); env: SCLEROX_MAX_INDEX_FILES\n\
+         # chunk_chars = {code_chars}                # chars per embedded code chunk; changing it re-chunks on the next index. env: SCLEROX_CODE_CHUNK_CHARS\n\
+         # chunk_lines = {code_lines}                 # lines per chunk without a tree-sitter grammar. env: SCLEROX_CODE_CHUNK_LINES\n\
          \n\
          [install]\n\
          # Refresh each managed artifact on a re-install/upgrade. Set false to keep\n\
@@ -201,6 +210,10 @@ pub fn config_template() -> String {
         model_names = crate::embed::models::names().join("|"),
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
+        model_limits = model_limits_doc(),
+        mem_chars = d.memory_embed_chars(),
+        code_chars = d.index.chunk_chars,
+        code_lines = d.index.chunk_lines,
         max_bytes = d.index.max_file_bytes,
         auto = d.index.auto,
         max_files = d.index.max_files,
@@ -227,6 +240,23 @@ fn model_thresholds_doc() -> String {
                 off(t.top_margin),
                 t.dedup_cosine,
                 off(t.merge)
+            )
+        })
+        .collect()
+}
+
+/// One commented line per registry model giving its input limit and default
+/// memory embedding size.
+fn model_limits_doc() -> String {
+    crate::embed::models::MODELS
+        .iter()
+        .map(|m| {
+            format!(
+                "#   {:<18} reads {} tokens (about {} chars); memory_chars {}\n",
+                format!("{}:", m.name),
+                m.max_tokens,
+                m.max_chars(),
+                m.memory_chars
             )
         })
         .collect()

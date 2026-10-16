@@ -1051,11 +1051,7 @@ fn distill_chunked(
             }
 
             // Embed the value once (if possible); reused for dedup and storage.
-            let capped: String = m
-                .value
-                .chars()
-                .take(crate::index::MAX_EMBED_CHARS)
-                .collect();
+            let capped = crate::embed::memory_embed_text(&m.value);
             let emb = embedder.as_mut().and_then(|e| e.embed_one(&capped).ok());
 
             // Reusing a hand-written memory's key would upsert over it in
@@ -1352,7 +1348,7 @@ fn decide_dedup_action(
 /// the distiller's dedup context.
 ///
 /// Probes several windows across the chunk rather than embedding its head. One
-/// embedding covers `MAX_EMBED_CHARS` (800) of a chunk that may be
+/// embedding covers `embed.chunk_size` (800 by default) of a chunk that may be
 /// `distill.chunk_chars` (20k by default) long, so a single head embedding
 /// describes ~4% of the text: it retrieves context for whatever the chunk
 /// happened to open with (often a slash-command banner or an unrelated first
@@ -1386,7 +1382,8 @@ fn related_memories_for_chunk(
     // Best score wins when several probes surface the same memory.
     let mut best: std::collections::HashMap<String, (f32, String)> =
         std::collections::HashMap::new();
-    for text in probe_windows(chunk, crate::index::MAX_EMBED_CHARS, PROBES) {
+    let window = crate::config::settings().embed.chunk_size;
+    for text in probe_windows(chunk, window, PROBES) {
         let Ok(emb) = embedder.embed_one(&text) else {
             continue;
         };

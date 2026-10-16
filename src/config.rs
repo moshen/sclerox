@@ -139,10 +139,14 @@ pub struct EmbedSettings {
     /// running `sclerox db reembed`; until then semantic search and dedup are
     /// off for databases embedded with the old model. Env: `SCLEROX_EMBED_MODEL`.
     pub model: String,
-    /// Entity-text chunk size for embeddings.
+    /// Most characters per embedded chunk of meeting, todo and research text.
     pub chunk_size: usize,
-    /// Overlap between adjacent chunks.
+    /// Characters of the previous chunk repeated at the start of the next.
     pub chunk_overlap: usize,
+    /// How many characters of a memory's value get embedded; the rest is still
+    /// stored and keyword-searchable. `None` = the model's default (see
+    /// `embed::models`). Env: `SCLEROX_EMBED_MEMORY_CHARS`.
+    pub memory_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +163,13 @@ pub struct IndexSettings {
     /// `sclerox repo index --force`). Guards against indexing a giant tree. Env:
     /// `SCLEROX_MAX_INDEX_FILES`.
     pub max_files: usize,
+    /// Most characters per embedded code chunk; longer functions are split.
+    /// Changing it re-chunks each repo on its next index run. Env:
+    /// `SCLEROX_CODE_CHUNK_CHARS`.
+    pub chunk_chars: usize,
+    /// Lines per chunk for languages without a tree-sitter grammar. Env:
+    /// `SCLEROX_CODE_CHUNK_LINES`.
+    pub chunk_lines: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +279,7 @@ impl Default for EmbedSettings {
             model: crate::embed::models::DEFAULT_MODEL.to_string(),
             chunk_size: 800,
             chunk_overlap: 200,
+            memory_chars: None,
         }
     }
 }
@@ -278,6 +290,8 @@ impl Default for IndexSettings {
             max_file_bytes: 1_000_000,
             auto: "git".to_string(),
             max_files: 50_000,
+            chunk_chars: crate::index::DEFAULT_CHUNK_CHARS,
+            chunk_lines: crate::index::DEFAULT_CHUNK_LINES,
         }
     }
 }
@@ -383,6 +397,22 @@ impl Settings {
                 self.index.max_files = n;
             }
         }
+        // A size that isn't a positive number is ignored, leaving the file's.
+        let size_env = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        };
+        if let Some(n) = size_env(crate::index::CHUNK_CHARS_ENV) {
+            self.index.chunk_chars = n;
+        }
+        if let Some(n) = size_env(crate::index::CHUNK_LINES_ENV) {
+            self.index.chunk_lines = n;
+        }
+        if let Some(n) = size_env(crate::embed::MEMORY_CHARS_ENV) {
+            self.embed.memory_chars = Some(n);
+        }
         if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {
             if !m.is_empty() {
                 self.embed.model = m;
@@ -471,6 +501,39 @@ impl Settings {
         require_positive("distill.min_turns", &mut self.distill.min_turns, 5);
         require_positive("distill.min_new_turns", &mut self.distill.min_new_turns, 50);
         require_positive("embed.chunk_size", &mut self.embed.chunk_size, 800);
+        if self.embed.memory_chars == Some(0) {
+            eprintln!("warning: embed.memory_chars must be > 0; using the model's default");
+            self.embed.memory_chars = None;
+        }
+        require_positive(
+            "index.chunk_chars",
+            &mut self.index.chunk_chars,
+            crate::index::DEFAULT_CHUNK_CHARS,
+        );
+        require_positive(
+            "index.chunk_lines",
+            &mut self.index.chunk_lines,
+            crate::index::DEFAULT_CHUNK_LINES,
+        );
+        // Larger sizes are allowed, but the model never sees past its token
+        // limit. Chars per token vary, so the char figure is an estimate.
+        let model = self.embed_model();
+        for (name, chars) in [
+            ("embed.chunk_size", self.embed.chunk_size),
+            ("embed.memory_chars", self.memory_embed_chars()),
+            ("index.chunk_chars", self.index.chunk_chars),
+        ] {
+            if chars > model.max_chars() {
+                eprintln!(
+                    "warning: {name} = {chars} may be more than {} reads in one input \
+                     ({} tokens, about {} chars depending on the text); the excess \
+                     would not be embedded",
+                    model.name,
+                    model.max_tokens,
+                    model.max_chars()
+                );
+            }
+        }
         require_positive(
             "index.max_file_bytes",
             &mut self.index.max_file_bytes,
@@ -565,6 +628,13 @@ impl Settings {
             .or(self.embed_model().thresholds.merge)
     }
 
+    /// How many characters of a memory's value get embedded.
+    pub fn memory_embed_chars(&self) -> usize {
+        self.embed
+            .memory_chars
+            .unwrap_or(self.embed_model().memory_chars)
+    }
+
     /// Loose floor for the related memories shown to the distiller. Not
     /// user-tunable: it only selects context, it never gates a write.
     pub fn context_threshold(&self) -> f64 {
@@ -631,6 +701,39 @@ pub fn init() {
             std::env::set_var(crate::embed::ENABLED_ENV, v);
         }
     }
+    // Sizes the library reads from env vars: the memory embedding cap and the
+    // code chunker's.
+    let d = IndexSettings::default();
+    let size_bridges = [
+        (
+            crate::index::CHUNK_CHARS_ENV,
+            s.index.chunk_chars,
+            d.chunk_chars,
+        ),
+        (
+            crate::index::CHUNK_LINES_ENV,
+            s.index.chunk_lines,
+            d.chunk_lines,
+        ),
+        (
+            crate::embed::MEMORY_CHARS_ENV,
+            s.embed.memory_chars.unwrap_or(0),
+            0,
+        ),
+    ];
+    for (var, n, default) in size_bridges {
+        // An env value that didn't parse was ignored above, so the library
+        // must not read it either.
+        let env_value = std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if n != default && env_value != Some(n) {
+            // SAFETY: single-threaded startup, before any thread is spawned.
+            unsafe {
+                std::env::set_var(var, n.to_string());
+            }
+        }
+    }
     // Same bridge for the max-files cap: the library indexer reads it from the
     // env var, so surface a customized config value there.
     let files_is_default = s.index.max_files == IndexSettings::default().max_files;
@@ -687,6 +790,33 @@ semantic_threshold = 0.7
         let mut s = Settings::from_toml_str("[search]\nsemantic_threshold = 5.0\n").unwrap();
         s.validate();
         assert_eq!(s.search.semantic_threshold, Some(1.0));
+    }
+
+    #[test]
+    fn size_settings_follow_the_model_unless_overridden() {
+        let granite = Settings::from_toml_str("").unwrap();
+        assert_eq!(granite.memory_embed_chars(), 4000);
+        assert_eq!(granite.index.chunk_chars, 800);
+        assert_eq!(granite.index.chunk_lines, 15);
+
+        let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+        assert_eq!(minilm.memory_embed_chars(), 800);
+
+        let set = Settings::from_toml_str(
+            "[embed]\nmemory_chars = 1500\n[index]\nchunk_chars = 1200\nchunk_lines = 30\n",
+        )
+        .unwrap();
+        assert_eq!(set.memory_embed_chars(), 1500);
+        assert_eq!(set.index.chunk_chars, 1200);
+        assert_eq!(set.index.chunk_lines, 30);
+
+        // Zero is repaired to the default rather than disabling embedding.
+        let mut zero =
+            Settings::from_toml_str("[embed]\nmemory_chars = 0\n[index]\nchunk_chars = 0\n")
+                .unwrap();
+        zero.validate();
+        assert_eq!(zero.memory_embed_chars(), 4000);
+        assert_eq!(zero.index.chunk_chars, 800);
     }
 
     #[test]
