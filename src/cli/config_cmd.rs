@@ -153,8 +153,8 @@ pub fn config_template() -> String {
          [embed]\n\
          # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
          # model = \"{embed_model}\"   # {model_names}; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
-         # Sizes past what the model reads in one input are warned about; the\n\
-         # model ignores the excess. Larger inputs cost more time and memory.\n\
+         # Text past a model's token limit is not embedded; sizes past its\n\
+         # estimated char limit warn. Larger inputs cost more time and memory.\n\
          {model_limits}\
          # chunk_size = {embed_size}                 # chars per embedded chunk of meeting/todo/research text\n\
          # chunk_overlap = {embed_overlap}               # chars repeated from the previous chunk\n\

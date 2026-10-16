@@ -29,7 +29,9 @@ How much text each vector covers:
 
 - `embed.memory_chars`: characters of a memory's value that get embedded
   (default per model: 4000 for Granite, 800 for MiniLM). The full value is
-  always stored and keyword-searchable.
+  always stored and keyword-searchable. Existing memories keep their vectors
+  until rewritten; `sclerox db reembed --force` re-embeds them all at the new
+  size.
 - `embed.chunk_size` / `embed.chunk_overlap` (800 / 200): chunks of meeting,
   todo and research text. New sizes apply to text saved from then on.
 - `index.chunk_chars` (800): code chunks; longer functions are split.
@@ -37,7 +39,9 @@ How much text each vector covers:
   grammar. Changing either re-chunks each repo on its next index run.
 
 A model only reads so much of one input: Granite 2048 tokens (about 8000
-characters of prose), MiniLM 256 (about 1000). A size past that warns, and the excess is not embedded.
+characters of prose), MiniLM 256 (about 1000). Text past the token limit is
+not embedded. Characters per token vary with the text, so a size past the
+character estimate warns rather than fails.
 Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
 4000 characters and over 1 s near its limit.
 

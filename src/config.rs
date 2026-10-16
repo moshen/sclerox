@@ -515,7 +515,8 @@ impl Settings {
             &mut self.index.chunk_lines,
             crate::index::DEFAULT_CHUNK_LINES,
         );
-        // Larger sizes are allowed, but the model never sees past its limit.
+        // Larger sizes are allowed, but the model never sees past its token
+        // limit. Chars per token vary, so the char figure is an estimate.
         let model = self.embed_model();
         for (name, chars) in [
             ("embed.chunk_size", self.embed.chunk_size),
@@ -524,8 +525,9 @@ impl Settings {
         ] {
             if chars > model.max_chars() {
                 eprintln!(
-                    "warning: {name} = {chars} is more than {} reads in one input \
-                     ({} tokens, about {} chars); text past that is not embedded",
+                    "warning: {name} = {chars} may be more than {} reads in one input \
+                     ({} tokens, about {} chars depending on the text); the excess \
+                     would not be embedded",
                     model.name,
                     model.max_tokens,
                     model.max_chars()

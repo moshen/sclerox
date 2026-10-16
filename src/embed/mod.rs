@@ -155,21 +155,25 @@ pub const MEMORY_CHARS_ENV: &str = "SCLEROX_EMBED_MEMORY_CHARS";
 
 /// How many characters of a memory's value get embedded.
 pub fn memory_chars() -> usize {
-    std::env::var(MEMORY_CHARS_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let model = models::configured().unwrap_or_else(|_| models::default_model());
+    resolve_memory_chars(std::env::var(MEMORY_CHARS_ENV).ok().as_deref(), model)
+}
+
+/// The env value when it is a positive number, else `model`'s default.
+fn resolve_memory_chars(env: Option<&str>, model: &ModelSpec) -> usize {
+    env.and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            models::configured()
-                .unwrap_or_else(|_| models::default_model())
-                .memory_chars
-        })
+        .unwrap_or(model.memory_chars)
 }
 
 /// The part of a memory's value that gets embedded: its first
 /// [`memory_chars`] characters.
 pub fn memory_embed_text(value: &str) -> String {
-    value.chars().take(memory_chars()).collect()
+    first_chars(value, memory_chars())
+}
+
+fn first_chars(value: &str, n: usize) -> String {
+    value.chars().take(n).collect()
 }
 
 /// Whether every file `spec` needs is already in the model cache.
@@ -389,12 +393,21 @@ mod tests {
     }
 
     #[test]
-    fn memory_embed_text_keeps_the_model_default_in_chars() {
-        // Unset env: the configured (default) model's size, counted in chars.
-        let value = "é".repeat(5000);
-        let text = memory_embed_text(&value);
-        assert_eq!(text.chars().count(), models::GRANITE_SMALL_R2.memory_chars);
-        assert_eq!(memory_embed_text("short"), "short");
+    fn memory_chars_take_a_positive_env_value_else_the_model_default() {
+        let (granite, minilm) = (&models::GRANITE_SMALL_R2, &models::MINILM_L6_V2);
+        assert_eq!(resolve_memory_chars(None, granite), 4000);
+        assert_eq!(resolve_memory_chars(None, minilm), 800);
+        assert_eq!(resolve_memory_chars(Some("1500"), granite), 1500);
+        for bad in ["0", "lots", ""] {
+            assert_eq!(resolve_memory_chars(Some(bad), granite), 4000, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn memory_text_is_cut_in_chars() {
+        let text = first_chars(&"é".repeat(5000), 4000);
+        assert_eq!(text.chars().count(), 4000);
+        assert_eq!(first_chars("short", 4000), "short");
     }
 
     #[test]
