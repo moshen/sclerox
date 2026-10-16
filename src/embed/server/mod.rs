@@ -175,6 +175,111 @@ fn socket_name() -> std::io::Result<Name<'static>> {
     Ok(name.to_ns_name::<GenericNamespaced>()?.into_owned())
 }
 
+/// Whether the process at the other end of `stream` runs as this user.
+#[cfg(unix)]
+fn same_user(stream: &Stream) -> std::io::Result<bool> {
+    // SAFETY: geteuid cannot fail.
+    let me = unsafe { libc::geteuid() };
+    Ok(stream.peer_creds()?.euid() == Some(me))
+}
+
+#[cfg(windows)]
+fn same_user(stream: &Stream) -> std::io::Result<bool> {
+    let pid = stream
+        .peer_creds()?
+        .pid()
+        .ok_or_else(|| std::io::Error::other("no process id for the pipe's server"))?;
+    windows_user::runs_as_this_user(pid)
+}
+
+/// Comparing the user a process runs as with this process's. The user, not
+/// the owner of the objects it creates: an elevated process's objects can be
+/// owned by the Administrators group.
+#[cfg(windows)]
+mod windows_user {
+    use std::ffi::c_void;
+    use std::io;
+
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: i32 = 1;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+        fn EqualSid(a: *const c_void, b: *const c_void) -> i32;
+    }
+
+    /// A TOKEN_USER: a pointer to the SID, then the SID itself, which is at
+    /// most 68 bytes.
+    #[repr(C, align(8))]
+    struct TokenUser([u8; 128]);
+
+    impl TokenUser {
+        fn sid(&self) -> *const c_void {
+            // SAFETY: TOKEN_USER starts with its SID pointer, which points
+            // into this buffer.
+            unsafe { *(self.0.as_ptr() as *const *const c_void) }
+        }
+    }
+
+    /// The user `process` runs as.
+    ///
+    /// # Safety
+    /// `process` must be a valid process handle with query access.
+    unsafe fn user_of(process: Handle) -> io::Result<TokenUser> {
+        let mut token: Handle = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut user = TokenUser([0; 128]);
+        let mut len = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER,
+            user.0.as_mut_ptr().cast(),
+            user.0.len() as u32,
+            &mut len,
+        );
+        let err = io::Error::last_os_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(user)
+    }
+
+    pub fn runs_as_this_user(pid: u32) -> io::Result<bool> {
+        // SAFETY: plain Win32 calls; every handle opened here is closed here,
+        // and the SIDs compared live in buffers on this stack.
+        unsafe {
+            let me = user_of(GetCurrentProcess())?;
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let them = user_of(process);
+            CloseHandle(process);
+            Ok(EqualSid(me.sid(), them?.sid()) != 0)
+        }
+    }
+}
+
 /// A connection to a running server, past the handshake.
 pub struct Client {
     /// `None` once a call has timed out: its thread still owns the stream.
@@ -221,6 +326,11 @@ impl Client {
                 return Ok(Found::Absent);
             }
         };
+        // Before sending anything: a Windows pipe name is global, so another
+        // user can hold it, and only the process behind it says whose it is.
+        if !same_user(&stream).context("couldn't tell who runs the model server")? {
+            bail!("the model server's socket belongs to another user; not using it");
+        }
         let mut client = Client {
             stream: Some(stream),
         };
@@ -600,6 +710,43 @@ pub fn start_detached(spec: &'static ModelSpec) -> Result<ServerStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server this process starts passes the check commands make before
+    /// sending it anything. (Failing it takes a second user account.)
+    #[test]
+    fn a_server_of_this_user_passes_the_ownership_check() {
+        use interprocess::local_socket::ListenerOptions;
+        let dir = tempfile::TempDir::new().unwrap();
+        #[cfg(unix)]
+        let name = {
+            use interprocess::local_socket::GenericFilePath;
+            dir.path()
+                .join("t.sock")
+                .to_fs_name::<GenericFilePath>()
+                .unwrap()
+                .into_owned()
+        };
+        #[cfg(windows)]
+        let name = {
+            use interprocess::local_socket::GenericNamespaced;
+            format!(
+                "sclerox-test-{}-{}",
+                std::process::id(),
+                dir_hash(dir.path())
+            )
+            .to_ns_name::<GenericNamespaced>()
+            .unwrap()
+            .into_owned()
+        };
+        let listener = ListenerOptions::new()
+            .name(name.clone())
+            .create_sync()
+            .unwrap();
+        let server = std::thread::spawn(move || listener.accept().map(drop));
+        let stream = Stream::connect(name).unwrap();
+        assert!(same_user(&stream).unwrap());
+        server.join().unwrap().unwrap();
+    }
 
     #[test]
     fn modes() {

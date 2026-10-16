@@ -110,7 +110,8 @@ sclerox server start [--foreground] [--model M]  # start it yourself, loading M 
 
 Commands never depend on it. If the server is off, from another build, or keeps
 failing, they load the model themselves as before; a newer build replaces an
-older build's server. The `reembed` commands always load the model in-process.
+older build's server. A command only talks to a server running as the same
+user. The `reembed` commands always load the model in-process.
 `embed.server = off` (env `SCLEROX_EMBED_SERVER=off`) makes commands load the
 model themselves and never start a server; it doesn't stop one already running
 (`sclerox server stop` does), and `sclerox server start` still works. Runs are
