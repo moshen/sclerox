@@ -496,6 +496,11 @@ fn handle(state: &State, mut stream: Stream) {
             Request::Embed { .. } | Request::Load { .. } if !greeted => {
                 Response::Error("model request before a matching hello".to_string())
             }
+            // Refused so the client embeds in-process and the server can exit
+            // instead of serving a bulk client's next batch, and the next.
+            Request::Embed { .. } | Request::Load { .. } if state.stopping().is_some() => {
+                Response::Error("model server is stopping".to_string())
+            }
             Request::Embed { model, texts } => state.embed(&model, texts),
             Request::Load { model } => state.load_only(&model),
             Request::Status => Response::Status(state.status()),

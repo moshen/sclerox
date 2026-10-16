@@ -52,11 +52,14 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
             Ok(())
         }
         ServerCommand::Stop => {
-            if server::stop()? {
-                println!("stopped the model server");
-            } else {
-                println!("no model server running");
-            }
+            let stopped = server::stop()?;
+            print_output(format, &serde_json::json!({ "stopped": stopped }), || {
+                if stopped {
+                    println!("stopped the model server");
+                } else {
+                    println!("no model server running");
+                }
+            });
             Ok(())
         }
         ServerCommand::Status => {

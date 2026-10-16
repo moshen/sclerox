@@ -1287,7 +1287,11 @@ fn todo_done_already_done_is_idempotent() {
 fn commands_stay_fast() {
     use std::time::{Duration, Instant};
 
-    let e = Env::new();
+    // A warm model server, as in real use: commands that embed get their
+    // vectors from it instead of each loading the model, so `search` is held
+    // to a real budget rather than one padded for a model load.
+    let e = ServerEnv::new();
+    e.run(&["server", "start"]);
 
     // Populate with some data
     e.run(&["memory", "set", "perf-key", "performance test value"]);
@@ -1312,8 +1316,7 @@ fn commands_stay_fast() {
     // Best-of-N: take the FASTEST of several runs. Tests run in parallel, so a
     // single run can be inflated by a transient scheduler/CI load spike; the
     // best case still reflects true command cost, so a real regression fails it
-    // while noise doesn't. (Model load can't be amortized this way - each `sclerox`
-    // invocation is a fresh process - which is why `search` is budgeted below.)
+    // while noise doesn't.
     let best_of = |args: &[&str], runs: u32| -> Duration {
         (0..runs)
             .map(|_| {
@@ -1343,13 +1346,19 @@ fn commands_stay_fast() {
         );
     }
 
-    // `sclerox search` loads the embedding model on every invocation - a fixed
-    // startup cost (~100ms+, hardware-dependent), not a data-size regression.
-    // It gets a looser budget that still catches gross slowdowns (seconds).
+    // `search` embeds its query on the server: one round trip on top of the
+    // SQLite work. Loading the model in-process instead takes about 0.5 s in
+    // a debug build, so the server's request count is checked too.
+    let requests = || e.status()["server"]["requests"].as_u64().unwrap();
+    let before = requests();
     let t = best_of(&["search", "perf"], 3);
     assert!(
-        t.as_millis() < 2000,
-        "search took {}ms (best of 3), expected < 2000ms",
+        requests() >= before + 3,
+        "search embedded its query in-process, not on the server"
+    );
+    assert!(
+        t.as_millis() < 300,
+        "search took {}ms (best of 3), expected < 300ms",
         t.as_millis()
     );
 }
@@ -1546,6 +1555,12 @@ fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
     let pid = |out: &str| out.lines().next().unwrap().to_string();
     assert_eq!(pid(&first), pid(&second));
     assert!(first.starts_with("model server: running, pid "), "{first}");
+
+    let stop = |s: &ServerEnv| -> serde_json::Value {
+        serde_json::from_str(&s.run(&["server", "stop", "--output", "json"])).unwrap()
+    };
+    assert_eq!(stop(&s), serde_json::json!({ "stopped": true }));
+    assert_eq!(stop(&s), serde_json::json!({ "stopped": false }));
 }
 
 /// Sessions configured for different models share one server, which loads
