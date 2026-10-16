@@ -40,6 +40,32 @@ pub fn register_vec_extension() {
 /// Rows of (id, first text, second text) that an item's chunks are cut from.
 pub type ChunkSources = Vec<(i64, Option<String>, Option<String>)>;
 
+/// Which table an item's text chunks live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextChunkKind {
+    Meeting,
+    Todo,
+    Research,
+}
+
+impl TextChunkKind {
+    /// (chunk table, column naming the item)
+    fn table(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Meeting => ("meeting_chunks", "meeting_id"),
+            Self::Todo => ("todo_chunks", "todo_id"),
+            Self::Research => ("investigation_chunks", "investigation_id"),
+        }
+    }
+}
+
+/// One item's new text chunks, each with its vector when it has one.
+pub struct ItemChunks {
+    pub kind: TextChunkKind,
+    pub id: i64,
+    pub chunks: Vec<(String, Option<Vec<f32>>)>,
+}
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -135,6 +161,45 @@ impl Database {
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
             params![crate::embed::TEXT_CHUNKER_KEY, signature],
         )?;
+        Ok(())
+    }
+
+    /// Replace the text chunks of every item in `items` and record `signature`
+    /// as the text chunker, all in one transaction: a failure leaves every
+    /// item's old chunks, and the old record, in place. Vectors are kept only
+    /// when the database may take them; see `write_with_vectors`.
+    pub fn replace_text_chunks(&self, items: &[ItemChunks], signature: &str) -> Result<()> {
+        let wants_vectors = items
+            .iter()
+            .any(|item| item.chunks.iter().any(|(_, e)| e.is_some()));
+        // `write_with_vectors` opens a transaction only to store vectors, and
+        // joins one already open, so open it here for the vector-less case too.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.write_with_vectors(wants_vectors, |keep_vectors| {
+            for item in items {
+                let (table, column) = item.kind.table();
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                    params![item.id],
+                )?;
+                let mut stmt = self.conn.prepare_cached(&format!(
+                    "INSERT INTO {table} ({column}, chunk_index, chunk_text, embedding)
+                     VALUES (?1, ?2, ?3, ?4)"
+                ))?;
+                for (i, (text, emb)) in item.chunks.iter().enumerate() {
+                    let emb_bytes = emb
+                        .as_deref()
+                        .filter(|_| keep_vectors)
+                        .map(embedding_to_bytes);
+                    stmt.execute(params![item.id, i as i64, text, emb_bytes])?;
+                }
+            }
+            self.set_meta(crate::embed::TEXT_CHUNKER_KEY, signature)
+        })?;
+        tx.commit()?;
         Ok(())
     }
 

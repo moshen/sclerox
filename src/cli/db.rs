@@ -110,7 +110,24 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     // Re-cut text chunks first. The new chunks have no vector yet, so the
     // rebuild or the missing-vector fill below embeds each of them once.
     if force || super::text_chunks::stale(db) {
-        match super::text_chunks::rechunk_all(db) {
+        // On the configured model, embed the new chunks before swapping them
+        // in. On another one the rebuild below embeds them.
+        let rechunked = if matches!(
+            main_state,
+            crate::embed::models::ModelCheck::Mismatch { .. }
+        ) {
+            super::text_chunks::rechunk_all(db, None, &mut |_, _, _| {})
+        } else {
+            let mut out = None;
+            rebuild_one(&mut embedder, |_, embed, progress| {
+                let r = super::text_chunks::rechunk_all(db, Some(embed), progress)?;
+                let n = r.chunks;
+                out = Some(r);
+                Ok(n)
+            })
+            .and_then(|_| out.ok_or_else(|| anyhow::anyhow!("re-chunk returned nothing")))
+        };
+        match rechunked {
             Ok(r) => {
                 let cfg = &crate::config::settings().embed;
                 println!(
@@ -126,7 +143,9 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
             }
         }
     }
-    let rebuild_main = needs_rebuild(&main_state, force);
+    // A failed re-chunk leaves the database as it was; don't switch its model
+    // on top of that.
+    let rebuild_main = main_ok && needs_rebuild(&main_state, force);
     if rebuild_main && !wait_for_distillations() {
         println!(
             "  skipped: a session distillation is still running and could write \

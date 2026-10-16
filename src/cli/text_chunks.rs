@@ -4,7 +4,8 @@
 //! here, so re-cutting stored text gives the same chunks a fresh write would.
 
 use crate::config::settings;
-use crate::db::Database;
+use crate::db::reembed::{EmbedFn, ProgressFn};
+use crate::db::{Database, ItemChunks, TextChunkKind};
 use crate::embed::chunk_text;
 use anyhow::Result;
 
@@ -57,44 +58,85 @@ pub fn stale(db: &Database) -> bool {
     matches!(db.text_chunker(), Ok(Some(recorded)) if recorded != signature())
 }
 
-/// How many items of each kind [`rechunk_all`] re-cut.
+/// How many items of each kind [`rechunk_all`] re-cut, and into how many chunks.
 pub struct Rechunked {
     pub meetings: usize,
     pub todos: usize,
     pub research: usize,
+    pub chunks: usize,
 }
 
 /// Re-cut every meeting, todo and investigation from its stored text, then
-/// record the configured chunker. The new chunks carry no vector; the caller
-/// embeds them (`db reembed` fills missing vectors next).
-pub fn rechunk_all(db: &Database) -> Result<Rechunked> {
-    let pieces = |text: &str| -> Vec<(String, Option<Vec<f32>>)> {
-        if text.trim().is_empty() {
-            return Vec::new();
-        }
-        chunk(text).into_iter().map(|c| (c, None)).collect()
+/// swap the new chunks and the chunker record in with one transaction, so a
+/// failure changes nothing.
+///
+/// With `embed`, the new chunks are embedded before the swap and search never
+/// sees them without a vector. Without it (the database is on another model
+/// and about to be rebuilt) they are stored without one.
+pub fn rechunk_all(
+    db: &Database,
+    embed: Option<&mut EmbedFn<'_>>,
+    progress: &mut ProgressFn<'_>,
+) -> Result<Rechunked> {
+    let mut items = Vec::new();
+    let mut push = |kind, id, text: &str| {
+        let chunks = if text.trim().is_empty() {
+            Vec::new()
+        } else {
+            chunk(text).into_iter().map(|c| (c, None)).collect()
+        };
+        items.push(ItemChunks { kind, id, chunks });
     };
-
     let meetings = db.meeting_chunk_inputs()?;
     for (id, transcript, notes) in &meetings {
         let text = meeting_source(transcript.as_deref(), notes.as_deref());
-        db.meeting_store_chunks(*id, &pieces(text))?;
+        push(TextChunkKind::Meeting, *id, text);
     }
     let todos = db.todo_chunk_inputs()?;
     for (id, title, notes) in &todos {
-        db.todo_store_chunks(*id, &pieces(&todo_source(title, notes.as_deref())))?;
+        push(
+            TextChunkKind::Todo,
+            *id,
+            &todo_source(title, notes.as_deref()),
+        );
     }
     let research = db.investigation_chunk_inputs()?;
     for (id, plan, findings) in &research {
         let text = research_source(plan.as_deref(), findings.as_deref());
-        db.investigation_store_chunks(*id, &pieces(&text))?;
+        push(TextChunkKind::Research, *id, &text);
     }
 
-    db.set_meta(crate::embed::TEXT_CHUNKER_KEY, &signature())?;
+    let total: usize = items.iter().map(|i| i.chunks.len()).sum();
+    if let Some(embed) = embed {
+        let mut done = 0;
+        for item in &mut items {
+            if item.chunks.is_empty() {
+                continue;
+            }
+            let vectors = {
+                let texts: Vec<&str> = item.chunks.iter().map(|(t, _)| t.as_str()).collect();
+                embed(&texts)?
+            };
+            let n = item.chunks.len();
+            anyhow::ensure!(
+                vectors.len() == n,
+                "embedder returned {} vectors for {n} texts",
+                vectors.len()
+            );
+            for ((_, slot), v) in item.chunks.iter_mut().zip(vectors) {
+                *slot = Some(v);
+            }
+            done += n;
+            progress("new text chunks", done, total);
+        }
+    }
+
+    db.replace_text_chunks(&items, &signature())?;
     Ok(Rechunked {
         meetings: meetings.len(),
         todos: todos.len(),
         research: research.len(),
+        chunks: total,
     })
 }
 
@@ -130,7 +172,7 @@ mod tests {
         db.set_meta(crate::embed::TEXT_CHUNKER_KEY, "v0").unwrap();
         assert!(stale(&db));
 
-        let done = rechunk_all(&db).unwrap();
+        let done = rechunk_all(&db, None, &mut |_, _, _| {}).unwrap();
         assert_eq!(done.meetings, 1);
         assert!(!stale(&db));
         assert_eq!(db.text_chunker().unwrap(), Some(signature()));
@@ -145,5 +187,62 @@ mod tests {
         assert!(chunks.len() > 1, "{} chunk(s)", chunks.len());
         let max = settings().embed.chunk_size;
         assert!(chunks.iter().all(|c| c.chars().count() <= max));
+    }
+
+    fn meeting_chunks(db: &Database, id: i64) -> Vec<(String, bool)> {
+        db.conn
+            .prepare("SELECT chunk_text, embedding IS NOT NULL FROM meeting_chunks WHERE meeting_id = ?1 ORDER BY chunk_index")
+            .unwrap()
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn rechunk_embeds_before_the_swap() {
+        let db = Database::open_in_memory().unwrap();
+        let transcript = "Paragraph on the billing cutover plan. ".repeat(60);
+        let id = db
+            .meeting_add("Billing", None, Some(&transcript), None)
+            .unwrap();
+        let mut calls = 0;
+        let mut embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            calls += 1;
+            Ok(texts.iter().map(|_| vec![0.5f32; 384]).collect())
+        };
+        let done = rechunk_all(&db, Some(&mut embed), &mut |_, _, _| {}).unwrap();
+        let chunks = meeting_chunks(&db, id);
+        assert_eq!(chunks.len(), done.chunks);
+        assert!(chunks.iter().all(|(_, has_vector)| *has_vector));
+        assert_eq!(calls, 1, "one call per item");
+    }
+
+    #[test]
+    fn a_failed_swap_keeps_every_old_chunk() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .meeting_add("Kept", None, Some("old text"), None)
+            .unwrap();
+        db.meeting_store_chunks(id, &[("old text".into(), None)])
+            .unwrap();
+        db.set_meta(crate::embed::TEXT_CHUNKER_KEY, "v0").unwrap();
+        // The second item names a meeting that doesn't exist, so its insert
+        // fails after the first item was already replaced.
+        let items = [
+            ItemChunks {
+                kind: TextChunkKind::Meeting,
+                id,
+                chunks: vec![("new text".into(), None)],
+            },
+            ItemChunks {
+                kind: TextChunkKind::Meeting,
+                id: 999,
+                chunks: vec![("orphan".into(), None)],
+            },
+        ];
+        assert!(db.replace_text_chunks(&items, &signature()).is_err());
+        assert_eq!(meeting_chunks(&db, id), [("old text".to_string(), false)]);
+        assert_eq!(db.text_chunker().unwrap().as_deref(), Some("v0"));
     }
 }
