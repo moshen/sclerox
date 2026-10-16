@@ -11,22 +11,23 @@ use crate::output::{print_output, OutputFormat};
 pub enum ServerCommand {
     /// Start the model server in the background.
     ///
-    /// The server keeps the embedding model loaded so commands don't each
-    /// load it. Commands start it themselves when `embed.server = auto`, so
-    /// this is rarely needed. It exits after `server.idle_minutes` unused.
+    /// The server keeps embedding models loaded so commands don't each load
+    /// one. Commands start it themselves when `embed.server = auto`, so this
+    /// is rarely needed. It exits after `server.idle_minutes` unused.
     Start {
         /// Run in this terminal instead of the background, until idle or stopped.
         #[arg(long)]
         foreground: bool,
-        /// Model to serve (default: embed.model).
+        /// Model to load now (default: embed.model). Others load when first
+        /// asked for.
         #[arg(long)]
         model: Option<String>,
     },
 
-    /// Stop running model servers, after any embedding in progress.
+    /// Stop the model server, after any embedding in progress.
     Stop,
 
-    /// Show running model servers and recent runs.
+    /// Show the running model server, its models, and recent runs.
     Status,
 }
 
@@ -51,39 +52,30 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
             Ok(())
         }
         ServerCommand::Stop => {
-            let mut stopped = 0;
-            for spec in models::MODELS {
-                if server::stop(spec)? {
-                    println!("stopped the model server for {}", spec.name);
-                    stopped += 1;
-                }
-            }
-            if stopped == 0 {
+            if server::stop()? {
+                println!("stopped the model server");
+            } else {
                 println!("no model server running");
             }
             Ok(())
         }
         ServerCommand::Status => {
-            let mut running: Vec<ServerStatus> = Vec::new();
-            for spec in models::MODELS {
-                match server::status(spec) {
-                    Ok(Some(status)) => running.push(status),
-                    Ok(None) => {}
-                    // There, but stuck or not provably this user's.
-                    Err(e) => eprintln!("warning: model server for {}: {e:#}", spec.name),
+            let running = match server::status() {
+                Ok(status) => status,
+                // There, but stuck or not provably this user's.
+                Err(e) => {
+                    eprintln!("warning: model server: {e:#}");
+                    None
                 }
-            }
+            };
             let recent = recent_runs()?;
-            let value = serde_json::json!({ "running": running, "recent_runs": recent });
+            let value = serde_json::json!({ "server": running, "recent_runs": recent });
             print_output(format, &value, || {
-                if running.is_empty() {
-                    println!("no model server running");
+                match &running {
+                    Some(status) => print_status(status),
+                    None => println!("no model server running"),
                 }
-                for status in &running {
-                    print_status(status);
-                }
-                let pids: Vec<u32> = running.iter().map(|s| s.pid).collect();
-                print_runs(&recent, &pids);
+                print_runs(&recent, running.as_ref().map(|s| s.pid));
             });
             Ok(())
         }
@@ -93,26 +85,23 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
 fn start_foreground(spec: &'static ModelSpec) -> Result<()> {
     let options = server::ServeOptions {
         idle: Duration::from_secs(settings().server.idle_minutes * 60),
+        preload: spec,
     };
-    let served = server::serve(spec, options, |status| {
+    let served = server::serve(options, |status| {
         eprintln!(
-            "model server for {} ready: pid {}, {} MB",
-            status.model, status.pid, status.loaded_mb
+            "model server ready: pid {}, {} MB with {} loaded",
+            status.pid, status.rss_mb, spec.name
         );
     })?;
     match served {
-        server::Served::AlreadyRunning => {
-            eprintln!("a model server for {} is already running", spec.name)
-        }
-        server::Served::Exited(reason) => {
-            eprintln!("model server for {} exited: {}", spec.name, reason.as_str())
-        }
+        server::Served::AlreadyRunning => eprintln!("a model server is already running"),
+        server::Served::Exited(reason) => eprintln!("model server exited: {}", reason.as_str()),
     }
     Ok(())
 }
 
 fn print_status(s: &ServerStatus) {
-    println!("{}: running, pid {}", s.model, s.pid);
+    println!("model server: running, pid {}", s.pid);
     let this = Build::current();
     let note = if s.build == this {
         String::new()
@@ -120,11 +109,7 @@ fn print_status(s: &ServerStatus) {
         format!(" - not this build, {}", this.label())
     };
     println!("  build     {}{note}", s.build.label());
-    println!("  device    {}", s.device);
-    println!(
-        "  memory    {} MB now, {} MB after loading, {} MB peak",
-        s.rss_mb, s.loaded_mb, s.peak_mb
-    );
+    println!("  memory    {} MB now, {} MB peak", s.rss_mb, s.peak_mb);
     println!(
         "  requests  {} (last {}; exits after {} idle)",
         s.requests,
@@ -132,6 +117,20 @@ fn print_status(s: &ServerStatus) {
         minutes(s.idle_limit_secs)
     );
     println!("  started   {}", s.started_at);
+    println!("  models");
+    for m in &s.models {
+        match &m.error {
+            Some(error) => println!("    {:<16}  failed to load: {error}", m.name),
+            None => println!(
+                "    {:<16}  {}, {} MB, {} requests (last {})",
+                m.name,
+                m.device,
+                m.loaded_mb,
+                m.requests,
+                ago(m.idle_secs)
+            ),
+        }
+    }
 }
 
 fn recent_runs() -> Result<Vec<runs::Run>> {
@@ -142,35 +141,37 @@ fn recent_runs() -> Result<Vec<runs::Run>> {
     runs::Runs::open(&path)?.recent(10)
 }
 
-/// `running` are the pids of servers that answered; an unfinished run that
-/// isn't one of them ended without recording why.
-fn print_runs(recent: &[runs::Run], running: &[u32]) {
+/// `running` is the pid of the server that answered; an unfinished run
+/// that isn't it ended without recording why.
+fn print_runs(recent: &[runs::Run], running: Option<u32>) {
     if recent.is_empty() {
         return;
     }
     println!("\nrecent runs (UTC):");
     println!(
-        "  {:<19}  {:<19}  {:<16}  {:>7}  {:<8}  {:>8}  {:>7}  {:>7}",
-        "started", "ended", "model", "pid", "reason", "requests", "load MB", "peak MB"
+        "  {:<19}  {:<19}  {:>7}  {:<8}  {:>8}  {:>7}  models",
+        "started", "ended", "pid", "reason", "requests", "peak MB"
     );
-    let mb = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
     for r in recent {
         println!(
-            "  {:<19}  {:<19}  {:<16}  {:>7}  {:<8}  {:>8}  {:>7}  {:>7}",
+            "  {:<19}  {:<19}  {:>7}  {:<8}  {:>8}  {:>7}  {}",
             r.started_at,
             r.ended_at.as_deref().unwrap_or("-"),
-            r.model,
             r.pid,
             r.exit_reason
                 .as_deref()
-                .unwrap_or(if running.contains(&r.pid) {
+                .unwrap_or(if running == Some(r.pid) {
                     "running"
                 } else {
                     "unknown"
                 }),
             r.requests,
-            mb(r.loaded_mb),
-            mb(r.peak_mb),
+            r.peak_mb.map_or_else(|| "-".to_string(), |n| n.to_string()),
+            if r.models.is_empty() {
+                "-".to_string()
+            } else {
+                r.models.join(", ")
+            },
         );
         if let Some(error) = &r.error {
             println!("    {error}");

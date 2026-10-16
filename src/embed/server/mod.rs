@@ -1,16 +1,16 @@
-//! The model server: one long-running `sclerox server` process per model that
-//! keeps the model loaded, so commands get vectors without loading it
+//! The model server: one long-running `sclerox server` process per user
+//! that keeps models loaded, so commands get vectors without loading a model
 //! themselves (about 0.27 s a command on the CPU).
 //!
-//! The server only embeds. Commands still open their databases and print
-//! their own output, and anything that goes wrong with the server - not
-//! running, another build, a dropped connection - falls back to loading the
-//! model in-process, as every command did before the server existed.
+//! The server only runs models. Commands still open their databases and
+//! print their own output, and anything that goes wrong with the server -
+//! not running, another build, a dropped connection - falls back to loading
+//! the model in-process, as every command did before the server existed.
 //!
-//! Each model gets its own socket (see `socket_path`; a named pipe on
-//! Windows) and its own lock, `server-<model>.lock` in the state directory,
-//! so sessions configured for different models never replace each other's
-//! server.
+//! There is one socket (see `socket_path`; a named pipe on Windows) and one
+//! lock, `server.lock` in the state directory. The server loads the model it
+//! was started for, and any other a request names on first use, so sessions
+//! configured for different models share it.
 
 pub mod protocol;
 pub mod runs;
@@ -68,7 +68,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// minutes while other commands wait to embed a query.
 const TEXTS_PER_REQUEST: usize = 16;
 /// Failed starts or crashes in [`FAILURE_WINDOW`] after which commands stop
-/// starting a server for the model and embed in-process.
+/// starting a server and embed in-process.
 const MAX_RECENT_FAILURES: usize = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -82,8 +82,8 @@ pub fn runs_path() -> PathBuf {
     state_dir().join("server.db")
 }
 
-fn lock_path(spec: &ModelSpec) -> PathBuf {
-    state_dir().join(format!("server-{}.lock", spec.name))
+fn lock_path() -> PathBuf {
+    state_dir().join("server.lock")
 }
 
 /// Whether this OS lets a listener create its socket owner-only (macOS
@@ -93,13 +93,13 @@ fn lock_path(spec: &ModelSpec) -> PathBuf {
 pub(super) const SOCKET_MODE_SUPPORTED: bool =
     cfg!(any(target_os = "linux", target_os = "android"));
 
-/// The Unix socket file, `$XDG_STATE_HOME/sclerox/run/<model>.sock`, in a
+/// The Unix socket file, `$XDG_STATE_HOME/sclerox/run/server.sock`, in a
 /// directory only this user can enter.
 #[cfg(unix)]
-fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
+fn socket_path() -> std::io::Result<PathBuf> {
     // sun_path is 104 bytes on macOS and 108 on Linux, including the NUL.
     const MAX_PATH: usize = 103;
-    let path = run_dir()?.join(format!("{}.sock", spec.name));
+    let path = run_dir()?.join("server.sock");
     if path.as_os_str().len() > MAX_PATH {
         return Err(std::io::Error::other(format!(
             "socket path {} is over the {MAX_PATH}-byte limit",
@@ -126,8 +126,8 @@ fn run_dir() -> std::io::Result<PathBuf> {
 
 /// Where the server keeps the token it proves itself with; see
 /// [`protocol::Response::Ready`].
-fn token_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
-    Ok(run_dir()?.join(format!("{}.token", spec.name)))
+fn token_path() -> std::io::Result<PathBuf> {
+    Ok(run_dir()?.join("server.token"))
 }
 
 /// Create `dir` owner-only if it's missing, and check that it is a
@@ -156,11 +156,9 @@ fn private_dir(dir: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn socket_name(spec: &ModelSpec) -> std::io::Result<Name<'static>> {
+fn socket_name() -> std::io::Result<Name<'static>> {
     use interprocess::local_socket::GenericFilePath;
-    Ok(socket_path(spec)?
-        .to_fs_name::<GenericFilePath>()?
-        .into_owned())
+    Ok(socket_path()?.to_fs_name::<GenericFilePath>()?.into_owned())
 }
 
 /// A short stand-in for a directory path in names that can't hold the path.
@@ -175,9 +173,9 @@ fn dir_hash(dir: &std::path::Path) -> String {
 /// state directory: two users, or a test with its own state directory,
 /// each get their own server.
 #[cfg(windows)]
-fn socket_name(spec: &ModelSpec) -> std::io::Result<Name<'static>> {
+fn socket_name() -> std::io::Result<Name<'static>> {
     use interprocess::local_socket::GenericNamespaced;
-    let name = format!("sclerox-{}-{}", spec.name, dir_hash(&state_dir()));
+    let name = format!("sclerox-{}", dir_hash(&state_dir()));
     Ok(name.to_ns_name::<GenericNamespaced>()?.into_owned())
 }
 
@@ -204,7 +202,7 @@ impl std::error::Error for TimedOut {}
 /// What a connection attempt found.
 enum Found {
     Ready(Client),
-    /// A server from another build, or for another model.
+    /// A server from another build.
     Mismatch(Client, Build),
     /// A server that couldn't prove it is this user's (see
     /// [`protocol::Response::Ready`]). It gets no texts, but `stop` may still
@@ -215,19 +213,19 @@ enum Found {
 }
 
 impl Client {
-    fn connect(spec: &ModelSpec) -> Result<Found> {
+    fn connect() -> Result<Found> {
         // No usable socket path means no server could have started either.
-        let name = match socket_name(spec) {
+        let name = match socket_name() {
             Ok(name) => name,
             Err(e) => {
-                log::debug!("no model server socket for {}: {e}", spec.name);
+                log::debug!("no model server socket: {e}");
                 return Ok(Found::Absent);
             }
         };
         let stream = match Stream::connect(name) {
             Ok(s) => s,
             Err(e) => {
-                log::trace!("no model server for {}: {e}", spec.name);
+                log::trace!("no model server: {e}");
                 return Ok(Found::Absent);
             }
         };
@@ -236,17 +234,13 @@ impl Client {
         };
         let hello = Request::Hello {
             build: Build::current(),
-            model_id: spec.id.to_string(),
         };
         let reply = match client.call(&hello, REPLY_TIMEOUT) {
             Ok(reply) => reply,
             Err(e) if e.is::<TimedOut>() => return Err(e),
             // Accepted and dropped: the server is on its way out.
             Err(e) => {
-                log::debug!(
-                    "model server for {} closed the connection: {e:#}",
-                    spec.name
-                );
+                log::debug!("model server closed the connection: {e:#}");
                 return Ok(Found::Absent);
             }
         };
@@ -254,17 +248,16 @@ impl Client {
             Response::Ready { token } => {
                 // Anyone can create a Windows pipe with our name first. Only a
                 // server of this user's can have written the token file.
-                let expected = token_path(spec).and_then(std::fs::read_to_string);
+                let expected = token_path().and_then(std::fs::read_to_string);
                 if expected.ok().as_deref() != Some(token.as_str()) {
                     return Ok(Found::Unproven(client));
                 }
                 Ok(Found::Ready(client))
             }
-            Response::Mismatch { build, model_id } => {
+            Response::Mismatch { build } => {
                 log::debug!(
-                    "model server runs {model_id} from {}, not {} from {}",
+                    "model server is {}, not {}",
                     build.label(),
-                    spec.id,
                     Build::current().label()
                 );
                 Ok(Found::Mismatch(client, build))
@@ -301,12 +294,13 @@ impl Client {
         }
     }
 
-    /// Embed texts exactly as given, in requests of at most
+    /// Embed texts exactly as given with `spec`, in requests of at most
     /// [`TEXTS_PER_REQUEST`].
-    pub fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed(&mut self, spec: &ModelSpec, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(TEXTS_PER_REQUEST) {
             let req = Request::Embed {
+                model: spec.name.to_string(),
                 texts: batch.to_vec(),
             };
             match self.call(&req, EMBED_TIMEOUT)? {
@@ -325,6 +319,18 @@ impl Client {
         Ok(vectors)
     }
 
+    /// Have the server load `spec` if it hasn't.
+    fn load(&mut self, spec: &ModelSpec) -> Result<()> {
+        let req = Request::Load {
+            model: spec.name.to_string(),
+        };
+        match self.call(&req, START_TIMEOUT)? {
+            Response::Loaded => Ok(()),
+            Response::Error(e) => bail!("model server: {e}"),
+            other => bail!("unexpected reply to load: {other:?}"),
+        }
+    }
+
     pub fn status(&mut self) -> Result<ServerStatus> {
         match self.call(&Request::Status, REPLY_TIMEOUT)? {
             Response::Status(s) => Ok(s),
@@ -340,17 +346,21 @@ impl Client {
     }
 }
 
-fn unproven(spec: &ModelSpec) -> String {
-    format!(
-        "the model server for {} couldn't prove it is this user's, so it gets no texts",
-        spec.name
-    )
-}
+const UNPROVEN: &str = "the model server couldn't prove it is this user's, so it gets no texts";
 
-/// A client for `spec`'s server, starting the server when none is running.
-/// `None` means embed in-process: the server is off, couldn't start, or
-/// belongs to an older build that this one doesn't replace. Why is logged.
+/// A client of the server, to embed with `spec`, starting the server when
+/// none is running. `None` means embed in-process: `spec` isn't downloaded
+/// yet (loading it in-process shows the download), or the server couldn't
+/// start or belongs to an older build that this one doesn't replace. Why is
+/// logged.
 pub fn connect_or_start(spec: &'static ModelSpec) -> Option<Client> {
+    if !super::is_downloaded(spec) {
+        log::debug!(
+            "{} not downloaded yet; not using the model server",
+            spec.name
+        );
+        return None;
+    }
     match try_connect_or_start(spec, false) {
         Ok(client) => client,
         Err(e) => {
@@ -363,7 +373,7 @@ pub fn connect_or_start(spec: &'static ModelSpec) -> Option<Client> {
 /// `explicit` is `sclerox server start`, which tries even after recent
 /// failures.
 fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
-    match Client::connect(spec)? {
+    match Client::connect()? {
         Found::Ready(client) => return Ok(Some(client)),
         Found::Mismatch(client, theirs) => {
             if !Build::current().newer_than(&theirs) {
@@ -375,36 +385,29 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
             }
             log::info!("replacing model server {} with this build", theirs.label());
             client.shutdown(ExitReason::Version)?;
-            wait_until_stopped(spec, Duration::from_secs(10))?;
+            wait_until_stopped(Duration::from_secs(10))?;
         }
-        Found::Unproven(_) => bail!("{}", unproven(spec)),
+        Found::Unproven(_) => bail!(UNPROVEN),
         Found::Absent => {}
     }
     start(spec, explicit)
 }
 
-/// Start `spec`'s server in the background and connect to it once the model
-/// has loaded. `None` when the model isn't downloaded yet (loading it
-/// in-process shows the download) or, unless `explicit`, the server keeps
+/// Start the server in the background, loading `spec` first, and connect to
+/// it once it is ready. `None` when, unless `explicit`, the server keeps
 /// failing.
 fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
-    if !super::is_downloaded(spec) {
-        log::debug!("{} not downloaded yet; not starting a server", spec.name);
-        return Ok(None);
-    }
-    if let Err(e) = socket_name(spec) {
+    if let Err(e) = socket_name() {
         if explicit {
             return Err(e).context("can't start a model server");
         }
-        log::debug!("no model server socket for {}: {e}", spec.name);
+        log::debug!("no model server socket: {e}");
         return Ok(None);
     }
-    let failures = runs::Runs::open(&runs_path())?.recent_failures(spec.name, FAILURE_WINDOW)?;
+    let failures = runs::Runs::open(&runs_path())?.recent_failures(FAILURE_WINDOW)?;
     if failures >= MAX_RECENT_FAILURES && !explicit {
         log::warn!(
-            "model server for {} failed {failures} times in the last {} minutes; \
-             embedding in-process",
-            spec.name,
+            "model server failed {failures} times in the last {} minutes; embedding in-process",
             FAILURE_WINDOW.as_secs() / 60
         );
         return Ok(None);
@@ -412,11 +415,11 @@ fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
     let mut child = spawn_detached(spec)?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        match Client::connect(spec)? {
+        match Client::connect()? {
             Found::Ready(client) => return Ok(Some(client)),
             // Another build won the race to start one.
             Found::Mismatch(..) => return Ok(None),
-            Found::Unproven(_) => bail!("{}", unproven(spec)),
+            Found::Unproven(_) => bail!(UNPROVEN),
             Found::Absent => {}
         }
         // Success means another server already held the lock; keep waiting
@@ -436,7 +439,7 @@ fn start(spec: &'static ModelSpec, explicit: bool) -> Result<Option<Client>> {
     }
 }
 
-/// Run `sclerox server start --foreground` for `spec`, detached from this
+/// Run `sclerox server start --foreground`, loading `spec`, detached from this
 /// process: no shared stdio (a hook's caller waits on its pipes closing), its
 /// own session on Unix, and out of this process's job on Windows, so it
 /// outlives whatever started it.
@@ -551,26 +554,22 @@ mod windows_std {
     }
 }
 
-/// Wait for `spec`'s server to exit, which is when it releases its lock.
-fn wait_until_stopped(spec: &ModelSpec, timeout: Duration) -> Result<()> {
+/// Wait for the server to exit, which is when it releases its lock.
+fn wait_until_stopped(timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    while is_running(spec) {
+    while is_running() {
         if Instant::now() >= deadline {
-            bail!(
-                "model server for {} did not stop within {}s",
-                spec.name,
-                timeout.as_secs()
-            );
+            bail!("model server did not stop within {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
 }
 
-/// Whether a server for `spec` is running (holds its lock), whether or not
-/// it has finished loading.
-fn is_running(spec: &ModelSpec) -> bool {
-    let Ok(file) = std::fs::File::open(lock_path(spec)) else {
+/// Whether a server is running (holds the lock), whether or not it has
+/// finished loading.
+fn is_running() -> bool {
+    let Ok(file) = std::fs::File::open(lock_path()) else {
         return false;
     };
     match file.try_lock() {
@@ -582,34 +581,36 @@ fn is_running(spec: &ModelSpec) -> bool {
     }
 }
 
-/// The status of `spec`'s server, or `None` when none is answering.
-pub fn status(spec: &ModelSpec) -> Result<Option<ServerStatus>> {
-    match Client::connect(spec)? {
+/// The server's status, or `None` when none is answering.
+pub fn status() -> Result<Option<ServerStatus>> {
+    match Client::connect()? {
         Found::Ready(mut c) | Found::Mismatch(mut c, _) => Ok(Some(c.status()?)),
-        Found::Unproven(_) => bail!("{}", unproven(spec)),
+        Found::Unproven(_) => bail!(UNPROVEN),
         Found::Absent => Ok(None),
     }
 }
 
-/// Stop `spec`'s server and wait for it to exit. `false` when none was
-/// running.
-pub fn stop(spec: &ModelSpec) -> Result<bool> {
-    match Client::connect(spec)? {
+/// Stop the server and wait for it to exit. `false` when none was running.
+pub fn stop() -> Result<bool> {
+    match Client::connect()? {
         Found::Ready(c) | Found::Mismatch(c, _) | Found::Unproven(c) => {
             c.shutdown(ExitReason::Stopped)?;
-            wait_until_stopped(spec, Duration::from_secs(30))?;
+            wait_until_stopped(Duration::from_secs(30))?;
             Ok(true)
         }
         Found::Absent => Ok(false),
     }
 }
 
-/// Start `spec`'s server in the background, as commands do, and return its
-/// status once it is ready.
+/// Start the server in the background, as commands do, make sure it has
+/// loaded `spec`, and return its status.
 pub fn start_detached(spec: &'static ModelSpec) -> Result<ServerStatus> {
     super::ensure_downloaded(spec)?;
     match try_connect_or_start(spec, true)? {
-        Some(mut client) => client.status(),
+        Some(mut client) => {
+            client.load(spec)?;
+            client.status()
+        }
         None => bail!(
             "a model server from another build is running; stop it with \
              `sclerox server stop` first"

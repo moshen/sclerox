@@ -98,13 +98,14 @@ flags them in `sclerox memory conflicts` instead.
 Loading the model costs each command about a quarter of a second. With
 `embed.server = auto` (the default) the first command that needs vectors starts
 a background model server, which keeps the model loaded, and later commands get
-their vectors from it. It serves every database and session and exits after
-`server.idle_minutes` (15) unused.
+their vectors from it. There is one server per user. It serves every database
+and session, loads another model the first time a command configured for it
+asks, and exits after `server.idle_minutes` (15) unused.
 
 ```bash
-sclerox server status                     # running server: memory, requests, idle; recent runs
+sclerox server status                     # running server: memory, requests, its models; recent runs
 sclerox server stop                       # stop it (the next command starts a new one)
-sclerox server start [--foreground]       # start it yourself; --foreground runs it in this terminal
+sclerox server start [--foreground] [--model M]  # start it yourself, loading M (default embed.model)
 ```
 
 Commands never depend on it. If the server is off, from another build, or keeps

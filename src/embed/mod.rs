@@ -155,7 +155,7 @@ impl Embedder {
     /// model here and carry on without it.
     fn run(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if let Backend::Server(client) = &mut self.backend {
-            match client.embed(&texts) {
+            match client.embed(self.spec, &texts) {
                 Ok(vectors) => return Ok(vectors),
                 Err(e) => {
                     log::warn!("model server failed, loading the model in-process: {e:#}");

@@ -1488,26 +1488,24 @@ fn model_server_starts_on_first_use_and_serves_later_commands() {
 
     s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
     let status = s.status();
-    let running = status["running"].as_array().unwrap();
-    assert_eq!(running.len(), 1, "{status}");
-    let pid = running[0]["pid"].as_u64().unwrap();
-    let served = running[0]["requests"].as_u64().unwrap();
+    let server = &status["server"];
+    let pid = server["pid"].as_u64().unwrap();
+    let served = server["requests"].as_u64().unwrap();
     assert!(served >= 1, "{status}");
+    assert_eq!(server["models"][0]["name"], "granite-small-r2", "{status}");
 
     // A later command uses the same server rather than starting another.
     let out = s.run(&["search", "database connection pooling"]);
     assert!(out.contains("pool"), "{out}");
     let status = s.status();
-    assert_eq!(status["running"][0]["pid"].as_u64(), Some(pid));
-    assert!(status["running"][0]["requests"].as_u64().unwrap() > served);
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid));
+    assert!(status["server"]["requests"].as_u64().unwrap() > served);
 
-    assert_eq!(
-        s.run(&["server", "stop"]),
-        "stopped the model server for granite-small-r2"
-    );
+    assert_eq!(s.run(&["server", "stop"]), "stopped the model server");
     let status = s.status();
-    assert_eq!(status["running"].as_array().unwrap().len(), 0);
+    assert!(status["server"].is_null(), "{status}");
     assert_eq!(status["recent_runs"][0]["exit_reason"], "stopped");
+    assert_eq!(status["recent_runs"][0]["models"][0], "granite-small-r2");
 }
 
 #[test]
@@ -1547,10 +1545,79 @@ fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
     let second = s.run(&["server", "start"]);
     let pid = |out: &str| out.lines().next().unwrap().to_string();
     assert_eq!(pid(&first), pid(&second));
-    assert!(
-        first.starts_with("granite-small-r2: running, pid "),
-        "{first}"
+    assert!(first.starts_with("model server: running, pid "), "{first}");
+}
+
+/// Sessions configured for different models share one server, which loads
+/// each model on first use and embeds with it exactly as in-process.
+#[test]
+fn model_server_serves_several_models() {
+    let s = ServerEnv::new();
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let pid = s.status()["server"]["pid"].as_u64().unwrap();
+
+    let other_db = TempDir::new().unwrap();
+    let minilm = |server: &str, args: &[&str]| {
+        let out = s
+            .cmd()
+            .env("SCLEROX_DB", other_db.path().join("minilm.db"))
+            .env("SCLEROX_EMBED_MODEL", "minilm-l6-v2")
+            .env("SCLEROX_EMBED_SERVER", server)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    minilm(
+        "auto",
+        &[
+            "memory",
+            "set",
+            "ci",
+            "the CI cache is keyed on the lockfile hash",
+        ],
     );
+    let search = ["search", "build caching", "--output", "json"];
+    assert_eq!(minilm("auto", &search), minilm("off", &search));
+
+    let status = s.status();
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid), "{status}");
+    let names: Vec<&str> = status["server"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["granite-small-r2", "minilm-l6-v2"]);
+}
+
+/// Many commands at once all get their vectors from the one server. On
+/// Windows this has the named pipe hand out a new instance per client.
+#[test]
+fn model_server_serves_concurrent_commands() {
+    let s = ServerEnv::new();
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let status = s.status();
+    let pid = status["server"]["pid"].as_u64().unwrap();
+    let before = status["server"]["requests"].as_u64().unwrap();
+
+    const COMMANDS: u64 = 8;
+    std::thread::scope(|scope| {
+        let searches: Vec<_> = (0..COMMANDS)
+            .map(|_| scope.spawn(|| s.run(&["search", "database connection pooling"])))
+            .collect();
+        for search in searches {
+            let out = search.join().unwrap();
+            assert!(out.contains("pool"), "{out}");
+        }
+    });
+
+    let status = s.status();
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid), "{status}");
+    // Each search embedded its query there, not in-process.
+    let after = status["server"]["requests"].as_u64().unwrap();
+    assert!(after >= before + COMMANDS, "{before} -> {after}");
 }
 
 /// A server that can't show the token only this user can read gets no texts:
@@ -1559,7 +1626,7 @@ fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
 fn model_server_that_cannot_prove_itself_gets_no_texts() {
     let s = ServerEnv::new();
     s.run(&["server", "start"]);
-    let token = s.state.path().join("sclerox/run/granite-small-r2.token");
+    let token = s.state.path().join("sclerox/run/server.token");
     assert!(token.exists());
     std::fs::write(&token, "not the server's").unwrap();
 
@@ -1569,9 +1636,6 @@ fn model_server_that_cannot_prove_itself_gets_no_texts() {
     assert!(stderr.contains("couldn't prove"), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("no model server running"));
 
-    assert_eq!(
-        s.run(&["server", "stop"]),
-        "stopped the model server for granite-small-r2"
-    );
+    assert_eq!(s.run(&["server", "stop"]), "stopped the model server");
     assert!(!token.exists(), "the server removes its token on exit");
 }

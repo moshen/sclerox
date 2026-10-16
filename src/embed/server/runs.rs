@@ -1,7 +1,7 @@
-//! `server.db`: one row per model server run, kept beside the logs in the
-//! state directory rather than in a knowledge-base database. One server
-//! serves every database, and its memory figures describe this machine, not
-//! the data.
+//! `server.db`: one row per model server run, and one per model it loaded,
+//! kept beside the logs in the state directory rather than in a
+//! knowledge-base database. One server serves every database, and its memory
+//! figures describe this machine, not the data.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -13,16 +13,17 @@ use super::protocol::ExitReason;
 /// Runs older than this are deleted when a server starts.
 const KEEP_DAYS: u32 = 30;
 
+/// `PRAGMA user_version` of the schema below. The file only holds history,
+/// so one with another version is emptied and recreated rather than
+/// migrated.
+const VERSION: i32 = 2;
+
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS server_runs (
+CREATE TABLE server_runs (
   id          INTEGER PRIMARY KEY,
   pid         INTEGER NOT NULL,
   version     TEXT NOT NULL,
-  model_id    TEXT NOT NULL,
-  device      TEXT NOT NULL,
-  max_tokens  INTEGER NOT NULL,
   started_at  TEXT NOT NULL,
-  loaded_mb   INTEGER,
   peak_mb     INTEGER,
   ended_at    TEXT,
   exit_reason TEXT,
@@ -30,7 +31,19 @@ CREATE TABLE IF NOT EXISTS server_runs (
   requests    INTEGER NOT NULL DEFAULT 0,
   bulk_items  INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS server_runs_model ON server_runs (model_id, started_at);
+CREATE TABLE model_loads (
+  id          INTEGER PRIMARY KEY,
+  run_id      INTEGER NOT NULL,
+  model       TEXT NOT NULL,
+  device      TEXT NOT NULL,
+  max_tokens  INTEGER NOT NULL,
+  loaded_at   TEXT NOT NULL,
+  load_ms     INTEGER,
+  loaded_mb   INTEGER,
+  error       TEXT,
+  requests    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX model_loads_run ON model_loads (run_id);
 ";
 
 /// A finished or running server, for `server status`.
@@ -38,16 +51,22 @@ CREATE INDEX IF NOT EXISTS server_runs_model ON server_runs (model_id, started_a
 pub struct Run {
     pub pid: u32,
     pub version: String,
-    pub model: String,
-    pub device: String,
     pub started_at: String,
-    pub loaded_mb: Option<u64>,
     pub peak_mb: Option<u64>,
     pub ended_at: Option<String>,
     pub exit_reason: Option<String>,
     /// Why a `failed` run couldn't start.
     pub error: Option<String>,
     pub requests: u64,
+    /// The models it loaded, in order; a failed load is marked so.
+    pub models: Vec<String>,
+}
+
+/// A model a server loaded, or tried to.
+pub struct Load<'a> {
+    pub model: &'a str,
+    pub device: &'a str,
+    pub max_tokens: usize,
 }
 
 pub struct Runs {
@@ -60,43 +79,37 @@ impl Runs {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
-        let conn =
+        let mut conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         // Commands read this while a server writes it.
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
+        let current =
+            |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0));
+        if current(&conn)? != VERSION {
+            // Checked again under the write lock: another process may have
+            // just recreated it.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if current(&tx)? != VERSION {
+                tx.execute_batch(&format!(
+                    "DROP TABLE IF EXISTS server_runs;
+                     DROP TABLE IF EXISTS model_loads;
+                     {SCHEMA}
+                     PRAGMA user_version = {VERSION};"
+                ))?;
+            }
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 
     /// Record a server starting; returns its run id.
-    pub fn start(
-        &self,
-        version: &str,
-        model: &str,
-        device: &str,
-        max_tokens: usize,
-    ) -> Result<i64> {
+    pub fn start(&self, version: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO server_runs (pid, version, model_id, device, max_tokens, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-            params![
-                std::process::id(),
-                version,
-                model,
-                device,
-                max_tokens as i64
-            ],
+            "INSERT INTO server_runs (pid, version, started_at) VALUES (?1, ?2, datetime('now'))",
+            params![std::process::id(), version],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn loaded(&self, id: i64, loaded_mb: u64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE server_runs SET loaded_mb = ?2, peak_mb = ?2 WHERE id = ?1",
-            params![id, loaded_mb as i64],
-        )?;
-        Ok(())
     }
 
     pub fn progress(&self, id: i64, peak_mb: u64, requests: u64) -> Result<()> {
@@ -126,26 +139,61 @@ impl Runs {
         Ok(())
     }
 
-    /// Mark `model`'s unfinished runs, other than `current`, as crashed. Only
-    /// a server holding the model's lock calls this, so none of them is
-    /// still running.
-    pub fn mark_crashed(&self, model: &str, current: i64) -> Result<usize> {
+    /// Record a model load in run `run_id`: how long it took and how much
+    /// memory it added, or why it failed. Returns the load's id.
+    pub fn loaded(
+        &self,
+        run_id: i64,
+        load: &Load,
+        took: Duration,
+        outcome: std::result::Result<u64, &str>,
+    ) -> Result<i64> {
+        let (loaded_mb, error) = match outcome {
+            Ok(mb) => (Some(mb as i64), None),
+            Err(e) => (None, Some(e)),
+        };
+        self.conn.execute(
+            "INSERT INTO model_loads
+               (run_id, model, device, max_tokens, loaded_at, load_ms, loaded_mb, error)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, ?7)",
+            params![
+                run_id,
+                load.model,
+                load.device,
+                load.max_tokens as i64,
+                took.as_millis() as i64,
+                loaded_mb,
+                error
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn model_progress(&self, load_id: i64, requests: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE model_loads SET requests = ?2 WHERE id = ?1",
+            params![load_id, requests as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Mark unfinished runs other than `current` as crashed. Only a server
+    /// holding the lock calls this, so none of them is still running.
+    pub fn mark_crashed(&self, current: i64) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE server_runs SET ended_at = datetime('now'), exit_reason = ?3
-             WHERE model_id = ?1 AND id != ?2 AND ended_at IS NULL",
-            params![model, current, ExitReason::Crashed.as_str()],
+            "UPDATE server_runs SET ended_at = datetime('now'), exit_reason = ?2
+             WHERE id != ?1 AND ended_at IS NULL",
+            params![current, ExitReason::Crashed.as_str()],
         )?)
     }
 
-    /// How many of `model`'s runs failed to start or crashed in the last
-    /// `window`. Clients stop starting servers for a model that keeps failing.
-    pub fn recent_failures(&self, model: &str, window: Duration) -> Result<usize> {
+    /// How many runs failed to start or crashed in the last `window`.
+    /// Clients stop starting a server that keeps failing.
+    pub fn recent_failures(&self, window: Duration) -> Result<usize> {
         let n: i64 = self.conn.query_row(
             "SELECT count(*) FROM server_runs
-             WHERE model_id = ?1 AND exit_reason IN (?2, ?3)
-               AND ended_at >= datetime('now', ?4)",
+             WHERE exit_reason IN (?1, ?2) AND ended_at >= datetime('now', ?3)",
             params![
-                model,
                 ExitReason::Failed.as_str(),
                 ExitReason::Crashed.as_str(),
                 format!("-{} seconds", window.as_secs()),
@@ -158,33 +206,45 @@ impl Runs {
     /// The most recent runs, newest first.
     pub fn recent(&self, limit: usize) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
-            "SELECT pid, version, model_id, device, started_at, loaded_mb, peak_mb,
-                    ended_at, exit_reason, error, requests
-             FROM server_runs ORDER BY id DESC LIMIT ?1",
+            "SELECT r.pid, r.version, r.started_at, r.peak_mb, r.ended_at, r.exit_reason,
+                    r.error, r.requests,
+                    (SELECT group_concat(name, char(31)) FROM (
+                       SELECT m.model || CASE WHEN m.error IS NULL THEN '' ELSE ' (failed)' END
+                              AS name
+                       FROM model_loads m WHERE m.run_id = r.id ORDER BY m.id))
+             FROM server_runs r ORDER BY r.id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
+            let models: Option<String> = r.get(8)?;
             Ok(Run {
                 pid: r.get(0)?,
                 version: r.get(1)?,
-                model: r.get(2)?,
-                device: r.get(3)?,
-                started_at: r.get(4)?,
-                loaded_mb: r.get::<_, Option<i64>>(5)?.map(|n| n as u64),
-                peak_mb: r.get::<_, Option<i64>>(6)?.map(|n| n as u64),
-                ended_at: r.get(7)?,
-                exit_reason: r.get(8)?,
-                error: r.get(9)?,
-                requests: r.get::<_, i64>(10)? as u64,
+                started_at: r.get(2)?,
+                peak_mb: r.get::<_, Option<i64>>(3)?.map(|n| n as u64),
+                ended_at: r.get(4)?,
+                exit_reason: r.get(5)?,
+                error: r.get(6)?,
+                requests: r.get::<_, i64>(7)? as u64,
+                models: models
+                    .map(|m| m.split('\u{1f}').map(str::to_string).collect())
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Delete runs that ended more than [`KEEP_DAYS`] ago.
+    /// Delete runs, and their model loads, that ended more than
+    /// [`KEEP_DAYS`] ago.
     pub fn prune(&self) -> Result<usize> {
+        let cutoff = format!("-{KEEP_DAYS} days");
+        self.conn.execute(
+            "DELETE FROM model_loads WHERE run_id IN
+               (SELECT id FROM server_runs WHERE ended_at < datetime('now', ?1))",
+            [&cutoff],
+        )?;
         Ok(self.conn.execute(
             "DELETE FROM server_runs WHERE ended_at < datetime('now', ?1)",
-            [format!("-{KEEP_DAYS} days")],
+            [&cutoff],
         )?)
     }
 
@@ -209,11 +269,27 @@ mod tests {
         (dir, runs)
     }
 
+    const GRANITE: Load = Load {
+        model: "granite",
+        device: "cpu",
+        max_tokens: 2048,
+    };
+
     #[test]
-    fn a_run_records_its_life() {
+    fn a_run_records_its_life_and_its_models() {
         let (_dir, runs) = runs();
-        let id = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
-        runs.loaded(id, 300).unwrap();
+        let id = runs.start("0.1.0").unwrap();
+        let granite = runs
+            .loaded(id, &GRANITE, Duration::from_millis(250), Ok(300))
+            .unwrap();
+        let minilm = Load {
+            model: "minilm",
+            max_tokens: 256,
+            ..GRANITE
+        };
+        runs.loaded(id, &minilm, Duration::ZERO, Err("no such file"))
+            .unwrap();
+        runs.model_progress(granite, 7).unwrap();
         runs.progress(id, 450, 7).unwrap();
         // A lower reading never lowers the peak.
         runs.progress(id, 350, 9).unwrap();
@@ -221,67 +297,83 @@ mod tests {
 
         let run = &runs.recent(5).unwrap()[0];
         assert_eq!(run.pid, std::process::id());
-        assert_eq!((run.loaded_mb, run.peak_mb), (Some(300), Some(450)));
+        assert_eq!(run.peak_mb, Some(450));
         assert_eq!(run.requests, 9);
         assert_eq!(run.exit_reason.as_deref(), Some("idle"));
         assert!(run.ended_at.is_some());
+        assert_eq!(run.models, ["granite", "minilm (failed)"]);
     }
 
     #[test]
-    fn unfinished_runs_of_the_model_are_marked_crashed() {
+    fn unfinished_runs_are_marked_crashed() {
         let (_dir, runs) = runs();
-        let dead = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
-        let other_model = runs.start("0.1.0", "minilm", "cpu", 256).unwrap();
-        let current = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
-        assert_eq!(runs.mark_crashed("granite", current).unwrap(), 1);
+        let _dead = runs.start("0.1.0").unwrap();
+        let done = runs.start("0.1.0").unwrap();
+        runs.end(done, ExitReason::Idle).unwrap();
+        let current = runs.start("0.1.0").unwrap();
+        assert_eq!(runs.mark_crashed(current).unwrap(), 1);
 
-        let reason = |id: i64| {
-            runs.recent(10)
-                .unwrap()
-                .into_iter()
-                .rev()
-                .nth(id as usize - 1)
-                .unwrap()
-                .exit_reason
-        };
-        assert_eq!(reason(dead).as_deref(), Some("crashed"));
-        assert_eq!(reason(other_model), None);
-        assert_eq!(reason(current), None);
+        let reasons: Vec<_> = runs
+            .recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.exit_reason)
+            .collect();
         assert_eq!(
-            runs.recent_failures("granite", Duration::from_secs(60))
-                .unwrap(),
-            1
+            reasons,
+            [None, Some("idle".to_string()), Some("crashed".to_string())]
         );
-        assert_eq!(
-            runs.recent_failures("minilm", Duration::from_secs(60))
-                .unwrap(),
-            0
-        );
+        assert_eq!(runs.recent_failures(Duration::from_secs(60)).unwrap(), 1);
     }
 
     #[test]
     fn old_failures_stop_counting_and_old_runs_are_pruned() {
         let (_dir, runs) = runs();
-        let old = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
+        let old = runs.start("0.1.0").unwrap();
+        runs.loaded(old, &GRANITE, Duration::ZERO, Ok(1)).unwrap();
         runs.end(old, ExitReason::Failed).unwrap();
         runs.backdate(old, 40);
-        let recent = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
+        let recent = runs.start("0.1.0").unwrap();
         runs.failed(recent, "no socket").unwrap();
         assert_eq!(
             runs.recent(1).unwrap()[0].error.as_deref(),
             Some("no socket")
         );
-        let running = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
+        let running = runs.start("0.1.0").unwrap();
 
         let window = Duration::from_secs(30 * 60);
-        assert_eq!(runs.recent_failures("granite", window).unwrap(), 1);
+        assert_eq!(runs.recent_failures(window).unwrap(), 1);
         assert_eq!(runs.prune().unwrap(), 1);
         assert_eq!(runs.recent(10).unwrap().len(), 2);
+        let loads: i64 = runs
+            .conn
+            .query_row("SELECT count(*) FROM model_loads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(loads, 0, "a pruned run's loads go with it");
         // A run still going is never pruned, however old.
         runs.backdate(running, 40);
         runs.conn
             .execute("UPDATE server_runs SET ended_at = NULL", [])
             .unwrap();
         assert_eq!(runs.prune().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_file_from_another_schema_is_recreated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("server.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE server_runs (id INTEGER PRIMARY KEY, model_id TEXT NOT NULL);
+             INSERT INTO server_runs (model_id) VALUES ('granite');",
+        )
+        .unwrap();
+        drop(old);
+
+        let runs = Runs::open(&path).unwrap();
+        assert!(runs.recent(10).unwrap().is_empty());
+        runs.start("0.1.0").unwrap();
+        // Opening again keeps what is there now.
+        assert_eq!(Runs::open(&path).unwrap().recent(10).unwrap().len(), 1);
     }
 }

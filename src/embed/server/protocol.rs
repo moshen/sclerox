@@ -66,7 +66,7 @@ pub enum ExitReason {
     Version,
     /// `sclerox server stop`.
     Stopped,
-    /// Couldn't load the model or open the socket.
+    /// Couldn't load the model it was started for, or open the socket.
     Failed,
     /// Ended without saying why (killed, crashed); recorded by the next server.
     Crashed,
@@ -86,16 +86,20 @@ impl ExitReason {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    /// The first message on a connection: the client's build and the model
-    /// it wants vectors from.
+    /// The first message on a connection: the client's build.
     Hello {
         build: Build,
-        model_id: String,
     },
     /// Embed texts exactly as given (prefixes already applied), one at a
-    /// time, as the in-process embedder does.
+    /// time, as the in-process embedder does. `model` is a model name
+    /// (`ModelSpec::name`); the server loads it on first use.
     Embed {
+        model: String,
         texts: Vec<String>,
+    },
+    /// Load `model` now, so the first request for it doesn't wait.
+    Load {
+        model: String,
     },
     Status,
     /// Exit once any embedding in progress finishes.
@@ -106,19 +110,18 @@ pub enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    /// Matching build and model. `token` is the contents of the server's
-    /// token file, which only this user can read: a client sends texts only
-    /// to a server that knows it, not to whatever took the socket name.
+    /// Matching build. `token` is the contents of the server's token file,
+    /// which only this user can read: a client sends texts only to a server
+    /// that knows it, not to whatever took the socket name.
     Ready {
         token: String,
     },
-    /// The server is another build or runs another model; it has nothing
-    /// for this client.
+    /// The server is another build; it has nothing for this client.
     Mismatch {
         build: Build,
-        model_id: String,
     },
     Vectors(Vec<Vec<f32>>),
+    Loaded,
     Status(ServerStatus),
     Stopping,
     Error(String),
@@ -129,18 +132,30 @@ pub enum Response {
 pub struct ServerStatus {
     pub pid: u32,
     pub build: Build,
-    pub model: String,
-    pub device: String,
     /// RFC 3339.
     pub started_at: String,
-    /// Resident memory right after the model loaded.
-    pub loaded_mb: u64,
     pub rss_mb: u64,
     pub peak_mb: u64,
     pub requests: u64,
     pub connections: usize,
     pub idle_secs: u64,
     pub idle_limit_secs: u64,
+    /// Models loaded, or that failed to load, in the order first asked for.
+    pub models: Vec<ModelStatus>,
+}
+
+/// One model in a server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStatus {
+    pub name: String,
+    pub device: String,
+    /// How much resident memory grew while it loaded.
+    pub loaded_mb: u64,
+    pub requests: u64,
+    /// Since its last request, or since it loaded.
+    pub idle_secs: u64,
+    /// Why the last load failed; it is tried again after a while.
+    pub error: Option<String>,
 }
 
 pub fn write_msg<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
@@ -185,6 +200,7 @@ mod tests {
         write_msg(
             &mut buf,
             &Request::Embed {
+                model: "granite-small-r2".into(),
                 texts: texts.clone(),
             },
         )
@@ -197,7 +213,10 @@ mod tests {
 
         let mut r = buf.as_slice();
         match read_msg(&mut r).unwrap() {
-            Request::Embed { texts: got } => assert_eq!(got, texts),
+            Request::Embed { model, texts: got } => {
+                assert_eq!(model, "granite-small-r2");
+                assert_eq!(got, texts);
+            }
             other => panic!("{other:?}"),
         }
         match read_msg(&mut r).unwrap() {
