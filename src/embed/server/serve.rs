@@ -67,7 +67,7 @@ pub fn serve(
     let model = match crate::embed::load_model(spec) {
         Ok(m) => m,
         Err(e) => {
-            let _ = runs.end(run_id, ExitReason::Failed);
+            let _ = runs.failed(run_id, &format!("{e:#}"));
             return Err(e);
         }
     };
@@ -81,15 +81,18 @@ pub fn serve(
         .name(name.clone())
         .try_overwrite(true);
     #[cfg(unix)]
-    let listener = {
+    let listener = if super::SOCKET_MODE_SUPPORTED {
         use interprocess::os::unix::local_socket::ListenerOptionsExt;
         listener.mode(0o600)
+    } else {
+        listener
     };
     let listener = match listener.create_sync() {
         Ok(l) => l,
         Err(e) => {
-            let _ = runs.end(run_id, ExitReason::Failed);
-            return Err(e).context("failed to open the model server socket");
+            let e = anyhow::Error::new(e).context("failed to open the model server socket");
+            let _ = runs.failed(run_id, &format!("{e:#}"));
+            return Err(e);
         }
     };
 

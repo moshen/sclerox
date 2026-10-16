@@ -167,6 +167,9 @@ fn print_runs(recent: &[runs::Run], running: &[u32]) {
             mb(r.loaded_mb),
             mb(r.peak_mb),
         );
+        if let Some(error) = &r.error {
+            println!("    {error}");
+        }
     }
 }
 

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS server_runs (
   peak_mb     INTEGER,
   ended_at    TEXT,
   exit_reason TEXT,
+  error       TEXT,
   requests    INTEGER NOT NULL DEFAULT 0,
   bulk_items  INTEGER NOT NULL DEFAULT 0
 );
@@ -44,6 +45,8 @@ pub struct Run {
     pub peak_mb: Option<u64>,
     pub ended_at: Option<String>,
     pub exit_reason: Option<String>,
+    /// Why a `failed` run couldn't start.
+    pub error: Option<String>,
     pub requests: u64,
 }
 
@@ -113,6 +116,16 @@ impl Runs {
         Ok(())
     }
 
+    /// Record a run that couldn't start, and why.
+    pub fn failed(&self, id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE server_runs SET ended_at = datetime('now'), exit_reason = ?2, error = ?3
+             WHERE id = ?1",
+            params![id, ExitReason::Failed.as_str(), error],
+        )?;
+        Ok(())
+    }
+
     /// Mark `model`'s unfinished runs, other than `current`, as crashed. Only
     /// a server holding the model's lock calls this, so none of them is
     /// still running.
@@ -146,7 +159,7 @@ impl Runs {
     pub fn recent(&self, limit: usize) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
             "SELECT pid, version, model_id, device, started_at, loaded_mb, peak_mb,
-                    ended_at, exit_reason, requests
+                    ended_at, exit_reason, error, requests
              FROM server_runs ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
@@ -160,7 +173,8 @@ impl Runs {
                 peak_mb: r.get::<_, Option<i64>>(6)?.map(|n| n as u64),
                 ended_at: r.get(7)?,
                 exit_reason: r.get(8)?,
-                requests: r.get::<_, i64>(9)? as u64,
+                error: r.get(9)?,
+                requests: r.get::<_, i64>(10)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -252,7 +266,11 @@ mod tests {
         runs.end(old, ExitReason::Failed).unwrap();
         runs.backdate(old, 40);
         let recent = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
-        runs.end(recent, ExitReason::Failed).unwrap();
+        runs.failed(recent, "no socket").unwrap();
+        assert_eq!(
+            runs.recent(1).unwrap()[0].error.as_deref(),
+            Some("no socket")
+        );
         let running = runs.start("0.1.0", "granite", "cpu", 2048).unwrap();
 
         let window = Duration::from_secs(30 * 60);

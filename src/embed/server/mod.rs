@@ -82,19 +82,26 @@ fn lock_path(spec: &ModelSpec) -> PathBuf {
     state_dir().join(format!("server-{}.lock", spec.name))
 }
 
-/// A Unix socket file in the state directory, which is the user's own; the
-/// socket is created owner-only. A socket path is limited to about 100
-/// bytes, so a deep state directory falls back to [`short_socket_dir`].
+/// Whether this OS lets a listener create its socket owner-only. Linux
+/// does; where it doesn't (macOS), the socket goes in a private directory
+/// instead, which keeps other users out the same way.
+#[cfg(unix)]
+pub(super) const SOCKET_MODE_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "android"));
+
+/// A Unix socket file: in the state directory when the socket itself can be
+/// owner-only and the path fits (about 100 bytes), else in
+/// [`private_socket_dir`].
 #[cfg(unix)]
 fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
     // sun_path is 104 bytes on macOS and 108 on Linux, including the NUL.
     const MAX_PATH: usize = 103;
     let dir = state_dir();
     let path = dir.join(format!("server-{}.sock", spec.name));
-    if path.as_os_str().len() <= MAX_PATH {
+    if SOCKET_MODE_SUPPORTED && path.as_os_str().len() <= MAX_PATH {
         return Ok(path);
     }
-    let path = short_socket_dir()?.join(format!("{}-{}.sock", dir_hash(&dir), spec.name));
+    let path = private_socket_dir()?.join(format!("{}-{}.sock", dir_hash(&dir), spec.name));
     if path.as_os_str().len() > MAX_PATH {
         return Err(std::io::Error::other(format!(
             "no socket path short enough for {}",
@@ -107,7 +114,7 @@ fn socket_path(spec: &ModelSpec) -> std::io::Result<PathBuf> {
 /// `$XDG_RUNTIME_DIR/sclerox`, else `sclerox-<uid>` in the temp directory,
 /// created owner-only. An existing directory must be ours and private.
 #[cfg(unix)]
-fn short_socket_dir() -> std::io::Result<PathBuf> {
+fn private_socket_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -142,7 +149,7 @@ fn socket_name(spec: &ModelSpec) -> std::io::Result<Name<'static>> {
 fn dir_hash(dir: &std::path::Path) -> String {
     use sha2::Digest;
     let hash = hex::encode(sha2::Sha256::digest(dir.to_string_lossy().as_bytes()));
-    hash[..16].to_string()
+    hash[..12].to_string()
 }
 
 /// A named pipe. Pipe names are global, so the name carries a hash of the
@@ -178,7 +185,13 @@ impl Client {
                 return Ok(Found::Absent);
             }
         };
-        stream.set_recv_timeout(Some(REPLY_TIMEOUT))?;
+        // Windows named pipes have no timeouts; there a hung server hangs
+        // the command, as a hung in-process model would.
+        if let Err(e) = stream.set_recv_timeout(Some(REPLY_TIMEOUT)) {
+            if e.kind() != std::io::ErrorKind::Unsupported || !cfg!(windows) {
+                return Err(e.into());
+            }
+        }
         let mut client = Client { stream };
         let hello = Request::Hello {
             build: Build::current(),
