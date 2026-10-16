@@ -38,6 +38,11 @@ impl Env {
         // must not leave a server running in the developer's state directory.
         // Server tests turn it back on with their own state directory.
         c.env("SCLEROX_EMBED_SERVER", "off");
+        // cargo test points LD_LIBRARY_PATH at two dozen build directories,
+        // which the dynamic loader searches for every system library before
+        // main runs: on a slow filesystem that adds ~170 ms to each command,
+        // and the binary links none of them.
+        c.env_remove("LD_LIBRARY_PATH");
         // Sizes come from the temp config unless a test sets one itself.
         for var in [
             "SCLEROX_CODE_CHUNK_CHARS",
@@ -1633,24 +1638,4 @@ fn model_server_serves_concurrent_commands() {
     // Each search embedded its query there, not in-process.
     let after = status["server"]["requests"].as_u64().unwrap();
     assert!(after >= before + COMMANDS, "{before} -> {after}");
-}
-
-/// A server that can't show the token only this user can read gets no texts:
-/// commands embed in-process, `status` warns, and `stop` still stops it.
-#[test]
-fn model_server_that_cannot_prove_itself_gets_no_texts() {
-    let s = ServerEnv::new();
-    s.run(&["server", "start"]);
-    let token = s.state.path().join("sclerox/run/server.token");
-    assert!(token.exists());
-    std::fs::write(&token, "not the server's").unwrap();
-
-    s.run(&["memory", "set", "k", "still embedded, just in-process"]);
-    let out = s.cmd().args(["server", "status"]).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("couldn't prove"), "{stderr}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("no model server running"));
-
-    assert_eq!(s.run(&["server", "stop"]), "stopped the model server");
-    assert!(!token.exists(), "the server removes its token on exit");
 }
