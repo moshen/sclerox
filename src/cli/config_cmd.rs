@@ -86,6 +86,8 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_EMBED_MEMORY_CHARS",
         "SCLEROX_CODE_CHUNK_CHARS",
         "SCLEROX_CODE_CHUNK_LINES",
+        "SCLEROX_EMBED_SERVER",
+        "SCLEROX_SERVER_IDLE_MINUTES",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]
@@ -162,6 +164,10 @@ pub fn config_template() -> String {
          # chunk_size = {embed_size}                 # chars per embedded chunk of meeting/todo/research text\n\
          # chunk_overlap = {embed_overlap}               # chars repeated from the previous chunk\n\
          # memory_chars = {mem_chars}               # chars of each memory embedded; unset = the model's. env: SCLEROX_EMBED_MEMORY_CHARS\n\
+         # server = \"{embed_server}\"               # auto: share one loaded model between commands via `sclerox server`; off: load it in each. env: SCLEROX_EMBED_SERVER\n\
+         \n\
+         [server]\n\
+         # idle_minutes = {idle_minutes}               # the model server exits after this long without requests. env: SCLEROX_SERVER_IDLE_MINUTES\n\
          \n\
          [index]\n\
          # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
@@ -215,6 +221,8 @@ pub fn config_template() -> String {
         embed_overlap = d.embed.chunk_overlap,
         model_limits = model_limits_doc(),
         mem_chars = d.memory_embed_chars(),
+        embed_server = d.embed.server,
+        idle_minutes = d.server.idle_minutes,
         code_chars = d.index.chunk_chars,
         code_lines = d.index.chunk_lines,
         max_bytes = d.index.max_file_bytes,
@@ -514,6 +522,7 @@ mod tests {
             "[distill]",
             "[embed]",
             "[index]",
+            "[server]",
             "[log]",
         ] {
             assert!(t.contains(section), "template missing {section}");

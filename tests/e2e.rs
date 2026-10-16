@@ -34,6 +34,15 @@ impl Env {
         // Never write test noise into the developer's real ~/.local/state/sclerox/logs/ (an
         // exported SCLEROX_LOG=debug once made a day's log 100x normal size).
         c.env("SCLEROX_LOG", "off");
+        // Load the model in each command, as before the model server: a test
+        // must not leave a server running in the developer's state directory.
+        // Server tests turn it back on with their own state directory.
+        c.env("SCLEROX_EMBED_SERVER", "off");
+        // cargo test points LD_LIBRARY_PATH at two dozen build directories,
+        // which the dynamic loader searches for every system library before
+        // main runs: on a slow filesystem that adds ~170 ms to each command,
+        // and the binary links none of them.
+        c.env_remove("LD_LIBRARY_PATH");
         // Sizes come from the temp config unless a test sets one itself.
         for var in [
             "SCLEROX_CODE_CHUNK_CHARS",
@@ -1283,7 +1292,11 @@ fn todo_done_already_done_is_idempotent() {
 fn commands_stay_fast() {
     use std::time::{Duration, Instant};
 
-    let e = Env::new();
+    // A warm model server, as in real use: commands that embed get their
+    // vectors from it instead of each loading the model, so `search` is held
+    // to a real budget rather than one padded for a model load.
+    let e = ServerEnv::new();
+    e.run(&["server", "start"]);
 
     // Populate with some data
     e.run(&["memory", "set", "perf-key", "performance test value"]);
@@ -1308,8 +1321,7 @@ fn commands_stay_fast() {
     // Best-of-N: take the FASTEST of several runs. Tests run in parallel, so a
     // single run can be inflated by a transient scheduler/CI load spike; the
     // best case still reflects true command cost, so a real regression fails it
-    // while noise doesn't. (Model load can't be amortized this way - each `sclerox`
-    // invocation is a fresh process - which is why `search` is budgeted below.)
+    // while noise doesn't.
     let best_of = |args: &[&str], runs: u32| -> Duration {
         (0..runs)
             .map(|_| {
@@ -1339,13 +1351,19 @@ fn commands_stay_fast() {
         );
     }
 
-    // `sclerox search` loads the embedding model on every invocation - a fixed
-    // startup cost (~100ms+, hardware-dependent), not a data-size regression.
-    // It gets a looser budget that still catches gross slowdowns (seconds).
+    // `search` embeds its query on the server: one round trip on top of the
+    // SQLite work. Loading the model in-process instead takes about 0.5 s in
+    // a debug build, so the server's request count is checked too.
+    let requests = || e.status()["server"]["requests"].as_u64().unwrap();
+    let before = requests();
     let t = best_of(&["search", "perf"], 3);
     assert!(
-        t.as_millis() < 2000,
-        "search took {}ms (best of 3), expected < 2000ms",
+        requests() >= before + 3,
+        "search embedded its query in-process, not on the server"
+    );
+    assert!(
+        t.as_millis() < 300,
+        "search took {}ms (best of 3), expected < 300ms",
         t.as_millis()
     );
 }
@@ -1377,6 +1395,7 @@ fn install_adopts_a_pre_rename_config() {
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
         .env_remove("SCLEROX_CONFIG")
         .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
@@ -1414,6 +1433,7 @@ fn install_never_overwrites_an_edited_config() {
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
         .env_remove("SCLEROX_CONFIG")
         .args(["install", "--target", "claude", "--no-model-download"]);
     c.assert().success();
@@ -1424,4 +1444,198 @@ fn install_never_overwrites_an_edited_config() {
         "the edited value is untouched, got:\n{contents}"
     );
     assert!(legacy.exists(), "legacy config kept for a manual merge");
+}
+
+// ─── Model server ────────────────────────────────────────────────────────────
+
+/// A test's own state directory with the model server turned on. Stops the
+/// server when dropped, so a failing test doesn't leave one running.
+struct ServerEnv {
+    env: Env,
+    state: TempDir,
+}
+
+impl ServerEnv {
+    fn new() -> Self {
+        Self {
+            env: Env::new(),
+            state: TempDir::new().unwrap(),
+        }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = self.env.cmd();
+        c.env("XDG_STATE_HOME", self.state.path())
+            .env("SCLEROX_EMBED_SERVER", "auto")
+            // Gone soon even if the drop below never runs.
+            .env("SCLEROX_SERVER_IDLE_MINUTES", "1");
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> String {
+        let out = self.cmd().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "sclerox {} failed:\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn status(&self) -> serde_json::Value {
+        serde_json::from_str(&self.run(&["server", "status", "--output", "json"])).unwrap()
+    }
+}
+
+impl Drop for ServerEnv {
+    fn drop(&mut self) {
+        let _ = self.cmd().args(["server", "stop"]).output();
+    }
+}
+
+#[test]
+fn model_server_starts_on_first_use_and_serves_later_commands() {
+    let s = ServerEnv::new();
+    assert_eq!(s.run(&["server", "status"]), "no model server running");
+
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let status = s.status();
+    let server = &status["server"];
+    let pid = server["pid"].as_u64().unwrap();
+    let served = server["requests"].as_u64().unwrap();
+    assert!(served >= 1, "{status}");
+    assert_eq!(server["models"][0]["name"], "granite-small-r2", "{status}");
+
+    // A later command uses the same server rather than starting another.
+    let out = s.run(&["search", "database connection pooling"]);
+    assert!(out.contains("pool"), "{out}");
+    let status = s.status();
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid));
+    assert!(status["server"]["requests"].as_u64().unwrap() > served);
+
+    assert_eq!(s.run(&["server", "stop"]), "stopped the model server");
+    let status = s.status();
+    assert!(status["server"].is_null(), "{status}");
+    assert_eq!(status["recent_runs"][0]["exit_reason"], "stopped");
+    assert_eq!(status["recent_runs"][0]["models"][0], "granite-small-r2");
+}
+
+#[test]
+fn model_server_matches_in_process_search() {
+    let s = ServerEnv::new();
+    s.run(&[
+        "memory",
+        "set",
+        "ci",
+        "the CI cache is keyed on the lockfile hash",
+    ]);
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let served = s.run(&["search", "build caching", "--output", "json"]);
+    let local = s.env.run(&["search", "build caching", "--output", "json"]);
+    assert_eq!(served, local);
+}
+
+#[test]
+fn model_server_off_never_starts_one() {
+    let s = ServerEnv::new();
+    let out = s
+        .cmd()
+        .env("SCLEROX_EMBED_SERVER", "off")
+        .args(["memory", "set", "k", "a value worth embedding"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(s.run(&["server", "status"]), "no model server running");
+    assert!(!s.state.path().join("sclerox/server.db").exists());
+}
+
+#[test]
+fn model_server_start_is_idempotent_and_stop_without_one_is_fine() {
+    let s = ServerEnv::new();
+    assert_eq!(s.run(&["server", "stop"]), "no model server running");
+    let first = s.run(&["server", "start"]);
+    let second = s.run(&["server", "start"]);
+    let pid = |out: &str| out.lines().next().unwrap().to_string();
+    assert_eq!(pid(&first), pid(&second));
+    assert!(first.starts_with("model server: running, pid "), "{first}");
+
+    let stop = |s: &ServerEnv| -> serde_json::Value {
+        serde_json::from_str(&s.run(&["server", "stop", "--output", "json"])).unwrap()
+    };
+    assert_eq!(stop(&s), serde_json::json!({ "stopped": true }));
+    assert_eq!(stop(&s), serde_json::json!({ "stopped": false }));
+}
+
+/// Sessions configured for different models share one server, which loads
+/// each model on first use and embeds with it exactly as in-process.
+#[test]
+fn model_server_serves_several_models() {
+    let s = ServerEnv::new();
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let pid = s.status()["server"]["pid"].as_u64().unwrap();
+
+    let other_db = TempDir::new().unwrap();
+    let minilm = |server: &str, args: &[&str]| {
+        let out = s
+            .cmd()
+            .env("SCLEROX_DB", other_db.path().join("minilm.db"))
+            .env("SCLEROX_EMBED_MODEL", "minilm-l6-v2")
+            .env("SCLEROX_EMBED_SERVER", server)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    minilm(
+        "auto",
+        &[
+            "memory",
+            "set",
+            "ci",
+            "the CI cache is keyed on the lockfile hash",
+        ],
+    );
+    let search = ["search", "build caching", "--output", "json"];
+    assert_eq!(minilm("auto", &search), minilm("off", &search));
+
+    let status = s.status();
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid), "{status}");
+    let names: Vec<&str> = status["server"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["granite-small-r2", "minilm-l6-v2"]);
+}
+
+/// Many commands at once all get their vectors from the one server. On
+/// Windows this has the named pipe hand out a new instance per client.
+#[test]
+fn model_server_serves_concurrent_commands() {
+    let s = ServerEnv::new();
+    s.run(&["memory", "set", "pool", "postgres pooling runs pgbouncer"]);
+    let status = s.status();
+    let pid = status["server"]["pid"].as_u64().unwrap();
+    let before = status["server"]["requests"].as_u64().unwrap();
+
+    const COMMANDS: u64 = 8;
+    std::thread::scope(|scope| {
+        let searches: Vec<_> = (0..COMMANDS)
+            .map(|_| scope.spawn(|| s.run(&["search", "database connection pooling"])))
+            .collect();
+        for search in searches {
+            let out = search.join().unwrap();
+            assert!(out.contains("pool"), "{out}");
+        }
+    });
+
+    let status = s.status();
+    assert_eq!(status["server"]["pid"].as_u64(), Some(pid), "{status}");
+    // Each search embedded its query there, not in-process.
+    let after = status["server"]["requests"].as_u64().unwrap();
+    assert!(after >= before + COMMANDS, "{before} -> {after}");
 }

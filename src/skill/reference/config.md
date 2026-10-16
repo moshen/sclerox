@@ -92,3 +92,27 @@ scale (`sclerox config show` prints the effective values).
 best hit for the query (Granite default 0.05; `1.0` turns it off). Granite small does
 not merge near-duplicates on score until its thresholds are calibrated; it
 flags them in `sclerox memory conflicts` instead.
+
+## Model server
+
+Loading the model costs each command about a quarter of a second. With
+`embed.server = auto` (the default) the first command that needs vectors starts
+a background model server, which keeps the model loaded, and later commands get
+their vectors from it. There is one server per user. It serves every database
+and session, loads another model the first time a command configured for it
+asks, and exits after `server.idle_minutes` (15) unused.
+
+```bash
+sclerox server status                     # running server: memory, requests, its models; recent runs
+sclerox server stop                       # stop it (the next command starts a new one)
+sclerox server start [--foreground] [--model M]  # start it yourself, loading M (default embed.model)
+```
+
+Commands never depend on it. If the server is off, from another build, or keeps
+failing, they load the model themselves as before; a newer build replaces an
+older build's server. A command only talks to a server running as the same
+user. The `reembed` commands always load the model in-process.
+`embed.server = off` (env `SCLEROX_EMBED_SERVER=off`) makes commands load the
+model themselves and never start a server; it doesn't stop one already running
+(`sclerox server stop` does), and `sclerox server start` still works. Runs are
+recorded in `~/.local/state/sclerox/server.db`.
