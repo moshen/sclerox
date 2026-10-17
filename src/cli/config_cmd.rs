@@ -88,6 +88,8 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_CODE_CHUNK_LINES",
         "SCLEROX_EMBED_SERVER",
         "SCLEROX_SERVER_IDLE_MINUTES",
+        "SCLEROX_SERVER_MAX_MEMORY_MB",
+        "SCLEROX_SERVER_HARD_MEMORY_MB",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]

@@ -457,9 +457,11 @@ impl State {
                 limit.store(0, Ordering::Relaxed);
             }
         }
-        if self.soft_limit_mb.load(Ordering::Relaxed) == 0 {
-            self.restart_due.store(false, Ordering::Relaxed);
-        }
+    }
+
+    /// Over the soft limit, and it hasn't been ignored since.
+    fn restart_due(&self) -> bool {
+        self.soft_limit_mb.load(Ordering::Relaxed) != 0 && self.restart_due.load(Ordering::Relaxed)
     }
 
     /// After a request: exit after it when over the hard limit, and once
@@ -587,7 +589,7 @@ impl State {
             idle_limit_secs: self.idle.as_secs(),
             soft_limit_mb: limit(&self.soft_limit_mb),
             hard_limit_mb: limit(&self.hard_limit_mb),
-            restart_due: self.restart_due.load(Ordering::Relaxed),
+            restart_due: self.restart_due(),
             waiting_queries,
             waiting_bulk,
             models,
@@ -697,7 +699,7 @@ fn housekeeping(state: &State) {
             state.request_stop(ExitReason::Idle);
             return;
         }
-        if quiet && unused >= RESTART_QUIET && state.restart_due.load(Ordering::Relaxed) {
+        if quiet && unused >= RESTART_QUIET && state.restart_due() {
             state.request_stop(ExitReason::Memory);
             return;
         }

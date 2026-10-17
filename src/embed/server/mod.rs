@@ -502,8 +502,7 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
                 return Ok(None);
             }
             log::info!("replacing model server {} with this build", theirs.label());
-            client.shutdown(ExitReason::Version)?;
-            wait_until_stopped(Duration::from_secs(10))?;
+            stop_other_build(client, ExitReason::Version, Duration::from_secs(10))?;
         }
         Found::Absent => {}
     }
@@ -671,6 +670,15 @@ mod windows_std {
 }
 
 /// Wait for the server to exit, which is when it releases its lock.
+/// Stop a server of another build. Its reply to `Shutdown` may not be in a
+/// form this build reads, so only whether it exits counts.
+fn stop_other_build(client: Client, reason: ExitReason, timeout: Duration) -> Result<()> {
+    if let Err(e) = client.shutdown(reason) {
+        log::debug!("model server's reply to shutdown: {e:#}");
+    }
+    wait_until_stopped(timeout)
+}
+
 fn wait_until_stopped(timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while is_running() {
@@ -708,9 +716,13 @@ pub fn status() -> Result<Option<ServerStatus>> {
 /// Stop the server and wait for it to exit. `false` when none was running.
 pub fn stop() -> Result<bool> {
     match Client::connect()? {
-        Found::Ready(c) | Found::Mismatch(c, _) => {
+        Found::Ready(c) => {
             c.shutdown(ExitReason::Stopped)?;
             wait_until_stopped(Duration::from_secs(30))?;
+            Ok(true)
+        }
+        Found::Mismatch(c, _) => {
+            stop_other_build(c, ExitReason::Stopped, Duration::from_secs(30))?;
             Ok(true)
         }
         Found::Absent => Ok(false),
