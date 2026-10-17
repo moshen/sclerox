@@ -32,9 +32,8 @@ pub fn enabled() -> bool {
 }
 
 /// The embedder for a command whose whole job is embedding (`db reembed`,
-/// `memory reembed`, `repo reembed`). Fails when embeddings are off or the
-/// model cannot be loaded. Always loads the model in-process: a long re-embed
-/// through the server would hold it away from other commands' queries.
+/// `memory reembed`, `repo reembed`), as bulk work (see [`Embedder::bulk`]).
+/// Fails when embeddings are off or the model cannot be loaded.
 pub fn required() -> Result<Embedder> {
     if !enabled() {
         anyhow::bail!(
@@ -42,7 +41,7 @@ pub fn required() -> Result<Embedder> {
              turn them on to embed"
         );
     }
-    Embedder::with_model(models::configured()?)
+    Ok(Embedder::new()?.bulk())
 }
 
 /// The embedder for everything else, where vectors are a bonus on top of
@@ -79,6 +78,7 @@ enum Backend {
 pub struct Embedder {
     backend: Backend,
     spec: &'static ModelSpec,
+    lane: server::Lane,
 }
 
 impl Embedder {
@@ -94,6 +94,7 @@ impl Embedder {
                 return Ok(Self {
                     backend: Backend::Server(client),
                     spec,
+                    lane: server::Lane::Query,
                 });
             }
         }
@@ -106,7 +107,15 @@ impl Embedder {
         Ok(Self {
             backend: Backend::Local(Box::new(load_model(spec)?)),
             spec,
+            lane: server::Lane::Query,
         })
+    }
+
+    /// Mark this embedder's work as bulk: the model server runs other
+    /// commands' queries before it, and takes turns between bulk commands.
+    pub fn bulk(mut self) -> Self {
+        self.lane = server::Lane::Bulk;
+        self
     }
 
     /// The model this embedder runs.
@@ -151,24 +160,48 @@ impl Embedder {
         self.run(prefixed)
     }
 
-    /// Embed prefixed texts one at a time. When the server fails, load the
-    /// model here and carry on without it.
+    /// Embed prefixed texts one at a time. When the server exits to give
+    /// back memory or for a newer build, go on with the next one from where
+    /// it stopped; when it fails, load the model here and carry on without it.
     fn run(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        if let Backend::Server(client) = &mut self.backend {
-            match client.embed(self.spec, &texts) {
-                Ok(vectors) => return Ok(vectors),
-                Err(e) => {
-                    log::warn!("model server failed, loading the model in-process: {e:#}");
-                    self.backend = Backend::Local(Box::new(load_model(self.spec)?));
+        /// Servers in a row that may be found exiting, with no progress
+        /// between them, before giving up on them.
+        const RECONNECTS: usize = 5;
+        let mut reconnects = 0;
+        let mut vectors = Vec::with_capacity(texts.len());
+        while let Backend::Server(client) = &mut self.backend {
+            let done = vectors.len();
+            let e = match client.embed(self.spec, &texts[done..], self.lane, &mut vectors) {
+                Ok(()) => return Ok(vectors),
+                Err(e) => e,
+            };
+            if vectors.len() > done {
+                reconnects = 0;
+            }
+            let restarting = e
+                .downcast_ref::<server::Stopping>()
+                .is_some_and(|s| s.0.restarts());
+            if restarting && reconnects < RECONNECTS {
+                reconnects += 1;
+                log::info!("{e:#}; moving to the next model server");
+                // Until the old server stops listening, connecting finds it.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(client) = server::connect_or_start(self.spec) {
+                    self.backend = Backend::Server(client);
+                    continue;
                 }
             }
+            log::warn!("model server failed, loading the model in-process: {e:#}");
+            self.backend = Backend::Local(Box::new(load_model(self.spec)?));
         }
         let Backend::Local(model) = &mut self.backend else {
             unreachable!("the server backend was just replaced");
         };
-        model
-            .embed(&texts, Some(1))
-            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
+        let rest = model
+            .embed(&texts[vectors.len()..], Some(1))
+            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+        vectors.extend(rest);
+        Ok(vectors)
     }
 
     /// Embed several texts as one padded batch. Only the reference parity

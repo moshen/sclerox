@@ -86,9 +86,13 @@ pub fn run(cmd: ServerCommand, format: OutputFormat) -> Result<()> {
 }
 
 fn start_foreground(spec: &'static ModelSpec) -> Result<()> {
+    let s = &settings().server;
+    let limit = |mb: u64| Some(mb).filter(|&mb| mb != 0);
     let options = server::ServeOptions {
-        idle: Duration::from_secs(settings().server.idle_minutes * 60),
+        idle: Duration::from_secs(s.idle_minutes * 60),
         preload: spec,
+        soft_limit_mb: limit(s.max_memory_mb),
+        hard_limit_mb: limit(s.hard_memory_mb),
     };
     let served = server::serve(options, |status| {
         eprintln!(
@@ -112,7 +116,21 @@ fn print_status(s: &ServerStatus) {
         format!(" - not this build, {}", this.label())
     };
     println!("  build     {}{note}", s.build.label());
-    println!("  memory    {} MB now, {} MB peak", s.rss_mb, s.peak_mb);
+    let limits = match (s.soft_limit_mb, s.hard_limit_mb) {
+        (None, None) => "no limit".to_string(),
+        (Some(soft), None) => format!("limit {soft} MB"),
+        (None, Some(hard)) => format!("hard limit {hard} MB"),
+        (Some(soft), Some(hard)) => format!("limit {soft} MB, hard {hard} MB"),
+    };
+    let due = if s.restart_due {
+        "; over it, exits once unused"
+    } else {
+        ""
+    };
+    println!(
+        "  memory    {} MB now, {} MB peak ({limits}{due})",
+        s.rss_mb, s.peak_mb
+    );
     println!(
         "  requests  {} (last {}; exits after {} idle)",
         s.requests,
@@ -120,6 +138,12 @@ fn print_status(s: &ServerStatus) {
         minutes(s.idle_limit_secs)
     );
     println!("  started   {}", s.started_at);
+    if s.waiting_queries + s.waiting_bulk > 0 {
+        println!(
+            "  waiting   {} queries, {} bulk",
+            s.waiting_queries, s.waiting_bulk
+        );
+    }
     println!("  models");
     for m in &s.models {
         match &m.error {

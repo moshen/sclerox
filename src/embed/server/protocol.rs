@@ -66,6 +66,10 @@ pub enum ExitReason {
     Version,
     /// `sclerox server stop`.
     Stopped,
+    /// Over `server.max_memory_mb`, once nothing was using it.
+    Memory,
+    /// Over `server.hard_memory_mb`, after the request in progress.
+    HardMemory,
     /// Couldn't load the model it was started for, or open the socket.
     Failed,
     /// Ended without saying why (killed, crashed); recorded by the next server.
@@ -78,10 +82,30 @@ impl ExitReason {
             ExitReason::Idle => "idle",
             ExitReason::Version => "version",
             ExitReason::Stopped => "stopped",
+            ExitReason::Memory => "memory",
+            ExitReason::HardMemory => "hard_memory",
             ExitReason::Failed => "failed",
             ExitReason::Crashed => "crashed",
         }
     }
+
+    /// Whether a server that stopped for this reason should be replaced
+    /// straight away by a client in the middle of its work, rather than the
+    /// client going on in-process.
+    pub fn restarts(self) -> bool {
+        matches!(
+            self,
+            ExitReason::Memory | ExitReason::HardMemory | ExitReason::Version
+        )
+    }
+}
+
+/// Which work an embedding is: a query someone is waiting on, or bulk work
+/// (re-embedding, indexing, background backfill) that can wait for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lane {
+    Query,
+    Bulk,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +120,7 @@ pub enum Request {
     Embed {
         model: String,
         texts: Vec<String>,
+        lane: Lane,
     },
     /// Load `model` now, so the first request for it doesn't wait.
     Load {
@@ -119,7 +144,11 @@ pub enum Response {
     Vectors(Vec<Vec<f32>>),
     Loaded,
     Status(ServerStatus),
-    Stopping,
+    /// The reply to `Shutdown`, and to a model request once the server is
+    /// on its way out.
+    Stopping {
+        reason: ExitReason,
+    },
     Error(String),
 }
 
@@ -136,6 +165,15 @@ pub struct ServerStatus {
     pub connections: usize,
     pub idle_secs: u64,
     pub idle_limit_secs: u64,
+    /// `server.max_memory_mb`, unless off or ignored for this run.
+    pub soft_limit_mb: Option<u64>,
+    /// `server.hard_memory_mb`, unless off or ignored for this run.
+    pub hard_limit_mb: Option<u64>,
+    /// Over the soft limit: the server exits once nothing is using it.
+    pub restart_due: bool,
+    /// Embedding requests waiting for their turn.
+    pub waiting_queries: usize,
+    pub waiting_bulk: usize,
     /// Models loaded, or that failed to load, in the order first asked for.
     pub models: Vec<ModelStatus>,
 }
@@ -198,6 +236,7 @@ mod tests {
             &Request::Embed {
                 model: "granite-small-r2".into(),
                 texts: texts.clone(),
+                lane: Lane::Bulk,
             },
         )
         .unwrap();
@@ -209,8 +248,13 @@ mod tests {
 
         let mut r = buf.as_slice();
         match read_msg(&mut r).unwrap() {
-            Request::Embed { model, texts: got } => {
+            Request::Embed {
+                model,
+                texts: got,
+                lane,
+            } => {
                 assert_eq!(model, "granite-small-r2");
+                assert_eq!(lane, Lane::Bulk);
                 assert_eq!(got, texts);
             }
             other => panic!("{other:?}"),

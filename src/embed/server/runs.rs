@@ -190,12 +190,18 @@ impl Runs {
     /// How many runs failed to start or crashed in the last `window`.
     /// Clients stop starting a server that keeps failing.
     pub fn recent_failures(&self, window: Duration) -> Result<usize> {
+        self.recent_exits(&[ExitReason::Failed, ExitReason::Crashed], window)
+    }
+
+    /// Runs that ended for one of `reasons` within `window`.
+    pub fn recent_exits(&self, reasons: &[ExitReason], window: Duration) -> Result<usize> {
+        let reasons: Vec<&str> = reasons.iter().map(|r| r.as_str()).collect();
         let n: i64 = self.conn.query_row(
             "SELECT count(*) FROM server_runs
-             WHERE exit_reason IN (?1, ?2) AND ended_at >= datetime('now', ?3)",
+             WHERE exit_reason IN (SELECT value FROM json_each(?1))
+               AND ended_at >= datetime('now', ?2)",
             params![
-                ExitReason::Failed.as_str(),
-                ExitReason::Crashed.as_str(),
+                serde_json::to_string(&reasons)?,
                 format!("-{} seconds", window.as_secs()),
             ],
             |r| r.get(0),
@@ -343,8 +349,12 @@ mod tests {
 
         let window = Duration::from_secs(30 * 60);
         assert_eq!(runs.recent_failures(window).unwrap(), 1);
+        let memory = runs.start("0.1.0").unwrap();
+        runs.end(memory, ExitReason::Memory).unwrap();
+        assert_eq!(runs.recent_failures(window).unwrap(), 1, "not a failure");
+        assert_eq!(runs.recent_exits(&[ExitReason::Memory], window).unwrap(), 1);
         assert_eq!(runs.prune().unwrap(), 1);
-        assert_eq!(runs.recent(10).unwrap().len(), 2);
+        assert_eq!(runs.recent(10).unwrap().len(), 3);
         let loads: i64 = runs
             .conn
             .query_row("SELECT count(*) FROM model_loads", [], |r| r.get(0))
