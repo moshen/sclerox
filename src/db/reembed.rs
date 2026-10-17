@@ -1,12 +1,13 @@
 //! Re-embed stored vectors with a new model (`sclerox db reembed`).
 //!
 //! A rebuild switches a database all-or-nothing. New vectors are computed
-//! first and staged in a temporary table on disk (so memory stays bounded
+//! first and staged in a database file beside it (so memory stays bounded
 //! however large the database), then applied in one short transaction
 //! together with the new `embedding_model` meta value. An interrupted or
-//! failed rebuild leaves the database exactly as it was, on the old model, and
-//! simply runs again from the start. The `*_vec` indexes follow the vector
-//! columns through the existing triggers.
+//! failed rebuild leaves the database exactly as it was, on the old model;
+//! the next rebuild to the same model goes on from the vectors already
+//! staged. The `*_vec` indexes follow the vector columns through the
+//! existing triggers.
 //!
 //! The apply step also guards against writes made while the vectors were
 //! being computed: a row whose text changed gets no vector rather than one for
@@ -17,6 +18,7 @@
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::path::PathBuf;
 
 use super::Database;
 
@@ -157,13 +159,35 @@ impl Database {
         embed: &mut EmbedFn<'_>,
         progress: &mut ProgressFn<'_>,
     ) -> Result<usize> {
-        fill_missing(&self.conn, &PRIMARY, model_id, embed, progress)
+        fill_missing(&self.conn, &PRIMARY, model_id, false, embed, progress)
     }
 
     /// How many rows should have a vector but don't.
     pub fn missing_vectors(&self) -> Result<usize> {
         missing(&self.conn, &PRIMARY)
     }
+}
+
+/// Rows a [`rebuild_except`] skipping `skip` embeds.
+pub fn rebuild_size(conn: &Connection, layout: &Layout, skip: &[&str]) -> Result<usize> {
+    let mut n = 0usize;
+    for t in layout.tables.iter().filter(|t| !skip.contains(&t.table)) {
+        let cond = if t.fill {
+            "1".to_string()
+        } else {
+            format!("{} IS NOT NULL", t.vector)
+        };
+        let c: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {} WHERE ({}) AND ({cond})",
+                t.table, t.filter
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        n += c as usize;
+    }
+    Ok(n)
 }
 
 /// `SELECT id, text` over `table`'s rows matching `cond`, one page after
@@ -192,12 +216,17 @@ fn apply_sql(t: &ReembedTable) -> String {
 
 type Row = (i64, Option<Vec<u8>>);
 
-/// Walk `table`'s rows matching `cond` in id order, a page at a time, calling
-/// `each` with every page's rows and their new vectors.
+/// Walk `table`'s rows matching `cond` in id order, a page at a time, from
+/// the first id above `after`, calling `each` with every page's rows and
+/// their new vectors. `done` rows were handled before; they count towards
+/// progress, not the returned number.
+#[allow(clippy::too_many_arguments)]
 fn embed_rows(
     conn: &Connection,
     t: &ReembedTable,
     cond: &str,
+    after: i64,
+    done: usize,
     embed: &mut EmbedFn<'_>,
     progress: &mut ProgressFn<'_>,
     mut each: impl FnMut(&[Row], Vec<Vec<f32>>) -> Result<()>,
@@ -212,8 +241,12 @@ fn embed_rows(
     )?;
     let total = total as usize;
     let sql = page_sql(t, cond);
-    let mut done = 0usize;
-    let mut after = i64::MIN;
+    if done > 0 {
+        progress(t.label, done.min(total), total.max(done));
+    }
+    let mut done = done;
+    let mut embedded = 0usize;
+    let mut after = after;
     loop {
         let rows: Vec<Row> = {
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -245,9 +278,10 @@ fn embed_rows(
         );
         each(&rows, vectors)?;
         done += rows.len();
+        embedded += rows.len();
         progress(t.label, done.min(total), total.max(done));
     }
-    Ok(done)
+    Ok(embedded)
 }
 
 /// Rebuild every vector in `conn`; see the module docs for the guarantees.
@@ -275,20 +309,62 @@ pub fn rebuild_except(
     progress: &mut ProgressFn<'_>,
 ) -> Result<usize> {
     // Stage on disk, not in memory: a large repo has hundreds of MB of vectors.
+    let staging = staging_path(conn);
+    let file = staging
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    conn.execute("ATTACH DATABASE ?1 AS reembed", [&file])?;
+    let result = start_staging(conn, model_id, skip)
+        .and_then(|()| stage_and_apply(conn, layout, model_id, skip, embed, progress));
+    let _ = conn.execute_batch("DETACH DATABASE reembed");
+    if let (Ok(_), Some(path)) = (&result, staging) {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// The file a rebuild of `conn`'s database stages its vectors in, kept until
+/// they are applied. `None` for an in-memory database, which stages in a
+/// temporary one.
+fn staging_path(conn: &Connection) -> Option<PathBuf> {
+    conn.path()
+        .filter(|p| !p.is_empty())
+        .map(|p| PathBuf::from(format!("{p}-reembed")))
+}
+
+/// Make the staging tables, keeping what an earlier rebuild to the same
+/// model, skipping the same tables, staged.
+fn start_staging(conn: &Connection, model_id: &str, skip: &[&str]) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA temp_store = FILE;
-         DROP TABLE IF EXISTS temp.reembed_staging;
-         CREATE TEMP TABLE reembed_staging (
+        "CREATE TABLE IF NOT EXISTS reembed.staging (
              tbl  INTEGER NOT NULL,
              id   INTEGER NOT NULL,
              text BLOB,
              vec  BLOB NOT NULL,
              PRIMARY KEY (tbl, id)
+         );
+         CREATE TABLE IF NOT EXISTS reembed.info (
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
          );",
     )?;
-    let result = stage_and_apply(conn, layout, model_id, skip, embed, progress);
-    let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.reembed_staging;");
-    result
+    let plan = format!("{model_id}; skip {}", skip.join(","));
+    let staged_for: Option<String> = conn
+        .query_row(
+            "SELECT value FROM reembed.info WHERE key = 'plan'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if staged_for.as_deref() != Some(plan.as_str()) {
+        conn.execute("DELETE FROM reembed.staging", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO reembed.info (key, value) VALUES ('plan', ?1)",
+            [&plan],
+        )?;
+    }
+    Ok(())
 }
 
 fn stage_and_apply(
@@ -312,15 +388,36 @@ fn stage_and_apply(
         } else {
             format!("{} IS NOT NULL", t.vector)
         };
-        let mut stage = conn.prepare(
-            "INSERT INTO temp.reembed_staging (tbl, id, text, vec) VALUES (?1, ?2, ?3, ?4)",
+        // Go on after what an earlier attempt staged.
+        let (after, done): (Option<i64>, i64) = conn.query_row(
+            "SELECT max(id), count(*) FROM reembed.staging WHERE tbl = ?1",
+            [i],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        embed_rows(conn, t, &cond, embed, progress, |rows, vectors| {
-            for ((id, text), v) in rows.iter().zip(vectors) {
-                stage.execute(params![i, id, text, super::embedding_to_bytes(&v)])?;
-            }
-            Ok(())
-        })?;
+        let mut stage = conn.prepare(
+            "INSERT OR REPLACE INTO reembed.staging (tbl, id, text, vec) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let after = after.unwrap_or(i64::MIN);
+        embed_rows(
+            conn,
+            t,
+            &cond,
+            after,
+            done as usize,
+            embed,
+            progress,
+            |rows, vectors| {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Deferred,
+                )?;
+                for ((id, text), v) in rows.iter().zip(vectors) {
+                    stage.execute(params![i, id, text, super::embedding_to_bytes(&v)])?;
+                }
+                tx.commit()?;
+                Ok(())
+            },
+        )?;
     }
 
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -331,8 +428,7 @@ fn stage_and_apply(
         }
         let i = i as i64;
         let mut apply = tx.prepare(&apply_sql(t))?;
-        let mut staged =
-            tx.prepare("SELECT id, text, vec FROM temp.reembed_staging WHERE tbl = ?1")?;
+        let mut staged = tx.prepare("SELECT id, text, vec FROM reembed.staging WHERE tbl = ?1")?;
         let mut rows = staged.query([i])?;
         while let Some(r) = rows.next()? {
             let (id, text, vec): (i64, Option<Vec<u8>>, Vec<u8>) =
@@ -345,7 +441,7 @@ fn stage_and_apply(
         tx.execute(
             &format!(
                 "UPDATE {table} SET {vector} = NULL WHERE {vector} IS NOT NULL
-                 AND id NOT IN (SELECT id FROM temp.reembed_staging WHERE tbl = ?1)",
+                 AND id NOT IN (SELECT id FROM reembed.staging WHERE tbl = ?1)",
                 table = t.table,
                 vector = t.vector,
             ),
@@ -359,6 +455,8 @@ fn stage_and_apply(
         ),
         params![crate::embed::models::META_KEY, model_id],
     )?;
+    // Applied: a later rebuild starts afresh, even if the file outlives this.
+    tx.execute("DELETE FROM reembed.staging", [])?;
     tx.commit()?;
     Ok(written)
 }
@@ -373,14 +471,16 @@ fn recorded_model(conn: &Connection, layout: &Layout) -> Result<Option<String>> 
         .optional()?)
 }
 
-/// Embed the rows of `layout`'s fill tables that have no vector, committing a
-/// batch at a time (each row stands alone, so there is nothing to keep
-/// all-or-nothing). Records `model_id` if nothing is recorded yet; refuses a
-/// database recorded under another model. Returns the vectors written.
+/// Embed the rows of `layout`'s fill tables (all its tables with
+/// `all_tables`) that have no vector, committing a batch at a time (each row
+/// stands alone, so there is nothing to keep all-or-nothing). Records
+/// `model_id` if nothing is recorded yet; refuses a database recorded under
+/// another model. Returns the vectors written.
 pub fn fill_missing(
     conn: &Connection,
     layout: &Layout,
     model_id: &str,
+    all_tables: bool,
     embed: &mut EmbedFn<'_>,
     progress: &mut ProgressFn<'_>,
 ) -> Result<usize> {
@@ -403,34 +503,49 @@ pub fn fill_missing(
         layout.meta_table
     );
     let mut written = 0usize;
-    for t in layout.tables.iter().filter(|t| t.fill) {
+    for t in layout.tables.iter().filter(|t| all_tables || t.fill) {
         let cond = format!("{} IS NULL", t.vector);
         let apply = apply_sql(t);
-        embed_rows(conn, t, &cond, embed, progress, |rows, vectors| {
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            check(&tx)?;
-            tx.execute(&record, params![crate::embed::models::META_KEY, model_id])?;
-            {
-                let mut stmt = tx.prepare_cached(&apply)?;
-                for ((id, text), v) in rows.iter().zip(vectors) {
-                    stmt.execute(params![super::embedding_to_bytes(&v), id, text])?;
-                    written += 1;
+        embed_rows(
+            conn,
+            t,
+            &cond,
+            i64::MIN,
+            0,
+            embed,
+            progress,
+            |rows, vectors| {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                check(&tx)?;
+                tx.execute(&record, params![crate::embed::models::META_KEY, model_id])?;
+                {
+                    let mut stmt = tx.prepare_cached(&apply)?;
+                    for ((id, text), v) in rows.iter().zip(vectors) {
+                        stmt.execute(params![super::embedding_to_bytes(&v), id, text])?;
+                        written += 1;
+                    }
                 }
-            }
-            tx.commit()?;
-            Ok(())
-        })?;
+                tx.commit()?;
+                Ok(())
+            },
+        )?;
     }
     Ok(written)
 }
 
 /// Rows of `layout`'s fill tables that should have a vector but don't.
 pub fn missing(conn: &Connection, layout: &Layout) -> Result<usize> {
+    missing_in(conn, layout, false)
+}
+
+/// [`missing`], counting every table with `all_tables`, as [`fill_missing`]
+/// fills them.
+pub fn missing_in(conn: &Connection, layout: &Layout, all_tables: bool) -> Result<usize> {
     let mut n = 0usize;
-    for t in layout.tables.iter().filter(|t| t.fill) {
+    for t in layout.tables.iter().filter(|t| all_tables || t.fill) {
         let c: i64 = conn.query_row(
             &format!(
                 "SELECT count(*) FROM {} WHERE ({}) AND {} IS NULL",
@@ -715,18 +830,109 @@ mod tests {
         assert_eq!(db.embedding_model_check().unwrap(), ModelCheck::Match);
     }
 
-    #[test]
-    fn staging_is_dropped_afterwards() {
-        let db = minilm_db();
-        db.reembed_all(GRANITE_SMALL_R2.id, &mut fake_embed(1), &mut |_, _, _| {})
+    /// [`minilm_db`], in a file, with enough memories for several pages.
+    fn minilm_file_db(dir: &tempfile::TempDir) -> Database {
+        let db = Database::open(&dir.path().join("db.sqlite")).unwrap();
+        for i in 0..(BATCH * 2 + 5) {
+            db.memory_set(&format!("m{i}"), &format!("fact {i}"), "feedback", None)
+                .unwrap();
+            db.memory_set_embedding(&format!("m{i}"), &unit(0)).unwrap();
+        }
+        db.set_meta(crate::embed::models::META_KEY, MINILM_L6_V2.id)
             .unwrap();
+        db
+    }
+
+    #[test]
+    fn an_interrupted_rebuild_goes_on_from_what_it_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = minilm_file_db(&dir);
+        let staging = dir.path().join("db.sqlite-reembed");
+        let mut calls = 0;
+        let mut failing = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            calls += 1;
+            if calls > 2 {
+                anyhow::bail!("interrupted");
+            }
+            Ok(texts.iter().map(|_| unit(1)).collect())
+        };
+        assert!(db
+            .reembed_all(GRANITE_SMALL_R2.id, &mut failing, &mut |_, _, _| {})
+            .is_err());
+        assert!(staging.exists(), "kept for the next attempt");
+        assert_eq!(
+            db.embedding_model().unwrap().as_deref(),
+            Some(MINILM_L6_V2.id)
+        );
+
+        // Another model's rebuild doesn't use those vectors...
+        let mut texts = 0;
+        let mut counting = |t: &[&str]| -> Result<Vec<Vec<f32>>> {
+            texts += t.len();
+            anyhow::bail!("stop")
+        };
+        let _ = db.reembed_all("other-model", &mut counting, &mut |_, _, _| {});
+        // ...and starting it threw them away, so this one starts over.
+        let mut texts = 0;
+        let mut counting = |t: &[&str]| -> Result<Vec<Vec<f32>>> {
+            texts += t.len();
+            Ok(t.iter().map(|_| unit(1)).collect())
+        };
+        db.reembed_all(GRANITE_SMALL_R2.id, &mut counting, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(texts, BATCH * 2 + 5);
+        assert!(!staging.exists(), "removed once applied");
+
+        // Interrupted again on the way to MiniLM, then resumed: only the
+        // rows after the two staged pages are embedded.
+        let mut calls = 0;
+        let mut failing = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            calls += 1;
+            if calls > 2 {
+                anyhow::bail!("interrupted");
+            }
+            Ok(texts.iter().map(|_| unit(2)).collect())
+        };
+        assert!(db
+            .reembed_all(MINILM_L6_V2.id, &mut failing, &mut |_, _, _| {})
+            .is_err());
+        let mut texts = 0;
+        let mut seen = Vec::new();
+        let mut counting = |t: &[&str]| -> Result<Vec<Vec<f32>>> {
+            texts += t.len();
+            Ok(t.iter().map(|_| unit(2)).collect())
+        };
+        let n = db
+            .reembed_all(MINILM_L6_V2.id, &mut counting, &mut |_, done, total| {
+                seen.push((done, total))
+            })
+            .unwrap();
+        assert_eq!(texts, 5);
+        assert_eq!(n, BATCH * 2 + 5, "applies the staged vectors too");
+        assert_eq!(seen.last(), Some(&(BATCH * 2 + 5, BATCH * 2 + 5)));
+        assert_eq!(
+            db.embedding_model().unwrap().as_deref(),
+            Some(MINILM_L6_V2.id)
+        );
         assert_eq!(
             vector_count(
                 &db,
-                "SELECT count(*) FROM temp.sqlite_master WHERE name = 'reembed_staging'"
+                "SELECT count(*) FROM memory WHERE embedding IS NOT NULL"
             ),
-            0
+            (BATCH * 2 + 5) as i64
         );
+    }
+
+    #[test]
+    fn an_in_memory_rebuild_leaves_nothing_attached() {
+        let db = minilm_db();
+        db.reembed_all(GRANITE_SMALL_R2.id, &mut fake_embed(1), &mut |_, _, _| {})
+            .unwrap();
+        let attached: i64 = vector_count(
+            &db,
+            "SELECT count(*) FROM pragma_database_list WHERE name = 'reembed'",
+        );
+        assert_eq!(attached, 0);
     }
 
     #[test]

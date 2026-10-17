@@ -69,6 +69,9 @@ pub enum MemoryCommand {
         /// Re-embed ALL active memories, not just those missing an embedding
         #[arg(long)]
         force: bool,
+        /// Wait for the model server to finish, showing progress
+        #[arg(long)]
+        wait: bool,
     },
     /// Mark a memory as reviewed (you've confirmed it's still accurate)
     Review { key: String },
@@ -362,7 +365,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             }
         }
 
-        MemoryCommand::Reembed { force } => {
+        MemoryCommand::Reembed { force, wait } => {
             // Memories share one model with meetings, todos and repos, so a
             // model switch has to convert the whole database at once.
             if let crate::embed::models::ModelCheck::Mismatch { recorded } =
@@ -383,6 +386,31 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             if targets.is_empty() {
                 println!("All active memories already embedded.");
                 return Ok(());
+            }
+            if crate::embed::enabled() {
+                let spec = crate::embed::models::configured()?;
+                if super::queue::server_takes_work(spec) {
+                    use crate::db::jobs::{DbKind, Kind};
+                    // Other tables' rows without a vector are filled too.
+                    let todo: &[_] = if force {
+                        &[(Kind::Rebuild, Some("memory")), (Kind::Fill, None)]
+                    } else {
+                        &[(Kind::Fill, None)]
+                    };
+                    let queued = [super::queue::submit(
+                        &db.conn,
+                        spec,
+                        "memories",
+                        DbKind::Main,
+                        todo,
+                    )?];
+                    if wait {
+                        super::queue::wait(spec, &queued)?;
+                    } else {
+                        super::queue::report(&queued);
+                    }
+                    return Ok(());
+                }
             }
             let mut embedder = crate::embed::required()?;
             let mut done = 0usize;

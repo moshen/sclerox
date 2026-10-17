@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use super::ModelSpec;
 pub use protocol::Lane;
-use protocol::{read_msg, write_msg, Build, ExitReason, Request, Response, ServerStatus};
+use protocol::{read_msg, write_msg, Build, DbKind, ExitReason, Request, Response, ServerStatus};
 pub use serve::{serve, ServeOptions, Served};
 
 /// Env var carrying `embed.server` from `config::init()` into this
@@ -458,6 +458,19 @@ impl Client {
         }
     }
 
+    fn enqueue(&mut self, path: &str, kind: DbKind) -> Result<()> {
+        let req = Request::Enqueue {
+            path: path.to_string(),
+            kind,
+        };
+        match self.call(&req, REPLY_TIMEOUT)? {
+            Response::Queued => Ok(()),
+            Response::Stopping { reason } => Err(Stopping(reason).into()),
+            Response::Error(e) => bail!("model server: {e}"),
+            other => bail!("unexpected reply to enqueue: {other:?}"),
+        }
+    }
+
     fn shutdown(mut self, reason: ExitReason) -> Result<()> {
         match self.call(&Request::Shutdown { reason }, REPLY_TIMEOUT)? {
             Response::Stopping { .. } => Ok(()),
@@ -486,6 +499,33 @@ pub fn connect_or_start(spec: &'static ModelSpec) -> Option<Client> {
             None
         }
     }
+}
+
+/// Have the server run the jobs queued in the database at `path`, starting
+/// it with `spec`, the model they are for, when none is running. `false`
+/// when no server can take them (see [`connect_or_start`]): they are then
+/// the caller's to run.
+pub fn enqueue(spec: &'static ModelSpec, path: &std::path::Path, kind: DbKind) -> bool {
+    if mode() == Mode::Off {
+        return false;
+    }
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = path.to_string_lossy();
+    // A server that is exiting refuses; the next one takes them.
+    for _ in 0..3 {
+        let Some(mut client) = connect_or_start(spec) else {
+            return false;
+        };
+        match client.enqueue(&path, kind) {
+            Ok(()) => return true,
+            Err(e) if e.is::<Stopping>() => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                log::warn!("model server couldn't take the queued work: {e:#}");
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// `explicit` is `sclerox server start`, which tries even after recent

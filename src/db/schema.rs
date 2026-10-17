@@ -772,7 +772,37 @@ CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 ";
 
-pub const REPO_SCHEMA: &str = "
+/// Embedding work queued for the model server in this database: a full
+/// rebuild for a model change (`table_name` limits it to one table), or a
+/// fill of the rows without a vector. Shared by both kinds of database; see
+/// `crate::db::jobs`.
+macro_rules! embed_jobs_table {
+    () => {
+        "
+CREATE TABLE IF NOT EXISTS embed_jobs (
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    target_model TEXT NOT NULL,
+    table_name   TEXT,
+    state        TEXT NOT NULL,
+    progress     INTEGER NOT NULL DEFAULT 0,
+    total        INTEGER,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+"
+    };
+}
+
+/// Migration v15: queue embedding work for the model server.
+pub const MIGRATION_V15: &str = embed_jobs_table!();
+
+/// Migration v7: queue embedding work for the model server.
+pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
+
+pub const REPO_SCHEMA: &str = concat!(
+    "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
@@ -865,4 +895,6 @@ CREATE TABLE IF NOT EXISTS symbol_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
-";
+",
+    embed_jobs_table!()
+);

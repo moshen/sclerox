@@ -812,6 +812,26 @@ fn run_embed_repo(repo_root: &std::path::Path) -> Result<()> {
     if !repo_db.semantic_ready() {
         return Ok(());
     }
+    // The model server takes the chunks when it runs; this worker then has
+    // nothing left to do.
+    if let Ok(spec) = crate::embed::models::configured() {
+        if crate::cli::queue::server_takes_work(spec) {
+            let queued = crate::cli::queue::submit(
+                &repo_db.conn,
+                spec,
+                &repo_root.display().to_string(),
+                crate::db::jobs::DbKind::Repo,
+                &[(crate::db::jobs::Kind::Fill, None)],
+            );
+            if let Err(e) = queued {
+                log::warn!(
+                    "couldn't queue {} for embedding: {e:#}",
+                    repo_root.display()
+                );
+            }
+            return Ok(());
+        }
+    }
     let Some(mut embedder) = crate::embed::optional(true).map(crate::embed::Embedder::bulk) else {
         return Ok(());
     };

@@ -7,6 +7,8 @@
 //! build either replaces it or embeds in-process.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+pub use crate::db::jobs::DbKind;
 use std::io::{self, Read, Write};
 
 /// Largest frame either side reads. A request of 16 long texts or a reply of
@@ -131,6 +133,11 @@ pub enum Request {
     Shutdown {
         reason: ExitReason,
     },
+    /// The database at `path` has jobs queued in its `embed_jobs`; run them.
+    Enqueue {
+        path: String,
+        kind: DbKind,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +157,8 @@ pub enum Response {
         reason: ExitReason,
     },
     Error(String),
+    /// The reply to `Enqueue`.
+    Queued,
 }
 
 /// What `sclerox server status` shows about a running server.
@@ -176,6 +185,15 @@ pub struct ServerStatus {
     pub waiting_bulk: usize,
     /// Models loaded, or that failed to load, in the order first asked for.
     pub models: Vec<ModelStatus>,
+    /// Databases whose queued jobs the server is running.
+    pub queue: Vec<QueuedDb>,
+}
+
+/// A database with jobs the server is running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedDb {
+    pub path: String,
+    pub kind: DbKind,
 }
 
 /// One model in a server.

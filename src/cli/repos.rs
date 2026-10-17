@@ -21,6 +21,9 @@ pub enum RepoCommand {
         /// Index even when the folder exceeds the max-files cap
         #[arg(long)]
         force: bool,
+        /// Wait for the model server to embed the chunks, showing progress
+        #[arg(long)]
+        wait: bool,
     },
     /// List all indexed repositories
     List,
@@ -67,6 +70,9 @@ pub enum RepoCommand {
         /// Re-embed ALL chunks, not just those missing an embedding
         #[arg(long)]
         force: bool,
+        /// Wait for the model server to finish, showing progress
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -77,6 +83,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             description,
             no_embed,
             force,
+            wait,
         } => {
             let canonical = path.canonicalize().unwrap_or(path);
             // Walk up to the git root so `sclerox repo index` from a subdirectory indexes the whole repo.
@@ -92,8 +99,17 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 );
                 return Ok(());
             }
+            // With the model server, index without vectors and queue them
+            // for it afterwards.
+            let queue_to = if no_embed || !crate::embed::enabled() {
+                None
+            } else {
+                crate::embed::models::configured()
+                    .ok()
+                    .filter(|spec| super::queue::server_takes_work(spec))
+            };
             // The repo DB checks its own recorded model while indexing.
-            let mut embedder_opt: Option<Embedder> = if no_embed {
+            let mut embedder_opt: Option<Embedder> = if no_embed || queue_to.is_some() {
                 None
             } else {
                 crate::embed::optional(true).map(Embedder::bulk)
@@ -105,6 +121,9 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                 "Done: {} files indexed, {} skipped, {} symbols, {} chunks, {} edges",
                 result.files_indexed, result.skipped, result.symbols, result.chunks, result.edges,
             );
+            if let Some(spec) = queue_to {
+                queue_index_embedding(db, &canonical, spec, wait)?;
+            }
         }
 
         RepoCommand::List => {
@@ -269,8 +288,8 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             heal_repos(db, force)?;
         }
 
-        RepoCommand::Reembed { repo, force } => {
-            reembed_repos(db, repo.as_deref(), force)?;
+        RepoCommand::Reembed { repo, force, wait } => {
+            reembed_repos(db, repo.as_deref(), force, wait)?;
         }
     }
     Ok(())
@@ -278,7 +297,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
 
 /// Backfill (or force-recompute) embeddings for indexed code chunks across
 /// registered repos, embedding the stored chunk text in place.
-fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Result<()> {
+fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool, wait: bool) -> Result<()> {
     for removed in db.repo_prune_gone()? {
         println!("Removing stale entry: {} (directory gone)", removed.name);
     }
@@ -286,6 +305,12 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
     if repos.is_empty() {
         println!("No repos indexed. Run `sclerox repo index [path]` first.");
         return Ok(());
+    }
+    if crate::embed::enabled() {
+        let spec = crate::embed::models::configured()?;
+        if super::queue::server_takes_work(spec) {
+            return queue_repos(&repos, repo_filter, spec, force, wait);
+        }
     }
 
     let mut embedder = crate::embed::required()?;
@@ -378,6 +403,129 @@ fn reembed_repos(db: &Database, repo_filter: Option<&str>, force: bool) -> Resul
         println!("Embedded {total_embedded} chunks across {touched_repos} repos.");
     }
     Ok(())
+}
+
+/// `repo reembed` through the model server: queue a rebuild where one is
+/// due and a fill of what has no vector, in each matching repo.
+fn queue_repos(
+    repos: &[crate::db::repos::RepoEntry],
+    repo_filter: Option<&str>,
+    spec: &'static crate::embed::ModelSpec,
+    force: bool,
+    wait: bool,
+) -> Result<()> {
+    use crate::db::jobs::{DbKind, Kind};
+
+    let mut queued = Vec::new();
+    let mut failed = 0usize;
+    for entry in repos {
+        if let Some(f) = repo_filter {
+            if !entry.name.to_lowercase().contains(&f.to_lowercase()) {
+                continue;
+            }
+        }
+        let db_path = PathBuf::from(&entry.db_path);
+        if !db_path.exists() {
+            continue;
+        }
+        let repo_db = match RepoDb::open(&db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {}: could not open ({e})", entry.name);
+                failed += 1;
+                continue;
+            }
+        };
+        let mismatched = match repo_db.embedding_model_check() {
+            Ok(state) => matches!(state, crate::embed::models::ModelCheck::Mismatch { .. }),
+            Err(e) => {
+                println!(
+                    "  {}: could not read its embedding model ({e:#})",
+                    entry.name
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        let mut todo = Vec::new();
+        if force || mismatched {
+            todo.push((Kind::Rebuild, None));
+        }
+        if !todo.is_empty() || repo_db.has_chunks_without_embedding()? {
+            todo.push((Kind::Fill, None));
+        }
+        if !todo.is_empty() {
+            queued.push(super::queue::submit(
+                &repo_db.conn,
+                spec,
+                &entry.name,
+                DbKind::Repo,
+                &todo,
+            )?);
+        }
+    }
+    if queued.is_empty() && failed == 0 {
+        println!("All indexed chunks already have embeddings.");
+        return Ok(());
+    }
+    if wait {
+        super::queue::wait(spec, &queued)?;
+    } else {
+        super::queue::report(&queued);
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} repo(s) could not be queued; run again to retry");
+    }
+    Ok(())
+}
+
+/// After `repo index` without vectors: queue them for the model server, in
+/// the repos indexed under `root` (nested ones included) and, for the repo
+/// descriptions, in the main database.
+fn queue_index_embedding(
+    db: &Database,
+    root: &std::path::Path,
+    spec: &'static crate::embed::ModelSpec,
+    wait: bool,
+) -> Result<()> {
+    use crate::db::jobs::{DbKind, Kind};
+
+    let mut queued = Vec::new();
+    for entry in db.repo_list()? {
+        if !std::path::Path::new(&entry.path).starts_with(root) {
+            continue;
+        }
+        let db_path = PathBuf::from(&entry.db_path);
+        if !db_path.exists() {
+            continue;
+        }
+        let repo_db = RepoDb::open(&db_path)?;
+        // One on another model takes no new vectors until it is rebuilt.
+        if repo_db.semantic_ready() && repo_db.has_chunks_without_embedding()? {
+            queued.push(super::queue::submit(
+                &repo_db.conn,
+                spec,
+                &entry.name,
+                DbKind::Repo,
+                &[(Kind::Fill, None)],
+            )?);
+        }
+    }
+    if db.semantic_ready() && db.missing_vectors()? > 0 {
+        queued.push(super::queue::submit(
+            &db.conn,
+            spec,
+            "main database",
+            DbKind::Main,
+            &[(Kind::Fill, None)],
+        )?);
+    }
+    if wait {
+        super::queue::wait(spec, &queued)
+    } else {
+        super::queue::report(&queued);
+        Ok(())
+    }
 }
 
 /// Embed a repo's chunks that have no vector, in batches to bound memory.

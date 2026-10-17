@@ -5,20 +5,26 @@
 //!
 //! Requests take turns on the CPU one text at a time (see [`Gate`]): queries
 //! go before bulk work, and clients doing bulk work alternate.
+//!
+//! Work queued in a database's `embed_jobs` runs on a thread of its own per
+//! database, as bulk work, so databases take turns too. The databases with
+//! work are listed in `server.db`, and a new server goes on with them.
 
 use anyhow::{bail, Context, Result};
 use interprocess::local_socket::{prelude::*, ListenerOptions, Name, Stream};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, TryLockError};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use super::protocol::{
-    read_msg, write_msg, Build, ExitReason, Lane, ModelStatus, Request, Response, ServerStatus,
+    read_msg, write_msg, Build, DbKind, ExitReason, Lane, ModelStatus, QueuedDb, Request, Response,
+    ServerStatus,
 };
 use super::runs::{Load, Runs};
 use super::{lock_path, runs_path, socket_name, state_dir, Client, Found};
+use crate::db::jobs;
 use crate::embed::{models, ModelSpec};
 
 /// What `sclerox server start --foreground` reads from its settings.
@@ -31,6 +37,9 @@ pub struct ServeOptions {
     pub soft_limit_mb: Option<u64>,
     /// `server.hard_memory_mb`: over it, exit after the request in progress.
     pub hard_limit_mb: Option<u64>,
+    /// Session distillations running now. A rebuild of a main database
+    /// waits for them.
+    pub distillations: fn() -> usize,
 }
 
 /// How [`serve`] ended.
@@ -56,6 +65,9 @@ const RESTART_QUIET: Duration = Duration::from_secs(60);
 /// reload the models over and over.
 const MAX_MEMORY_EXITS: usize = 3;
 const MEMORY_EXIT_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// How long a job waits before trying a locked database again, and between
+/// checks for session distillations before rebuilding the main database.
+const RETRY_WORK: Duration = Duration::from_secs(5);
 
 /// Serve until idle or stopped. `on_ready` runs once the preloaded model has
 /// loaded and the socket is listening.
@@ -128,6 +140,8 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
         soft_limit_mb: AtomicU64::new(soft_limit_mb.unwrap_or(0)),
         hard_limit_mb: AtomicU64::new(options.hard_limit_mb.unwrap_or(0)),
         restart_due: AtomicBool::new(false),
+        workers: Mutex::new(HashMap::new()),
+        distillations: options.distillations,
     });
     let failed = |e: anyhow::Error| -> Result<Served> {
         let _ = state.runs().failed(run_id, &format!("{e:#}"));
@@ -163,6 +177,14 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
         let state = Arc::clone(&state);
         std::thread::spawn(move || housekeeping(&state));
     }
+    match state.runs().with_work() {
+        Ok(dbs) => {
+            for (path, kind) in dbs {
+                start_worker(&state, path, kind);
+            }
+        }
+        Err(e) => log::warn!("model server couldn't read its queued work: {e:#}"),
+    }
     for conn in listener.incoming() {
         if state.stopping().is_some() {
             break;
@@ -179,9 +201,12 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
     // Removes the socket, so new commands start a fresh server (which waits
     // for this one's lock) instead of connecting here.
     drop(listener);
-    // Let embeddings in progress reply.
+    // Let embeddings in progress reply, and queued work reach a point it can
+    // go on from.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while state.busy.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+    while (state.busy.load(Ordering::SeqCst) > 0 || !self::lock(&state.workers).is_empty())
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     state.save_progress()?;
@@ -240,6 +265,15 @@ struct State {
     hard_limit_mb: AtomicU64,
     /// Over the soft limit: exit after [`RESTART_QUIET`] unused.
     restart_due: AtomicBool,
+    /// Databases whose jobs a thread is running, by path.
+    workers: Mutex<HashMap<String, Worker>>,
+    distillations: fn() -> usize,
+}
+
+struct Worker {
+    kind: DbKind,
+    /// More was queued while it ran: look again before finishing.
+    again: bool,
 }
 
 /// Turns on the CPU: one text at a time across all models, since each
@@ -593,6 +627,13 @@ impl State {
             waiting_queries,
             waiting_bulk,
             models,
+            queue: lock(&self.workers)
+                .iter()
+                .map(|(path, w)| QueuedDb {
+                    path: path.clone(),
+                    kind: w.kind,
+                })
+                .collect(),
         }
     }
 
@@ -615,7 +656,7 @@ impl State {
 }
 
 /// Answer one client until it disconnects.
-fn handle(state: &State, mut stream: Stream) {
+fn handle(state: &Arc<State>, mut stream: Stream) {
     let _connection = Counted::new(&state.connections);
     let mut greeted = false;
     loop {
@@ -639,12 +680,14 @@ fn handle(state: &State, mut stream: Stream) {
                     }
                 }
             }
-            Request::Embed { .. } | Request::Load { .. } if !greeted => {
+            Request::Embed { .. } | Request::Load { .. } | Request::Enqueue { .. } if !greeted => {
                 Response::Error("model request before a matching hello".to_string())
             }
             // Refused so the server can exit instead of serving a bulk
             // client's next batch, and the next.
-            Request::Embed { .. } | Request::Load { .. } if state.stopping().is_some() => {
+            Request::Embed { .. } | Request::Load { .. } | Request::Enqueue { .. }
+                if state.stopping().is_some() =>
+            {
                 Response::Stopping {
                     reason: state.stopping().unwrap_or(ExitReason::Stopped),
                 }
@@ -652,6 +695,16 @@ fn handle(state: &State, mut stream: Stream) {
             Request::Embed { model, texts, lane } => state.embed(&model, texts, lane),
             Request::Load { model } => state.load_only(&model),
             Request::Status => Response::Status(state.status()),
+            Request::Enqueue { path, kind } => {
+                state.touch();
+                match state.runs().set_work(&path, kind, true) {
+                    Ok(()) => {
+                        start_worker(state, path, kind);
+                        Response::Queued
+                    }
+                    Err(e) => Response::Error(format!("couldn't note the queued work: {e:#}")),
+                }
+            }
             Request::Shutdown { reason } => {
                 state.request_stop(reason);
                 let reason = state.stopping().unwrap_or(reason);
@@ -664,6 +717,98 @@ fn handle(state: &State, mut stream: Stream) {
         }
     }
     state.touch();
+}
+
+/// Run the jobs queued in the database at `path` on a thread of its own,
+/// unless one is already at it, in which case it looks again before
+/// finishing.
+fn start_worker(state: &Arc<State>, path: String, kind: DbKind) {
+    {
+        let mut workers = lock(&state.workers);
+        if let Some(worker) = workers.get_mut(&path) {
+            worker.again = true;
+            return;
+        }
+        workers.insert(path.clone(), Worker { kind, again: false });
+    }
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        loop {
+            match run_jobs(&state, &path, kind) {
+                Ok(()) => {}
+                Err(e) if state.stopping().is_some() => {
+                    // Left queued for the next server.
+                    log::info!("model server stopped work on {path}: {e:#}");
+                    lock(&state.workers).remove(&path);
+                    return;
+                }
+                Err(e) if jobs::is_interrupted(&e) => {
+                    log::debug!("model server will retry {path}: {e:#}");
+                    std::thread::sleep(RETRY_WORK);
+                    continue;
+                }
+                Err(e) => log::warn!("model server couldn't run the jobs in {path}: {e:#}"),
+            }
+            let mut workers = lock(&state.workers);
+            match workers.get_mut(&path) {
+                Some(worker) if worker.again => worker.again = false,
+                _ => {
+                    if let Err(e) = state.runs().set_work(&path, kind, false) {
+                        log::debug!("model server couldn't note {path} done: {e:#}");
+                    }
+                    workers.remove(&path);
+                    state.touch();
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Run the jobs queued in one database, as bulk work.
+fn run_jobs(state: &State, path: &str, kind: DbKind) -> Result<()> {
+    let path = std::path::Path::new(path);
+    if !jobs::has_queue(path)? {
+        // Removed since, or not one of ours: opening it would make or
+        // migrate one.
+        log::warn!(
+            "model server ignored {}: no embedding queue there",
+            path.display()
+        );
+        return Ok(());
+    }
+    let conn = kind.open(path)?;
+    let mut embed = |model_id: &str, texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+        let spec = models::by_id(model_id)
+            .with_context(|| format!("unknown embedding model '{model_id}'"))?;
+        let texts = texts.iter().map(|t| t.to_string()).collect();
+        match state.embed(spec.name, texts, Lane::Bulk) {
+            Response::Vectors(v) => Ok(v),
+            Response::Stopping { reason } => Err(jobs::Interrupted(format!(
+                "the server is stopping ({})",
+                reason.as_str()
+            ))
+            .into()),
+            Response::Error(e) => bail!("{e}"),
+            other => bail!("unexpected reply to embed: {other:?}"),
+        }
+    };
+    // A distiller from before an upgrade would write the old model's vectors
+    // into the rebuilt database, as `db reembed` explains.
+    let mut before_rebuild = || -> Result<()> {
+        while kind == DbKind::Main && (state.distillations)() > 0 {
+            if let Some(reason) = state.stopping() {
+                return Err(jobs::Interrupted(format!(
+                    "the server is stopping ({})",
+                    reason.as_str()
+                ))
+                .into());
+            }
+            std::thread::sleep(RETRY_WORK);
+        }
+        Ok(())
+    };
+    jobs::run(&conn, kind, &mut embed, &mut before_rebuild)
 }
 
 /// One more in `count` while alive, including while unwinding from a panic
@@ -692,8 +837,9 @@ fn housekeeping(state: &State) {
         if state.stopping().is_some() {
             return;
         }
-        let quiet =
-            state.connections.load(Ordering::SeqCst) == 0 && state.busy.load(Ordering::SeqCst) == 0;
+        let quiet = state.connections.load(Ordering::SeqCst) == 0
+            && state.busy.load(Ordering::SeqCst) == 0
+            && lock(&state.workers).is_empty();
         let unused = lock(&state.last_activity).elapsed();
         if quiet && unused >= state.idle {
             state.request_stop(ExitReason::Idle);

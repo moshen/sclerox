@@ -1689,7 +1689,7 @@ fn model_server_runs_bulk_work_with_the_same_vectors() {
     assert!(s.status()["server"].is_null(), "off started a server");
 
     // ...then through the server, which writes the same bytes.
-    s.run(&["db", "reembed", "--force"]);
+    s.run(&["db", "reembed", "--force", "--wait"]);
     let status = s.status();
     assert!(
         status["server"]["models"][0]["requests"].as_u64().unwrap() >= 1,
@@ -1726,7 +1726,7 @@ fn model_server_restarts_over_its_hard_memory_limit() {
     let out = s
         .cmd()
         .env("SCLEROX_SERVER_HARD_MEMORY_MB", &limit)
-        .args(["db", "reembed", "--force"])
+        .args(["db", "reembed", "--force", "--wait"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -1740,4 +1740,54 @@ fn model_server_restarts_over_its_hard_memory_limit() {
         .filter(|r| r["exit_reason"] == "hard_memory")
         .count();
     assert!(restarts >= 1, "{runs}");
+}
+
+/// Memories that have a vector.
+fn embedded_memories(db: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT count(*) FROM memory WHERE embedding IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Bulk work is queued in the database and the command returns. A server
+/// killed partway through leaves the work there, and the next server
+/// finishes it on its own.
+#[cfg(unix)]
+#[test]
+fn model_server_finishes_queued_work_after_being_killed() {
+    let s = ServerEnv::new();
+    add_long_memories(&s, 20);
+    let out = s.run(&["db", "reembed"]);
+    assert!(out.contains("queued"), "{out}");
+    let pid = s.status()["server"]["pid"].as_u64().unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(embedded_memories(&s.env.db) < 20);
+
+    s.run(&["server", "start"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while embedded_memories(&s.env.db) < 20 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of 20 embedded",
+            embedded_memories(&s.env.db)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let conn = rusqlite::Connection::open(&s.env.db).unwrap();
+    let unfinished: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM embed_jobs WHERE state NOT IN ('done')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unfinished, 0);
 }

@@ -8,7 +8,14 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::time::Duration;
 
-use super::protocol::ExitReason;
+use super::protocol::{DbKind, ExitReason};
+
+fn kind_str(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::Main => "main",
+        DbKind::Repo => "repo",
+    }
+}
 
 /// Runs older than this are deleted when a server starts.
 const KEEP_DAYS: u32 = 30;
@@ -16,7 +23,7 @@ const KEEP_DAYS: u32 = 30;
 /// `PRAGMA user_version` of the schema below. The file only holds history,
 /// so one with another version is emptied and recreated rather than
 /// migrated.
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE server_runs (
@@ -44,6 +51,12 @@ CREATE TABLE model_loads (
   requests    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX model_loads_run ON model_loads (run_id);
+CREATE TABLE known_dbs (
+  path      TEXT PRIMARY KEY,
+  kind      TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  has_work  INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// A finished or running server, for `server status`.
@@ -94,6 +107,7 @@ impl Runs {
                 tx.execute_batch(&format!(
                     "DROP TABLE IF EXISTS server_runs;
                      DROP TABLE IF EXISTS model_loads;
+                     DROP TABLE IF EXISTS known_dbs;
                      {SCHEMA}
                      PRAGMA user_version = {VERSION};"
                 ))?;
@@ -209,6 +223,37 @@ impl Runs {
         Ok(n as usize)
     }
 
+    /// Note that the database at `path` has queued work (`has_work`) or
+    /// none left.
+    pub fn set_work(&self, path: &str, kind: DbKind, has_work: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO known_dbs (path, kind, last_seen, has_work)
+             VALUES (?1, ?2, datetime('now'), ?3)
+             ON CONFLICT (path) DO UPDATE SET
+               kind = excluded.kind, last_seen = excluded.last_seen, has_work = excluded.has_work",
+            params![path, kind_str(kind), has_work],
+        )?;
+        Ok(())
+    }
+
+    /// Databases with queued work, for a new server to go on with.
+    pub fn with_work(&self) -> Result<Vec<(String, DbKind)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, kind FROM known_dbs WHERE has_work ORDER BY last_seen")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, kind) = row?;
+            match kind.as_str() {
+                "main" => out.push((path, DbKind::Main)),
+                "repo" => out.push((path, DbKind::Repo)),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
     /// The most recent runs, newest first.
     pub fn recent(&self, limit: usize) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
@@ -246,6 +291,10 @@ impl Runs {
         self.conn.execute(
             "DELETE FROM model_loads WHERE run_id IN
                (SELECT id FROM server_runs WHERE ended_at < datetime('now', ?1))",
+            [&cutoff],
+        )?;
+        self.conn.execute(
+            "DELETE FROM known_dbs WHERE NOT has_work AND last_seen < datetime('now', ?1)",
             [&cutoff],
         )?;
         Ok(self.conn.execute(
