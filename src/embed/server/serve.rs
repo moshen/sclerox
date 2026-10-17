@@ -457,6 +457,9 @@ impl State {
                 limit.store(0, Ordering::Relaxed);
             }
         }
+        if self.soft_limit_mb.load(Ordering::Relaxed) == 0 {
+            self.restart_due.store(false, Ordering::Relaxed);
+        }
     }
 
     /// After a request: exit after it when over the hard limit, and once
