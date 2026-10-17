@@ -11,6 +11,10 @@
 //! lock, `run/server.lock` in the state directory. The server loads the model it
 //! was started for, and any other a request names on first use, so sessions
 //! configured for different models share it.
+//!
+//! Each embed request says whether it is a query or bulk work; the server
+//! runs queries first (see `serve`). A server over its memory limit exits,
+//! and a client in the middle of bulk work starts the next one.
 
 pub mod protocol;
 pub mod runs;
@@ -22,6 +26,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::ModelSpec;
+pub use protocol::Lane;
 use protocol::{read_msg, write_msg, Build, ExitReason, Request, Response, ServerStatus};
 pub use serve::{serve, ServeOptions, Served};
 
@@ -64,8 +69,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a command waits for anything else: the handshake, status, stop.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Texts per embed request, so a long bulk job doesn't hold the model for
-/// minutes while other commands wait to embed a query.
+/// Texts per embed request, so each gets its reply well within
+/// [`EMBED_TIMEOUT`] even while other commands take turns with it.
 const TEXTS_PER_REQUEST: usize = 16;
 /// Failed starts or crashes in [`FAILURE_WINDOW`] after which commands stop
 /// starting a server and embed in-process.
@@ -300,6 +305,18 @@ impl std::fmt::Display for TimedOut {
 
 impl std::error::Error for TimedOut {}
 
+/// The server is exiting and refused the request.
+#[derive(Debug)]
+pub struct Stopping(pub ExitReason);
+
+impl std::fmt::Display for Stopping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model server is stopping ({})", self.0.as_str())
+    }
+}
+
+impl std::error::Error for Stopping {}
+
 /// What a connection attempt found.
 enum Found {
     Ready(Client),
@@ -389,13 +406,21 @@ impl Client {
     }
 
     /// Embed texts exactly as given with `spec`, in requests of at most
-    /// [`TEXTS_PER_REQUEST`].
-    pub fn embed(&mut self, spec: &ModelSpec, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut vectors = Vec::with_capacity(texts.len());
+    /// [`TEXTS_PER_REQUEST`], adding each request's vectors to `vectors` as
+    /// they arrive: after a failure it holds those of the texts before. Fails
+    /// with [`Stopping`] when the server is exiting.
+    pub fn embed(
+        &mut self,
+        spec: &ModelSpec,
+        texts: &[String],
+        lane: Lane,
+        vectors: &mut Vec<Vec<f32>>,
+    ) -> Result<()> {
         for batch in texts.chunks(TEXTS_PER_REQUEST) {
             let req = Request::Embed {
                 model: spec.name.to_string(),
                 texts: batch.to_vec(),
+                lane,
             };
             match self.call(&req, EMBED_TIMEOUT)? {
                 Response::Vectors(v) if v.len() == batch.len() => vectors.extend(v),
@@ -406,11 +431,12 @@ impl Client {
                         batch.len()
                     )
                 }
+                Response::Stopping { reason } => return Err(Stopping(reason).into()),
                 Response::Error(e) => bail!("model server: {e}"),
                 other => bail!("unexpected reply to embed: {other:?}"),
             }
         }
-        Ok(vectors)
+        Ok(())
     }
 
     /// Have the server load `spec` if it hasn't.
@@ -434,7 +460,7 @@ impl Client {
 
     fn shutdown(mut self, reason: ExitReason) -> Result<()> {
         match self.call(&Request::Shutdown { reason }, REPLY_TIMEOUT)? {
-            Response::Stopping => Ok(()),
+            Response::Stopping { .. } => Ok(()),
             other => bail!("unexpected reply to shutdown: {other:?}"),
         }
     }
@@ -476,8 +502,7 @@ fn try_connect_or_start(spec: &'static ModelSpec, explicit: bool) -> Result<Opti
                 return Ok(None);
             }
             log::info!("replacing model server {} with this build", theirs.label());
-            client.shutdown(ExitReason::Version)?;
-            wait_until_stopped(Duration::from_secs(10))?;
+            stop_other_build(client, ExitReason::Version, Duration::from_secs(10))?;
         }
         Found::Absent => {}
     }
@@ -645,6 +670,15 @@ mod windows_std {
 }
 
 /// Wait for the server to exit, which is when it releases its lock.
+/// Stop a server of another build. Its reply to `Shutdown` may not be in a
+/// form this build reads, so only whether it exits counts.
+fn stop_other_build(client: Client, reason: ExitReason, timeout: Duration) -> Result<()> {
+    if let Err(e) = client.shutdown(reason) {
+        log::debug!("model server's reply to shutdown: {e:#}");
+    }
+    wait_until_stopped(timeout)
+}
+
 fn wait_until_stopped(timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while is_running() {
@@ -682,9 +716,13 @@ pub fn status() -> Result<Option<ServerStatus>> {
 /// Stop the server and wait for it to exit. `false` when none was running.
 pub fn stop() -> Result<bool> {
     match Client::connect()? {
-        Found::Ready(c) | Found::Mismatch(c, _) => {
+        Found::Ready(c) => {
             c.shutdown(ExitReason::Stopped)?;
             wait_until_stopped(Duration::from_secs(30))?;
+            Ok(true)
+        }
+        Found::Mismatch(c, _) => {
+            stop_other_build(c, ExitReason::Stopped, Duration::from_secs(30))?;
             Ok(true)
         }
         Found::Absent => Ok(false),

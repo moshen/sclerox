@@ -88,6 +88,8 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_CODE_CHUNK_LINES",
         "SCLEROX_EMBED_SERVER",
         "SCLEROX_SERVER_IDLE_MINUTES",
+        "SCLEROX_SERVER_MAX_MEMORY_MB",
+        "SCLEROX_SERVER_HARD_MEMORY_MB",
         "SCLEROX_LOG",
         "SCLEROX_CONFIG",
     ]
@@ -168,6 +170,8 @@ pub fn config_template() -> String {
          \n\
          [server]\n\
          # idle_minutes = {idle_minutes}               # the model server exits after this long without requests. env: SCLEROX_SERVER_IDLE_MINUTES\n\
+         # max_memory_mb = {max_memory_mb}            # over this (MB), the model server exits once unused for a minute, giving memory back; 0: no limit. env: SCLEROX_SERVER_MAX_MEMORY_MB\n\
+         # hard_memory_mb = {hard_memory_mb}              # over this (MB), it exits after the request in progress, even mid bulk work; 0: no limit. env: SCLEROX_SERVER_HARD_MEMORY_MB\n\
          \n\
          [index]\n\
          # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
@@ -223,6 +227,8 @@ pub fn config_template() -> String {
         mem_chars = d.memory_embed_chars(),
         embed_server = d.embed.server,
         idle_minutes = d.server.idle_minutes,
+        max_memory_mb = d.server.max_memory_mb,
+        hard_memory_mb = d.server.hard_memory_mb,
         code_chars = d.index.chunk_chars,
         code_lines = d.index.chunk_lines,
         max_bytes = d.index.max_file_bytes,

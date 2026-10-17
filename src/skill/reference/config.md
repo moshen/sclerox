@@ -111,8 +111,21 @@ sclerox server start [--foreground] [--model M]  # start it yourself, loading M 
 Commands never depend on it. If the server is off, from another build, or keeps
 failing, they load the model themselves as before; a newer build replaces an
 older build's server. A command only talks to a server running as the same
-user. The `reembed` commands always load the model in-process.
+user.
 `embed.server = off` (env `SCLEROX_EMBED_SERVER=off`) makes commands load the
 model themselves and never start a server; it doesn't stop one already running
 (`sclerox server stop` does), and `sclerox server start` still works. Runs are
 recorded in `~/.local/state/sclerox/server.db`.
+
+Bulk work - the `reembed` commands, `repo index`, the session hooks' background
+embedding and distillation - goes through the server too. A query waits for at
+most the one text being embedded, and two bulk commands take turns.
+
+The model runtime keeps the memory a long input needed. Over
+`server.max_memory_mb` (2000; 0 for no limit) the server exits once nothing has
+used it for a minute, and the next command starts a fresh one. Over
+`server.hard_memory_mb` (off by default) it exits after the request in
+progress, even in the middle of bulk work, which carries on with a new server.
+A limit the loaded models alone exceed is ignored, as is the soft limit after
+three memory exits in 30 minutes. Env: `SCLEROX_SERVER_MAX_MEMORY_MB`,
+`SCLEROX_SERVER_HARD_MEMORY_MB`.

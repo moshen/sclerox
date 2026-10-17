@@ -812,7 +812,7 @@ fn run_embed_repo(repo_root: &std::path::Path) -> Result<()> {
     if !repo_db.semantic_ready() {
         return Ok(());
     }
-    let Some(mut embedder) = crate::embed::optional(true) else {
+    let Some(mut embedder) = crate::embed::optional(true).map(crate::embed::Embedder::bulk) else {
         return Ok(());
     };
     let started = std::time::Instant::now();
@@ -1008,8 +1008,10 @@ fn distill_chunked(
     // Best-effort embedder, reused across all chunks. None if the model is
     // unavailable, or if this database's vectors came from a different model
     // (their scores against ours would be meaningless) - dedup then falls back
-    // to lexical and no vectors are stored.
-    let mut embedder = crate::embed::optional(db.semantic_ready());
+    // to lexical and no vectors are stored. Nobody waits on a distillation,
+    // so its embeddings go after other commands' queries.
+    let mut embedder =
+        crate::embed::optional(db.semantic_ready()).map(crate::embed::Embedder::bulk);
 
     for chunk in chunk_turns(turns, chunk_chars) {
         // Show the distiller the memories this chunk is topically near, so it

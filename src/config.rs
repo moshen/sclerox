@@ -161,6 +161,14 @@ pub struct ServerSettings {
     /// The model server exits after this many minutes without requests.
     /// Env: `SCLEROX_SERVER_IDLE_MINUTES`.
     pub idle_minutes: u64,
+    /// Soft memory limit in MB, 0 for none: over it, the model server exits
+    /// once unused for a minute, giving back what the model runtime holds on
+    /// to after long inputs. Env: `SCLEROX_SERVER_MAX_MEMORY_MB`.
+    pub max_memory_mb: u64,
+    /// Hard memory limit in MB, 0 for none: over it, the model server exits
+    /// after the request in progress, even mid bulk work.
+    /// Env: `SCLEROX_SERVER_HARD_MEMORY_MB`.
+    pub hard_memory_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +310,11 @@ impl Default for EmbedSettings {
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self { idle_minutes: 15 }
+        Self {
+            idle_minutes: 15,
+            max_memory_mb: 2000,
+            hard_memory_mb: 0,
+        }
     }
 }
 
@@ -455,9 +467,13 @@ impl Settings {
                 self.embed.server = v;
             }
         }
-        if let Ok(v) = std::env::var(IDLE_MINUTES_ENV) {
-            if let Ok(n) = v.parse::<u64>() {
-                self.server.idle_minutes = n;
+        for (var, field) in [
+            (IDLE_MINUTES_ENV, &mut self.server.idle_minutes),
+            (MAX_MEMORY_MB_ENV, &mut self.server.max_memory_mb),
+            (HARD_MEMORY_MB_ENV, &mut self.server.hard_memory_mb),
+        ] {
+            if let Some(n) = std::env::var(var).ok().and_then(|v| v.parse().ok()) {
+                *field = n;
             }
         }
         if let Ok(l) = std::env::var("SCLEROX_LOG") {
@@ -724,6 +740,10 @@ fn enabled_bridge(resolved: bool, env: Option<&str>) -> Option<&'static str> {
 /// Env var for `server.idle_minutes`. Only the binary reads it, so it is not
 /// bridged.
 pub const IDLE_MINUTES_ENV: &str = "SCLEROX_SERVER_IDLE_MINUTES";
+/// Env vars for `server.max_memory_mb` and `server.hard_memory_mb`; not
+/// bridged either.
+pub const MAX_MEMORY_MB_ENV: &str = "SCLEROX_SERVER_MAX_MEMORY_MB";
+pub const HARD_MEMORY_MB_ENV: &str = "SCLEROX_SERVER_HARD_MEMORY_MB";
 
 /// A week. Longer is pointless, and keeps the conversion to seconds far from
 /// overflowing.
