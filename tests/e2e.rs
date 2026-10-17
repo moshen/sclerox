@@ -1743,6 +1743,7 @@ fn model_server_restarts_over_its_hard_memory_limit() {
 }
 
 /// Memories that have a vector.
+#[cfg(unix)]
 fn embedded_memories(db: &std::path::Path) -> i64 {
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.query_row(
@@ -1772,22 +1773,25 @@ fn model_server_finishes_queued_work_after_being_killed() {
     assert!(embedded_memories(&s.env.db) < 20);
 
     s.run(&["server", "start"]);
+    // The last vectors go in just before their job is marked done.
+    let unfinished = || -> i64 {
+        rusqlite::Connection::open(&s.env.db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM embed_jobs WHERE state != 'done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while embedded_memories(&s.env.db) < 20 {
+    while embedded_memories(&s.env.db) < 20 || unfinished() > 0 {
         assert!(
             std::time::Instant::now() < deadline,
-            "only {} of 20 embedded",
-            embedded_memories(&s.env.db)
+            "{} of 20 embedded, {} job(s) unfinished",
+            embedded_memories(&s.env.db),
+            unfinished()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    let conn = rusqlite::Connection::open(&s.env.db).unwrap();
-    let unfinished: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM embed_jobs WHERE state NOT IN ('done')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(unfinished, 0);
 }

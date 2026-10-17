@@ -159,7 +159,14 @@ impl Database {
         embed: &mut EmbedFn<'_>,
         progress: &mut ProgressFn<'_>,
     ) -> Result<usize> {
-        fill_missing(&self.conn, &PRIMARY, model_id, false, embed, progress)
+        fill_missing(
+            &self.conn,
+            &PRIMARY,
+            model_id,
+            Fill::Default,
+            embed,
+            progress,
+        )
     }
 
     /// How many rows should have a vector but don't.
@@ -299,8 +306,24 @@ pub fn rebuild(
     rebuild_except(conn, layout, model_id, &[], embed, progress)
 }
 
-/// [`rebuild`], leaving the tables named in `skip` as they are.
+/// [`rebuild`], leaving the tables named in `skip` as they are. Refuses to
+/// start while another process re-embeds the database (see [`EmbedLock`]).
 pub fn rebuild_except(
+    conn: &Connection,
+    layout: &Layout,
+    model_id: &str,
+    skip: &[&str],
+    embed: &mut EmbedFn<'_>,
+    progress: &mut ProgressFn<'_>,
+) -> Result<usize> {
+    let Some(_lock) = EmbedLock::try_new(conn)? else {
+        bail!("another process is re-embedding this database; try again once it finishes");
+    };
+    rebuild_locked(conn, layout, model_id, skip, embed, progress)
+}
+
+/// [`rebuild_except`] for a caller holding the [`EmbedLock`].
+pub(crate) fn rebuild_locked(
     conn: &Connection,
     layout: &Layout,
     model_id: &str,
@@ -322,6 +345,58 @@ pub fn rebuild_except(
         let _ = std::fs::remove_file(path);
     }
     result
+}
+
+/// Held by the one process that may rebuild a database or run its queued
+/// jobs, so two can't share the staged vectors or the same job: a lock on
+/// a file beside the database, released when dropped or when the process
+/// ends. An in-memory database needs none.
+pub struct EmbedLock {
+    _file: Option<std::fs::File>,
+}
+
+impl EmbedLock {
+    /// `None` while another process holds it.
+    pub fn try_new(conn: &Connection) -> Result<Option<Self>> {
+        let Some(path) = conn.path().filter(|p| !p.is_empty()) else {
+            return Ok(Some(Self { _file: None }));
+        };
+        let path = format!("{path}-embed.lock");
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {path}"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: Some(file) })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("failed to lock {path}"))
+            }
+        }
+    }
+}
+
+/// Which tables [`fill_missing`] fills.
+#[derive(Debug, Clone, Copy)]
+pub enum Fill<'a> {
+    /// The fill tables (see [`ReembedTable::fill`]).
+    Default,
+    /// Every table, code chunks included.
+    All,
+    /// Just this one.
+    Only(&'a str),
+}
+
+impl Fill<'_> {
+    fn includes(self, t: &ReembedTable) -> bool {
+        match self {
+            Fill::Default => t.fill,
+            Fill::All => true,
+            Fill::Only(table) => t.table == table,
+        }
+    }
 }
 
 /// The file a rebuild of `conn`'s database stages its vectors in, kept until
@@ -471,16 +546,15 @@ fn recorded_model(conn: &Connection, layout: &Layout) -> Result<Option<String>> 
         .optional()?)
 }
 
-/// Embed the rows of `layout`'s fill tables (all its tables with
-/// `all_tables`) that have no vector, committing a batch at a time (each row
-/// stands alone, so there is nothing to keep all-or-nothing). Records
-/// `model_id` if nothing is recorded yet; refuses a database recorded under
-/// another model. Returns the vectors written.
+/// Embed the rows of `layout`'s `tables` that have no vector, committing a
+/// batch at a time (each row stands alone, so there is nothing to keep
+/// all-or-nothing). Records `model_id` if nothing is recorded yet; refuses a
+/// database recorded under another model. Returns the vectors written.
 pub fn fill_missing(
     conn: &Connection,
     layout: &Layout,
     model_id: &str,
-    all_tables: bool,
+    tables: Fill<'_>,
     embed: &mut EmbedFn<'_>,
     progress: &mut ProgressFn<'_>,
 ) -> Result<usize> {
@@ -503,7 +577,7 @@ pub fn fill_missing(
         layout.meta_table
     );
     let mut written = 0usize;
-    for t in layout.tables.iter().filter(|t| all_tables || t.fill) {
+    for t in layout.tables.iter().filter(|t| tables.includes(t)) {
         let cond = format!("{} IS NULL", t.vector);
         let apply = apply_sql(t);
         embed_rows(
@@ -538,14 +612,13 @@ pub fn fill_missing(
 
 /// Rows of `layout`'s fill tables that should have a vector but don't.
 pub fn missing(conn: &Connection, layout: &Layout) -> Result<usize> {
-    missing_in(conn, layout, false)
+    missing_in(conn, layout, Fill::Default)
 }
 
-/// [`missing`], counting every table with `all_tables`, as [`fill_missing`]
-/// fills them.
-pub fn missing_in(conn: &Connection, layout: &Layout, all_tables: bool) -> Result<usize> {
+/// [`missing`] in `tables`, as [`fill_missing`] fills them.
+pub fn missing_in(conn: &Connection, layout: &Layout, tables: Fill<'_>) -> Result<usize> {
     let mut n = 0usize;
-    for t in layout.tables.iter().filter(|t| all_tables || t.fill) {
+    for t in layout.tables.iter().filter(|t| tables.includes(t)) {
         let c: i64 = conn.query_row(
             &format!(
                 "SELECT count(*) FROM {} WHERE ({}) AND {} IS NULL",

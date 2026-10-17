@@ -177,7 +177,10 @@ pub fn serve(options: ServeOptions, on_ready: impl FnOnce(&ServerStatus)) -> Res
         let state = Arc::clone(&state);
         std::thread::spawn(move || housekeeping(&state));
     }
-    match state.runs().with_work() {
+    // Bound first, so the `runs` lock is let go before `start_worker` takes
+    // `workers`: workers take them the other way round.
+    let queued = state.runs().with_work();
+    match queued {
         Ok(dbs) => {
             for (path, kind) in dbs {
                 start_worker(&state, path, kind);
@@ -697,7 +700,9 @@ fn handle(state: &Arc<State>, mut stream: Stream) {
             Request::Status => Response::Status(state.status()),
             Request::Enqueue { path, kind } => {
                 state.touch();
-                match state.runs().set_work(&path, kind, true) {
+                // Bound first; see the startup loop.
+                let noted = state.runs().set_work(&path, kind, true);
+                match noted {
                     Ok(()) => {
                         start_worker(state, path, kind);
                         Response::Queued
@@ -730,6 +735,11 @@ fn start_worker(state: &Arc<State>, path: String, kind: DbKind) {
             return;
         }
         workers.insert(path.clone(), Worker { kind, again: false });
+        // A worker finishing just now may have cleared it. `runs` after
+        // `workers`, as everywhere.
+        if let Err(e) = state.runs().set_work(&path, kind, true) {
+            log::debug!("model server couldn't note work in {path}: {e:#}");
+        }
     }
     let state = Arc::clone(state);
     std::thread::spawn(move || {

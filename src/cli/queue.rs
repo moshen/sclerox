@@ -62,7 +62,8 @@ pub fn submit(
     })
 }
 
-/// Run a database's queued jobs in this process.
+/// Run a database's queued jobs in this process, unless another process
+/// (the server, still at it after all) already is.
 fn run_here(conn: &rusqlite::Connection, kind: DbKind) -> Result<()> {
     let mut loaded: Option<crate::embed::Embedder> = None;
     let mut embed = |model_id: &str, texts: &[&str]| -> Result<Vec<Vec<f32>>> {
@@ -79,7 +80,13 @@ fn run_here(conn: &rusqlite::Connection, kind: DbKind) -> Result<()> {
         }
         Ok(())
     };
-    jobs::run(conn, kind, &mut embed, &mut before_rebuild)
+    match jobs::run(conn, kind, &mut embed, &mut before_rebuild) {
+        Err(e) if jobs::is_interrupted(&e) => {
+            log::info!("not embedding here: {e:#}");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Say what was queued and how to follow it.
@@ -168,16 +175,22 @@ pub fn wait(spec: &'static ModelSpec, queued: &[Queued]) -> Result<()> {
         }
         if last_check.elapsed() >= CHECK_SERVER {
             last_check = Instant::now();
-            if !matches!(server::status(), Ok(Some(_))) {
-                // Gone before finishing: hand the work to a new server, or do it here.
-                for (q, conn) in queued.iter().zip(&conns) {
-                    if pending.contains(&q.label) && !server::enqueue(spec, &q.path, q.kind) {
-                        println!(
-                            "\n  {}: the model server is unavailable; embedding here",
-                            q.label
-                        );
-                        run_here(conn, q.kind)?;
-                    }
+            // The databases a server is working on, if one is running.
+            let working: Option<Vec<PathBuf>> = match server::status() {
+                Ok(Some(s)) => Some(s.queue.into_iter().map(|d| d.path.into()).collect()),
+                _ => None,
+            };
+            // Gone before finishing, or no longer on it: hand the work to a
+            // server again, or do it here.
+            for (q, conn) in queued.iter().zip(&conns) {
+                let path = std::fs::canonicalize(&q.path).unwrap_or_else(|_| q.path.clone());
+                let owned = working.as_ref().is_some_and(|w| w.contains(&path));
+                if pending.contains(&q.label) && !owned && !server::enqueue(spec, &q.path, q.kind) {
+                    println!(
+                        "\n  {}: the model server is unavailable; embedding here",
+                        q.label
+                    );
+                    run_here(conn, q.kind)?;
                 }
             }
         }

@@ -391,11 +391,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 let spec = crate::embed::models::configured()?;
                 if super::queue::server_takes_work(spec) {
                     use crate::db::jobs::{DbKind, Kind};
-                    // Other tables' rows without a vector are filled too.
                     let todo: &[_] = if force {
-                        &[(Kind::Rebuild, Some("memory")), (Kind::Fill, None)]
+                        &[
+                            (Kind::Rebuild, Some("memory")),
+                            (Kind::Fill, Some("memory")),
+                        ]
                     } else {
-                        &[(Kind::Fill, None)]
+                        &[(Kind::Fill, Some("memory"))]
                     };
                     let queued = [super::queue::submit(
                         &db.conn,

@@ -499,7 +499,13 @@ fn queue_index_embedding(
         if !db_path.exists() {
             continue;
         }
-        let repo_db = RepoDb::open(&db_path)?;
+        let repo_db = match RepoDb::open(&db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {}: could not open ({e})", entry.name);
+                continue;
+            }
+        };
         // One on another model takes no new vectors until it is rebuilt.
         if repo_db.semantic_ready() && repo_db.has_chunks_without_embedding()? {
             queued.push(super::queue::submit(
