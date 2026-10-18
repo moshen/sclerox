@@ -50,9 +50,10 @@ Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
 
 `embed.model` picks the model behind semantic search and dedup:
 `granite-small-r2`, `granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the
-model the knowledge base was embedded with, so its vectors stay comparable
-whichever machine opens it; a new one starts on the int8 `granite-small-r2`,
-the faster one on the CPU. Where `sclerox install` finds an accelerator
+Granite model the knowledge base was embedded with, so its vectors stay
+comparable whichever machine opens it. A new knowledge base starts on the int8
+`granite-small-r2`, the faster one on the CPU, and one still on MiniLM from an
+older version moves to it; keeping MiniLM takes `embed.model = "minilm-l6-v2"`. Where `sclerox install` finds an accelerator
 (CoreML on Apple Silicon, DirectML on a Windows GPU) it switches the
 knowledge base to Granite at full precision (`-fp32`), re-embedding it; search
 keeps using the old vectors until that finishes. It never switches back:

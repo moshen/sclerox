@@ -329,6 +329,11 @@ pub fn names() -> Vec<&'static str> {
     MODELS.iter().map(|m| m.name).collect()
 }
 
+/// The models a knowledge base stays on without `embed.model`: the default
+/// and its full-precision form. A database on another model (MiniLM, from
+/// older versions) is re-embedded to the default.
+pub const KEPT: [&ModelSpec; 2] = [&GRANITE_SMALL_R2, &GRANITE_SMALL_R2_FP32];
+
 /// The model used when neither `embed.model` nor a database says otherwise.
 pub fn default_model() -> &'static ModelSpec {
     &MODELS[0]

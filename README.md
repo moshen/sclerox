@@ -218,8 +218,9 @@ model and sizes (`chunk_size`, `chunk_overlap`, `memory_chars`), `[index]`
 ### Embedding model
 
 `[embed] model` selects the embedding model: `granite-small-r2`,
-`granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the model the
-knowledge base was embedded with (`granite-small-r2` for a new one). Where
+`granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the Granite model the
+knowledge base was embedded with, else `granite-small-r2` (for a new one, or
+one still on MiniLM from an older version, which install converts). Where
 `sclerox install` finds an accelerator (CoreML on Apple Silicon, DirectML on a
 Windows GPU) it switches the knowledge base to the full-precision Granite;
 it never switches back. `[embed] device` (`auto|cpu|coreml|directml`) picks where it runs; `auto` uses

@@ -816,8 +816,8 @@ fn bridge(var: &'static str, value: &str) {
 }
 
 /// The embedding model the database at `path` records, if it exists and
-/// records a known one. Opened read-only, so it is never created or
-/// migrated just to look.
+/// records one it stays on (see `embed::models::KEPT`). Opened read-only, so
+/// it is never created or migrated just to look.
 fn recorded_model(path: &std::path::Path) -> Option<&'static crate::embed::ModelSpec> {
     use rusqlite::{Connection, OpenFlags};
     if !path.exists() {
@@ -832,7 +832,8 @@ fn recorded_model(path: &std::path::Path) -> Option<&'static crate::embed::Model
             |r| r.get(0),
         )
         .ok()?;
-    crate::embed::models::by_id(&id)
+    let model = crate::embed::models::by_id(&id)?;
+    crate::embed::models::KEPT.contains(&model).then_some(model)
 }
 
 /// Point library code at `name` as the embedding model when `embed.model`
@@ -1142,6 +1143,9 @@ semantic_threshold = 0.7
             Some(&crate::embed::models::GRANITE_SMALL_R2_FP32)
         );
         record("some-model-this-build-doesnt-know");
+        assert_eq!(recorded_model(&path), None);
+        // MiniLM is from older versions: the default replaces it.
+        record(crate::embed::models::MINILM_L6_V2.id);
         assert_eq!(recorded_model(&path), None);
     }
 

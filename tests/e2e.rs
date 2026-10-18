@@ -1526,46 +1526,53 @@ fn install_picks_the_model_for_the_device() {
 }
 
 /// With `embed.model` unset, commands use the model the main database
-/// records; `embed.model` overrides it.
+/// records, if it is one of the Granite models; `embed.model` overrides it.
 #[test]
 fn the_model_follows_the_database_unless_configured() {
     let home = TempDir::new().unwrap();
     let dir = home.path().join(".local/share/sclerox");
     std::fs::create_dir_all(&dir).unwrap();
     let conn = rusqlite::Connection::open(dir.join("sclerox.db")).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-         INSERT INTO meta VALUES ('embedding_model', 'Qdrant/all-MiniLM-L6-v2-onnx:model');",
-    )
-    .unwrap();
-    drop(conn);
+    conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    let record = |id: &str| {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('embedding_model', ?1)",
+            [id],
+        )
+        .unwrap();
+    };
+    let effective = |home: &std::path::Path, model: &str| {
+        sclerox_in(home)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "effective thresholds for {model}:"
+            )))
+            .stdout(predicate::str::contains(format!("model = \"{model}\"")));
+    };
 
+    record("onnx-community/granite-embedding-small-english-r2-ONNX:model");
+    effective(home.path(), "granite-small-r2-fp32");
+
+    // A database left on MiniLM by an older version moves to the default.
+    record("Qdrant/all-MiniLM-L6-v2-onnx:model");
+    effective(home.path(), "granite-small-r2");
+
+    // `embed.model` wins, from the environment or config.toml.
     sclerox_in(home.path())
+        .env("SCLEROX_EMBED_MODEL", "minilm-l6-v2")
         .args(["config", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
             "effective thresholds for minilm-l6-v2:",
-        ))
-        .stdout(predicate::str::contains("model = \"minilm-l6-v2\""));
-    sclerox_in(home.path())
-        .env("SCLEROX_EMBED_MODEL", "granite-small-r2")
-        .args(["config", "show"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "effective thresholds for granite-small-r2:",
         ));
     let config = home.path().join(".config/sclerox/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-    std::fs::write(&config, "[embed]\nmodel = \"granite-small-r2-fp32\"\n").unwrap();
-    sclerox_in(home.path())
-        .args(["config", "show"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "effective thresholds for granite-small-r2-fp32:",
-        ));
+    std::fs::write(&config, "[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+    effective(home.path(), "minilm-l6-v2");
 }
 
 // ─── Model server ────────────────────────────────────────────────────────────
