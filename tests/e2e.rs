@@ -38,6 +38,13 @@ impl Env {
         // must not leave a server running in the developer's state directory.
         // Server tests turn it back on with their own state directory.
         c.env("SCLEROX_EMBED_SERVER", "off");
+        // The default model `sclerox install` recorded for the developer's
+        // machine lives in the state directory: use the test's own, and the
+        // model and device the tests expect. Tests that need a state
+        // directory or a model set their own.
+        c.env("XDG_STATE_HOME", self.config.with_file_name("state"));
+        c.env_remove("SCLEROX_EMBED_MODEL");
+        c.env_remove("SCLEROX_EMBED_DEVICE");
         // cargo test points LD_LIBRARY_PATH at two dozen build directories,
         // which the dynamic loader searches for every system library before
         // main runs: on a slow filesystem that adds ~170 ms to each command,
