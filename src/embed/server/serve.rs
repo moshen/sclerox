@@ -797,7 +797,11 @@ fn run_jobs(state: &State, path: &str, kind: DbKind) -> Result<()> {
     let mut embed = |model_id: &str, texts: &[&str]| -> Result<Vec<Vec<f32>>> {
         let spec = models::by_id(model_id)
             .with_context(|| format!("unknown embedding model '{model_id}'"))?;
-        let texts = texts.iter().map(|t| t.to_string()).collect();
+        // Prefixed as `Embedder::embed_each` does, so the vectors match.
+        let texts = texts
+            .iter()
+            .map(|t| format!("{}{t}", spec.document_prefix))
+            .collect();
         match state.embed(spec.name, texts, Lane::Bulk) {
             Response::Vectors(v) => Ok(v),
             Response::Stopping { reason } => Err(jobs::Interrupted(format!(

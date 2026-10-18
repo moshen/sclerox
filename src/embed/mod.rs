@@ -232,6 +232,15 @@ pub fn memory_chars() -> usize {
     resolve_memory_chars(std::env::var(MEMORY_CHARS_ENV).ok().as_deref(), model)
 }
 
+/// [`memory_chars`] for vectors from the model with ID `model_id`, which
+/// may not be the configured one: a rebuild run by the model server, say.
+pub fn memory_chars_for(model_id: &str) -> usize {
+    match models::by_id(model_id) {
+        Some(model) => resolve_memory_chars(std::env::var(MEMORY_CHARS_ENV).ok().as_deref(), model),
+        None => memory_chars(),
+    }
+}
+
 /// The env value when it is a positive number, else `model`'s default.
 fn resolve_memory_chars(env: Option<&str>, model: &ModelSpec) -> usize {
     env.and_then(|v| v.parse().ok())

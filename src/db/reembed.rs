@@ -226,11 +226,13 @@ type Row = (i64, Option<Vec<u8>>);
 /// Walk `table`'s rows matching `cond` in id order, a page at a time, from
 /// the first id above `after`, calling `each` with every page's rows and
 /// their new vectors. `done` rows were handled before; they count towards
-/// progress, not the returned number.
+/// progress, not the returned number. `model_id` is the model the vectors
+/// are for, which decides how much of a memory is embedded.
 #[allow(clippy::too_many_arguments)]
 fn embed_rows(
     conn: &Connection,
     t: &ReembedTable,
+    model_id: &str,
     cond: &str,
     after: i64,
     done: usize,
@@ -248,6 +250,7 @@ fn embed_rows(
     )?;
     let total = total as usize;
     let sql = page_sql(t, cond);
+    let memory_chars = crate::embed::memory_chars_for(model_id);
     if done > 0 {
         progress(t.label, done.min(total), total.max(done));
     }
@@ -269,7 +272,7 @@ fn embed_rows(
             .map(|(_, b)| {
                 let s = String::from_utf8_lossy(b.as_deref().unwrap_or_default());
                 if t.cap {
-                    crate::embed::memory_embed_text(&s)
+                    s.chars().take(memory_chars).collect()
                 } else {
                     s.into_owned()
                 }
@@ -476,6 +479,7 @@ fn stage_and_apply(
         embed_rows(
             conn,
             t,
+            model_id,
             &cond,
             after,
             done as usize,
@@ -583,6 +587,7 @@ pub fn fill_missing(
         embed_rows(
             conn,
             t,
+            model_id,
             &cond,
             i64::MIN,
             0,
@@ -994,6 +999,22 @@ mod tests {
             ),
             (BATCH * 2 + 5) as i64
         );
+    }
+
+    #[test]
+    fn memories_are_cut_for_the_model_being_rebuilt_to() {
+        // On Granite (4000 chars), rebuilding to MiniLM (800).
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("long", &"x".repeat(5000), "feedback", None)
+            .unwrap();
+        let mut lengths = Vec::new();
+        let mut embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            lengths.extend(texts.iter().map(|t| t.chars().count()));
+            Ok(texts.iter().map(|_| unit(1)).collect())
+        };
+        db.reembed_all(MINILM_L6_V2.id, &mut embed, &mut |_, _, _| {})
+            .unwrap();
+        assert_eq!(lengths, [MINILM_L6_V2.memory_chars]);
     }
 
     #[test]
