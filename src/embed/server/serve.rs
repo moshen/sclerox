@@ -744,8 +744,9 @@ fn start_worker(state: &Arc<State>, path: String, kind: DbKind) {
     let state = Arc::clone(state);
     std::thread::spawn(move || {
         loop {
-            match run_jobs(&state, &path, kind) {
-                Ok(()) => {}
+            // Left marked as having work when it failed, for the next server.
+            let finished = match run_jobs(&state, &path, kind) {
+                Ok(()) => true,
                 Err(e) if state.stopping().is_some() => {
                     // Left queued for the next server.
                     log::info!("model server stopped work on {path}: {e:#}");
@@ -757,14 +758,19 @@ fn start_worker(state: &Arc<State>, path: String, kind: DbKind) {
                     std::thread::sleep(RETRY_WORK);
                     continue;
                 }
-                Err(e) => log::warn!("model server couldn't run the jobs in {path}: {e:#}"),
-            }
+                Err(e) => {
+                    log::warn!("model server couldn't run the jobs in {path}: {e:#}");
+                    false
+                }
+            };
             let mut workers = lock(&state.workers);
             match workers.get_mut(&path) {
                 Some(worker) if worker.again => worker.again = false,
                 _ => {
-                    if let Err(e) = state.runs().set_work(&path, kind, false) {
-                        log::debug!("model server couldn't note {path} done: {e:#}");
+                    if finished {
+                        if let Err(e) = state.runs().set_work(&path, kind, false) {
+                            log::debug!("model server couldn't note {path} done: {e:#}");
+                        }
                     }
                     workers.remove(&path);
                     state.touch();

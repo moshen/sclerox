@@ -100,9 +100,10 @@ pub fn has_queue(path: &std::path::Path) -> Result<bool> {
 const KEEP_FINISHED: &str = "-7 days";
 
 /// Queue `kind` for `model_id` (a model ID, as the database records it),
-/// limited to `table` if given, and return the job's ID. A job like it that hasn't started yet is reused.
-/// Unfinished jobs for another model are cancelled: their vectors would be
-/// refused or replaced.
+/// limited to `table` if given, and return the job's ID. A job like it that
+/// hasn't started yet is reused, and so is a rebuild that has: a fill that
+/// has started may already be past rows added since. Unfinished jobs for
+/// another model are cancelled: their vectors would be refused or replaced.
 pub fn queue(conn: &Connection, kind: Kind, model_id: &str, table: Option<&str>) -> Result<i64> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
@@ -122,8 +123,9 @@ pub fn queue(conn: &Connection, kind: Kind, model_id: &str, table: Option<&str>)
     let waiting: Option<i64> = tx
         .query_row(
             "SELECT id FROM embed_jobs
-             WHERE state = ?1 AND kind = ?2 AND target_model = ?3 AND table_name IS ?4",
-            params![QUEUED, kind.as_str(), model_id, table],
+             WHERE (state = ?1 OR (state = ?5 AND kind = 'rebuild'))
+               AND kind = ?2 AND target_model = ?3 AND table_name IS ?4",
+            params![QUEUED, kind.as_str(), model_id, table, RUNNING],
             |r| r.get(0),
         )
         .optional()?;
@@ -384,6 +386,23 @@ mod tests {
         let left: Vec<i64> = unfinished(&db.conn).unwrap().iter().map(|j| j.id).collect();
         assert_eq!(left, [m]);
         assert_eq!(get(&db.conn, a).unwrap().unwrap().state, CANCELLED);
+    }
+
+    #[test]
+    fn a_running_rebuild_is_reused_but_a_running_fill_is_not() {
+        let db = Database::open_in_memory().unwrap();
+        let r = queue(&db.conn, Kind::Rebuild, GRANITE_SMALL_R2.id, None).unwrap();
+        let f = queue(&db.conn, Kind::Fill, GRANITE_SMALL_R2.id, None).unwrap();
+        set_state(&db.conn, r, RUNNING, None).unwrap();
+        set_state(&db.conn, f, RUNNING, None).unwrap();
+        assert_eq!(
+            queue(&db.conn, Kind::Rebuild, GRANITE_SMALL_R2.id, None).unwrap(),
+            r
+        );
+        assert_ne!(
+            queue(&db.conn, Kind::Fill, GRANITE_SMALL_R2.id, None).unwrap(),
+            f
+        );
     }
 
     #[test]

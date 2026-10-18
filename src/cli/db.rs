@@ -273,7 +273,7 @@ const DISTILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 /// checks and would write old-model vectors into the rebuilt database, where
 /// nothing could tell them apart. Ones started since refuse to, but there is
 /// no telling which is which, so wait for all of them. False on timeout.
-fn wait_for_distillations() -> bool {
+pub(crate) fn wait_for_distillations() -> bool {
     let started = std::time::Instant::now();
     let mut told = false;
     loop {

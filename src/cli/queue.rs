@@ -74,9 +74,13 @@ fn run_here(conn: &rusqlite::Connection, kind: DbKind) -> Result<()> {
         }
         loaded.as_mut().expect("loaded above").embed_each(texts)
     };
+    // As `db reembed` does without the server.
     let mut before_rebuild = || -> Result<()> {
-        while kind == DbKind::Main && super::hook::distillations_in_progress() > 0 {
-            std::thread::sleep(Duration::from_secs(2));
+        if kind == DbKind::Main && !super::db::wait_for_distillations() {
+            anyhow::bail!(
+                "a session distillation is still running and could write vectors from the \
+                 old model after the switch; run `sclerox db reembed` once it finishes"
+            );
         }
         Ok(())
     };
