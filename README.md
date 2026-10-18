@@ -65,7 +65,7 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 - `~/.claude/skills/sclerox-kb/` - skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
 - `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories
 - `~/.config/git/ignore` - excludes `.sclerox/` from all repos
-- `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, downloaded once and hash-checked; `--no-model-download` defers it to first use)
+- `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, or ~200 MB for the full-precision model where an accelerator is found; downloaded once and hash-checked; `--no-model-download` defers it to first use)
 
 ## Quick start
 

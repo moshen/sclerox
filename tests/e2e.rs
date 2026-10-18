@@ -1466,6 +1466,7 @@ fn sclerox_in(home: &std::path::Path) -> Command {
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env("SCLEROX_LOG", "off")
         .env("SCLEROX_EMBED_SERVER", "off")
+        .env_remove("SCLEROX_DB")
         .env_remove("SCLEROX_CONFIG")
         .env_remove("SCLEROX_EMBED_MODEL")
         .env_remove("SCLEROX_EMBED_DEVICE");
