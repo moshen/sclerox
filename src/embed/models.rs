@@ -224,9 +224,9 @@ pub const GRANITE_SMALL_R2_FP32: ModelSpec = ModelSpec {
     // It ranks like int8 but scores higher: over 4,400 pairs of doc
     // paragraphs, by 0.012 at the median and 0.025-0.03 near the top. Each
     // int8 threshold is moved to the score at the same rank among those pairs
-    // (and near-duplicates made by dropping a sentence): 0.70 -> 0.72,
-    // 0.72 -> 0.735, 0.90 -> 0.91, 0.97 -> 0.977. Gaps to the best hit barely
-    // change, so `top_margin` stays.
+    // (and near-duplicates made by dropping a sentence): 0.70 -> 0.719,
+    // 0.72 -> 0.737, 0.90 -> 0.910, 0.97 -> 0.977, rounded to the nearest
+    // 0.005. Gaps to the best hit barely change, so `top_margin` stays.
     thresholds: Thresholds {
         semantic: 0.735,
         dedup_cosine: 0.91,

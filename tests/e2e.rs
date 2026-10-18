@@ -139,7 +139,7 @@ fn config_show_lists_only_real_env_overrides() {
     // Every one of these is copied into an env var at startup for library code.
     std::fs::write(
         &e.config,
-        "[embed]\nmodel = \"minilm-l6-v2\"\nenabled = false\nmemory_chars = 600\n\
+        "[embed]\nmodel = \"minilm-l6-v2\"\nenabled = false\nmemory_chars = 600\ndevice = \"cpu\"\n\
          [index]\nmax_file_bytes = 5000\nmax_files = 10\nchunk_chars = 1200\nchunk_lines = 20\n",
     )
     .unwrap();
@@ -157,6 +157,7 @@ fn config_show_lists_only_real_env_overrides() {
         "SCLEROX_EMBED_MODEL",
         "SCLEROX_EMBED_ENABLED",
         "SCLEROX_EMBED_MEMORY_CHARS",
+        "SCLEROX_EMBED_DEVICE",
         "SCLEROX_MAX_INDEX_FILE_BYTES",
         "SCLEROX_MAX_INDEX_FILES",
         "SCLEROX_CODE_CHUNK_CHARS",
@@ -170,10 +171,12 @@ fn config_show_lists_only_real_env_overrides() {
         .cmd()
         .env("SCLEROX_CODE_CHUNK_CHARS", "900")
         .env("SCLEROX_MAX_INDEX_FILES", "20")
+        .env("SCLEROX_EMBED_DEVICE", "auto")
         .args(["config", "show"])
         .output()
         .unwrap();
     let line = overrides(&String::from_utf8_lossy(&out.stdout));
+    assert!(line.contains("SCLEROX_EMBED_DEVICE"), "{line}");
     assert!(line.contains("SCLEROX_CODE_CHUNK_CHARS"), "{line}");
     assert!(line.contains("SCLEROX_MAX_INDEX_FILES"), "{line}");
     assert!(!line.contains("SCLEROX_EMBED_MODEL"), "{line}");
