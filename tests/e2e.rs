@@ -1555,6 +1555,17 @@ fn the_model_follows_the_database_unless_configured() {
 
     record("onnx-community/granite-embedding-small-english-r2-ONNX:model");
     effective(home.path(), "granite-small-r2-fp32");
+    // An empty or unknown env value doesn't hide it.
+    for value in ["", "bert-giant"] {
+        sclerox_in(home.path())
+            .env("SCLEROX_EMBED_MODEL", value)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "effective thresholds for granite-small-r2-fp32:",
+            ));
+    }
 
     // A database left on MiniLM by an older version moves to the default.
     record("Qdrant/all-MiniLM-L6-v2-onnx:model");

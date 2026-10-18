@@ -892,18 +892,35 @@ pub fn init() {
     // The embedder (library code) reads the model name from the env var.
     // Unset in config, it is the model the main database records, so that
     // database's vectors stay comparable whichever machine opens it.
-    if std::env::var(crate::embed::models::MODEL_ENV).is_err() {
-        match &s.embed.model {
+    // An empty or unknown env value was ignored when settings resolved, so
+    // it is replaced here rather than left for the library to read.
+    let model_env = std::env::var(crate::embed::models::MODEL_ENV).ok();
+    let model_env_valid = model_env
+        .as_deref()
+        .is_some_and(|v| crate::embed::models::lookup(v).is_ok());
+    if !model_env_valid {
+        let model = match &s.embed.model {
+            Some(model) => Some(model.as_str()),
+            None => recorded_model(&s.db_path).map(|m| m.name),
+        };
+        match model {
             Some(model) => bridge(crate::embed::models::MODEL_ENV, model),
-            None => {
-                if let Some(model) = recorded_model(&s.db_path) {
-                    bridge(crate::embed::models::MODEL_ENV, model.name);
-                }
-            }
+            // The library reads empty as the default, not anything else.
+            None if model_env.is_some_and(|v| !v.is_empty()) => bridge(
+                crate::embed::models::MODEL_ENV,
+                crate::embed::models::default_model().name,
+            ),
+            None => {}
         }
     }
-    // ...and where to run it. Unset reads as auto.
-    if s.embed.device != "auto" && std::env::var(crate::embed::device::DEVICE_ENV).is_err() {
+    // ...and where to run it. Unset reads as auto, as does an env value that
+    // isn't a device, which settings ignored too.
+    let device_env = std::env::var(crate::embed::device::DEVICE_ENV).ok();
+    let device_env_valid = device_env
+        .as_deref()
+        .and_then(crate::embed::device::parse_choice)
+        .is_some();
+    if s.embed.device != "auto" && !device_env_valid {
         bridge(crate::embed::device::DEVICE_ENV, &s.embed.device);
     }
     // ...and whether embeddings are on at all.
