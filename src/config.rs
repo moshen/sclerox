@@ -530,7 +530,8 @@ impl Settings {
             .map(crate::embed::models::lookup)
         {
             eprintln!(
-                "warning: embed.model: {e}; using {}",
+                "warning: embed.model: {e}; using the knowledge base's model, or {} \
+                 for a new one",
                 crate::embed::models::default_model().name
             );
             self.embed.model = None;
