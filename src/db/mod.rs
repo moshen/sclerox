@@ -366,6 +366,12 @@ impl Database {
         })
     }
 
+    /// Record the configured model as this database's if it records none
+    /// yet, as its first vector would.
+    pub fn claim_embedding_model(&self) -> Result<()> {
+        self.write_with_vectors(true, |_| Ok(()))
+    }
+
     /// Returns `(current_version, target_version, pending_count)`.
     pub fn migration_status(&self) -> Result<(u32, u32, usize)> {
         let current = self.user_version()?;

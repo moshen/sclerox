@@ -138,9 +138,10 @@ pub struct EmbedSettings {
     pub enabled: bool,
     /// Embedding model, by registry name (`embed::models`). Changing it means
     /// running `sclerox db reembed`; until then semantic search and dedup are
-    /// off for databases embedded with the old model. `None` = the one
-    /// `sclerox install` picked for this machine (`embed::models::Machine`);
-    /// see [`EmbedSettings::model_name`]. Env: `SCLEROX_EMBED_MODEL`.
+    /// off for databases embedded with the old model. `None` = the model the
+    /// main database was embedded with (`sclerox install` switches it to
+    /// full precision where it finds an accelerator), else the default; see
+    /// [`EmbedSettings::model_name`]. Env: `SCLEROX_EMBED_MODEL`.
     pub model: Option<String>,
     /// Most characters per embedded chunk of meeting, todo and research text.
     pub chunk_size: usize,
@@ -162,11 +163,17 @@ pub struct EmbedSettings {
 }
 
 impl EmbedSettings {
-    /// The embedding model's name: `model`, or this machine's default.
+    /// The embedding model's name: `model`, else the one [`init`] found
+    /// recorded in the main database, else the default.
     pub fn model_name(&self) -> &str {
-        self.model
-            .as_deref()
-            .unwrap_or_else(|| crate::embed::models::default_model().name)
+        match &self.model {
+            Some(name) => name,
+            None => {
+                crate::embed::models::configured()
+                    .unwrap_or_else(|_| crate::embed::models::default_model())
+                    .name
+            }
+        }
     }
 }
 
@@ -808,10 +815,29 @@ fn bridge(var: &'static str, value: &str) {
     BRIDGED.lock().unwrap_or_else(|e| e.into_inner()).push(var);
 }
 
+/// The embedding model the database at `path` records, if it exists and
+/// records a known one. Opened read-only, so it is never created or
+/// migrated just to look.
+fn recorded_model(path: &std::path::Path) -> Option<&'static crate::embed::ModelSpec> {
+    use rusqlite::{Connection, OpenFlags};
+    if !path.exists() {
+        return None;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags).ok()?;
+    let id: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [crate::embed::models::META_KEY],
+            |r| r.get(0),
+        )
+        .ok()?;
+    crate::embed::models::by_id(&id)
+}
+
 /// Point library code at `name` as the embedding model when `embed.model`
-/// is unset: for `sclerox install`, once it has recorded this machine's
-/// default, which settings and the library resolved before it did. Call only
-/// while no other thread runs.
+/// is unset: for `sclerox install`, once it has chosen the model to switch
+/// the main database to. Call only while no other thread runs.
 pub fn use_default_model(name: &str) {
     if settings().embed.model.is_none() {
         bridge(crate::embed::models::MODEL_ENV, name);
@@ -843,9 +869,16 @@ pub fn init() {
         );
     }
     // The embedder (library code) reads the model name from the env var.
-    if let Some(model) = &s.embed.model {
-        if std::env::var(crate::embed::models::MODEL_ENV).is_err() {
-            bridge(crate::embed::models::MODEL_ENV, model);
+    // Unset in config, it is the model the main database records, so that
+    // database's vectors stay comparable whichever machine opens it.
+    if std::env::var(crate::embed::models::MODEL_ENV).is_err() {
+        match &s.embed.model {
+            Some(model) => bridge(crate::embed::models::MODEL_ENV, model),
+            None => {
+                if let Some(model) = recorded_model(&s.db_path) {
+                    bridge(crate::embed::models::MODEL_ENV, model.name);
+                }
+            }
         }
     }
     // ...and where to run it. Unset reads as auto.
@@ -1074,7 +1107,7 @@ semantic_threshold = 0.7
     }
 
     #[test]
-    fn an_unset_model_is_the_machine_default() {
+    fn an_unset_model_is_the_default_until_a_database_records_one() {
         let unset = Settings::from_toml_str("").unwrap();
         assert_eq!(unset.embed.model, None);
         assert_eq!(
@@ -1083,6 +1116,33 @@ semantic_threshold = 0.7
         );
         let set = Settings::from_toml_str("[embed]\nmodel = \"granite-small-r2\"\n").unwrap();
         assert_eq!(set.embed.model.as_deref(), Some("granite-small-r2"));
+    }
+
+    #[test]
+    fn the_recorded_model_is_read_without_creating_anything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sclerox.db");
+        assert_eq!(recorded_model(&path), None);
+        assert!(!path.exists(), "looking must not create the database");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        assert_eq!(recorded_model(&path), None);
+        let record = |id: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES (?1, ?2)",
+                [crate::embed::models::META_KEY, id],
+            )
+            .unwrap();
+        };
+        record(crate::embed::models::GRANITE_SMALL_R2_FP32.id);
+        assert_eq!(
+            recorded_model(&path),
+            Some(&crate::embed::models::GRANITE_SMALL_R2_FP32)
+        );
+        record("some-model-this-build-doesnt-know");
+        assert_eq!(recorded_model(&path), None);
     }
 
     #[test]

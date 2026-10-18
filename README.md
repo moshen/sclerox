@@ -218,10 +218,11 @@ model and sizes (`chunk_size`, `chunk_overlap`, `memory_chars`), `[index]`
 ### Embedding model
 
 `[embed] model` selects the embedding model: `granite-small-r2`,
-`granite-small-r2-fp32` or `minilm-l6-v2`. Unset, `sclerox install` picks one
-for the machine: the full-precision Granite where it finds an accelerator
-(CoreML on Apple Silicon, DirectML on a Windows GPU), else the int8 one.
-`[embed] device` (`auto|cpu|coreml|directml`) picks where it runs; `auto` uses
+`granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the model the
+knowledge base was embedded with (`granite-small-r2` for a new one). Where
+`sclerox install` finds an accelerator (CoreML on Apple Silicon, DirectML on a
+Windows GPU) it switches the knowledge base to the full-precision Granite;
+it never switches back. `[embed] device` (`auto|cpu|coreml|directml`) picks where it runs; `auto` uses
 the accelerator for the model server and bulk work. Models download once into `$XDG_CACHE_HOME/sclerox/models/`
 (`~/.cache/sclerox/models/`), never into the shared `~/.cache/huggingface/`.
 Every file is pinned to a Hugging Face commit and checked against a sha256
@@ -266,7 +267,7 @@ Environment variables still work and override the file:
 | `SCLEROX_AI_MODEL` | agent default | Model appended to the default command |
 | `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
-| `SCLEROX_EMBED_MODEL` | picked by `sclerox install` | Embedding model (`granite-small-r2\|granite-small-r2-fp32\|minilm-l6-v2`) |
+| `SCLEROX_EMBED_MODEL` | the knowledge base's | Embedding model (`granite-small-r2\|granite-small-r2-fp32\|minilm-l6-v2`) |
 | `SCLEROX_EMBED_DEVICE` | `auto` | Where the model runs (`auto\|cpu\|coreml\|directml`) |
 | `SCLEROX_EMBED_ENABLED` | `true` | `false` turns embeddings off (`[embed] enabled`) |
 | `SCLEROX_EMBED_MEMORY_CHARS` | per model | Characters of each memory embedded (`[embed] memory_chars`) |

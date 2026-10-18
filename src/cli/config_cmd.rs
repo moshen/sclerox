@@ -163,7 +163,7 @@ pub fn config_template() -> String {
          \n\
          [embed]\n\
          # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
-         # model = \"{embed_model}\"   # {model_names}; unset: what `sclerox install` picked for this machine ({fp32} where it found an accelerator); switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
+         # model = \"{embed_model}\"   # {model_names}; unset: the one the knowledge base was embedded with (`sclerox install` switches it to {fp32} where it finds an accelerator); switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
          # Text past a model's token limit is not embedded; sizes past its\n\
          # estimated char limit warn. Larger inputs cost more time and memory.\n\
          {model_limits}\

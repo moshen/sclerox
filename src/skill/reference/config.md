@@ -50,11 +50,13 @@ Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
 
 `embed.model` picks the model behind semantic search and dedup:
 `granite-small-r2`, `granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the
-one `sclerox install` picked for this machine: Granite at full precision
-(`-fp32`) where it found an accelerator (CoreML on Apple Silicon, DirectML on
-a Windows GPU), else the int8 `granite-small-r2`, which is faster on the CPU.
-Install records that choice in `$XDG_STATE_HOME/sclerox/machine.toml`, not in
-config.toml, which may be shared with other machines. It downloads once, on first use
+model the knowledge base was embedded with, so its vectors stay comparable
+whichever machine opens it; a new one starts on the int8 `granite-small-r2`,
+the faster one on the CPU. Where `sclerox install` finds an accelerator
+(CoreML on Apple Silicon, DirectML on a Windows GPU) it switches the
+knowledge base to Granite at full precision (`-fp32`), re-embedding it; search
+keeps using the old vectors until that finishes. It never switches back:
+full precision still works on the CPU. It downloads once, on first use
 or during `sclerox install`, into `$XDG_CACHE_HOME/sclerox/models/`
 (`~/.cache/sclerox/models/` by default), along with the tokenizer used for
 token budgets. Every file is pinned to a commit and hash-checked before use;

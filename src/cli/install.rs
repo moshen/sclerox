@@ -84,41 +84,65 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
-/// Look for an accelerator to embed on and record this machine's default
-/// model: Granite at full precision where one starts, else int8, which is
-/// faster on the CPU. Returns the model to use, which is `embed.model` when
-/// that is set.
+/// Look for an accelerator to embed on and pick the knowledge base's model:
+/// Granite at full precision where one starts. Unless `embed.model` names
+/// one, the model is the one the main database records (see
+/// `config::init`), so switching it means re-embedding, which
+/// [`reembed_on_install`] then does. Never switches back to int8 without an
+/// accelerator: full precision still works on the CPU, and a database shared
+/// with a machine that has one would otherwise flip back and forth.
 fn choose_model(dry_run: bool) -> &'static crate::embed::ModelSpec {
     use crate::embed::{device, models};
 
     let found = device::detect(device::configured());
-    let default = match found {
-        Some(_) => &models::GRANITE_SMALL_R2_FP32,
-        None => &models::GRANITE_SMALL_R2,
-    };
     match found {
         Some(d) => println!("embedding device: {d}"),
         None => println!("embedding device: cpu (no accelerator found)"),
     }
-    if !dry_run {
-        let machine = models::Machine {
-            device: found.unwrap_or(device::Device::Cpu).name().to_string(),
-            model: default.name.to_string(),
-        };
-        if let Err(e) = machine.write() {
-            println!("embedding device: couldn't record it ({e:#})");
-        }
+    let current = models::configured().unwrap_or_else(|_| models::default_model());
+    if crate::config::settings().embed.model.is_some() {
+        println!("embedding model: {} (set by embed.model)", current.name);
+        return current;
     }
-    match &crate::config::settings().embed.model {
-        Some(name) => {
-            println!("embedding model: {name} (set by embed.model)");
-            models::lookup(name).unwrap_or(default)
+    let target = model_for(current, found.is_some());
+    if target == current {
+        println!("embedding model: {}", current.name);
+        return current;
+    }
+    if dry_run {
+        println!("  would switch the embedding model to {}", target.name);
+        return target;
+    }
+    println!(
+        "embedding model: {} (to run on the accelerator)",
+        target.name
+    );
+    crate::config::use_default_model(target.name);
+    // A database with no vectors yet takes it now; one with vectors switches
+    // when its re-embed finishes.
+    let path = &crate::config::settings().db_path;
+    match crate::db::Database::open(path) {
+        Ok(db) => {
+            if let Err(e) = db.claim_embedding_model() {
+                println!("embedding model: couldn't record it ({e:#})");
+            }
         }
-        None => {
-            // Settings resolved the default before it was recorded.
-            crate::config::use_default_model(default.name);
-            default
-        }
+        Err(e) => println!("embedding model: could not open {} ({e:#})", path.display()),
+    }
+    target
+}
+
+/// The model to switch from `current` to: Granite at full precision with an
+/// accelerator, else no change.
+fn model_for(
+    current: &'static crate::embed::ModelSpec,
+    accelerator: bool,
+) -> &'static crate::embed::ModelSpec {
+    use crate::embed::models::{GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32};
+    if accelerator && current == &GRANITE_SMALL_R2 {
+        &GRANITE_SMALL_R2_FP32
+    } else {
+        current
     }
 }
 
@@ -1271,6 +1295,19 @@ mod tests {
             legacy.exists(),
             "legacy file preserved when overwrite disabled"
         );
+    }
+
+    #[test]
+    fn install_switches_to_full_precision_only_with_an_accelerator() {
+        use crate::embed::models::{GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32, MINILM_L6_V2};
+        assert_eq!(model_for(&GRANITE_SMALL_R2, true), &GRANITE_SMALL_R2_FP32);
+        assert_eq!(model_for(&GRANITE_SMALL_R2, false), &GRANITE_SMALL_R2);
+        // Never back to int8, and never off a model chosen some other way.
+        assert_eq!(
+            model_for(&GRANITE_SMALL_R2_FP32, false),
+            &GRANITE_SMALL_R2_FP32
+        );
+        assert_eq!(model_for(&MINILM_L6_V2, true), &MINILM_L6_V2);
     }
 
     #[test]

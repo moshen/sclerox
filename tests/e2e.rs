@@ -1473,13 +1473,25 @@ fn sclerox_in(home: &std::path::Path) -> Command {
     c
 }
 
-/// Install records the device it found and the default model that suits it,
-/// and commands then use that model while `embed.model` is unset.
-#[test]
-fn install_picks_the_default_model_for_the_device() {
-    let home = TempDir::new().unwrap();
-    let machine = home.path().join(".local/state/sclerox/machine.toml");
+/// The embedding model a test home's main database records.
+fn recorded_model(home: &std::path::Path) -> Option<String> {
+    let db = home.join(".local/share/sclerox/sclerox.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'embedding_model'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
 
+/// Without an accelerator install leaves the model alone; with one it
+/// switches a new knowledge base to full precision.
+#[test]
+fn install_picks_the_model_for_the_device() {
+    let home = TempDir::new().unwrap();
     sclerox_in(home.path())
         .env("SCLEROX_EMBED_DEVICE", "cpu")
         .args(["install", "--target", "claude", "--no-model-download"])
@@ -1487,38 +1499,55 @@ fn install_picks_the_default_model_for_the_device() {
         .success()
         .stdout(predicate::str::contains(
             "embedding device: cpu (no accelerator found)",
+        ))
+        .stdout(predicate::str::contains(
+            "embedding model: granite-small-r2\n",
         ));
-    let recorded = std::fs::read_to_string(&machine).unwrap();
-    assert!(recorded.contains("device = \"cpu\""), "{recorded}");
-    assert!(
-        recorded.contains("model = \"granite-small-r2\""),
-        "{recorded}"
-    );
+    assert_eq!(recorded_model(home.path()), None, "nothing to record");
 
-    // Whatever this machine has: fp32 exactly where an accelerator started.
+    // Whatever this machine has: full precision exactly where an
+    // accelerator started.
     let out = sclerox_in(home.path())
         .args(["install", "--target", "claude", "--no-model-download"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let recorded = std::fs::read_to_string(&machine).unwrap();
-    let on_cpu = recorded.contains("device = \"cpu\"");
-    assert_eq!(
-        recorded.contains("granite-small-r2-fp32"),
-        !on_cpu,
-        "{recorded}"
-    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fp32 = "onnx-community/granite-embedding-small-english-r2-ONNX:model";
+    if stdout.contains("embedding device: cpu") {
+        assert_eq!(recorded_model(home.path()), None, "{stdout}");
+    } else {
+        assert_eq!(
+            recorded_model(home.path()).as_deref(),
+            Some(fp32),
+            "{stdout}"
+        );
+    }
+}
 
-    // Commands follow the recorded default...
-    std::fs::write(&machine, "device = \"cpu\"\nmodel = \"minilm-l6-v2\"\n").unwrap();
+/// With `embed.model` unset, commands use the model the main database
+/// records; `embed.model` overrides it.
+#[test]
+fn the_model_follows_the_database_unless_configured() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join(".local/share/sclerox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("sclerox.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO meta VALUES ('embedding_model', 'Qdrant/all-MiniLM-L6-v2-onnx:model');",
+    )
+    .unwrap();
+    drop(conn);
+
     sclerox_in(home.path())
         .args(["config", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "effective thresholds for minilm-l6-v2",
-        ));
-    // ...unless embed.model says otherwise.
+            "effective thresholds for minilm-l6-v2:",
+        ))
+        .stdout(predicate::str::contains("model = \"minilm-l6-v2\""));
     sclerox_in(home.path())
         .env("SCLEROX_EMBED_MODEL", "granite-small-r2")
         .args(["config", "show"])
@@ -1526,6 +1555,16 @@ fn install_picks_the_default_model_for_the_device() {
         .success()
         .stdout(predicate::str::contains(
             "effective thresholds for granite-small-r2:",
+        ));
+    let config = home.path().join(".config/sclerox/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[embed]\nmodel = \"granite-small-r2-fp32\"\n").unwrap();
+    sclerox_in(home.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "effective thresholds for granite-small-r2-fp32:",
         ));
 }
 

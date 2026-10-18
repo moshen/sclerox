@@ -14,8 +14,7 @@ use fastembed::Pooling;
 /// settings-free library module. Unset means [`DEFAULT_MODEL`].
 pub const MODEL_ENV: &str = "SCLEROX_EMBED_MODEL";
 
-/// Config name of the default model where `sclerox install` found no
-/// accelerator (see [`default_model`]).
+/// Config name of the default model.
 pub const DEFAULT_MODEL: &str = "granite-small-r2";
 
 /// Every `*_vec` vec0 table is declared `float[384]`. A model with another
@@ -196,8 +195,8 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     },
 };
 
-/// Granite small at full precision: the default where an accelerator runs
-/// it. The same weights as [`GRANITE_SMALL_R2`] before quantizing, so the
+/// Granite small at full precision, which `sclerox install` switches the
+/// knowledge base to where it finds an accelerator to run it on. The same weights as [`GRANITE_SMALL_R2`] before quantizing, so the
 /// same sizes, but its vectors differ slightly, so it is a model of its own.
 pub const GRANITE_SMALL_R2_FP32: ModelSpec = ModelSpec {
     name: "granite-small-r2-fp32",
@@ -307,7 +306,7 @@ pub const TOKEN_COUNTER: Pinned<'static> = Pinned {
     files: &[MINILM_TOKENIZER],
 };
 
-/// All known models. The first entry is the default without an accelerator.
+/// All known models. The first entry is the default.
 pub const MODELS: &[ModelSpec] = &[GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32, MINILM_L6_V2];
 
 /// The registry entry for a config name, or an error naming the valid ones.
@@ -330,65 +329,9 @@ pub fn names() -> Vec<&'static str> {
     MODELS.iter().map(|m| m.name).collect()
 }
 
-/// The model used when `embed.model` is unset: the one `sclerox install`
-/// picked for this machine (see [`Machine`]), else [`DEFAULT_MODEL`].
+/// The model used when neither `embed.model` nor a database says otherwise.
 pub fn default_model() -> &'static ModelSpec {
-    static DEFAULT: std::sync::OnceLock<&'static ModelSpec> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(|| {
-        Machine::read()
-            .and_then(|m| lookup(&m.model).ok())
-            .unwrap_or(&MODELS[0])
-    })
-}
-
-/// What `sclerox install` found on this machine: the accelerator it can
-/// embed on, and so the default model. Kept in the state folder, not in
-/// config.toml, which may be shared with machines that have other hardware.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Machine {
-    /// The accelerator found, or `cpu`.
-    pub device: String,
-    /// The default model's name.
-    pub model: String,
-}
-
-impl Machine {
-    /// `$XDG_STATE_HOME/sclerox/machine.toml`.
-    pub fn path() -> std::path::PathBuf {
-        crate::xdg::state_home()
-            .join("sclerox")
-            .join("machine.toml")
-    }
-
-    /// What install last recorded. `None` before it has run, and in unit
-    /// tests, which mustn't depend on the machine they run on.
-    pub fn read() -> Option<Self> {
-        if cfg!(test) {
-            return None;
-        }
-        let text = std::fs::read_to_string(Self::path()).ok()?;
-        match toml::from_str(&text) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                log::warn!("ignoring {}: {e}", Self::path().display());
-                None
-            }
-        }
-    }
-
-    pub fn write(&self) -> Result<()> {
-        use anyhow::Context;
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-        }
-        let text = format!(
-            "# Written by `sclerox install`: what it found on this machine.\n{}",
-            toml::to_string(self)?
-        );
-        std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
-    }
+    &MODELS[0]
 }
 
 /// The model selected by `SCLEROX_EMBED_MODEL` (bridged from `embed.model`),

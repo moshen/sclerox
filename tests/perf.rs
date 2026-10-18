@@ -26,6 +26,17 @@ impl Env {
             .unwrap()
             .env("SCLEROX_DB", &self.db)
             .env("SCLEROX_EMBED_SERVER", "off")
+            // Keep the developer's config, state (logs, markers, the model
+            // default `sclerox install` recorded) and exported settings out,
+            // as the e2e tests do. The config file is never created.
+            .env("SCLEROX_CONFIG", self.db.with_file_name("config.toml"))
+            .env("XDG_STATE_HOME", self.db.with_file_name("state"))
+            .env("SCLEROX_LOG", "off")
+            .env_remove("SCLEROX_EMBED_MODEL")
+            .env_remove("SCLEROX_EMBED_DEVICE")
+            .env_remove("SCLEROX_EMBED_MEMORY_CHARS")
+            .env_remove("SCLEROX_CODE_CHUNK_CHARS")
+            .env_remove("SCLEROX_CODE_CHUNK_LINES")
             .args(args)
             .output()
             .unwrap();
