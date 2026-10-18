@@ -74,7 +74,8 @@ sclerox db reembed --force                # re-embed even ones already current
 ```
 
 `db reembed` covers the main database and every indexed repo, from stored text
-(no re-parsing). Each database switches all-or-nothing; rerun it if interrupted.
+(no re-parsing). Each database switches all-or-nothing; rerun it if
+interrupted, and it goes on from where it stopped.
 It first waits (up to 5 minutes) for running session distillations, which may
 be from the version you upgraded from.
 It also embeds main-database items saved without a vector (model unavailable,
@@ -85,6 +86,9 @@ re-chunked from its stored text first, and always with `--force`.
 
 `sclerox install` runs the same re-embed for you when it finds a database on
 another model or items without a vector (skipped with `--no-model-download`).
+
+With the model server on (below), these commands queue the work for it and
+return; add `--wait` to follow it to the end.
 
 Unset similarity thresholds follow the model, since each scores on its own
 scale (`sclerox config show` prints the effective values).
@@ -117,15 +121,21 @@ model themselves and never start a server; it doesn't stop one already running
 (`sclerox server stop` does), and `sclerox server start` still works. Runs are
 recorded in `~/.local/state/sclerox/server.db`.
 
-Bulk work - the `reembed` commands, `repo index`, the session hooks' background
-embedding and distillation - goes through the server too. A query waits for at
-most the one text being embedded, and two bulk commands take turns.
+Bulk work goes through the server too, and a query waits for at most the one
+text being embedded. The `reembed` commands, `repo index`, `install` and the
+session hooks' background embedding queue their work in the database it
+belongs to and return; the server embeds it and writes the vectors, taking
+the databases in turn. `--wait` follows it, and `sclerox server status` lists
+it. Queued work outlives the server: the next one goes on with it. Until it is
+done, keyword search still finds what has no vector. Session distillation
+embeds as it goes, through the server.
 
 The model runtime keeps the memory a long input needed. Over
 `server.max_memory_mb` (2000; 0 for no limit) the server exits once nothing has
 used it for a minute, and the next command starts a fresh one. Over
 `server.hard_memory_mb` (off by default) it exits after the request in
-progress, even in the middle of bulk work, which carries on with a new server.
+progress, even in the middle of bulk work, which carries on with a new server
+(started by the next command, or by one waiting with `--wait`).
 A limit the loaded models alone exceed is ignored, as is the soft limit after
 three memory exits in 30 minutes. Env: `SCLEROX_SERVER_MAX_MEMORY_MB`,
 `SCLEROX_SERVER_HARD_MEMORY_MB`.

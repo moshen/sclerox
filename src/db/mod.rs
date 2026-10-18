@@ -1,5 +1,6 @@
 pub mod fts;
 pub mod investigations;
+pub mod jobs;
 pub mod meetings;
 pub mod memory;
 pub mod migrations;

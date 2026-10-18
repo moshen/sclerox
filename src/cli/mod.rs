@@ -10,6 +10,7 @@ pub mod memory;
 pub mod migrate;
 pub mod people;
 pub mod projects;
+pub mod queue;
 pub mod repos;
 pub mod research;
 pub mod search;

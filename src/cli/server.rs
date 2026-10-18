@@ -93,6 +93,7 @@ fn start_foreground(spec: &'static ModelSpec) -> Result<()> {
         preload: spec,
         soft_limit_mb: limit(s.max_memory_mb),
         hard_limit_mb: limit(s.hard_memory_mb),
+        distillations: super::hook::distillations_in_progress,
     };
     let served = server::serve(options, |status| {
         eprintln!(
@@ -156,6 +157,27 @@ fn print_status(s: &ServerStatus) {
                 m.requests,
                 ago(m.idle_secs)
             ),
+        }
+    }
+    if !s.queue.is_empty() {
+        println!("  queue");
+    }
+    for q in &s.queue {
+        if !std::path::Path::new(&q.path).exists() {
+            continue;
+        }
+        let jobs = q
+            .kind
+            .open(std::path::Path::new(&q.path))
+            .and_then(|conn| crate::db::jobs::unfinished(&conn));
+        match jobs {
+            Ok(jobs) if jobs.is_empty() => println!("    {}  finishing", q.path),
+            Ok(jobs) => {
+                for job in jobs {
+                    println!("    {}  {}", q.path, super::queue::describe(&job));
+                }
+            }
+            Err(e) => println!("    {}  couldn't read its jobs: {e:#}", q.path),
         }
     }
 }

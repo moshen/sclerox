@@ -40,7 +40,11 @@ pub enum DbCommand {
     /// descriptions) and every indexed repo's code chunks, embedding the stored
     /// text in place - nothing is re-parsed. Each database switches
     /// all-or-nothing: an interrupted run leaves it on the old model, and
-    /// running again starts it over.
+    /// running again goes on from where it stopped.
+    ///
+    /// With the model server (`embed.server = auto`) the work is queued for
+    /// it and the command returns; --wait follows it to the end. The server
+    /// carries on across its own restarts.
     ///
     /// Meeting, todo and research text is first re-cut into chunks when it was
     /// cut at other `embed.chunk_size` / `chunk_overlap` values (always with
@@ -58,6 +62,9 @@ pub enum DbCommand {
         /// Re-embed databases already on the configured model too.
         #[arg(long)]
         force: bool,
+        /// Wait for the model server to finish, showing progress.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -65,7 +72,7 @@ pub fn run(db: &Database, cmd: DbCommand) -> Result<()> {
     match cmd {
         DbCommand::Migrate { repos } => migrate(db, repos),
         DbCommand::Export { dir } => export(db, &dir),
-        DbCommand::Reembed { force } => reembed(db, force),
+        DbCommand::Reembed { force, wait } => reembed_or_queue(db, force, wait),
     }
 }
 
@@ -131,24 +138,7 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
         };
         match rechunked {
             Ok(r) => {
-                let cfg = &crate::config::settings().embed;
-                println!(
-                    "  re-chunked {} meeting(s), {} todo(s) and {} research item(s) \
-                     at chunk_size {}, overlap {}",
-                    r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
-                );
-                if r.replaced.recut > 0 {
-                    println!(
-                        "  {} item(s) edited meanwhile were cut from their new text",
-                        r.replaced.recut
-                    );
-                }
-                if r.replaced.gone > 0 {
-                    println!(
-                        "  {} item(s) deleted meanwhile were skipped",
-                        r.replaced.gone
-                    );
-                }
+                print_rechunked(&r);
                 main_done = true;
                 text_chunks_embedded = !mismatched;
             }
@@ -283,7 +273,7 @@ const DISTILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 /// checks and would write old-model vectors into the rebuilt database, where
 /// nothing could tell them apart. Ones started since refuse to, but there is
 /// no telling which is which, so wait for all of them. False on timeout.
-fn wait_for_distillations() -> bool {
+pub(crate) fn wait_for_distillations() -> bool {
     let started = std::time::Instant::now();
     let mut told = false;
     loop {
@@ -304,6 +294,153 @@ fn wait_for_distillations() -> bool {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+}
+
+fn print_rechunked(r: &super::text_chunks::Rechunked) {
+    let cfg = &crate::config::settings().embed;
+    println!(
+        "  re-chunked {} meeting(s), {} todo(s) and {} research item(s) \
+         at chunk_size {}, overlap {}",
+        r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
+    );
+    if r.replaced.recut > 0 {
+        println!(
+            "  {} item(s) edited meanwhile were cut from their new text",
+            r.replaced.recut
+        );
+    }
+    if r.replaced.gone > 0 {
+        println!(
+            "  {} item(s) deleted meanwhile were skipped",
+            r.replaced.gone
+        );
+    }
+}
+
+/// [`reembed`], through the model server when it runs: re-cut text chunks
+/// here, queue the embedding for the server, and return unless `wait`.
+/// Shared by `sclerox db reembed` and `sclerox install`.
+pub(crate) fn reembed_or_queue(db: &Database, force: bool, wait: bool) -> Result<()> {
+    if !crate::embed::enabled() {
+        // Says why.
+        return reembed(db, force);
+    }
+    let spec = crate::embed::models::configured()?;
+    if !super::queue::server_takes_work(spec) {
+        return reembed(db, force);
+    }
+    queue_reembed(db, spec, force, wait)
+}
+
+fn queue_reembed(
+    db: &Database,
+    spec: &'static crate::embed::ModelSpec,
+    force: bool,
+    wait: bool,
+) -> Result<()> {
+    use crate::db::jobs::{DbKind, Kind};
+    use crate::index::repo_db::RepoDb;
+
+    println!("Embedding model: {} ({})", spec.name, spec.id);
+    let mut queued = Vec::new();
+    let mut failed = 0usize;
+
+    let main_state = db.embedding_model_check()?;
+    println!("\nMain database:");
+    let mut main_ok = true;
+    let mut rechunked = false;
+    // The new chunks go in without vectors; the server embeds them below.
+    if force || super::text_chunks::stale(db) {
+        match super::text_chunks::rechunk_all(db, None, &mut |_, _, _| {}) {
+            Ok(r) => {
+                print_rechunked(&r);
+                rechunked = true;
+            }
+            Err(e) => {
+                println!("  could not re-chunk text (run again to retry): {e:#}");
+                main_ok = false;
+                failed += 1;
+            }
+        }
+    }
+    if main_ok {
+        let mut todo = Vec::new();
+        if needs_rebuild(&main_state, force) {
+            todo.push((Kind::Rebuild, None));
+        }
+        if !todo.is_empty() || rechunked || db.missing_vectors()? > 0 {
+            todo.push((Kind::Fill, None));
+        }
+        if todo.is_empty() {
+            println!("  {}", describe_skip(&main_state));
+        } else {
+            queued.push(super::queue::submit(
+                &db.conn,
+                spec,
+                "main database",
+                DbKind::Main,
+                &todo,
+            )?);
+        }
+    }
+
+    let pruned = db.repo_prune_gone()?;
+    let repos = db.repo_list()?;
+    if !repos.is_empty() || !pruned.is_empty() {
+        println!("\nRepo indexes:");
+    }
+    for repo in &pruned {
+        println!("  {}: removed stale entry (directory gone)", repo.name);
+    }
+    for repo in &repos {
+        let db_path = PathBuf::from(&repo.db_path);
+        if !db_path.exists() {
+            println!("  {}: index missing ({})", repo.name, repo.db_path);
+            continue;
+        }
+        let rdb = match RepoDb::open(&db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {}: could not open ({e})", repo.name);
+                failed += 1;
+                continue;
+            }
+        };
+        match rdb.embedding_model_check() {
+            Ok(state) if needs_rebuild(&state, force) => {
+                queued.push(super::queue::submit(
+                    &rdb.conn,
+                    spec,
+                    &repo.name,
+                    DbKind::Repo,
+                    &[(Kind::Rebuild, None)],
+                )?);
+            }
+            Ok(state) => println!("  {}: {}", repo.name, describe_skip(&state)),
+            Err(e) => {
+                println!(
+                    "  {}: could not read its embedding model ({e:#})",
+                    repo.name
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    if queued.is_empty() && failed == 0 {
+        println!("\nNothing to re-embed.");
+        return Ok(());
+    }
+    if wait {
+        println!();
+        super::queue::wait(spec, &queued)?;
+    } else {
+        super::queue::report(&queued);
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} database(s) could not be queued; run again to retry");
+    }
+    Ok(())
 }
 
 /// A mismatch always needs a rebuild. A database with nothing recorded has

@@ -35,6 +35,10 @@ pub struct InstallArgs {
     /// databases left on a previous model; run `sclerox db reembed` for that
     #[arg(long)]
     no_model_download: bool,
+    /// Wait for re-embedding to finish; otherwise the model server does it
+    /// in the background
+    #[arg(long)]
+    wait: bool,
     /// Show what would be done without writing anything
     #[arg(long)]
     dry_run: bool,
@@ -63,7 +67,7 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         }
     } else {
         prefetch_embedding_model(args.dry_run);
-        reembed_on_install(args.dry_run);
+        reembed_on_install(args.dry_run, args.wait);
     }
     if super::migrate::legacy_data_present() {
         println!(
@@ -131,7 +135,7 @@ fn prefetch_tokenizer(dry_run: bool) {
 /// search and dedup keep working without a separate step. Best-effort: a
 /// failure is reported and left for `sclerox db reembed`, never fails install.
 /// Never creates the database just to check it.
-fn reembed_on_install(dry_run: bool) {
+fn reembed_on_install(dry_run: bool, wait: bool) {
     let path = &crate::config::settings().db_path;
     if !path.exists() {
         return;
@@ -156,7 +160,7 @@ fn reembed_on_install(dry_run: bool) {
         "\nUpdating embeddings for {} (large repos take minutes)...",
         crate::config::settings().embed.model
     );
-    if let Err(e) = super::db::reembed(&db, false) {
+    if let Err(e) = super::db::reembed_or_queue(&db, false, wait) {
         println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
     }
 }

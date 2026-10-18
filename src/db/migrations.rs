@@ -8,10 +8,10 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 14;
+pub const PRIMARY_VERSION: u32 = 15;
 
 /// Current target schema version for per-repo databases.
-pub const REPO_VERSION: u32 = 6;
+pub const REPO_VERSION: u32 = 7;
 
 /// Migrations for the primary database (~/.local/share/sclerox/sclerox.db).
 ///
@@ -91,6 +91,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         description: "meta table; record the embedding model of existing vectors",
         sql: crate::db::schema::MIGRATION_V14,
     },
+    Migration {
+        version: 15,
+        description: "embed_jobs: embedding work queued for the model server",
+        sql: crate::db::schema::MIGRATION_V15,
+    },
 ];
 
 /// Migrations for per-repo databases (<repo>/.sclerox/repo.db).
@@ -119,6 +124,11 @@ pub const REPO_MIGRATIONS: &[Migration] = &[
         version: 6,
         description: "index chunks and symbols by file",
         sql: crate::db::schema::REPO_MIGRATION_V6,
+    },
+    Migration {
+        version: 7,
+        description: "embed_jobs: embedding work queued for the model server",
+        sql: crate::db::schema::REPO_MIGRATION_V7,
     },
 ];
 
