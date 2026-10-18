@@ -824,14 +824,33 @@ fn recorded_model(path: &std::path::Path) -> Option<&'static crate::embed::Model
         return None;
     }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags).ok()?;
-    let id: String = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            [crate::embed::models::META_KEY],
-            |r| r.get(0),
-        )
-        .ok()?;
+    let conn = match Connection::open_with_flags(path, flags) {
+        Ok(conn) => conn,
+        Err(e) => {
+            log::warn!(
+                "couldn't read the embedding model of {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let found = conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [crate::embed::models::META_KEY],
+        |r| r.get::<_, String>(0),
+    );
+    let id = match found {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
+            // No `meta` table yet, say: not migrated since before it existed.
+            log::debug!(
+                "couldn't read the embedding model of {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
     let model = crate::embed::models::by_id(&id)?;
     crate::embed::models::KEPT.contains(&model).then_some(model)
 }
@@ -948,7 +967,7 @@ mod tests {
         assert_eq!(s.search.semantic_threshold, None);
         assert_eq!(s.search.semantic_limit, 5);
         assert_eq!(s.dedup.cosine_threshold, None);
-        assert_eq!(s.embed.model_name(), "granite-small-r2");
+        assert_eq!(s.embed.model, None);
         assert_eq!(s.memory.max_value_chars, 800);
         assert_eq!(s.session_context.max_chars, 3000);
         assert_eq!(s.embed.chunk_size, 800);
@@ -985,9 +1004,13 @@ semantic_threshold = 0.7
         assert_eq!(s.search.semantic_threshold, Some(1.0));
     }
 
+    /// Names the model, which unset would follow the developer's
+    /// `SCLEROX_EMBED_MODEL` (see `EmbedSettings::model_name`).
+    const GRANITE: &str = "[embed]\nmodel = \"granite-small-r2\"\n";
+
     #[test]
     fn size_settings_follow_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         assert_eq!(granite.memory_embed_chars(), 4000);
         assert_eq!(granite.index.chunk_chars, 800);
         assert_eq!(granite.index.chunk_lines, 15);
@@ -1004,9 +1027,10 @@ semantic_threshold = 0.7
         assert_eq!(set.index.chunk_lines, 30);
 
         // Zero is repaired to the default rather than disabling embedding.
-        let mut zero =
-            Settings::from_toml_str("[embed]\nmemory_chars = 0\n[index]\nchunk_chars = 0\n")
-                .unwrap();
+        let mut zero = Settings::from_toml_str(&format!(
+            "{GRANITE}memory_chars = 0\n[index]\nchunk_chars = 0\n"
+        ))
+        .unwrap();
         zero.validate();
         assert_eq!(zero.memory_embed_chars(), 4000);
         assert_eq!(zero.index.chunk_chars, 800);
@@ -1014,7 +1038,7 @@ semantic_threshold = 0.7
 
     #[test]
     fn thresholds_follow_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         let t = crate::embed::models::GRANITE_SMALL_R2.thresholds;
         assert_eq!(granite.semantic_threshold(), t.semantic);
         assert_eq!(granite.dedup_cosine_threshold(), t.dedup_cosine);
@@ -1038,7 +1062,7 @@ semantic_threshold = 0.7
 
     #[test]
     fn semantic_margin_follows_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         assert_eq!(granite.semantic_margin(), Some(0.05));
         let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         assert_eq!(minilm.semantic_margin(), None);
@@ -1064,7 +1088,7 @@ semantic_threshold = 0.7
     fn validate_rejects_unknown_model() {
         let mut s = Settings::from_toml_str("[embed]\nmodel = \"bert-giant\"\n").unwrap();
         s.validate();
-        assert_eq!(s.embed.model_name(), "granite-small-r2");
+        assert_eq!(s.embed.model, None, "falls back to the default");
 
         let mut ok = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         ok.validate();
@@ -1077,7 +1101,7 @@ semantic_threshold = 0.7
         let off = Settings::from_toml_str("[embed]\nenabled = false\n").unwrap();
         assert!(!off.embed.enabled);
         // The model choice is kept, so turning them back on needs no re-embed.
-        assert_eq!(off.embed.model_name(), "granite-small-r2");
+        assert_eq!(off.embed.model, None);
     }
 
     #[test]
@@ -1111,10 +1135,11 @@ semantic_threshold = 0.7
     fn an_unset_model_is_the_default_until_a_database_records_one() {
         let unset = Settings::from_toml_str("").unwrap();
         assert_eq!(unset.embed.model, None);
-        assert_eq!(
-            unset.embed.model_name(),
-            crate::embed::models::default_model().name
-        );
+        // `init` puts the database's model in the env var, which tests can't
+        // set safely while others run, so compare with what it resolves to.
+        let resolved = crate::embed::models::configured()
+            .unwrap_or_else(|_| crate::embed::models::default_model());
+        assert_eq!(unset.embed.model_name(), resolved.name);
         let set = Settings::from_toml_str("[embed]\nmodel = \"granite-small-r2\"\n").unwrap();
         assert_eq!(set.embed.model.as_deref(), Some("granite-small-r2"));
     }
