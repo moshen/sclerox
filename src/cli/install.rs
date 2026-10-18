@@ -224,7 +224,9 @@ fn reembed_on_install(dry_run: bool, wait: bool) {
         crate::embed::models::display_id(crate::embed::models::configured_id())
     );
     if let Err(e) = super::db::reembed_or_queue(&db, false, wait) {
-        println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
+        // Not `db reembed`: a switch to fp32 lives only in this process until
+        // the re-embed finishes, so only install retries it.
+        println!("embeddings: {e:#}; run `sclerox install` again to retry");
     }
 }
 
@@ -240,11 +242,18 @@ fn report_reembed_needed() {
     };
     if let Ok(crate::embed::models::ModelCheck::Mismatch { recorded }) = db.embedding_model_check()
     {
+        use crate::embed::models;
+        // A model the knowledge base stays on is still the one commands use
+        // until the switch finishes; any other no longer is.
+        let meanwhile = match models::by_id(&recorded) {
+            Some(m) if models::KEPT.contains(&m) => "search keeps using it meanwhile",
+            _ => "until then semantic search and dedup are off for it",
+        };
         println!(
-            "\nYour knowledge base was embedded with '{}'. Run `sclerox db reembed` to \
-             switch it to '{}'; until then semantic search and dedup are off for it.",
-            crate::embed::models::display_id(&recorded),
-            crate::embed::models::display_id(crate::embed::models::configured_id())
+            "\nYour knowledge base was embedded with '{}'. Run `sclerox install` without \
+             --no-model-download to switch it to '{}'; {meanwhile}.",
+            models::display_id(&recorded),
+            models::display_id(models::configured_id())
         );
     }
     if super::text_chunks::stale(&db) {
