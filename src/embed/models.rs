@@ -14,7 +14,8 @@ use fastembed::Pooling;
 /// settings-free library module. Unset means [`DEFAULT_MODEL`].
 pub const MODEL_ENV: &str = "SCLEROX_EMBED_MODEL";
 
-/// Config name of the default model.
+/// Config name of the default model where `sclerox install` found no
+/// accelerator (see [`default_model`]).
 pub const DEFAULT_MODEL: &str = "granite-small-r2";
 
 /// Every `*_vec` vec0 table is declared `float[384]`. A model with another
@@ -100,8 +101,36 @@ pub struct ModelSpec {
     pub query_prefix: &'static str,
     /// Prepended to stored text before embedding.
     pub document_prefix: &'static str,
+    /// Whether it runs well on an accelerator (see `embed::device`): full
+    /// precision. An int8 graph's quantized operators mostly have no GPU
+    /// kernels, so it would run there in pieces, shuttling between the two.
+    pub accelerates: bool,
     pub thresholds: Thresholds,
 }
+
+/// The [`TOKENIZER_FILES`] both Granite variants load.
+const GRANITE_TOKENIZER_FILES: [RepoFile; 4] = [
+    RepoFile {
+        path: "tokenizer.json",
+        size: 2_128_614,
+        sha256: "feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149",
+    },
+    RepoFile {
+        path: "config.json",
+        size: 1_526,
+        sha256: "1a1710c20911da8c96179716bf44058e54cca6fa7952cce77be83ef05edae3ee",
+    },
+    RepoFile {
+        path: "special_tokens_map.json",
+        size: 694,
+        sha256: "ea97ecdbcc73713039d8d64dbb05e3689495c96657fbd9a18f5bed381be81049",
+    },
+    RepoFile {
+        path: "tokenizer_config.json",
+        size: 20_839,
+        sha256: "ce06781b38bb393db68c9e0709bddd31ef5d88f2c6fbb3fd9f369778fb85e451",
+    },
+];
 
 pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     name: "granite-small-r2",
@@ -119,26 +148,10 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
             size: 51_885_568,
             sha256: "1f4cf47e4adec7f7ae09db03d071ba8667e07f9a4203142c7efa8d37fe453597",
         },
-        RepoFile {
-            path: "tokenizer.json",
-            size: 2_128_614,
-            sha256: "feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149",
-        },
-        RepoFile {
-            path: "config.json",
-            size: 1_526,
-            sha256: "1a1710c20911da8c96179716bf44058e54cca6fa7952cce77be83ef05edae3ee",
-        },
-        RepoFile {
-            path: "special_tokens_map.json",
-            size: 694,
-            sha256: "ea97ecdbcc73713039d8d64dbb05e3689495c96657fbd9a18f5bed381be81049",
-        },
-        RepoFile {
-            path: "tokenizer_config.json",
-            size: 20_839,
-            sha256: "ce06781b38bb393db68c9e0709bddd31ef5d88f2c6fbb3fd9f369778fb85e451",
-        },
+        GRANITE_TOKENIZER_FILES[0],
+        GRANITE_TOKENIZER_FILES[1],
+        GRANITE_TOKENIZER_FILES[2],
+        GRANITE_TOKENIZER_FILES[3],
     ],
     onnx_file: "onnx/model_quantized.onnx",
     external_data: &["onnx/model_quantized.onnx_data"],
@@ -155,6 +168,7 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     memory_chars: 4000,
     query_prefix: "",
     document_prefix: "",
+    accelerates: false,
     // Granite's scores sit high and close together, and where the bands fall
     // depends on the text. Code search (the eval): correct chunk 0.85 mean,
     // random chunk 0.75 mean, 0.79 at the 95th percentile. Short memories
@@ -180,6 +194,47 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
         context: 0.70,
         top_margin: Some(0.05),
     },
+};
+
+/// Granite small at full precision: the default where an accelerator runs
+/// it. The same weights as [`GRANITE_SMALL_R2`] before quantizing, so the
+/// same sizes, but its vectors differ slightly, so it is a model of its own.
+pub const GRANITE_SMALL_R2_FP32: ModelSpec = ModelSpec {
+    name: "granite-small-r2-fp32",
+    id: "onnx-community/granite-embedding-small-english-r2-ONNX:model",
+    files: &[
+        RepoFile {
+            path: "onnx/model.onnx",
+            size: 182_504,
+            sha256: "cddb145cd1147ec24a3908b2ca2602b98b20a3d198365cff270b7cb26c98179e",
+        },
+        RepoFile {
+            path: "onnx/model.onnx_data",
+            size: 194_844_160,
+            sha256: "86a3a705d4598615894d89540ea71a3d9bbdb17a315e79edcd5dfc737222834b",
+        },
+        GRANITE_TOKENIZER_FILES[0],
+        GRANITE_TOKENIZER_FILES[1],
+        GRANITE_TOKENIZER_FILES[2],
+        GRANITE_TOKENIZER_FILES[3],
+    ],
+    onnx_file: "onnx/model.onnx",
+    external_data: &["onnx/model.onnx_data"],
+    accelerates: true,
+    // It ranks like int8 but scores higher: over 4,400 pairs of doc
+    // paragraphs, by 0.012 at the median and 0.025-0.03 near the top. Each
+    // int8 threshold is moved to the score at the same rank among those pairs
+    // (and near-duplicates made by dropping a sentence): 0.70 -> 0.72,
+    // 0.72 -> 0.735, 0.90 -> 0.91, 0.97 -> 0.977. Gaps to the best hit barely
+    // change, so `top_margin` stays.
+    thresholds: Thresholds {
+        semantic: 0.735,
+        dedup_cosine: 0.91,
+        merge: Some(0.975),
+        context: 0.72,
+        top_margin: Some(0.05),
+    },
+    ..GRANITE_SMALL_R2
 };
 
 pub const MINILM_L6_V2: ModelSpec = ModelSpec {
@@ -226,6 +281,7 @@ pub const MINILM_L6_V2: ModelSpec = ModelSpec {
     memory_chars: 800,
     query_prefix: "",
     document_prefix: "",
+    accelerates: true,
     // Calibrated against real MiniLM scores; see `DedupSettings` in config.rs.
     thresholds: Thresholds {
         semantic: 0.45,
@@ -251,8 +307,8 @@ pub const TOKEN_COUNTER: Pinned<'static> = Pinned {
     files: &[MINILM_TOKENIZER],
 };
 
-/// All known models. The first entry is the default.
-pub const MODELS: &[ModelSpec] = &[GRANITE_SMALL_R2, MINILM_L6_V2];
+/// All known models. The first entry is the default without an accelerator.
+pub const MODELS: &[ModelSpec] = &[GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32, MINILM_L6_V2];
 
 /// The registry entry for a config name, or an error naming the valid ones.
 pub fn lookup(name: &str) -> Result<&'static ModelSpec> {
@@ -274,8 +330,65 @@ pub fn names() -> Vec<&'static str> {
     MODELS.iter().map(|m| m.name).collect()
 }
 
+/// The model used when `embed.model` is unset: the one `sclerox install`
+/// picked for this machine (see [`Machine`]), else [`DEFAULT_MODEL`].
 pub fn default_model() -> &'static ModelSpec {
-    &MODELS[0]
+    static DEFAULT: std::sync::OnceLock<&'static ModelSpec> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| {
+        Machine::read()
+            .and_then(|m| lookup(&m.model).ok())
+            .unwrap_or(&MODELS[0])
+    })
+}
+
+/// What `sclerox install` found on this machine: the accelerator it can
+/// embed on, and so the default model. Kept in the state folder, not in
+/// config.toml, which may be shared with machines that have other hardware.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Machine {
+    /// The accelerator found, or `cpu`.
+    pub device: String,
+    /// The default model's name.
+    pub model: String,
+}
+
+impl Machine {
+    /// `$XDG_STATE_HOME/sclerox/machine.toml`.
+    pub fn path() -> std::path::PathBuf {
+        crate::xdg::state_home()
+            .join("sclerox")
+            .join("machine.toml")
+    }
+
+    /// What install last recorded. `None` before it has run, and in unit
+    /// tests, which mustn't depend on the machine they run on.
+    pub fn read() -> Option<Self> {
+        if cfg!(test) {
+            return None;
+        }
+        let text = std::fs::read_to_string(Self::path()).ok()?;
+        match toml::from_str(&text) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log::warn!("ignoring {}: {e}", Self::path().display());
+                None
+            }
+        }
+    }
+
+    pub fn write(&self) -> Result<()> {
+        use anyhow::Context;
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        let text = format!(
+            "# Written by `sclerox install`: what it found on this machine.\n{}",
+            toml::to_string(self)?
+        );
+        std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
+    }
 }
 
 /// The model selected by `SCLEROX_EMBED_MODEL` (bridged from `embed.model`),

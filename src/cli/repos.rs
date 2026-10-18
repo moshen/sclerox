@@ -112,7 +112,7 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let mut embedder_opt: Option<Embedder> = if no_embed || queue_to.is_some() {
                 None
             } else {
-                crate::embed::optional(true).map(Embedder::bulk)
+                crate::embed::optional_bulk(true)
             };
             let mut indexer = RepoIndexer::new(embedder_opt.as_mut()).with_force(force);
             println!("Indexing {}...", canonical.display());

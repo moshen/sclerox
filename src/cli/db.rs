@@ -105,7 +105,12 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
 
     let mut embedder = crate::embed::required()?;
     let model = embedder.model();
-    println!("Embedding model: {} ({})", model.name, model.id);
+    println!(
+        "Embedding model: {} ({}){}",
+        model.name,
+        model.id,
+        on_device(embedder.device())
+    );
 
     let mut rebuilt = 0usize;
     let mut failed = 0usize;
@@ -317,6 +322,11 @@ fn print_rechunked(r: &super::text_chunks::Rechunked) {
     }
 }
 
+/// ", on <device>" when the device is known.
+fn on_device(device: Option<String>) -> String {
+    device.map_or(String::new(), |d| format!(", on {d}"))
+}
+
 /// [`reembed`], through the model server when it runs: re-cut text chunks
 /// here, queue the embedding for the server, and return unless `wait`.
 /// Shared by `sclerox db reembed` and `sclerox install`.
@@ -341,7 +351,12 @@ fn queue_reembed(
     use crate::db::jobs::{DbKind, Kind};
     use crate::index::repo_db::RepoDb;
 
-    println!("Embedding model: {} ({})", spec.name, spec.id);
+    println!(
+        "Embedding model: {} ({}){}",
+        spec.name,
+        spec.id,
+        on_device(crate::embed::server::device_of(spec))
+    );
     let mut queued = Vec::new();
     let mut failed = 0usize;
 

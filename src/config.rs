@@ -138,8 +138,10 @@ pub struct EmbedSettings {
     pub enabled: bool,
     /// Embedding model, by registry name (`embed::models`). Changing it means
     /// running `sclerox db reembed`; until then semantic search and dedup are
-    /// off for databases embedded with the old model. Env: `SCLEROX_EMBED_MODEL`.
-    pub model: String,
+    /// off for databases embedded with the old model. `None` = the one
+    /// `sclerox install` picked for this machine (`embed::models::Machine`);
+    /// see [`EmbedSettings::model_name`]. Env: `SCLEROX_EMBED_MODEL`.
+    pub model: Option<String>,
     /// Most characters per embedded chunk of meeting, todo and research text.
     pub chunk_size: usize,
     /// Characters of the previous chunk repeated at the start of the next.
@@ -153,6 +155,19 @@ pub struct EmbedSettings {
     /// rather than in every command. `off`: each command loads the model
     /// itself. Env: `SCLEROX_EMBED_SERVER`.
     pub server: String,
+    /// Where the model runs (`embed::device`): `auto` uses an accelerator
+    /// where one is found and pays off, `cpu`, `coreml` or `directml` use that
+    /// one. Env: `SCLEROX_EMBED_DEVICE`.
+    pub device: String,
+}
+
+impl EmbedSettings {
+    /// The embedding model's name: `model`, or this machine's default.
+    pub fn model_name(&self) -> &str {
+        self.model
+            .as_deref()
+            .unwrap_or_else(|| crate::embed::models::default_model().name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,11 +314,12 @@ impl Default for EmbedSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: crate::embed::models::DEFAULT_MODEL.to_string(),
+            model: None,
             chunk_size: 800,
             chunk_overlap: 200,
             memory_chars: None,
             server: "auto".to_string(),
+            device: "auto".to_string(),
         }
     }
 }
@@ -449,7 +465,7 @@ impl Settings {
         }
         if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {
             if !m.is_empty() {
-                self.embed.model = m;
+                self.embed.model = Some(m);
             }
         }
         if let Ok(v) = std::env::var(crate::embed::ENABLED_ENV) {
@@ -465,6 +481,11 @@ impl Settings {
         if let Ok(v) = std::env::var(crate::embed::server::MODE_ENV) {
             if !v.is_empty() {
                 self.embed.server = v;
+            }
+        }
+        if let Ok(v) = std::env::var(crate::embed::device::DEVICE_ENV) {
+            if !v.is_empty() {
+                self.embed.device = v;
             }
         }
         for (var, field) in [
@@ -495,12 +516,17 @@ impl Settings {
         clamp_unit_opt("dedup.merge_threshold", &mut self.dedup.merge_threshold);
 
         // The embedding model must be one the registry knows.
-        if let Err(e) = crate::embed::models::lookup(&self.embed.model) {
+        if let Some(Err(e)) = self
+            .embed
+            .model
+            .as_deref()
+            .map(crate::embed::models::lookup)
+        {
             eprintln!(
                 "warning: embed.model: {e}; using {}",
-                crate::embed::models::DEFAULT_MODEL
+                crate::embed::models::default_model().name
             );
-            self.embed.model = crate::embed::models::DEFAULT_MODEL.to_string();
+            self.embed.model = None;
         }
 
         require_positive("search.semantic_limit", &mut self.search.semantic_limit, 5);
@@ -600,6 +626,26 @@ impl Settings {
                 self.embed.server = "auto".to_string();
             }
         }
+        match crate::embed::device::parse_choice(&self.embed.device) {
+            Some(crate::embed::device::Choice::Auto) => self.embed.device = "auto".to_string(),
+            Some(crate::embed::device::Choice::Only(d)) => {
+                if !d.built_in() {
+                    eprintln!(
+                        "warning: embed.device = \"{d}\" isn't available on this platform; \
+                         embedding will fail until it is auto or cpu"
+                    );
+                }
+                self.embed.device = d.name().to_string();
+            }
+            None => {
+                eprintln!(
+                    "warning: embed.device = \"{}\" is not valid (auto|cpu|coreml|directml); \
+                     using auto",
+                    self.embed.device
+                );
+                self.embed.device = "auto".to_string();
+            }
+        }
         if self.server.idle_minutes == 0 {
             eprintln!("warning: server.idle_minutes must be > 0; using default 15");
             self.server.idle_minutes = 15;
@@ -667,7 +713,7 @@ fn require_positive(name: &str, v: &mut usize, default: usize) {
 impl Settings {
     /// The configured embedding model's registry entry.
     pub fn embed_model(&self) -> &'static crate::embed::ModelSpec {
-        crate::embed::models::lookup(&self.embed.model)
+        crate::embed::models::lookup(self.embed.model_name())
             .unwrap_or_else(|_| crate::embed::models::default_model())
     }
 
@@ -755,11 +801,21 @@ static BRIDGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec:
 /// Set `var` for library code and remember that config, not the user, set it.
 fn bridge(var: &'static str, value: &str) {
     // SAFETY: called only from `init`, at single-threaded startup, before any
-    // thread is spawned.
+    // thread is spawned, and from `use_default_model`, likewise.
     unsafe {
         std::env::set_var(var, value);
     }
     BRIDGED.lock().unwrap_or_else(|e| e.into_inner()).push(var);
+}
+
+/// Point library code at `name` as the embedding model when `embed.model`
+/// is unset: for `sclerox install`, once it has recorded this machine's
+/// default, which settings and the library resolved before it did. Call only
+/// while no other thread runs.
+pub fn use_default_model(name: &str) {
+    if settings().embed.model.is_none() {
+        bridge(crate::embed::models::MODEL_ENV, name);
+    }
 }
 
 /// Whether `var` holds a value [`init`] bridged from config rather than one
@@ -787,9 +843,14 @@ pub fn init() {
         );
     }
     // The embedder (library code) reads the model name from the env var.
-    let model_is_default = s.embed.model == EmbedSettings::default().model;
-    if !model_is_default && std::env::var(crate::embed::models::MODEL_ENV).is_err() {
-        bridge(crate::embed::models::MODEL_ENV, &s.embed.model);
+    if let Some(model) = &s.embed.model {
+        if std::env::var(crate::embed::models::MODEL_ENV).is_err() {
+            bridge(crate::embed::models::MODEL_ENV, model);
+        }
+    }
+    // ...and where to run it. Unset reads as auto.
+    if s.embed.device != "auto" && std::env::var(crate::embed::device::DEVICE_ENV).is_err() {
+        bridge(crate::embed::device::DEVICE_ENV, &s.embed.device);
     }
     // ...and whether embeddings are on at all.
     let env = std::env::var(crate::embed::ENABLED_ENV).ok();
@@ -853,7 +914,7 @@ mod tests {
         assert_eq!(s.search.semantic_threshold, None);
         assert_eq!(s.search.semantic_limit, 5);
         assert_eq!(s.dedup.cosine_threshold, None);
-        assert_eq!(s.embed.model, "granite-small-r2");
+        assert_eq!(s.embed.model_name(), "granite-small-r2");
         assert_eq!(s.memory.max_value_chars, 800);
         assert_eq!(s.session_context.max_chars, 3000);
         assert_eq!(s.embed.chunk_size, 800);
@@ -969,11 +1030,11 @@ semantic_threshold = 0.7
     fn validate_rejects_unknown_model() {
         let mut s = Settings::from_toml_str("[embed]\nmodel = \"bert-giant\"\n").unwrap();
         s.validate();
-        assert_eq!(s.embed.model, "granite-small-r2");
+        assert_eq!(s.embed.model_name(), "granite-small-r2");
 
         let mut ok = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         ok.validate();
-        assert_eq!(ok.embed.model, "minilm-l6-v2");
+        assert_eq!(ok.embed.model_name(), "minilm-l6-v2");
     }
 
     #[test]
@@ -982,7 +1043,7 @@ semantic_threshold = 0.7
         let off = Settings::from_toml_str("[embed]\nenabled = false\n").unwrap();
         assert!(!off.embed.enabled);
         // The model choice is kept, so turning them back on needs no re-embed.
-        assert_eq!(off.embed.model, "granite-small-r2");
+        assert_eq!(off.embed.model_name(), "granite-small-r2");
     }
 
     #[test]
@@ -997,6 +1058,31 @@ semantic_threshold = 0.7
         assert_eq!(enabled_bridge(true, None), None);
         assert_eq!(enabled_bridge(true, Some("yes")), None);
         assert_eq!(enabled_bridge(true, Some("maybe")), None);
+    }
+
+    #[test]
+    fn device_defaults_to_auto_and_validates() {
+        let mut s = Settings::from_toml_str("").unwrap();
+        s.validate();
+        assert_eq!(s.embed.device, "auto");
+        let mut cpu = Settings::from_toml_str("[embed]\ndevice = \"CPU\"\n").unwrap();
+        cpu.validate();
+        assert_eq!(cpu.embed.device, "cpu");
+        let mut bad = Settings::from_toml_str("[embed]\ndevice = \"cuda\"\n").unwrap();
+        bad.validate();
+        assert_eq!(bad.embed.device, "auto");
+    }
+
+    #[test]
+    fn an_unset_model_is_the_machine_default() {
+        let unset = Settings::from_toml_str("").unwrap();
+        assert_eq!(unset.embed.model, None);
+        assert_eq!(
+            unset.embed.model_name(),
+            crate::embed::models::default_model().name
+        );
+        let set = Settings::from_toml_str("[embed]\nmodel = \"granite-small-r2\"\n").unwrap();
+        assert_eq!(set.embed.model.as_deref(), Some("granite-small-r2"));
     }
 
     #[test]

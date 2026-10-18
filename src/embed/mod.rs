@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+pub mod device;
 pub mod download;
 pub mod models;
 pub mod server;
@@ -41,7 +42,7 @@ pub fn required() -> Result<Embedder> {
              turn them on to embed"
         );
     }
-    Ok(Embedder::new()?.bulk())
+    Embedder::new(server::Lane::Bulk)
 }
 
 /// The embedder for everything else, where vectors are a bonus on top of
@@ -53,10 +54,19 @@ pub fn required() -> Result<Embedder> {
 /// Uses the model server when `embed.server` allows it (see [`server`]),
 /// starting one if needed; otherwise loads the model in-process.
 pub fn optional(ready: bool) -> Option<Embedder> {
+    optional_in(ready, server::Lane::Query)
+}
+
+/// [`optional`], for bulk work (see [`Embedder::new`]).
+pub fn optional_bulk(ready: bool) -> Option<Embedder> {
+    optional_in(ready, server::Lane::Bulk)
+}
+
+fn optional_in(ready: bool, lane: server::Lane) -> Option<Embedder> {
     if !enabled() || !ready {
         return None;
     }
-    match Embedder::new() {
+    match Embedder::new(lane) {
         Ok(e) => Some(e),
         Err(e) => {
             let msg = format!("embedding model unavailable, continuing without vectors: {e:#}");
@@ -67,9 +77,10 @@ pub fn optional(ready: bool) -> Option<Embedder> {
     }
 }
 
-/// Where an [`Embedder`] runs the model.
+/// Where an [`Embedder`] runs the model: here, on a device, or in the
+/// model server.
 enum Backend {
-    Local(Box<fastembed::TextEmbedding>),
+    Local(Box<fastembed::TextEmbedding>, device::Device),
     Server(server::Client),
 }
 
@@ -85,8 +96,10 @@ impl Embedder {
     /// The model selected by `embed.model` (bridged through
     /// `SCLEROX_EMBED_MODEL`): through the model server when it is on and
     /// running (or can be started), else loaded here, downloading it on
-    /// first use.
-    fn new() -> Result<Self> {
+    /// first use. With [`server::Lane::Bulk`], the server runs other
+    /// commands' queries before this one's work and takes turns between bulk
+    /// commands, and a model loaded here may go on an accelerator.
+    fn new(lane: server::Lane) -> Result<Self> {
         let spec = models::configured()?;
         spec.check_supported()?;
         if server::mode() == server::Mode::Auto {
@@ -94,33 +107,36 @@ impl Embedder {
                 return Ok(Self {
                     backend: Backend::Server(client),
                     spec,
-                    lane: server::Lane::Query,
+                    lane,
                 });
             }
         }
-        Self::with_model(spec)
+        Self::with_model(spec, lane)
     }
 
     /// Load `spec` in-process, downloading its files into the sclerox model
     /// cache (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
-    pub fn with_model(spec: &'static ModelSpec) -> Result<Self> {
+    pub fn with_model(spec: &'static ModelSpec, lane: server::Lane) -> Result<Self> {
+        let (model, device) = load_model(spec, lane == server::Lane::Bulk)?;
         Ok(Self {
-            backend: Backend::Local(Box::new(load_model(spec)?)),
+            backend: Backend::Local(Box::new(model), device),
             spec,
-            lane: server::Lane::Query,
+            lane,
         })
-    }
-
-    /// Mark this embedder's work as bulk: the model server runs other
-    /// commands' queries before it, and takes turns between bulk commands.
-    pub fn bulk(mut self) -> Self {
-        self.lane = server::Lane::Bulk;
-        self
     }
 
     /// The model this embedder runs.
     pub fn model(&self) -> &'static ModelSpec {
         self.spec
+    }
+
+    /// The device the model runs on: here, or in the model server, which
+    /// reports it. `None` when the server doesn't say.
+    pub fn device(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Local(_, device) => Some(device.to_string()),
+            Backend::Server(_) => server::device_of(self.spec),
+        }
     }
 
     /// Embed text that will be stored and searched against.
@@ -192,9 +208,10 @@ impl Embedder {
                 }
             }
             log::warn!("model server failed, loading the model in-process: {e:#}");
-            self.backend = Backend::Local(Box::new(load_model(self.spec)?));
+            let (model, device) = load_model(self.spec, self.lane == server::Lane::Bulk)?;
+            self.backend = Backend::Local(Box::new(model), device);
         }
-        let Backend::Local(model) = &mut self.backend else {
+        let Backend::Local(model, _) = &mut self.backend else {
             unreachable!("the server backend was just replaced");
         };
         let rest = model
@@ -210,7 +227,7 @@ impl Embedder {
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        let Backend::Local(model) = &mut self.backend else {
+        let Backend::Local(model, _) = &mut self.backend else {
             anyhow::bail!("batch embedding needs the model in-process");
         };
         model
@@ -273,14 +290,39 @@ pub fn ensure_downloaded(spec: &ModelSpec) -> Result<Vec<(&'static str, PathBuf)
     Ok(spec.files.iter().map(|f| f.path).zip(paths).collect())
 }
 
-/// Load `spec` in this process, downloading its files first if needed.
-pub(crate) fn load_model(spec: &'static ModelSpec) -> Result<fastembed::TextEmbedding> {
+/// Load `spec` in this process, downloading its files first if needed, on
+/// the first device of `embed.device`'s [`device::candidates`] that starts.
+/// `long_lived` is for a model that will embed many texts: the model
+/// server's, or bulk work.
+pub(crate) fn load_model(
+    spec: &'static ModelSpec,
+    long_lived: bool,
+) -> Result<(fastembed::TextEmbedding, device::Device)> {
     spec.check_supported()?;
+    let devices = device::candidates(device::configured(), spec, long_lived)?;
     let files = ensure_downloaded(spec)?;
-    load(spec, &files).with_context(|| format!("failed to load embedding model '{}'", spec.name))
+    let mut failed = None;
+    for device in devices {
+        match load(spec, &files, device) {
+            Ok(model) => {
+                log::info!("loaded {} on {device}", spec.name);
+                return Ok((model, device));
+            }
+            Err(e) => {
+                log::warn!("couldn't load {} on {device}: {e:#}", spec.name);
+                failed = Some(e);
+            }
+        }
+    }
+    let e = failed.unwrap_or_else(|| anyhow::anyhow!("no device to load it on"));
+    Err(e.context(format!("failed to load embedding model '{}'", spec.name)))
 }
 
-fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed::TextEmbedding> {
+fn load(
+    spec: &ModelSpec,
+    files: &[(&'static str, PathBuf)],
+    device: device::Device,
+) -> Result<fastembed::TextEmbedding> {
     use fastembed::{
         InitOptionsUserDefined, OutputKey, QuantizationMode, TokenizerFiles,
         UserDefinedEmbeddingModel,
@@ -296,8 +338,20 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
     };
 
     let [tokenizer, config, special_tokens_map, tokenizer_config] = models::TOKENIZER_FILES;
+    let mut onnx = read(spec.onnx_file)?;
+    if device == device::Device::CoreMl {
+        // Name the compiled model after the graph and weights it was
+        // compiled from.
+        let hash = |path: &str| {
+            let file = spec.files.iter().find(|f| f.path == path);
+            file.map_or("", |f| &f.sha256[..16])
+        };
+        let weights = spec.external_data.first().map_or("", |w| hash(w));
+        let key = format!("{}{}{weights}", spec.name, hash(spec.onnx_file));
+        onnx = device::with_coreml_cache_key(onnx, &key);
+    }
     let mut model_def = UserDefinedEmbeddingModel::new(
-        read(spec.onnx_file)?,
+        onnx,
         TokenizerFiles {
             tokenizer_file: read(tokenizer)?,
             config_file: read(config)?,
@@ -319,7 +373,10 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         model_def = model_def.with_external_initializer(graph_name.to_string(), read(data)?);
     }
 
-    let options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    let mut options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    if let Some(ep) = device.provider() {
+        options = options.with_execution_providers(vec![ep]);
+    }
     fastembed::TextEmbedding::try_new_from_user_defined(model_def, options)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -448,7 +505,7 @@ mod tests {
     #[test]
     #[ignore = "downloads Granite small (~52 MB) into the model cache"]
     fn granite_parity_with_reference() {
-        let mut e = Embedder::with_model(&models::GRANITE_SMALL_R2).unwrap();
+        let mut e = Embedder::with_model(&models::GRANITE_SMALL_R2, server::Lane::Query).unwrap();
         let queries = ["Who made the song My achy breaky heart?", "summit define"];
         let passages = [
             "Achy Breaky Heart is a country song written by Don Von Tress. Originally \
@@ -473,10 +530,40 @@ mod tests {
         }
     }
 
+    /// Full-precision Granite ranks like the int8 reference and scores a
+    /// little higher (see its thresholds in `models`).
+    #[test]
+    #[ignore = "downloads Granite small at full precision (~195 MB) into the model cache"]
+    fn granite_fp32_is_close_to_int8() {
+        let mut e =
+            Embedder::with_model(&models::GRANITE_SMALL_R2_FP32, server::Lane::Query).unwrap();
+        let queries = ["Who made the song My achy breaky heart?", "summit define"];
+        let passages = [
+            "Achy Breaky Heart is a country song written by Don Von Tress. Originally \
+             titled Don't Tell My Heart and performed by The Marcy Brothers in 1991.",
+            "Definition of summit for English Language Learners. : 1 the highest point \
+             of a mountain : the top of a mountain. : 2 the highest level.",
+        ];
+        let reference = [[0.888, 0.638], [0.686, 0.826]];
+        let q = e.embed_each(&queries).unwrap();
+        let p = e.embed_each(&passages).unwrap();
+        for (i, qv) in q.iter().enumerate() {
+            for (j, pv) in p.iter().enumerate() {
+                let got = cosine(qv, pv);
+                eprintln!("query {i} / passage {j}: {got:.4}");
+                assert!(
+                    (got - reference[i][j]).abs() <= 0.03,
+                    "query {i} / passage {j}: got {got:.4}, int8 reference {}",
+                    reference[i][j]
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "downloads MiniLM (~90 MB) into the model cache"]
     fn minilm_still_loads() {
-        let mut e = Embedder::with_model(&models::MINILM_L6_V2).unwrap();
+        let mut e = Embedder::with_model(&models::MINILM_L6_V2, server::Lane::Query).unwrap();
         let a = e.embed_one("the cat sat on the mat").unwrap();
         let b = e.embed_one("a cat was sitting on a mat").unwrap();
         let c = e.embed_one("quarterly revenue projections").unwrap();

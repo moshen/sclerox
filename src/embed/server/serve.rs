@@ -55,8 +55,6 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_EVERY: Duration = Duration::from_secs(30);
 /// How long a model that failed to load is refused before it is tried again.
 const RETRY_LOAD: Duration = Duration::from_secs(5 * 60);
-/// Where models run, until `embed.device` exists.
-const DEVICE: &str = "cpu";
 /// How long a server over its soft memory limit waits with no connections
 /// and no requests before exiting.
 const RESTART_QUIET: Duration = Duration::from_secs(60);
@@ -358,6 +356,8 @@ struct Slot {
     last_used: Mutex<Instant>,
     /// Its row in `model_loads`, once loaded.
     load_id: AtomicI64,
+    /// What it runs on, once loaded.
+    device: Mutex<&'static str>,
 }
 
 enum Loaded {
@@ -404,6 +404,7 @@ impl State {
             requests: AtomicU64::new(0),
             last_used: Mutex::new(Instant::now()),
             load_id: AtomicI64::new(0),
+            device: Mutex::new("cpu"),
         });
         models.push(Arc::clone(&slot));
         slot
@@ -436,18 +437,25 @@ impl State {
         let spec = slot.spec;
         let before = rss_mb();
         let started = Instant::now();
-        let result = crate::embed::load_model(spec);
+        // Loaded for the server's lifetime, so where `embed.device` is
+        // `auto` it may go on an accelerator.
+        let result = crate::embed::load_model(spec, true);
         let took = started.elapsed();
+        let device = match &result {
+            Ok((_, device)) => device.name(),
+            Err(_) => "none",
+        };
         let record = Load {
             model: spec.name,
-            device: DEVICE,
+            device,
             max_tokens: spec.max_tokens,
         };
         match result {
-            Ok(model) => {
+            Ok((model, device)) => {
+                *lock(&slot.device) = device.name();
                 let mb = rss_mb().saturating_sub(before);
                 log::info!(
-                    "model server loaded {} in {} ms, {mb} MB",
+                    "model server loaded {} on {device} in {} ms, {mb} MB",
                     spec.name,
                     took.as_millis()
                 );
@@ -606,7 +614,7 @@ impl State {
                 }
                 Some(ModelStatus {
                     name: slot.spec.name.to_string(),
-                    device: DEVICE.to_string(),
+                    device: lock(&slot.device).to_string(),
                     loaded_mb: slot.loaded_mb.load(Ordering::Relaxed),
                     requests: slot.requests.load(Ordering::Relaxed),
                     idle_secs: lock(&slot.last_used).elapsed().as_secs(),

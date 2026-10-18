@@ -753,6 +753,13 @@ pub fn status() -> Result<Option<ServerStatus>> {
     }
 }
 
+/// The device the running server has `spec` loaded on, if it has.
+pub fn device_of(spec: &ModelSpec) -> Option<String> {
+    let status = status().ok().flatten()?;
+    let model = status.models.into_iter().find(|m| m.name == spec.name)?;
+    model.error.is_none().then_some(model.device)
+}
+
 /// Stop the server and wait for it to exit. `false` when none was running.
 pub fn stop() -> Result<bool> {
     match Client::connect()? {

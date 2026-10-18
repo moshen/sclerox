@@ -62,11 +62,13 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
             prefetch_tokenizer(args.dry_run);
         }
     } else if args.no_model_download {
+        choose_model(args.dry_run);
         if !args.dry_run {
             report_reembed_needed();
         }
     } else {
-        prefetch_embedding_model(args.dry_run);
+        let spec = choose_model(args.dry_run);
+        prefetch_embedding_model(spec, args.dry_run);
         reembed_on_install(args.dry_run, args.wait);
     }
     if super::migrate::legacy_data_present() {
@@ -82,11 +84,48 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// Look for an accelerator to embed on and record this machine's default
+/// model: Granite at full precision where one starts, else int8, which is
+/// faster on the CPU. Returns the model to use, which is `embed.model` when
+/// that is set.
+fn choose_model(dry_run: bool) -> &'static crate::embed::ModelSpec {
+    use crate::embed::{device, models};
+
+    let found = device::detect(device::configured());
+    let default = match found {
+        Some(_) => &models::GRANITE_SMALL_R2_FP32,
+        None => &models::GRANITE_SMALL_R2,
+    };
+    match found {
+        Some(d) => println!("embedding device: {d}"),
+        None => println!("embedding device: cpu (no accelerator found)"),
+    }
+    if !dry_run {
+        let machine = models::Machine {
+            device: found.unwrap_or(device::Device::Cpu).name().to_string(),
+            model: default.name.to_string(),
+        };
+        if let Err(e) = machine.write() {
+            println!("embedding device: couldn't record it ({e:#})");
+        }
+    }
+    match &crate::config::settings().embed.model {
+        Some(name) => {
+            println!("embedding model: {name} (set by embed.model)");
+            models::lookup(name).unwrap_or(default)
+        }
+        None => {
+            // Settings resolved the default before it was recorded.
+            crate::config::use_default_model(default.name);
+            default
+        }
+    }
+}
+
 /// Download the embedding model and the token-counting tokenizer now, so the
 /// first session hook to need them is not the one stalled by the download.
 /// Best-effort: a failure only means the download is retried on first use.
-fn prefetch_embedding_model(dry_run: bool) {
-    let spec = crate::config::settings().embed_model();
+fn prefetch_embedding_model(spec: &'static crate::embed::ModelSpec, dry_run: bool) {
     let dir = crate::embed::model_cache_dir();
     let tokenizer = crate::embed::models::TOKEN_COUNTER;
     if crate::embed::is_downloaded(spec) && tokenizer.is_cached() {
@@ -158,7 +197,7 @@ fn reembed_on_install(dry_run: bool, wait: bool) {
     }
     println!(
         "\nUpdating embeddings for {} (large repos take minutes)...",
-        crate::config::settings().embed.model
+        crate::embed::models::display_id(crate::embed::models::configured_id())
     );
     if let Err(e) = super::db::reembed_or_queue(&db, false, wait) {
         println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
@@ -181,7 +220,7 @@ fn report_reembed_needed() {
             "\nYour knowledge base was embedded with '{}'. Run `sclerox db reembed` to \
              switch it to '{}'; until then semantic search and dedup are off for it.",
             crate::embed::models::display_id(&recorded),
-            crate::config::settings().embed.model
+            crate::embed::models::display_id(crate::embed::models::configured_id())
         );
     }
     if super::text_chunks::stale(&db) {

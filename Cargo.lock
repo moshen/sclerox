@@ -2692,6 +2692,7 @@ dependencies = [
  "libc",
  "log",
  "memory-stats",
+ "ort",
  "postcard",
  "predicates",
  "rusqlite",

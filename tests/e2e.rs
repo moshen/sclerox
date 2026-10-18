@@ -1446,6 +1446,78 @@ fn install_never_overwrites_an_edited_config() {
     assert!(legacy.exists(), "legacy config kept for a manual merge");
 }
 
+/// `sclerox` with every path pinned into `home`.
+fn sclerox_in(home: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("sclerox").unwrap();
+    c.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
+        .env_remove("SCLEROX_CONFIG")
+        .env_remove("SCLEROX_EMBED_MODEL")
+        .env_remove("SCLEROX_EMBED_DEVICE");
+    c
+}
+
+/// Install records the device it found and the default model that suits it,
+/// and commands then use that model while `embed.model` is unset.
+#[test]
+fn install_picks_the_default_model_for_the_device() {
+    let home = TempDir::new().unwrap();
+    let machine = home.path().join(".local/state/sclerox/machine.toml");
+
+    sclerox_in(home.path())
+        .env("SCLEROX_EMBED_DEVICE", "cpu")
+        .args(["install", "--target", "claude", "--no-model-download"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "embedding device: cpu (no accelerator found)",
+        ));
+    let recorded = std::fs::read_to_string(&machine).unwrap();
+    assert!(recorded.contains("device = \"cpu\""), "{recorded}");
+    assert!(
+        recorded.contains("model = \"granite-small-r2\""),
+        "{recorded}"
+    );
+
+    // Whatever this machine has: fp32 exactly where an accelerator started.
+    let out = sclerox_in(home.path())
+        .args(["install", "--target", "claude", "--no-model-download"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let recorded = std::fs::read_to_string(&machine).unwrap();
+    let on_cpu = recorded.contains("device = \"cpu\"");
+    assert_eq!(
+        recorded.contains("granite-small-r2-fp32"),
+        !on_cpu,
+        "{recorded}"
+    );
+
+    // Commands follow the recorded default...
+    std::fs::write(&machine, "device = \"cpu\"\nmodel = \"minilm-l6-v2\"\n").unwrap();
+    sclerox_in(home.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "effective thresholds for minilm-l6-v2",
+        ));
+    // ...unless embed.model says otherwise.
+    sclerox_in(home.path())
+        .env("SCLEROX_EMBED_MODEL", "granite-small-r2")
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "effective thresholds for granite-small-r2:",
+        ));
+}
+
 // ─── Model server ────────────────────────────────────────────────────────────
 
 /// A test's own state directory with the model server turned on. Stops the

@@ -832,7 +832,7 @@ fn run_embed_repo(repo_root: &std::path::Path) -> Result<()> {
             return Ok(());
         }
     }
-    let Some(mut embedder) = crate::embed::optional(true).map(crate::embed::Embedder::bulk) else {
+    let Some(mut embedder) = crate::embed::optional_bulk(true) else {
         return Ok(());
     };
     let started = std::time::Instant::now();
@@ -1030,8 +1030,7 @@ fn distill_chunked(
     // (their scores against ours would be meaningless) - dedup then falls back
     // to lexical and no vectors are stored. Nobody waits on a distillation,
     // so its embeddings go after other commands' queries.
-    let mut embedder =
-        crate::embed::optional(db.semantic_ready()).map(crate::embed::Embedder::bulk);
+    let mut embedder = crate::embed::optional_bulk(db.semantic_ready());
 
     for chunk in chunk_turns(turns, chunk_chars) {
         // Show the distiller the memories this chunk is topically near, so it
