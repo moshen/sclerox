@@ -848,10 +848,27 @@ mod tests {
         let counts: Vec<usize> = pieces.iter().map(|p| tokens(p)).collect();
 
         // A session whose inputs are always 1 x `length` tokens.
-        let fixed_session = |length: usize, ep: Option<fastembed::ExecutionProviderDispatch>| {
+        // `directml` sets the session options DirectML needs, as fastembed
+        // does; `no_fusion` also turns off its graph fusion.
+        let fixed_session = |length: usize,
+                             ep: Option<fastembed::ExecutionProviderDispatch>,
+                             directml: bool,
+                             no_fusion: bool| {
             let mut builder = ort::session::Session::builder().unwrap();
             if let Some(ep) = ep {
                 builder = builder.with_execution_providers([ep]).unwrap();
+            }
+            if directml {
+                builder = builder
+                    .with_memory_pattern(false)
+                    .unwrap()
+                    .with_parallel_execution(false)
+                    .unwrap();
+            }
+            if no_fusion {
+                builder = builder
+                    .with_config_entry("ep.dml.disable_graph_fusion", "1")
+                    .unwrap();
             }
             builder
                 .with_dimension_override("batch_size", 1)
@@ -911,7 +928,9 @@ mod tests {
             let mut variants: Vec<(
                 String,
                 Option<fastembed::ExecutionProviderDispatch>,
-            )> = vec![("cpu fixed".to_string(), None)];
+                bool,
+                bool,
+            )> = vec![("cpu fixed".to_string(), None, false, false)];
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
                 use ort::ep::coreml::{ComputeUnits, ModelFormat};
@@ -929,15 +948,27 @@ mod tests {
                             .with_static_input_shapes(true)
                             .build()
                             .error_on_failure();
-                        variants.push((format!("coreml {format_name} + {units_name}"), Some(ep)));
+                        variants.push((
+                            format!("coreml {format_name} + {units_name}"),
+                            Some(ep),
+                            false,
+                            false,
+                        ));
                     }
                 }
             }
             #[cfg(windows)]
-            variants.push(("directml".to_string(), device::Device::DirectMl.provider()));
-            for (name, ep) in variants {
+            for (name, no_fusion) in [("directml", false), ("directml, no graph fusion", true)] {
+                variants.push((
+                    name.to_string(),
+                    device::Device::DirectMl.provider(),
+                    true,
+                    no_fusion,
+                ));
+            }
+            for (name, ep, directml, no_fusion) in variants {
                 let started = Instant::now();
-                let mut session = match fixed_session(length, ep) {
+                let mut session = match fixed_session(length, ep, directml, no_fusion) {
                     Ok(s) => s,
                     Err(e) => {
                         println!("  {name}: load failed: {e}");
