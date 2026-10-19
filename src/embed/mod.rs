@@ -624,97 +624,136 @@ mod tests {
         }
     }
 
-    /// Which CoreML settings run full-precision Granite over texts of
-    /// varying length, how fast, and how close to the CPU. Run on an Apple
-    /// Silicon Mac:
-    ///   cargo test --release --lib coreml_variants -- --ignored --nocapture
+    /// How fast full-precision Granite embeds on this machine's accelerator
+    /// once loaded and reused, as the model server uses it, against the
+    /// CPU. Run on an Apple Silicon Mac or on Windows:
+    ///   cargo test --release --lib accelerator_benchmark -- --ignored --nocapture 2>/dev/null
+    /// (results go to stdout; CoreML logs a lot to stderr).
     #[test]
-    #[ignore = "diagnostic: needs an Apple Silicon Mac and Granite fp32 (~195 MB)"]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn coreml_variants() {
-        use ort::ep::coreml::{ComputeUnits, ModelFormat};
-        use std::time::Instant;
+    #[ignore = "benchmark: needs an accelerator and Granite fp32 (~195 MB); takes minutes"]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), windows))]
+    fn accelerator_benchmark() {
+        use std::time::{Duration, Instant};
 
         let spec = &models::GRANITE_SMALL_R2_FP32;
         let files = ensure_downloaded(spec).unwrap();
-        // Short and long, mixed, since the failure is in resizing between
-        // sequence lengths. About 4 characters per token.
+
+        // Lengths spread like stored text: mostly short memories and
+        // code-sized chunks, some long ones, a few near the token limit.
+        // Fixed seed, so every run and machine gets the same texts.
         let sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
-        let texts: Vec<String> = [16, 600, 64, 4000, 8, 1500, 7800, 200, 32]
-            .iter()
-            .map(|&chars| sentence.repeat(chars / sentence.len() + 1)[..chars].to_string())
-            .collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut lengths = |n: usize| -> Vec<usize> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    match seed % 10 {
+                        0..=4 => 40 + (seed >> 8) as usize % 400,
+                        5..=7 => 400 + (seed >> 8) as usize % 1200,
+                        8 => 1600 + (seed >> 8) as usize % 2400,
+                        _ => 4000 + (seed >> 8) as usize % 4000,
+                    }
+                })
+                .collect()
+        };
+        let text = |chars: usize| sentence.repeat(chars / sentence.len() + 1)[..chars].to_string();
+        let warm: Vec<String> = lengths(100).into_iter().map(text).collect();
+        let fresh: Vec<String> = lengths(100).into_iter().map(|n| text(n + 1)).collect();
+        let chars: usize = warm.iter().map(String::len).sum();
+        println!(
+            "{} texts, {chars} chars per pass (about {} tokens)",
+            warm.len(),
+            chars / 4
+        );
+
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        let reference = cpu.embed(&warm, Some(1)).unwrap();
+
+        // Several passes over the same texts, then one over lengths not
+        // seen yet: a device that compiles per input shape is slow there.
+        let run = |name: &str, model: &mut fastembed::TextEmbedding, loaded: Duration| {
+            let mut passes = Vec::new();
+            let mut worst = 1.0f32;
+            let mut failed = 0;
+            for _ in 0..4 {
+                let started = Instant::now();
+                for (text, cpu_vector) in warm.iter().zip(&reference) {
+                    match model.embed(std::slice::from_ref(text), Some(1)) {
+                        Ok(v) => worst = worst.min(cosine(&v[0], cpu_vector)),
+                        Err(_) => failed += 1,
+                    }
+                }
+                passes.push(started.elapsed());
+            }
+            let started = Instant::now();
+            for text in &fresh {
+                if model.embed(std::slice::from_ref(text), Some(1)).is_err() {
+                    failed += 1;
+                }
+            }
+            let new_lengths = started.elapsed();
+            let secs: Vec<String> = passes
+                .iter()
+                .map(|d| format!("{:.2}", d.as_secs_f64()))
+                .collect();
+            println!(
+                "{name:<36} load {:>5.2}s | passes {} s | new lengths {:.2}s | \
+                 failed {failed} | lowest cosine to cpu {worst:.4}",
+                loaded.as_secs_f64(),
+                secs.join(" "),
+                new_lengths.as_secs_f64()
+            );
+        };
 
         let started = Instant::now();
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
-        let reference = cpu.embed(&texts, Some(1)).unwrap();
-        let cpu_load_and_run = started.elapsed();
-        let started = Instant::now();
-        cpu.embed(&texts, Some(1)).unwrap();
-        eprintln!(
-            "cpu: {:.2}s for {} texts (first run with load {:.2}s)",
-            started.elapsed().as_secs_f64(),
-            texts.len(),
-            cpu_load_and_run.as_secs_f64()
-        );
+        run("cpu", &mut cpu, started.elapsed());
+        drop(cpu);
 
-        let formats = [
-            ("MLProgram", ModelFormat::MLProgram),
-            ("NeuralNetwork", ModelFormat::NeuralNetwork),
-        ];
-        let units = [
-            ("All", ComputeUnits::All),
-            ("CPUAndGPU", ComputeUnits::CPUAndGPU),
-            ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
-        ];
-        for (format_name, format) in formats {
-            for (units_name, unit) in units {
-                let cache = tempfile::TempDir::new().unwrap();
-                let ep = ort::ep::CoreML::default()
-                    .with_model_format(format)
-                    .with_compute_units(unit)
-                    .with_model_cache_dir(cache.path().display())
-                    .build()
-                    .error_on_failure();
-                let name = format!("{format_name} + {units_name}");
-                let started = Instant::now();
-                let mut model = match load_with(spec, &files, device::Device::CoreMl, Some(ep)) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("{name}: load failed: {e:#}");
-                        continue;
-                    }
-                };
-                let loaded = started.elapsed();
-                // Twice: the first run may compile per shape.
-                let mut results = Vec::new();
-                for _ in 0..2 {
-                    let started = Instant::now();
-                    let mut failures = Vec::new();
-                    let mut worst = 1.0f32;
-                    for (text, cpu_vector) in texts.iter().zip(&reference) {
-                        match model.embed(std::slice::from_ref(text), Some(1)) {
-                            Ok(v) => worst = worst.min(cosine(&v[0], cpu_vector)),
-                            Err(e) => failures.push(format!("{} chars: {e}", text.len())),
-                        }
-                    }
-                    results.push((started.elapsed(), failures, worst));
+        let mut variants: Vec<(String, device::Device, fastembed::ExecutionProviderDispatch)> =
+            Vec::new();
+        // Each CoreML variant gets its own compiled-model cache, kept until
+        // the loads below are done.
+        #[cfg(target_os = "macos")]
+        let caches = tempfile::TempDir::new().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            for (format_name, format) in [
+                ("NeuralNetwork", ModelFormat::NeuralNetwork),
+                ("MLProgram", ModelFormat::MLProgram),
+            ] {
+                for (units_name, unit) in [
+                    ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
+                    ("CPUAndGPU", ComputeUnits::CPUAndGPU),
+                    ("All", ComputeUnits::All),
+                ] {
+                    let name = format!("coreml {format_name} + {units_name}");
+                    let cache = caches.path().join(name.replace(' ', "_"));
+                    let ep = ort::ep::CoreML::default()
+                        .with_model_format(format)
+                        .with_compute_units(unit)
+                        .with_model_cache_dir(cache.display())
+                        .build()
+                        .error_on_failure();
+                    variants.push((name, device::Device::CoreMl, ep));
                 }
-                let (first, first_failures, _) = &results[0];
-                let (second, failures, worst) = &results[1];
-                eprintln!(
-                    "{name}: load {:.2}s, run {:.2}s then {:.2}s, failed {} then {} of {}, \
-                     lowest cosine to cpu {worst:.4}",
-                    loaded.as_secs_f64(),
-                    first.as_secs_f64(),
-                    second.as_secs_f64(),
-                    first_failures.len(),
-                    failures.len(),
-                    texts.len()
-                );
-                for f in first_failures.iter().chain(failures).take(3) {
-                    eprintln!("    {f}");
-                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let ep = device::Device::DirectMl
+                .provider()
+                .expect("DirectML provider");
+            variants.push(("directml".to_string(), device::Device::DirectMl, ep));
+        }
+        for (name, device, ep) in variants {
+            let started = Instant::now();
+            match load_with(spec, &files, device, Some(ep)) {
+                Ok(mut model) => run(&name, &mut model, started.elapsed()),
+                Err(e) => println!("{name}: load failed: {e:#}"),
             }
         }
     }
