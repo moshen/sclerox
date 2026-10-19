@@ -362,7 +362,7 @@ struct Slot {
 
 enum Loaded {
     No,
-    Yes(Box<fastembed::TextEmbedding>),
+    Yes(Box<crate::embed::LocalModel>),
     Failed(Instant),
 }
 
@@ -415,7 +415,7 @@ impl State {
     fn with_model<R>(
         &self,
         spec: &'static ModelSpec,
-        f: impl FnOnce(&mut fastembed::TextEmbedding) -> R,
+        f: impl FnOnce(&mut crate::embed::LocalModel) -> R,
     ) -> std::result::Result<R, String> {
         let slot = self.slot(spec);
         let mut model = lock(&slot.model);
@@ -428,7 +428,12 @@ impl State {
             *model = self.load(&slot);
         }
         match &mut *model {
-            Loaded::Yes(m) => Ok(f(m)),
+            Loaded::Yes(m) => {
+                let result = f(m);
+                // Embedding may have moved it off a failing accelerator.
+                *lock(&slot.device) = m.device().name();
+                Ok(result)
+            }
             _ => Err(lock(&slot.error).clone().unwrap_or_default()),
         }
     }
@@ -442,7 +447,7 @@ impl State {
         let result = crate::embed::load_model(spec, true);
         let took = started.elapsed();
         let device = match &result {
-            Ok((_, device)) => device.name(),
+            Ok(model) => model.device().name(),
             Err(_) => "none",
         };
         let record = Load {
@@ -451,7 +456,8 @@ impl State {
             max_tokens: spec.max_tokens,
         };
         match result {
-            Ok((model, device)) => {
+            Ok(model) => {
+                let device = model.device();
                 *lock(&slot.device) = device.name();
                 let mb = rss_mb().saturating_sub(before);
                 log::info!(
@@ -573,11 +579,11 @@ impl State {
                 let _turn = self.gate.enter(lane);
                 // One at a time, as the in-process embedder runs them, so
                 // the vectors come out identical.
-                match self.with_model(spec, |m| m.embed(std::slice::from_ref(text), Some(1))) {
+                match self.with_model(spec, |m| m.embed(std::slice::from_ref(text))) {
                     Ok(Ok(v)) => vectors.extend(v),
                     Ok(Err(e)) => {
-                        log::error!("model server embedding failed: {e}");
-                        return Response::Error(format!("embedding failed: {e}"));
+                        log::error!("model server {e:#}");
+                        return Response::Error(format!("{e:#}"));
                     }
                     Err(e) => return Response::Error(e),
                 }

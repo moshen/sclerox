@@ -80,7 +80,7 @@ fn optional_in(ready: bool, lane: server::Lane) -> Option<Embedder> {
 /// Where an [`Embedder`] runs the model: here, on a device, or in the
 /// model server.
 enum Backend {
-    Local(Box<fastembed::TextEmbedding>, device::Device),
+    Local(Box<LocalModel>),
     Server(server::Client),
 }
 
@@ -117,9 +117,9 @@ impl Embedder {
     /// Load `spec` in-process, downloading its files into the sclerox model
     /// cache (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
     pub fn with_model(spec: &'static ModelSpec, lane: server::Lane) -> Result<Self> {
-        let (model, device) = load_model(spec, lane == server::Lane::Bulk)?;
+        let model = load_model(spec, lane == server::Lane::Bulk)?;
         Ok(Self {
-            backend: Backend::Local(Box::new(model), device),
+            backend: Backend::Local(Box::new(model)),
             spec,
             lane,
         })
@@ -134,7 +134,7 @@ impl Embedder {
     /// reports it. `None` when the server doesn't say.
     pub fn device(&self) -> Option<String> {
         match &self.backend {
-            Backend::Local(_, device) => Some(device.to_string()),
+            Backend::Local(model) => Some(model.device().to_string()),
             Backend::Server(_) => server::device_of(self.spec),
         }
     }
@@ -208,15 +208,13 @@ impl Embedder {
                 }
             }
             log::warn!("model server failed, loading the model in-process: {e:#}");
-            let (model, device) = load_model(self.spec, self.lane == server::Lane::Bulk)?;
-            self.backend = Backend::Local(Box::new(model), device);
+            let model = load_model(self.spec, self.lane == server::Lane::Bulk)?;
+            self.backend = Backend::Local(Box::new(model));
         }
-        let Backend::Local(model, _) = &mut self.backend else {
+        let Backend::Local(model) = &mut self.backend else {
             unreachable!("the server backend was just replaced");
         };
-        let rest = model
-            .embed(&texts[vectors.len()..], Some(1))
-            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+        let rest = model.embed(&texts[vectors.len()..])?;
         vectors.extend(rest);
         Ok(vectors)
     }
@@ -227,10 +225,11 @@ impl Embedder {
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.spec.document_prefix;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        let Backend::Local(model, _) = &mut self.backend else {
+        let Backend::Local(model) = &mut self.backend else {
             anyhow::bail!("batch embedding needs the model in-process");
         };
         model
+            .model
             .embed(&prefixed, None)
             .map_err(|e| anyhow::anyhow!("batch embedding failed: {e}"))
     }
@@ -290,23 +289,78 @@ pub fn ensure_downloaded(spec: &ModelSpec) -> Result<Vec<(&'static str, PathBuf)
     Ok(spec.files.iter().map(|f| f.path).zip(paths).collect())
 }
 
+/// A model loaded in this process, on a device.
+pub(crate) struct LocalModel {
+    model: fastembed::TextEmbedding,
+    device: device::Device,
+    spec: &'static ModelSpec,
+}
+
+/// Models whose accelerator failed to embed in this process, which load on
+/// the CPU from then on.
+static FAILED_ON: std::sync::Mutex<Vec<(&str, device::Device)>> = std::sync::Mutex::new(Vec::new());
+
+impl LocalModel {
+    pub(crate) fn device(&self) -> device::Device {
+        self.device
+    }
+
+    /// Embed `texts` one at a time (see [`Embedder::embed_each`]). An
+    /// accelerator can start yet fail on some inputs; then the model moves to
+    /// the CPU for good and embeds them there.
+    pub(crate) fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let failed = match self.model.embed(texts, Some(1)) {
+            Ok(vectors) => return Ok(vectors),
+            Err(e) => e,
+        };
+        if self.device == device::Device::Cpu {
+            anyhow::bail!("embedding failed: {failed}");
+        }
+        log::warn!(
+            "{} failed on {}, moving it to the cpu: {failed}",
+            self.spec.name,
+            self.device
+        );
+        FAILED_ON
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.spec.name, self.device));
+        let files = ensure_downloaded(self.spec)?;
+        self.model = load(self.spec, &files, device::Device::Cpu)
+            .with_context(|| format!("failed to load '{}' on the cpu", self.spec.name))?;
+        self.device = device::Device::Cpu;
+        self.model
+            .embed(texts, Some(1))
+            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
+    }
+}
+
 /// Load `spec` in this process, downloading its files first if needed, on
 /// the first device of `embed.device`'s [`device::candidates`] that starts.
 /// `long_lived` is for a model that will embed many texts: the model
 /// server's, or bulk work.
-pub(crate) fn load_model(
-    spec: &'static ModelSpec,
-    long_lived: bool,
-) -> Result<(fastembed::TextEmbedding, device::Device)> {
+pub(crate) fn load_model(spec: &'static ModelSpec, long_lived: bool) -> Result<LocalModel> {
     spec.check_supported()?;
-    let devices = device::candidates(device::configured(), spec, long_lived)?;
+    let mut devices = device::candidates(device::configured(), spec, long_lived)?;
+    {
+        let failed = FAILED_ON.lock().unwrap_or_else(|e| e.into_inner());
+        devices.retain(|d| !failed.contains(&(spec.name, *d)));
+    }
+    if devices.is_empty() {
+        // A named accelerator that failed: only the CPU is left.
+        devices.push(device::Device::Cpu);
+    }
     let files = ensure_downloaded(spec)?;
     let mut failed = None;
     for device in devices {
         match load(spec, &files, device) {
             Ok(model) => {
                 log::info!("loaded {} on {device}", spec.name);
-                return Ok((model, device));
+                return Ok(LocalModel {
+                    model,
+                    device,
+                    spec,
+                });
             }
             Err(e) => {
                 log::warn!("couldn't load {} on {device}: {e:#}", spec.name);
@@ -322,6 +376,16 @@ fn load(
     spec: &ModelSpec,
     files: &[(&'static str, PathBuf)],
     device: device::Device,
+) -> Result<fastembed::TextEmbedding> {
+    load_with(spec, files, device, device.provider())
+}
+
+/// [`load`] with `provider` in place of `device`'s own.
+fn load_with(
+    spec: &ModelSpec,
+    files: &[(&'static str, PathBuf)],
+    device: device::Device,
+    provider: Option<fastembed::ExecutionProviderDispatch>,
 ) -> Result<fastembed::TextEmbedding> {
     use fastembed::{
         InitOptionsUserDefined, OutputKey, QuantizationMode, TokenizerFiles,
@@ -374,7 +438,7 @@ fn load(
     }
 
     let mut options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
-    if let Some(ep) = device.provider() {
+    if let Some(ep) = provider {
         options = options.with_execution_providers(vec![ep]);
     }
     fastembed::TextEmbedding::try_new_from_user_defined(model_def, options)
@@ -556,6 +620,101 @@ mod tests {
                     "query {i} / passage {j}: got {got:.4}, int8 reference {}",
                     reference[i][j]
                 );
+            }
+        }
+    }
+
+    /// Which CoreML settings run full-precision Granite over texts of
+    /// varying length, how fast, and how close to the CPU. Run on an Apple
+    /// Silicon Mac:
+    ///   cargo test --release --lib coreml_variants -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: needs an Apple Silicon Mac and Granite fp32 (~195 MB)"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn coreml_variants() {
+        use ort::ep::coreml::{ComputeUnits, ModelFormat};
+        use std::time::Instant;
+
+        let spec = &models::GRANITE_SMALL_R2_FP32;
+        let files = ensure_downloaded(spec).unwrap();
+        // Short and long, mixed, since the failure is in resizing between
+        // sequence lengths. About 4 characters per token.
+        let sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
+        let texts: Vec<String> = [16, 600, 64, 4000, 8, 1500, 7800, 200, 32]
+            .iter()
+            .map(|&chars| sentence.repeat(chars / sentence.len() + 1)[..chars].to_string())
+            .collect();
+
+        let started = Instant::now();
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        let reference = cpu.embed(&texts, Some(1)).unwrap();
+        let cpu_load_and_run = started.elapsed();
+        let started = Instant::now();
+        cpu.embed(&texts, Some(1)).unwrap();
+        eprintln!(
+            "cpu: {:.2}s for {} texts (first run with load {:.2}s)",
+            started.elapsed().as_secs_f64(),
+            texts.len(),
+            cpu_load_and_run.as_secs_f64()
+        );
+
+        let formats = [
+            ("MLProgram", ModelFormat::MLProgram),
+            ("NeuralNetwork", ModelFormat::NeuralNetwork),
+        ];
+        let units = [
+            ("All", ComputeUnits::All),
+            ("CPUAndGPU", ComputeUnits::CPUAndGPU),
+            ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
+        ];
+        for (format_name, format) in formats {
+            for (units_name, unit) in units {
+                let cache = tempfile::TempDir::new().unwrap();
+                let ep = ort::ep::CoreML::default()
+                    .with_model_format(format)
+                    .with_compute_units(unit)
+                    .with_model_cache_dir(cache.path().display())
+                    .build()
+                    .error_on_failure();
+                let name = format!("{format_name} + {units_name}");
+                let started = Instant::now();
+                let mut model = match load_with(spec, &files, device::Device::CoreMl, Some(ep)) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("{name}: load failed: {e:#}");
+                        continue;
+                    }
+                };
+                let loaded = started.elapsed();
+                // Twice: the first run may compile per shape.
+                let mut results = Vec::new();
+                for _ in 0..2 {
+                    let started = Instant::now();
+                    let mut failures = Vec::new();
+                    let mut worst = 1.0f32;
+                    for (text, cpu_vector) in texts.iter().zip(&reference) {
+                        match model.embed(std::slice::from_ref(text), Some(1)) {
+                            Ok(v) => worst = worst.min(cosine(&v[0], cpu_vector)),
+                            Err(e) => failures.push(format!("{} chars: {e}", text.len())),
+                        }
+                    }
+                    results.push((started.elapsed(), failures, worst));
+                }
+                let (first, first_failures, _) = &results[0];
+                let (second, failures, worst) = &results[1];
+                eprintln!(
+                    "{name}: load {:.2}s, run {:.2}s then {:.2}s, failed {} then {} of {}, \
+                     lowest cosine to cpu {worst:.4}",
+                    loaded.as_secs_f64(),
+                    first.as_secs_f64(),
+                    second.as_secs_f64(),
+                    first_failures.len(),
+                    failures.len(),
+                    texts.len()
+                );
+                for f in first_failures.iter().chain(failures).take(3) {
+                    eprintln!("    {f}");
+                }
             }
         }
     }
