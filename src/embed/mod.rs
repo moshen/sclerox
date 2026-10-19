@@ -820,9 +820,9 @@ mod tests {
             .chars()
             .collect();
         let mut offset = 0;
-        let pieces: Vec<String> = (0..400)
+        let pieces: Vec<String> = (0..800)
             .map(|i| {
-                let chars = 40 + (i * 37) % 2400;
+                let chars = 40 + (i * 37) % 9000;
                 let piece: String = corpus.iter().cycle().skip(offset).take(chars).collect();
                 offset = (offset + chars) % corpus.len();
                 piece
@@ -855,14 +855,15 @@ mod tests {
                 .commit_from_memory(&onnx)
         };
 
-        for length in [128usize, 512] {
+        for length in [512usize, 1024, 2048] {
             // The texts that fit this length, as a bucket would hold them.
             let texts: Vec<&String> = pieces
                 .iter()
                 .zip(&counts)
-                .filter(|(_, &n)| n <= length && n > length / 4)
+                // Buckets double, so a text is at most half padding.
+                .filter(|(_, &n)| n <= length && n > length / 2)
                 .map(|(p, _)| p)
-                .take(60)
+                .take(40)
                 .collect();
             let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
             let reference = cpu.embed(&owned, Some(1)).unwrap();
@@ -904,10 +905,9 @@ mod tests {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
                 use ort::ep::coreml::{ComputeUnits, ModelFormat};
-                for (format_name, format) in [
-                    ("NeuralNetwork", ModelFormat::NeuralNetwork),
-                    ("MLProgram", ModelFormat::MLProgram),
-                ] {
+                // NeuralNetwork was two to three times slower at 128 and
+                // 512 tokens.
+                for (format_name, format) in [("MLProgram", ModelFormat::MLProgram)] {
                     for (units_name, unit) in [
                         ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
                         ("CPUAndGPU", ComputeUnits::CPUAndGPU),
