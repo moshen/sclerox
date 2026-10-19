@@ -691,8 +691,22 @@ mod tests {
             paths.len()
         );
 
+        // Each step is announced first, flushed, so a crash shows where.
+        let step = |what: &str| {
+            use std::io::Write;
+            print!("{what}... ");
+            let _ = std::io::stdout().flush();
+        };
+        step("loading fp32 on the cpu");
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
-        let reference = cpu.embed(&warm, Some(1)).unwrap();
+        println!("ok");
+        let mut reference = Vec::new();
+        for (n, text) in warm.iter().enumerate() {
+            step(&format!("reference {n} ({} chars)", text.chars().count()));
+            reference.extend(cpu.embed(std::slice::from_ref(text), Some(1)).unwrap());
+            print!("\r\x1b[K");
+        }
+        println!("reference vectors ok");
 
         // Several passes over the same texts, then one over lengths not
         // seen yet: a device that compiles per input shape is slow there.
