@@ -641,7 +641,24 @@ mod tests {
         // Lengths spread like stored text: mostly short memories and
         // code-sized chunks, some long ones, a few near the token limit.
         // Fixed seed, so every run and machine gets the same texts.
-        let sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
+        // Real text, the same on every machine: sclerox's own code and docs.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(root.join("src"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs" || x == "md"))
+            .collect();
+        paths.push(root.join("README.md"));
+        paths.sort();
+        let corpus: Vec<char> = paths
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .chars()
+            .collect();
+        let mut offset = 0;
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut lengths = |n: usize| -> Vec<usize> {
             (0..n)
@@ -658,14 +675,19 @@ mod tests {
                 })
                 .collect()
         };
-        let text = |chars: usize| sentence.repeat(chars / sentence.len() + 1)[..chars].to_string();
-        let warm: Vec<String> = lengths(100).into_iter().map(text).collect();
+        // Consecutive pieces of the corpus, so no two texts are the same.
+        let mut text = |chars: usize| -> String {
+            let piece: String = corpus.iter().cycle().skip(offset).take(chars).collect();
+            offset = (offset + chars) % corpus.len();
+            piece
+        };
+        let warm: Vec<String> = lengths(100).into_iter().map(&mut text).collect();
         let fresh: Vec<String> = lengths(100).into_iter().map(|n| text(n + 1)).collect();
-        let chars: usize = warm.iter().map(String::len).sum();
+        let chars: usize = warm.iter().map(|t| t.chars().count()).sum();
         println!(
-            "{} texts, {chars} chars per pass (about {} tokens)",
+            "{} texts from {} files, {chars} chars per pass",
             warm.len(),
-            chars / 4
+            paths.len()
         );
 
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
