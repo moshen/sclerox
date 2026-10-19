@@ -626,7 +626,8 @@ mod tests {
 
     /// How fast full-precision Granite embeds on this machine's accelerator
     /// once loaded and reused, as the model server uses it, against the
-    /// CPU. Run on an Apple Silicon Mac or on Windows:
+    /// CPU running it and running int8 Granite, what sclerox uses without an
+    /// accelerator. Run on an Apple Silicon Mac or on Windows:
     ///   cargo test --release --lib accelerator_benchmark -- --ignored --nocapture 2>/dev/null
     /// (results go to stdout; CoreML logs a lot to stderr).
     #[test]
@@ -731,8 +732,17 @@ mod tests {
 
         let started = Instant::now();
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
-        run("cpu", &mut cpu, started.elapsed());
+        run("cpu fp32", &mut cpu, started.elapsed());
         drop(cpu);
+
+        // What sclerox runs without an accelerator: Granite int8 on the CPU.
+        // Another model, so its cosine to fp32 shows only that it's close.
+        let int8 = &models::GRANITE_SMALL_R2;
+        let int8_files = ensure_downloaded(int8).unwrap();
+        let started = Instant::now();
+        let mut cpu_int8 = load(int8, &int8_files, device::Device::Cpu).unwrap();
+        run("cpu int8 (other model)", &mut cpu_int8, started.elapsed());
+        drop(cpu_int8);
 
         let mut variants: Vec<(String, device::Device, fastembed::ExecutionProviderDispatch)> =
             Vec::new();
@@ -784,7 +794,7 @@ mod tests {
     /// texts padded to a fixed number of tokens, run by a session whose
     /// input shape never changes, against the CPU embedding them unpadded as
     /// sclerox does. Padding must leave the vectors as they were. Runs the
-    /// CPU anywhere and CoreML on an Apple Silicon Mac:
+    /// CPU anywhere, CoreML on an Apple Silicon Mac and DirectML on Windows:
     ///   cargo test --release --lib fixed_length_benchmark -- --ignored --nocapture 2>/dev/null
     #[test]
     #[ignore = "benchmark: needs Granite fp32 (~195 MB); takes minutes"]
@@ -893,9 +903,9 @@ mod tests {
                 .map(|t| tokenizer.encode(t.as_str(), true).unwrap())
                 .collect();
 
-            // Only the CPU off a Mac, so nothing is pushed there.
+            // Only the CPU off a Mac or Windows, so nothing is pushed there.
             #[cfg_attr(
-                not(all(target_os = "macos", target_arch = "aarch64")),
+                not(any(all(target_os = "macos", target_arch = "aarch64"), windows)),
                 allow(unused_mut)
             )]
             let mut variants: Vec<(
@@ -923,6 +933,8 @@ mod tests {
                     }
                 }
             }
+            #[cfg(windows)]
+            variants.push(("directml".to_string(), device::Device::DirectMl.provider()));
             for (name, ep) in variants {
                 let started = Instant::now();
                 let mut session = match fixed_session(length, ep) {
