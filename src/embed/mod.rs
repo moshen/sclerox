@@ -780,6 +780,199 @@ mod tests {
         }
     }
 
+    /// Whether fixing the input length lets an accelerator beat the CPU:
+    /// texts padded to a fixed number of tokens, run by a session whose
+    /// input shape never changes, against the CPU embedding them unpadded as
+    /// sclerox does. Padding must leave the vectors as they were. Runs the
+    /// CPU anywhere and CoreML on an Apple Silicon Mac:
+    ///   cargo test --release --lib fixed_length_benchmark -- --ignored --nocapture 2>/dev/null
+    #[test]
+    #[ignore = "benchmark: needs Granite fp32 (~195 MB); takes minutes"]
+    fn fixed_length_benchmark() {
+        use std::time::Instant;
+        use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
+
+        let spec = &models::GRANITE_SMALL_R2_FP32;
+        let files = ensure_downloaded(spec).unwrap();
+        let read = |name: &str| {
+            let (_, path) = files.iter().find(|(f, _)| *f == name).unwrap();
+            std::fs::read(path).unwrap()
+        };
+        let onnx = read(spec.onnx_file);
+        let weights = read(spec.external_data[0]);
+        let weights_name = Path::new(spec.external_data[0]).file_name().unwrap();
+
+        // Real text, the same on every machine: sclerox's own code and docs,
+        // cut into pieces of many lengths.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(root.join("src"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs" || x == "md"))
+            .collect();
+        paths.sort();
+        let corpus: Vec<char> = paths
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .chars()
+            .collect();
+        let mut offset = 0;
+        let pieces: Vec<String> = (0..400)
+            .map(|i| {
+                let chars = 40 + (i * 37) % 2400;
+                let piece: String = corpus.iter().cycle().skip(offset).take(chars).collect();
+                offset = (offset + chars) % corpus.len();
+                piece
+            })
+            .collect();
+
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        let tokens = |text: &str| {
+            let mut t = cpu.tokenizer.clone();
+            t.with_padding(None);
+            t.encode(text, true).unwrap().len()
+        };
+        let counts: Vec<usize> = pieces.iter().map(|p| tokens(p)).collect();
+
+        // A session whose inputs are always 1 x `length` tokens.
+        let fixed_session = |length: usize, ep: Option<fastembed::ExecutionProviderDispatch>| {
+            let mut builder = ort::session::Session::builder().unwrap();
+            if let Some(ep) = ep {
+                builder = builder.with_execution_providers([ep]).unwrap();
+            }
+            builder
+                .with_dimension_override("batch_size", 1)
+                .unwrap()
+                .with_dimension_override("sequence_length", length as i64)
+                .unwrap()
+                .with_dimension_override("total_sequence_length", length as i64)
+                .unwrap()
+                .with_external_initializer_file_in_memory(weights_name, weights.clone().into())
+                .unwrap()
+                .commit_from_memory(&onnx)
+        };
+
+        for length in [128usize, 512] {
+            // The texts that fit this length, as a bucket would hold them.
+            let texts: Vec<&String> = pieces
+                .iter()
+                .zip(&counts)
+                .filter(|(_, &n)| n <= length && n > length / 4)
+                .map(|(p, _)| p)
+                .take(60)
+                .collect();
+            let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+            let reference = cpu.embed(&owned, Some(1)).unwrap();
+            let started = Instant::now();
+            for _ in 0..3 {
+                cpu.embed(&owned, Some(1)).unwrap();
+            }
+            println!(
+                "\n{length} tokens, {} texts: cpu unpadded {:.2}s per pass",
+                texts.len(),
+                started.elapsed().as_secs_f64() / 3.0
+            );
+
+            let mut tokenizer = cpu.tokenizer.clone();
+            tokenizer.with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::Fixed(length),
+                ..cpu.tokenizer.get_padding().cloned().unwrap_or_default()
+            }));
+            tokenizer
+                .with_truncation(Some(TruncationParams {
+                    max_length: length,
+                    ..Default::default()
+                }))
+                .unwrap();
+            let encoded: Vec<_> = texts
+                .iter()
+                .map(|t| tokenizer.encode(t.as_str(), true).unwrap())
+                .collect();
+
+            // Only the CPU off a Mac, so nothing is pushed there.
+            #[cfg_attr(
+                not(all(target_os = "macos", target_arch = "aarch64")),
+                allow(unused_mut)
+            )]
+            let mut variants: Vec<(
+                String,
+                Option<fastembed::ExecutionProviderDispatch>,
+            )> = vec![("cpu fixed".to_string(), None)];
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                use ort::ep::coreml::{ComputeUnits, ModelFormat};
+                for (format_name, format) in [
+                    ("NeuralNetwork", ModelFormat::NeuralNetwork),
+                    ("MLProgram", ModelFormat::MLProgram),
+                ] {
+                    for (units_name, unit) in [
+                        ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
+                        ("CPUAndGPU", ComputeUnits::CPUAndGPU),
+                        ("All", ComputeUnits::All),
+                    ] {
+                        let ep = ort::ep::CoreML::default()
+                            .with_model_format(format)
+                            .with_compute_units(unit)
+                            .with_static_input_shapes(true)
+                            .build()
+                            .error_on_failure();
+                        variants.push((format!("coreml {format_name} + {units_name}"), Some(ep)));
+                    }
+                }
+            }
+            for (name, ep) in variants {
+                let started = Instant::now();
+                let mut session = match fixed_session(length, ep) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("  {name}: load failed: {e}");
+                        continue;
+                    }
+                };
+                let loaded = started.elapsed();
+                let mut embed = |encoding: &tokenizers::Encoding| -> Result<Vec<f32>> {
+                    let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+                    let mask: Vec<i64> = encoding
+                        .get_attention_mask()
+                        .iter()
+                        .map(|&x| x as i64)
+                        .collect();
+                    let outputs = session.run(ort::inputs![
+                        "input_ids" => ort::value::Tensor::from_array(([1usize, length], ids))?,
+                        "attention_mask" => ort::value::Tensor::from_array(([1usize, length], mask))?,
+                    ])?;
+                    let (_, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+                    // CLS pooling: the first token's state.
+                    Ok(hidden[..spec.dim].to_vec())
+                };
+                // One pass to warm up, then three timed.
+                let mut worst = 1.0f32;
+                let mut failed = 0;
+                for (e, r) in encoded.iter().zip(&reference) {
+                    match embed(e) {
+                        Ok(v) => worst = worst.min(cosine(&v, r)),
+                        Err(_) => failed += 1,
+                    }
+                }
+                let started = Instant::now();
+                for _ in 0..3 {
+                    for e in &encoded {
+                        let _ = embed(e);
+                    }
+                }
+                println!(
+                    "  {name:<36} load {:>5.2}s | {:.2}s per pass | failed {failed} | \
+                     lowest cosine to cpu {worst:.4}",
+                    loaded.as_secs_f64(),
+                    started.elapsed().as_secs_f64() / 3.0
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "downloads MiniLM (~90 MB) into the model cache"]
     fn minilm_still_loads() {
