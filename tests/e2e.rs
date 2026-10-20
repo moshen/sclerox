@@ -1179,12 +1179,13 @@ fn global_search_finds_all_types() {
     assert!(out.contains("[todo]"), "missing todo result");
     assert!(out.contains("[research]"), "missing research result");
 
-    // Every hit says when it last changed (meetings: when they were added).
-    for line in out.lines().filter(|l| l.starts_with('[')) {
-        let stamp = if line.starts_with("[meeting]") {
-            "(created "
-        } else {
-            "(updated "
+    // Every hit with a time says when it last changed, or for meetings and
+    // repos when they were added. Code hits have none.
+    for line in out.lines() {
+        let stamp = match line.split(']').next().unwrap_or("") {
+            "[memory" | "[person" | "[project" | "[todo" | "[research" => "(updated ",
+            "[meeting" | "[repo" => "(created ",
+            _ => continue,
         };
         assert!(line.contains(stamp), "no {stamp}...) on: {line}");
     }
@@ -1221,7 +1222,12 @@ fn global_search_json_output() {
     assert!(types.contains(&"Memory"), "missing Memory type");
     assert!(types.contains(&"Todo"), "missing Todo type");
     for r in parsed.as_array().unwrap() {
-        for field in ["created_at", "updated_at"] {
+        let fields: &[&str] = match r["type"].as_str() {
+            Some("Meeting" | "Repo") => &["created_at"],
+            Some("Symbol" | "CodeChunk") => &[],
+            _ => &["created_at", "updated_at"],
+        };
+        for field in fields {
             assert!(r[field].is_string(), "{field} missing from {r}");
         }
     }
