@@ -495,6 +495,32 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
+/// Cosine of two stored embedding blobs, or `None` when either is unreadable
+/// or they came from models of different widths.
+///
+/// Vectors are written normalized, so this is usually a plain dot product, but
+/// it divides by the norms anyway rather than trusting that invariant.
+pub fn cosine_of_bytes(a: &[u8], b: &[u8]) -> Option<f32> {
+    let decode = |v: &[u8]| -> Option<Vec<f32>> {
+        (!v.is_empty() && v.len().is_multiple_of(4)).then(|| {
+            v.as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
+                .collect()
+        })
+    };
+    let (a, b) = (decode(a)?, decode(b)?);
+    if a.len() != b.len() {
+        return None;
+    }
+    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let (na, nb) = (norm(&a), norm(&b));
+    (na > 0.0 && nb > 0.0).then(|| dot / (na * nb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

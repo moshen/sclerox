@@ -163,11 +163,22 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     // real memory hits. `semantic` sits at the memory band's edge instead;
     // hits are still ranked and capped by `search.semantic_limit`.
     //
-    // Dedup, on real memory pairs: unrelated pairs score median 0.770 (p99
-    // 0.851), so `dedup_cosine` at 0.90 is a safe near-duplicate floor. Real
-    // duplicates score 0.953-0.985 but some distinct pairs reach 0.961, so no
-    // cutoff is clean. `merge` at 0.97 merges only the most confident
-    // duplicates and leaves 0.90-0.97 to `sclerox memory conflicts`.
+    // Dedup, over all 9.4M pairs of a 4,343-memory knowledge base: unrelated
+    // pairs score median 0.770, p99 0.851, p99.9 0.896. Reading 86 of the
+    // pairs this flagged, by band: 0 duplicates in 14 read at 0.90-0.92,
+    // 1 in 8 at 0.92-0.93, 6 in 12 at 0.93-0.95, 6 in 8 at 0.95-0.96,
+    // 19 in 22 at 0.96-0.97, and 30 in 30 above 0.97. Granite scores pairs on
+    // the same topic but stating different facts in the low 0.90s routinely
+    // (two memories naming *different* account ids for one service scored
+    // 0.9003), which is why `dedup_cosine` sits at 0.93 rather than 0.90:
+    // below it the flags were ~5% real and made up 58% of the review queue.
+    // Hand-marked `memory_distinct` pairs top out at 0.9634, so `merge` at
+    // 0.97 merges only the most confident duplicates and leaves 0.93-0.97 to
+    // `sclerox memory conflicts`.
+    //
+    // Raising this floor does not weaken key reuse: a distiller-declared
+    // `supersedes` is validated against the keys it was shown, not against
+    // these candidates, so the model-driven merge path is unaffected.
     //
     // The bands also overlap across queries: "Rust" scores an unrelated
     // "Python for scripts" memory 0.73, above some true matches elsewhere. What
@@ -175,7 +186,7 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     // every probe), hence `top_margin`.
     thresholds: Thresholds {
         semantic: 0.72,
-        dedup_cosine: 0.90,
+        dedup_cosine: 0.93,
         merge: Some(0.97),
         context: 0.70,
         top_margin: Some(0.05),

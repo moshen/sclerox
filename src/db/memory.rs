@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use super::{embedding_to_bytes, fts, Database};
+use super::{cosine_of_bytes, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -717,7 +717,55 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn memory_conflicts(&self) -> Result<Vec<MemoryConflict>> {
+    /// Re-score every scored conflict against the vectors its two memories
+    /// hold now, then drop the ones below `floor`.
+    ///
+    /// The stored score is a snapshot from the moment the pair was flagged.
+    /// Editing either memory moves the real score away from it in both
+    /// directions, so deleting on the snapshot would discard pairs that have
+    /// since become duplicates. Rows with no score, or whose memories are
+    /// missing a vector or carry one of another width, are left alone: there
+    /// is nothing to compare, and silence is not evidence that they agree.
+    fn rescore_conflicts(&self, floor: f64) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, a.embedding, b.embedding
+               FROM memory_conflicts c
+               JOIN memory a ON a.id = c.memory_id
+               JOIN memory b ON b.id = c.matched_id
+              WHERE c.score IS NOT NULL
+                AND a.embedding IS NOT NULL
+                AND b.embedding IS NOT NULL",
+        )?;
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (id, a, b) in rows {
+            let Some(score) = cosine_of_bytes(&a, &b) else {
+                continue;
+            };
+            if (score as f64) < floor {
+                self.conn
+                    .execute("DELETE FROM memory_conflicts WHERE id = ?1", params![id])?;
+            } else {
+                self.conn.execute(
+                    "UPDATE memory_conflicts SET score = ?1 WHERE id = ?2",
+                    params![score as f64, id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flagged near-duplicate pairs, after dropping the ones that are no
+    /// longer conflicts.
+    ///
+    /// `floor` is the caller's current `dedup.cosine_threshold`. Pairs are
+    /// re-scored against the vectors the two memories hold now and dropped
+    /// below it, so lowering the threshold stops flagging new noise *and*
+    /// clears the noise already queued. Pass `None` to read the queue without
+    /// re-scoring it.
+    pub fn memory_conflicts(&self, floor: Option<f64>) -> Result<Vec<MemoryConflict>> {
         self.conn.execute(
             "DELETE FROM memory_conflicts WHERE id IN (
                  SELECT c.id FROM memory_conflicts c
@@ -731,6 +779,9 @@ impl Database {
                           AND d.hi_id = MAX(c.memory_id, c.matched_id)))",
             [],
         )?;
+        if let Some(floor) = floor {
+            self.rescore_conflicts(floor)?;
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, memory_id, matched_id, score, created_at
              FROM memory_conflicts ORDER BY created_at, id",
@@ -1322,19 +1373,19 @@ mod tests {
     #[test]
     fn distinct_marking_clears_and_suppresses_the_conflict() {
         let (db, a, b) = db_with_conflicting_pair();
-        assert_eq!(db.memory_conflicts().unwrap().len(), 1);
+        assert_eq!(db.memory_conflicts(None).unwrap().len(), 1);
 
         db.memory_distinct_add(a, b, Some("different facts"))
             .unwrap();
         assert!(
-            db.memory_conflicts().unwrap().is_empty(),
+            db.memory_conflicts(None).unwrap().is_empty(),
             "marking distinct clears the existing flag"
         );
 
         // And a later re-flag of the same pair does not come back.
         db.memory_conflict_add(a, b, Some(0.9)).unwrap();
         assert!(
-            db.memory_conflicts().unwrap().is_empty(),
+            db.memory_conflicts(None).unwrap().is_empty(),
             "a re-flagged distinct pair stays suppressed"
         );
     }
@@ -1345,6 +1396,85 @@ mod tests {
         db.memory_distinct_add(b, a, None).unwrap();
         assert!(db.memory_is_distinct(a, b).unwrap());
         assert!(db.memory_is_distinct(b, a).unwrap());
+    }
+
+    /// Two unit vectors `theta` apart, as a stand-in for a memory pair at a
+    /// known cosine.
+    fn pair_at(db: &Database, cos: f32) -> (i64, i64) {
+        let mut a = vec![0.0f32; 384];
+        a[0] = 1.0;
+        let mut b = vec![0.0f32; 384];
+        b[0] = cos;
+        b[1] = (1.0 - cos * cos).sqrt();
+        db.memory_set("alpha", "first fact", "project", None)
+            .unwrap();
+        db.memory_set("beta", "second fact", "project", None)
+            .unwrap();
+        db.memory_set_embedding("alpha", &a).unwrap();
+        db.memory_set_embedding("beta", &b).unwrap();
+        (
+            db.memory_get("alpha").unwrap().unwrap().id,
+            db.memory_get("beta").unwrap().unwrap().id,
+        )
+    }
+
+    #[test]
+    fn conflicts_below_the_floor_are_dropped_on_read() {
+        let db = Database::open_in_memory().unwrap();
+        let (a, b) = pair_at(&db, 0.91);
+        db.memory_conflict_add(a, b, Some(0.91)).unwrap();
+
+        assert_eq!(
+            db.memory_conflicts(None).unwrap().len(),
+            1,
+            "no floor, kept"
+        );
+        assert_eq!(db.memory_conflicts(Some(0.90)).unwrap().len(), 1, "above");
+        assert!(
+            db.memory_conflicts(Some(0.93)).unwrap().is_empty(),
+            "0.91 does not clear a 0.93 floor"
+        );
+    }
+
+    /// The stored score is a snapshot. Editing a memory moves the real score,
+    /// so the floor has to be applied to what the vectors say now: this pair
+    /// was filed at 0.88 and would be swept on its stored score, but it reads
+    /// 0.96 today and is a duplicate worth showing.
+    #[test]
+    fn a_stale_low_score_is_refreshed_rather_than_swept() {
+        let db = Database::open_in_memory().unwrap();
+        let (a, b) = pair_at(&db, 0.96);
+        db.memory_conflict_add(a, b, Some(0.88)).unwrap();
+
+        let conflicts = db.memory_conflicts(Some(0.93)).unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "kept on its current score, not its old one"
+        );
+        let score = conflicts[0].score.expect("re-scored");
+        assert!(
+            (score - 0.96).abs() < 0.001,
+            "stored score refreshed to {score}, expected ~0.96"
+        );
+    }
+
+    /// No score means it was never scored, not that it scored low.
+    #[test]
+    fn unscored_conflicts_survive_the_floor() {
+        let db = Database::open_in_memory().unwrap();
+        let (a, b) = pair_at(&db, 0.10);
+        db.memory_conflict_add(a, b, None).unwrap();
+        assert_eq!(db.memory_conflicts(Some(0.93)).unwrap().len(), 1);
+    }
+
+    /// Nothing to compare: a pair is never dropped for want of a vector.
+    #[test]
+    fn conflicts_without_vectors_survive_the_floor() {
+        let (db, a, b) = db_with_conflicting_pair();
+        assert!(db.memory_needing_embedding().unwrap().len() >= 2);
+        let _ = (a, b);
+        assert_eq!(db.memory_conflicts(Some(0.99)).unwrap().len(), 1);
     }
 
     #[test]
@@ -1359,7 +1489,7 @@ mod tests {
 
         // Removing restores normal behaviour: the pair can be flagged again.
         db.memory_conflict_add(a, b, Some(0.9)).unwrap();
-        assert_eq!(db.memory_conflicts().unwrap().len(), 1);
+        assert_eq!(db.memory_conflicts(None).unwrap().len(), 1);
         assert!(
             !db.memory_distinct_remove(a, b).unwrap(),
             "second remove is a no-op"
@@ -1523,7 +1653,7 @@ mod tests {
         db.memory_conflict_add(a, b, Some(0.91)).unwrap();
         db.memory_conflict_add(a, b, Some(0.99)).unwrap(); // duplicate pair: no-op
 
-        let conflicts = db.memory_conflicts().unwrap();
+        let conflicts = db.memory_conflicts(None).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].memory.key, "a");
         assert_eq!(conflicts[0].matched.key, "b");
@@ -1532,7 +1662,7 @@ mod tests {
         // Resolving one side (supersede) makes the conflict disappear.
         db.memory_supersede("b", "a-and-b", "fact one, merged", "project", "manual")
             .unwrap();
-        assert!(db.memory_conflicts().unwrap().is_empty());
+        assert!(db.memory_conflicts(None).unwrap().is_empty());
     }
 
     #[test]

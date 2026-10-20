@@ -95,9 +95,12 @@ scale (`sclerox config show` prints the effective values).
 `search.code_text_limit` caps the code lines `code search` and `sclerox search`
 show for matching the query word for word (default 20).
 `search.semantic_margin` drops semantic hits scoring more than that below the
-best hit for the query (Granite default 0.05; `1.0` turns it off). Granite small does
-not merge near-duplicates on score until its thresholds are calibrated; it
-flags them in `sclerox memory conflicts` instead.
+best hit for the query (Granite default 0.05; `1.0` turns it off).
+Distillation merges a near-duplicate into the memory it matched only at or
+above `dedup.merge_threshold` (Granite 0.97, where every pair read was a real
+duplicate). Between `dedup.cosine_threshold` and that, a score cannot tell a
+restated fact from a similar but distinct one, so both are kept and flagged in
+`sclerox memory conflicts` instead.
 
 ## Model server
 

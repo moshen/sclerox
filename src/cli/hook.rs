@@ -197,7 +197,9 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
     // 2b. Unresolved memory conflicts - near-duplicate clusters distillation
     // refused to auto-merge. One line each; they need a content-aware human
     // (or agent) decision, which is exactly what a session can provide.
-    if let Ok(conflicts) = db.memory_conflicts() {
+    if let Ok(conflicts) =
+        db.memory_conflicts(Some(crate::config::settings().dedup_cosine_threshold()))
+    {
         if !conflicts.is_empty() {
             let mut section = format!(
                 "### Memory conflicts ({}) - resolve with `sclerox memory conflicts`\n",
