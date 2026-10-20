@@ -36,6 +36,13 @@ pub fn research_line(inv: &Investigation) -> String {
     format!("{checkbox} {id_col} {}  ({})", inv.name, inv.slug)
 }
 
+/// When a search hit was last changed, appended to its line:
+/// `(updated <at>)`, or `(created <at>)` for records never updated. `at` is
+/// shown as stored (UTC).
+pub fn stamp(label: &str, at: &str) -> String {
+    format!("({label} {at})")
+}
+
 /// Map a status string to its checkbox.
 pub fn status_checkbox(status: &str) -> &'static str {
     match status {

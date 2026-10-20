@@ -247,7 +247,8 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                         println!("No matches for: {query}");
                     } else {
                         for t in &fts_results {
-                            print_todo_line(t);
+                            let at = crate::cli::format::stamp("updated", &t.updated_at);
+                            println!("{}  {at}", crate::cli::format::todo_line(t));
                         }
                         if !semantic.is_empty() {
                             if !fts_results.is_empty() {
@@ -255,9 +256,10 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                             }
                             for r in &semantic {
                                 println!(
-                                    "{}  ({:.0}% match)",
+                                    "{}  ({:.0}% match)  {}",
                                     crate::cli::format::todo_line(&r.todo),
-                                    r.score * 100.0
+                                    r.score * 100.0,
+                                    crate::cli::format::stamp("updated", &r.todo.updated_at)
                                 );
                                 println!("  > {}", truncate(&r.matched_chunk, 100));
                             }

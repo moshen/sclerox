@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::cli::format::{code_chunk_lines, code_location, symbol_line};
+use crate::cli::format::{code_chunk_lines, code_location, stamp, symbol_line};
 use crate::db::Database;
 use crate::output::{print_output, OutputFormat};
 use crate::search::{global_search, SearchResult};
@@ -27,20 +27,34 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
         }
         for r in &results {
             match r {
-                SearchResult::Memory { key, snippet, .. } => {
-                    println!("[memory] {} - {}", key, snippet);
+                SearchResult::Memory {
+                    key,
+                    snippet,
+                    updated_at,
+                    ..
+                } => {
+                    let at = stamp("updated", updated_at);
+                    println!("[memory] {key} - {snippet}  {at}");
                 }
-                SearchResult::Person { id, name } => {
-                    println!("[person] #{id} {name}");
+                SearchResult::Person {
+                    id,
+                    name,
+                    updated_at,
+                    ..
+                } => {
+                    let at = stamp("updated", updated_at);
+                    println!("[person] #{id} {name}  {at}");
                 }
                 SearchResult::Meeting {
                     id,
                     title,
                     date,
                     snippet,
+                    created_at,
                 } => {
                     let date = date.as_deref().unwrap_or("no date");
-                    println!("[meeting] #{id} [{date}] {title}");
+                    let at = stamp("created", created_at);
+                    println!("[meeting] #{id} [{date}] {title}  {at}");
                     if !snippet.is_empty() {
                         println!("          {snippet}");
                     }
@@ -49,20 +63,26 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     id,
                     name,
                     description,
+                    updated_at,
+                    ..
                 } => {
                     let desc = description.as_deref().unwrap_or("-");
-                    println!("[project] #{id} {name} - {desc}");
+                    let at = stamp("updated", updated_at);
+                    println!("[project] #{id} {name} - {desc}  {at}");
                 }
                 SearchResult::Todo {
                     id,
                     title,
                     status,
                     category,
+                    updated_at,
+                    ..
                 } => {
                     let cb = crate::cli::format::status_checkbox(status);
                     let id_col = format!("{:<5}", format!("#{id}"));
                     let cat_col = format!("{:<9}", format!("[{category}]"));
-                    println!("[todo] {cb} {id_col} {cat_col} {title}");
+                    let at = stamp("updated", updated_at);
+                    println!("[todo] {cb} {id_col} {cat_col} {title}  {at}");
                 }
                 SearchResult::Investigation {
                     id,
@@ -70,10 +90,13 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     slug,
                     status,
                     snippet,
+                    updated_at,
+                    ..
                 } => {
                     let cb = crate::cli::format::status_checkbox(status);
                     let id_col = format!("{:<5}", format!("#{id}"));
-                    println!("[research] {cb} {id_col} {name}  ({slug})");
+                    let at = stamp("updated", updated_at);
+                    println!("[research] {cb} {id_col} {name}  ({slug})  {at}");
                     if !snippet.is_empty() {
                         println!("           {snippet}");
                     }
@@ -83,9 +106,11 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     name,
                     path,
                     description,
+                    created_at,
                 } => {
                     let desc = description.as_deref().unwrap_or("-");
-                    println!("[repo] #{id} {name} ({path}) - {desc}");
+                    let at = stamp("created", created_at);
+                    println!("[repo] #{id} {name} ({path}) - {desc}  {at}");
                 }
                 SearchResult::Symbol {
                     repo_path,

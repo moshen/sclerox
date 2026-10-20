@@ -148,7 +148,8 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
 
             for m in &fts_hits {
                 let date = m.meeting_date.as_deref().unwrap_or("no date");
-                println!("#{} [{}] {}", m.id, date, m.title);
+                let at = crate::cli::format::stamp("created", &m.created_at);
+                println!("#{} [{}] {}  {at}", m.id, date, m.title);
             }
 
             // Semantic results - appended, deduped against FTS hits
@@ -167,11 +168,12 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                     for r in &semantic {
                         let date = r.meeting.meeting_date.as_deref().unwrap_or("no date");
                         println!(
-                            "#{} [{}] {}  ({:.0}% match)",
+                            "#{} [{}] {}  ({:.0}% match)  {}",
                             r.meeting.id,
                             date,
                             r.meeting.title,
-                            r.score * 100.0
+                            r.score * 100.0,
+                            crate::cli::format::stamp("created", &r.meeting.created_at)
                         );
                         println!("  > {}", truncate(&r.matched_chunk, 100));
                     }

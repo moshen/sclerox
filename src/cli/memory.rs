@@ -325,7 +325,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     println!("No matches for: {query}");
                 } else {
                     for e in &results {
-                        println!("[{}] {} - {}", e.memory_type, e.key, truncate(&e.value, 80));
+                        println!(
+                            "[{}] {} - {}  {}",
+                            e.memory_type,
+                            e.key,
+                            truncate(&e.value, 80),
+                            crate::cli::format::stamp("updated", &e.updated_at)
+                        );
                     }
                     println!("\n{} results", results.len());
                 }
