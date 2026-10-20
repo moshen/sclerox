@@ -159,7 +159,8 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                     println!("No matches for: {query}");
                 } else {
                     for p in &results {
-                        println!("#{} {}", p.id, p.name);
+                        let at = crate::cli::format::stamp("updated", &p.updated_at);
+                        println!("#{} {}  {at}", p.id, p.name);
                     }
                 }
             });

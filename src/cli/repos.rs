@@ -155,7 +155,8 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|r| r.id).collect();
 
             for r in &fts_hits {
-                println!("#{} {} - {}", r.id, r.name, r.path);
+                let at = crate::cli::format::stamp("created", &r.created_at);
+                println!("#{} {} - {}  {at}", r.id, r.name, r.path);
                 if let Some(desc) = &r.description {
                     println!("   {}", truncate(desc, 100));
                 }
@@ -176,10 +177,11 @@ pub fn run(db: &Database, cmd: RepoCommand) -> Result<()> {
                     }
                     for r in &semantic {
                         println!(
-                            "#{} {}  ({:.0}% match)",
+                            "#{} {}  ({:.0}% match)  {}",
                             r.repo.id,
                             r.repo.name,
-                            r.score * 100.0
+                            r.score * 100.0,
+                            crate::cli::format::stamp("created", &r.repo.created_at)
                         );
                         println!("   {}", r.repo.path);
                         if let Some(desc) = &r.repo.description {

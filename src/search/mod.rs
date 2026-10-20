@@ -11,27 +11,36 @@ pub enum SearchResult {
         id: i64,
         key: String,
         snippet: String,
+        created_at: String,
+        updated_at: String,
     },
     Person {
         id: i64,
         name: String,
+        created_at: String,
+        updated_at: String,
     },
     Meeting {
         id: i64,
         title: String,
         date: Option<String>,
         snippet: String,
+        created_at: String,
     },
     Project {
         id: i64,
         name: String,
         description: Option<String>,
+        created_at: String,
+        updated_at: String,
     },
     Todo {
         id: i64,
         title: String,
         status: String,
         category: String,
+        created_at: String,
+        updated_at: String,
     },
     Investigation {
         id: i64,
@@ -39,12 +48,15 @@ pub enum SearchResult {
         slug: String,
         status: String,
         snippet: String,
+        created_at: String,
+        updated_at: String,
     },
     Repo {
         id: i64,
         name: String,
         path: String,
         description: Option<String>,
+        created_at: String,
     },
     Symbol {
         repo_name: String,
@@ -98,6 +110,8 @@ pub fn global_search(
             id: m.id,
             key: m.key,
             snippet: truncate(&m.value, 120),
+            created_at: m.created_at,
+            updated_at: m.updated_at,
         });
     }
     if let Some(ref qe) = query_emb {
@@ -109,6 +123,8 @@ pub fn global_search(
                     id: r.entry.id,
                     key: r.entry.key,
                     snippet: truncate(&r.entry.value, 120),
+                    created_at: r.entry.created_at,
+                    updated_at: r.entry.updated_at,
                 });
             }
         }
@@ -118,6 +134,8 @@ pub fn global_search(
         results.push(SearchResult::Person {
             id: p.id,
             name: p.name,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
         });
     }
 
@@ -136,6 +154,7 @@ pub fn global_search(
             title: m.title,
             date: m.meeting_date,
             snippet,
+            created_at: m.created_at,
         });
     }
     if let Some(ref qe) = query_emb {
@@ -148,6 +167,7 @@ pub fn global_search(
                     title: r.meeting.title,
                     date: r.meeting.meeting_date,
                     snippet: truncate(&r.matched_chunk, 120),
+                    created_at: r.meeting.created_at,
                 });
             }
         }
@@ -158,6 +178,8 @@ pub fn global_search(
             id: p.id,
             name: p.name,
             description: p.description,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
         });
     }
 
@@ -169,6 +191,8 @@ pub fn global_search(
             title: t.title,
             status: t.status,
             category: t.category,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
         });
     }
     if let Some(ref qe) = query_emb {
@@ -181,6 +205,8 @@ pub fn global_search(
                     title: r.todo.title,
                     status: r.todo.status,
                     category: r.todo.category,
+                    created_at: r.todo.created_at,
+                    updated_at: r.todo.updated_at,
                 });
             }
         }
@@ -201,6 +227,8 @@ pub fn global_search(
             slug: i.slug,
             status: i.status,
             snippet,
+            created_at: i.created_at,
+            updated_at: i.updated_at,
         });
     }
     if let Some(ref qe) = query_emb {
@@ -216,6 +244,8 @@ pub fn global_search(
                     slug: r.investigation.slug,
                     status: r.investigation.status,
                     snippet: truncate(&r.matched_chunk, 120),
+                    created_at: r.investigation.created_at,
+                    updated_at: r.investigation.updated_at,
                 });
             }
         }
@@ -231,6 +261,7 @@ pub fn global_search(
             name: r.name,
             path: r.path,
             description: r.description,
+            created_at: r.created_at,
         });
     }
     if let Some(ref qe) = query_emb {
@@ -243,6 +274,7 @@ pub fn global_search(
                     name: r.repo.name,
                     path: r.repo.path,
                     description: r.repo.description,
+                    created_at: r.repo.created_at,
                 });
             }
         }

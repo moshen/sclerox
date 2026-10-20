@@ -1178,6 +1178,27 @@ fn global_search_finds_all_types() {
     assert!(out.contains("[project]"), "missing project result");
     assert!(out.contains("[todo]"), "missing todo result");
     assert!(out.contains("[research]"), "missing research result");
+
+    // Every hit says when it last changed (meetings: when they were added).
+    for line in out.lines().filter(|l| l.starts_with('[')) {
+        let stamp = if line.starts_with("[meeting]") {
+            "(created "
+        } else {
+            "(updated "
+        };
+        assert!(line.contains(stamp), "no {stamp}...) on: {line}");
+    }
+    for (args, stamp) in [
+        (&["memory", "search", "auth"][..], "(updated "),
+        (&["people", "search", "auth"][..], "(updated "),
+        (&["meeting", "search", "auth"][..], "(created "),
+        (&["project", "search", "auth"][..], "(updated "),
+        (&["todo", "search", "auth"][..], "(updated "),
+        (&["research", "search", "auth"][..], "(updated "),
+    ] {
+        let out = e.run(args);
+        assert!(out.contains(stamp), "{args:?} shows no {stamp}...):\n{out}");
+    }
 }
 
 #[test]
@@ -1199,6 +1220,11 @@ fn global_search_json_output() {
         .collect();
     assert!(types.contains(&"Memory"), "missing Memory type");
     assert!(types.contains(&"Todo"), "missing Todo type");
+    for r in parsed.as_array().unwrap() {
+        for field in ["created_at", "updated_at"] {
+            assert!(r[field].is_string(), "{field} missing from {r}");
+        }
+    }
 }
 
 // ─── Migration ────────────────────────────────────────────────────────────────

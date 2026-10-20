@@ -165,7 +165,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
 
             for inv in &fts_hits {
-                println!("{}", research_line(inv));
+                let at = crate::cli::format::stamp("updated", &inv.updated_at);
+                println!("{}  {at}", research_line(inv));
                 if let Some(f) = &inv.findings {
                     println!("  {}", truncate(f, 100));
                 }
@@ -186,9 +187,10 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     }
                     for r in &semantic {
                         println!(
-                            "{} ({:.0}% match)",
+                            "{} ({:.0}% match)  {}",
                             research_line(&r.investigation),
-                            r.score * 100.0
+                            r.score * 100.0,
+                            crate::cli::format::stamp("updated", &r.investigation.updated_at)
                         );
                         println!("  > {}", truncate(&r.matched_chunk, 100));
                     }

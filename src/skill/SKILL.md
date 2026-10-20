@@ -123,7 +123,9 @@ list` at session start - they're already visible. Use `sclerox memory get <key>`
 
 ## Reference
 
-Global search across everything: `sclerox search "<query>"`. For an area's full
+Global search across everything: `sclerox search "<query>"`. Each hit shows when
+it last changed, in UTC: `(updated ...)`, or `(created ...)` for meetings and
+repos. When two hits disagree, the newer one is usually current. For an area's full
 commands and its workflow, read the matching file on demand:
 
 - [reference/memory.md](reference/memory.md) - set/get/search, stale, supersede, review, distill, import
