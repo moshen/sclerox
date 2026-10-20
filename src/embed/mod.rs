@@ -587,9 +587,9 @@ mod tests {
                 .with_dimension_override("sequence_length", length as i64)?
                 .with_dimension_override("total_sequence_length", length as i64)?;
         }
-        Ok(builder
+        builder
             .with_external_initializer_file_in_memory(weights.0, weights.1.into())?
-            .commit_from_memory(onnx)?)
+            .commit_from_memory(onnx)
     }
 
     /// Granite's vector for one encoded text from a [`bench_session`]: the
