@@ -557,6 +557,63 @@ mod tests {
         dot / (norm(a) * norm(b))
     }
 
+    /// A session of its own on `onnx` and its external `weights`, for the
+    /// benchmarks: on `ep`, with inputs fixed at 1 x `length` tokens when
+    /// given. `directml` sets the session options DirectML needs, as
+    /// fastembed does; `no_fusion` also turns off its graph fusion.
+    fn bench_session(
+        onnx: &[u8],
+        weights: (&std::ffi::OsStr, &'static [u8]),
+        length: Option<usize>,
+        ep: Option<fastembed::ExecutionProviderDispatch>,
+        directml: bool,
+        no_fusion: bool,
+    ) -> ort::Result<ort::session::Session> {
+        let mut builder = ort::session::Session::builder()?;
+        if let Some(ep) = ep {
+            builder = builder.with_execution_providers([ep])?;
+        }
+        if directml {
+            builder = builder
+                .with_memory_pattern(false)?
+                .with_parallel_execution(false)?;
+        }
+        if no_fusion {
+            builder = builder.with_config_entry("ep.dml.disable_graph_fusion", "1")?;
+        }
+        if let Some(length) = length {
+            builder = builder
+                .with_dimension_override("batch_size", 1)?
+                .with_dimension_override("sequence_length", length as i64)?
+                .with_dimension_override("total_sequence_length", length as i64)?;
+        }
+        Ok(builder
+            .with_external_initializer_file_in_memory(weights.0, weights.1.into())?
+            .commit_from_memory(onnx)?)
+    }
+
+    /// Granite's vector for one encoded text from a [`bench_session`]: the
+    /// first token's state (CLS pooling).
+    fn bench_embed(
+        session: &mut ort::session::Session,
+        encoding: &tokenizers::Encoding,
+        dim: usize,
+    ) -> Result<Vec<f32>> {
+        let length = encoding.get_ids().len();
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+        let mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let outputs = session.run(ort::inputs![
+            "input_ids" => ort::value::Tensor::from_array(([1usize, length], ids))?,
+            "attention_mask" => ort::value::Tensor::from_array(([1usize, length], mask))?,
+        ])?;
+        let (_, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+        Ok(hidden[..dim].to_vec())
+    }
+
     /// Granite through fastembed must match onnxruntime in Python on the same
     /// int8 model. Cosines all near 0.6-0.7 would mean mean pooling crept in
     /// where CLS belongs.
@@ -700,6 +757,15 @@ mod tests {
         step("loading fp32 on the cpu");
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
         println!("ok");
+        // For the sessions of sclerox's own below: the CPU's tokenizer, which
+        // cuts at the model's limit, without its padding.
+        #[cfg(windows)]
+        let (tokenizer, pad) = {
+            let mut tokenizer = cpu.tokenizer.clone();
+            let pad = tokenizer.get_padding().cloned().unwrap_or_default();
+            tokenizer.with_padding(None);
+            (tokenizer, pad)
+        };
         let mut reference = Vec::new();
         for (n, text) in warm.iter().enumerate() {
             step(&format!("reference {n} ({} chars)", text.chars().count()));
@@ -710,43 +776,56 @@ mod tests {
 
         // Several passes over the same texts, then one over lengths not
         // seen yet: a device that compiles per input shape is slow there.
-        let run = |name: &str, model: &mut fastembed::TextEmbedding, loaded: Duration| {
-            let mut passes = Vec::new();
-            let mut worst = 1.0f32;
-            let mut failed = 0;
-            for _ in 0..4 {
+        let run =
+            |name: &str, embed: &mut dyn FnMut(&String) -> Result<Vec<f32>>, loaded: Duration| {
+                let mut passes = Vec::new();
+                let mut worst = 1.0f32;
+                let mut failed = 0;
+                for _ in 0..4 {
+                    let started = Instant::now();
+                    for (text, cpu_vector) in warm.iter().zip(&reference) {
+                        match embed(text) {
+                            Ok(v) => worst = worst.min(cosine(&v, cpu_vector)),
+                            Err(_) => failed += 1,
+                        }
+                    }
+                    passes.push(started.elapsed());
+                }
                 let started = Instant::now();
-                for (text, cpu_vector) in warm.iter().zip(&reference) {
-                    match model.embed(std::slice::from_ref(text), Some(1)) {
-                        Ok(v) => worst = worst.min(cosine(&v[0], cpu_vector)),
-                        Err(_) => failed += 1,
+                for text in &fresh {
+                    if embed(text).is_err() {
+                        failed += 1;
                     }
                 }
-                passes.push(started.elapsed());
-            }
-            let started = Instant::now();
-            for text in &fresh {
-                if model.embed(std::slice::from_ref(text), Some(1)).is_err() {
-                    failed += 1;
-                }
-            }
-            let new_lengths = started.elapsed();
-            let secs: Vec<String> = passes
-                .iter()
-                .map(|d| format!("{:.2}", d.as_secs_f64()))
-                .collect();
-            println!(
-                "{name:<36} load {:>5.2}s | passes {} s | new lengths {:.2}s | \
+                let new_lengths = started.elapsed();
+                let secs: Vec<String> = passes
+                    .iter()
+                    .map(|d| format!("{:.2}", d.as_secs_f64()))
+                    .collect();
+                println!(
+                    "{name:<36} load {:>5.2}s | passes {} s | new lengths {:.2}s | \
                  failed {failed} | lowest cosine to cpu {worst:.4}",
-                loaded.as_secs_f64(),
-                secs.join(" "),
-                new_lengths.as_secs_f64()
-            );
-        };
+                    loaded.as_secs_f64(),
+                    secs.join(" "),
+                    new_lengths.as_secs_f64()
+                );
+            };
+
+        // One text at a time through fastembed, as sclerox embeds.
+        fn one(
+            model: &mut fastembed::TextEmbedding,
+        ) -> impl FnMut(&String) -> Result<Vec<f32>> + '_ {
+            |text| {
+                let mut v = model
+                    .embed(std::slice::from_ref(text), Some(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(v.remove(0))
+            }
+        }
 
         let started = Instant::now();
         let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
-        run("cpu fp32", &mut cpu, started.elapsed());
+        run("cpu fp32", &mut one(&mut cpu), started.elapsed());
         drop(cpu);
 
         // What sclerox runs without an accelerator: Granite int8 on the CPU.
@@ -755,7 +834,11 @@ mod tests {
         let int8_files = ensure_downloaded(int8).unwrap();
         let started = Instant::now();
         let mut cpu_int8 = load(int8, &int8_files, device::Device::Cpu).unwrap();
-        run("cpu int8 (other model)", &mut cpu_int8, started.elapsed());
+        run(
+            "cpu int8 (other model)",
+            &mut one(&mut cpu_int8),
+            started.elapsed(),
+        );
         drop(cpu_int8);
 
         let mut variants: Vec<(String, device::Device, fastembed::ExecutionProviderDispatch)> =
@@ -798,8 +881,75 @@ mod tests {
         for (name, device, ep) in variants {
             let started = Instant::now();
             match load_with(spec, &files, device, Some(ep)) {
-                Ok(mut model) => run(&name, &mut model, started.elapsed()),
+                Ok(mut model) => run(&name, &mut one(&mut model), started.elapsed()),
                 Err(e) => println!("{name}: load failed: {e:#}"),
+            }
+        }
+
+        // DirectML without graph fusion, in sessions of sclerox's own, since
+        // fastembed can't turn it off: first at each text's own length, then
+        // padded to the smallest of a few fixed lengths that holds it, one
+        // session per length.
+        #[cfg(windows)]
+        {
+            let read = |name: &str| {
+                let (_, path) = files.iter().find(|(f, _)| *f == name).unwrap();
+                std::fs::read(path).unwrap()
+            };
+            let onnx = read(spec.onnx_file);
+            let weights: &'static [u8] = Box::leak(read(spec.external_data[0]).into_boxed_slice());
+            let weights = (
+                Path::new(spec.external_data[0]).file_name().unwrap(),
+                weights,
+            );
+            let encode = |text: &String| {
+                tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(anyhow::Error::msg)
+            };
+            let directml = || device::Device::DirectMl.provider();
+
+            let name = "directml, no graph fusion";
+            let started = Instant::now();
+            match bench_session(&onnx, weights, None, directml(), true, true) {
+                Ok(mut session) => run(
+                    name,
+                    &mut |text| bench_embed(&mut session, &encode(text)?, spec.dim),
+                    started.elapsed(),
+                ),
+                Err(e) => println!("{name}: load failed: {e}"),
+            }
+
+            // The model reads at most 2048 tokens, so the last length holds
+            // every text.
+            const LENGTHS: [usize; 5] = [128, 256, 512, 1024, 2048];
+            let name = "directml, no fusion, fixed lengths";
+            let started = Instant::now();
+            let sessions: ort::Result<Vec<_>> = LENGTHS
+                .iter()
+                .map(|&n| bench_session(&onnx, weights, Some(n), directml(), true, true))
+                .collect();
+            match sessions {
+                Ok(mut sessions) => run(
+                    name,
+                    &mut |text| {
+                        let mut encoding = encode(text)?;
+                        let i = LENGTHS
+                            .iter()
+                            .position(|&n| encoding.len() <= n)
+                            .context("text longer than the longest length")?;
+                        encoding.pad(
+                            LENGTHS[i],
+                            pad.pad_id,
+                            pad.pad_type_id,
+                            &pad.pad_token,
+                            pad.direction,
+                        );
+                        bench_embed(&mut sessions[i], &encoding, spec.dim)
+                    },
+                    started.elapsed(),
+                ),
+                Err(e) => println!("{name}: load failed: {e}"),
             }
         }
     }
@@ -823,7 +973,7 @@ mod tests {
             std::fs::read(path).unwrap()
         };
         let onnx = read(spec.onnx_file);
-        let weights = read(spec.external_data[0]);
+        let weights: &'static [u8] = Box::leak(read(spec.external_data[0]).into_boxed_slice());
         let weights_name = Path::new(spec.external_data[0]).file_name().unwrap();
 
         // Real text, the same on every machine: sclerox's own code and docs,
@@ -860,41 +1010,6 @@ mod tests {
             t.encode(text, true).unwrap().len()
         };
         let counts: Vec<usize> = pieces.iter().map(|p| tokens(p)).collect();
-
-        // A session whose inputs are always 1 x `length` tokens.
-        // `directml` sets the session options DirectML needs, as fastembed
-        // does; `no_fusion` also turns off its graph fusion.
-        let fixed_session = |length: usize,
-                             ep: Option<fastembed::ExecutionProviderDispatch>,
-                             directml: bool,
-                             no_fusion: bool| {
-            let mut builder = ort::session::Session::builder().unwrap();
-            if let Some(ep) = ep {
-                builder = builder.with_execution_providers([ep]).unwrap();
-            }
-            if directml {
-                builder = builder
-                    .with_memory_pattern(false)
-                    .unwrap()
-                    .with_parallel_execution(false)
-                    .unwrap();
-            }
-            if no_fusion {
-                builder = builder
-                    .with_config_entry("ep.dml.disable_graph_fusion", "1")
-                    .unwrap();
-            }
-            builder
-                .with_dimension_override("batch_size", 1)
-                .unwrap()
-                .with_dimension_override("sequence_length", length as i64)
-                .unwrap()
-                .with_dimension_override("total_sequence_length", length as i64)
-                .unwrap()
-                .with_external_initializer_file_in_memory(weights_name, weights.clone().into())
-                .unwrap()
-                .commit_from_memory(&onnx)
-        };
 
         for length in [512usize, 1024, 2048] {
             // The texts that fit this length, as a bucket would hold them.
@@ -982,7 +1097,15 @@ mod tests {
             }
             for (name, ep, directml, no_fusion) in variants {
                 let started = Instant::now();
-                let mut session = match fixed_session(length, ep, directml, no_fusion) {
+                let session = bench_session(
+                    &onnx,
+                    (weights_name, weights),
+                    Some(length),
+                    ep,
+                    directml,
+                    no_fusion,
+                );
+                let mut session = match session {
                     Ok(s) => s,
                     Err(e) => {
                         println!("  {name}: load failed: {e}");
@@ -990,21 +1113,7 @@ mod tests {
                     }
                 };
                 let loaded = started.elapsed();
-                let mut embed = |encoding: &tokenizers::Encoding| -> Result<Vec<f32>> {
-                    let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-                    let mask: Vec<i64> = encoding
-                        .get_attention_mask()
-                        .iter()
-                        .map(|&x| x as i64)
-                        .collect();
-                    let outputs = session.run(ort::inputs![
-                        "input_ids" => ort::value::Tensor::from_array(([1usize, length], ids))?,
-                        "attention_mask" => ort::value::Tensor::from_array(([1usize, length], mask))?,
-                    ])?;
-                    let (_, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-                    // CLS pooling: the first token's state.
-                    Ok(hidden[..spec.dim].to_vec())
-                };
+                let mut embed = |e| bench_embed(&mut session, e, spec.dim);
                 // One pass to warm up, then three timed.
                 let mut worst = 1.0f32;
                 let mut failed = 0;
