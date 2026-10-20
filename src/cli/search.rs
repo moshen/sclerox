@@ -142,3 +142,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
     });
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "search_live_eval.rs"]
+mod live_eval;

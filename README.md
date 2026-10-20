@@ -95,6 +95,9 @@ sclerox memory import --agent claude    # import from Claude Code auto-memory fi
 
 ### `sclerox search <query>`
 Global full-text search across memory, people, meetings, projects, todos, investigations, and code symbols.
+Results come in one list, best first: by cosine similarity to the query,
+keyword matches included, then people, projects, symbols and anything else
+without a stored vector. Up to `search.semantic_limit` (25) semantic hits per type.
 
 ### `sclerox code search [--repo <name>] <query>`
 Search symbols across all indexed repos. `--repo` filters by repo name substring.

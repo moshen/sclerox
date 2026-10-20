@@ -245,7 +245,7 @@ impl Default for SearchSettings {
     fn default() -> Self {
         Self {
             semantic_threshold: None,
-            semantic_limit: 5,
+            semantic_limit: 25,
             semantic_margin: None,
         }
     }
@@ -503,7 +503,7 @@ impl Settings {
             self.embed.model = crate::embed::models::DEFAULT_MODEL.to_string();
         }
 
-        require_positive("search.semantic_limit", &mut self.search.semantic_limit, 5);
+        require_positive("search.semantic_limit", &mut self.search.semantic_limit, 25);
         require_positive(
             "memory.max_value_chars",
             &mut self.memory.max_value_chars,
@@ -851,7 +851,7 @@ mod tests {
     fn defaults_when_empty() {
         let s = Settings::from_toml_str("").unwrap();
         assert_eq!(s.search.semantic_threshold, None);
-        assert_eq!(s.search.semantic_limit, 5);
+        assert_eq!(s.search.semantic_limit, 25);
         assert_eq!(s.dedup.cosine_threshold, None);
         assert_eq!(s.embed.model, "granite-small-r2");
         assert_eq!(s.memory.max_value_chars, 800);
@@ -871,7 +871,7 @@ semantic_threshold = 0.7
         assert_eq!(s.search.semantic_threshold, Some(0.7));
         assert_eq!(s.semantic_threshold(), 0.7);
         // untouched keys keep defaults
-        assert_eq!(s.search.semantic_limit, 5);
+        assert_eq!(s.search.semantic_limit, 25);
         assert_eq!(s.dedup.cosine_threshold, None);
     }
 
@@ -1029,7 +1029,7 @@ semantic_threshold = 0.7
     fn validate_repairs_zero_counts() {
         let mut s = Settings::from_toml_str("[search]\nsemantic_limit = 0\n").unwrap();
         s.validate();
-        assert_eq!(s.search.semantic_limit, 5);
+        assert_eq!(s.search.semantic_limit, 25);
     }
 
     #[test]
