@@ -289,17 +289,23 @@ impl<'a> RepoIndexer<'a> {
             // text, for full-text search only: no symbols, chunks or vectors,
             // so lockfiles and generated data don't flood semantic search.
             // Over the size cap it is more likely data than prose, and skipped
-            // before it is read.
+            // before it is read. One indexed before that no longer qualifies
+            // (grown, or no longer text) is dropped from the index.
             let lang = detect_language(path);
             if lang.is_none()
                 && std::fs::metadata(path)
                     .map_or(true, |m| m.len() > max_tree_sitter_bytes() as u64)
             {
+                repo_db.remove_file(&rel_path)?;
                 continue;
             }
 
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
+                Err(_) if lang.is_none() => {
+                    repo_db.remove_file(&rel_path)?; // not UTF-8, so not text
+                    continue;
+                }
                 Err(_) => {
                     // A file the old chunker cut, or the text backfill needs,
                     // that can't be read now keeps its old rows, so leave
@@ -313,7 +319,8 @@ impl<'a> RepoIndexer<'a> {
             };
 
             if lang.is_none() && source.contains('\0') {
-                continue; // valid UTF-8, but binary
+                repo_db.remove_file(&rel_path)?; // valid UTF-8, but binary
+                continue;
             }
 
             // For very large files, skip tree-sitter to avoid unbounded memory
@@ -1095,6 +1102,29 @@ mod tests {
         // Unchanged on the next run.
         let again = RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
         assert_eq!((again.files_indexed, again.skipped), (0, 4));
+
+        // Files that stop being plain text, or outgrow the cap, leave the
+        // index; one that qualifies again comes back.
+        std::fs::write(p.join("ci.yml"), b"zebra\0binary").unwrap();
+        std::fs::write(p.join("notes.txt"), b"zebra caf\xe9\n").unwrap();
+        std::fs::write(
+            p.join("Dockerfile"),
+            format!("FROM zebra{}", "x".repeat(DEFAULT_MAX_TREE_SITTER_BYTES)),
+        )
+        .unwrap();
+        RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        let paths = || -> Vec<String> {
+            rdb.list_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        assert_eq!(paths(), ["Cargo.toml"]);
+        assert_eq!(rdb.search_text(p, "zebra", 20).unwrap().len(), 1);
+        std::fs::write(p.join("notes.txt"), "zebra notes\n").unwrap();
+        RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        assert_eq!(paths(), ["Cargo.toml", "notes.txt"]);
     }
 
     #[test]

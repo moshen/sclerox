@@ -285,6 +285,20 @@ impl RepoDb {
         Ok(out)
     }
 
+    /// Drop the file at `path` from the index: its row (so its hash, and an
+    /// unchanged file is indexed afresh if it qualifies again), its symbols
+    /// and chunks (by cascade) and its full text. Does nothing for a path not
+    /// in `files`.
+    pub fn remove_file(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = (SELECT id FROM files WHERE path = ?1)",
+            params![path],
+        )?;
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
