@@ -332,21 +332,26 @@ impl RepoDb {
                       (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
                       files_fts.rank",
         )?;
+        // Every read must resolve inside the repo; see below.
+        let Ok(root) = root.canonicalize() else {
+            return Ok(Vec::new());
+        };
         let mut rows = stmt.query(params![fts_query, phrase_query])?;
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
             let file_path: String = row.get(0)?;
-            // Stored paths are repo-relative; one that would leave the repo
-            // (a tampered or shipped repo.db) is never read.
-            let inside = Path::new(&file_path)
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)));
-            if !inside {
-                log::warn!("skipping indexed path outside the repo: {file_path}");
+            // A path that resolves outside the repo is never read: a `../`
+            // or absolute one from a tampered or shipped repo.db, or an
+            // indexed file since replaced by a symlink pointing out.
+            let Ok(target) = root.join(&file_path).canonicalize() else {
+                continue;
+            };
+            if !target.starts_with(&root) {
+                log::warn!("skipping indexed path that resolves outside the repo: {file_path}");
                 continue;
             }
-            let Ok(source) = std::fs::read_to_string(root.join(&file_path)) else {
+            let Ok(source) = std::fs::read_to_string(&target) else {
                 continue;
             };
             // Lines holding every term; those with the terms as one phrase
@@ -863,6 +868,34 @@ mod tests {
         let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
         db.delete_file_data(id).unwrap();
         assert!(lines("frobnicate").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_text_does_not_follow_a_symlink_out_of_the_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "frobnicate secret\n").unwrap();
+        std::fs::write(root.path().join("inner.txt"), "frobnicate inside\n").unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        for path in ["a.rs", "in.rs"] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, "frobnicate secret inside\n")
+                .unwrap();
+        }
+        // Indexed files since replaced by symlinks: one out of the repo, one
+        // to another file inside it.
+        std::os::unix::fs::symlink(&secret, root.path().join("a.rs")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("inner.txt"), root.path().join("in.rs"))
+            .unwrap();
+        let found: Vec<String> = db
+            .search_text(root.path(), "frobnicate", 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(found, ["frobnicate inside"]);
     }
 
     #[test]
