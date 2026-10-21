@@ -28,7 +28,7 @@ pub enum RepoCommand {
     },
     /// List all indexed repositories
     List,
-    /// Search repos by name/description (FTS + semantic combined)
+    /// Search repos by name/description/path (FTS + semantic combined)
     Search { query: String },
     /// Show indexed files and symbols for a repo
     Show {
@@ -182,7 +182,7 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
 
         RepoCommand::Search { query } => {
             db.repo_prune_gone()?;
-            // FTS on name/description first
+            // Keyword (FTS + substring) on name/description/path first
             let fts_hits = db.repo_search(&query)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|r| r.id).collect();
 

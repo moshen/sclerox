@@ -64,15 +64,19 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Projects whose name or description matches `query` in full text (word
+    /// prefixes) or holds it as a substring.
     pub fn project_search(&self, query: &str) -> Result<Vec<Project>> {
-        let query = fts::sanitize(query);
+        let fts_query = fts::sanitize(query);
+        let like_pat = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
             "SELECT id, name, description, links, created_at, updated_at
              FROM projects
              WHERE id IN (SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1)
+                OR name LIKE ?2 ESCAPE '\\' OR description LIKE ?2 ESCAPE '\\'
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![query], row_to_project)?;
+        let rows = stmt.query_map(params![fts_query, like_pat], row_to_project)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -293,6 +297,11 @@ mod tests {
         let results = db.project_search("auth").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Auth Overhaul");
+
+        // A mid-word substring matches too.
+        let results = db.project_search("board").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Dashboard v2");
     }
 
     #[test]

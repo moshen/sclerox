@@ -67,6 +67,15 @@ pub enum SearchResult {
         file_path: String,
         start_line: i64,
     },
+    /// A line of an indexed file holding every term of the query (substring,
+    /// any case): the full-text tier of code search.
+    CodeText {
+        repo_name: String,
+        repo_path: String,
+        file_path: String,
+        line: i64,
+        text: String,
+    },
     /// A semantically-matched code chunk (not a named symbol) from a repo's
     /// indexed content - catches comments, strings, and logic FTS symbol search
     /// misses.
@@ -98,6 +107,7 @@ pub fn global_search(
     semantic_threshold: f32,
     semantic_margin: Option<f32>,
     semantic_limit: usize,
+    code_text_limit: usize,
 ) -> Result<Vec<SearchResult>> {
     let hits = search_hits(
         db,
@@ -105,6 +115,7 @@ pub fn global_search(
         semantic_threshold,
         semantic_margin,
         semantic_limit,
+        code_text_limit,
     )?;
     Ok(rank(hits).into_iter().map(|h| h.result).collect())
 }
@@ -127,6 +138,8 @@ pub fn rank(mut hits: Vec<Hit>) -> Vec<Hit> {
 /// `semantic_threshold` and capping each entity type at `semantic_limit`.
 /// With a `semantic_margin`, hits more than that far below the best hit of
 /// their entity type are dropped too (see `embed::models::semantic_cutoff`).
+/// Code is also searched word for word, up to `code_text_limit` lines across
+/// all repos (see [`code_text_hits`]).
 /// The tunables are passed in so this library function stays config-free.
 pub fn search_hits(
     db: &Database,
@@ -134,6 +147,7 @@ pub fn search_hits(
     semantic_threshold: f32,
     semantic_margin: Option<f32>,
     semantic_limit: usize,
+    code_text_limit: usize,
 ) -> Result<Vec<Hit>> {
     use crate::db::ScoredTable;
 
@@ -386,9 +400,10 @@ pub fn search_hits(
         }
     }
 
-    // Fan out to all registered repo DBs: FTS symbol search always, plus a
-    // semantic code-chunk pass (ranked globally across repos) when embeddings
-    // are available.
+    // Fan out to all registered repo DBs: symbol and full-text search always,
+    // plus a semantic code-chunk pass (ranked globally across repos) when
+    // embeddings are available.
+    let mut code_text = Vec::new();
     let mut code_chunks: Vec<(
         f32,
         crate::db::repos::RepoEntry,
@@ -428,6 +443,7 @@ pub fn search_hits(
                 },
             });
         }
+        code_text_hits(&mut code_text, &repo, &repo_db, query, code_text_limit);
         if let Some(ref qe) = query_emb {
             for c in repo_db
                 .similar_chunks(qe, semantic_limit)
@@ -439,6 +455,10 @@ pub fn search_hits(
             }
         }
     }
+    results.extend(code_text.into_iter().map(|result| Hit {
+        score: None,
+        result,
+    }));
     // Rank code chunks across all repos and keep the global top N, dropping
     // any too far below the best of them.
     let cut = cutoff(&mut code_chunks.iter().map(|(s, _, _)| *s));
@@ -460,6 +480,33 @@ pub fn search_hits(
     }
 
     Ok(results)
+}
+
+/// Add `repo`'s lines holding `query` word for word to `out`, as
+/// [`SearchResult::CodeText`], until `out` holds `limit`. Repos are taken in
+/// turn, so the cap is shared across all of them. A failed lookup is logged
+/// and leaves the other search tiers running.
+pub fn code_text_hits(
+    out: &mut Vec<SearchResult>,
+    repo: &crate::db::repos::RepoEntry,
+    repo_db: &crate::index::repo_db::RepoDb,
+    query: &str,
+    limit: usize,
+) {
+    let room = limit.saturating_sub(out.len());
+    if room == 0 {
+        return;
+    }
+    match repo_db.search_text(std::path::Path::new(&repo.path), query, room) {
+        Ok(lines) => out.extend(lines.into_iter().map(|m| SearchResult::CodeText {
+            repo_name: repo.name.clone(),
+            repo_path: repo.path.clone(),
+            file_path: m.file_path,
+            line: m.line,
+            text: m.text,
+        })),
+        Err(e) => log::error!("full-text search failed for repo '{}': {e:#}", repo.name),
+    }
 }
 
 #[cfg(test)]
@@ -518,7 +565,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = global_search(&db, "Rust", 0.45, None, 5).unwrap();
+        let results = global_search(&db, "Rust", 0.45, None, 5, 20).unwrap();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",
@@ -536,6 +583,7 @@ mod tests {
                 SearchResult::Investigation { .. } => "investigation",
                 SearchResult::Repo { .. } => "repo",
                 SearchResult::Symbol { .. } => "symbol",
+                SearchResult::CodeText { .. } => "code-text",
                 SearchResult::CodeChunk { .. } => "code",
             })
             .collect();

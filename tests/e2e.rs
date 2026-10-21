@@ -934,6 +934,43 @@ fn symbol_hits_print_the_same_full_path_everywhere() {
     }
 }
 
+#[test]
+fn code_text_is_found_word_for_word_without_embeddings() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "//! Retries the flaky upstream.\nconst BACKOFF_MS: u64 = 250;\n\nfn go() {\n    sleep(BACKOFF_MS);\n}\n",
+    )
+    .unwrap();
+    e.run(&["repo", "index", "--no-embed", dir.path().to_str().unwrap()]);
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+
+    for args in [
+        &["code", "search", "flaky upstream"][..],
+        &["search", "flaky upstream"][..],
+    ] {
+        let out = e.run(args);
+        assert!(
+            out.contains(&format!("{}/lib.rs:1", root.display()))
+                && out.contains("//! Retries the flaky upstream."),
+            "{args:?} printed:\n{out}"
+        );
+    }
+
+    // A mid-identifier substring finds every line using it.
+    let out = e.run(&["code", "search", "--output", "json", "ckoff_m"]);
+    let hits: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let lines: Vec<i64> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["type"] == "CodeText")
+        .map(|h| h["line"].as_i64().unwrap())
+        .collect();
+    assert_eq!(lines, [2, 5], "{out}");
+}
+
 /// (chunks, chunks without a vector) in a repo's index.
 fn chunk_counts(repo: &std::path::Path) -> (i64, i64) {
     let conn = rusqlite::Connection::open(repo.join(".sclerox/repo.db")).unwrap();

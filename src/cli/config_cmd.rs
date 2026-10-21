@@ -142,6 +142,7 @@ pub fn config_template() -> String {
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
          # semantic_limit = {sem_lim}                # max semantic hits per entity type\n\
          # semantic_margin = {sem_margin}            # drop hits this far below the best one; 1.0 = off\n\
+         # code_text_limit = {code_text_lim}               # max code lines matching the query word for word\n\
          \n\
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
@@ -203,6 +204,7 @@ pub fn config_template() -> String {
         model_thresholds = model_thresholds_doc(),
         sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
+        code_text_lim = d.search.code_text_limit,
         // MiniLM has no margin; show Granite's as the example value.
         sem_margin = dm
             .top_margin

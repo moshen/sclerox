@@ -64,6 +64,18 @@ pub fn symbol_line(kind: &str, signature: &str, location: &str) -> String {
     format!("[{kind}] {signature} ({location})")
 }
 
+/// A full-text code hit: `location`, then the matching line, indented and
+/// cut to the snippet length.
+pub fn code_text_lines(location: &str, text: &str) -> String {
+    let snippet: String = text.chars().take(CODE_SNIPPET_CHARS).collect();
+    let more = if text.chars().count() > CODE_SNIPPET_CHARS {
+        "..."
+    } else {
+        ""
+    };
+    format!("{location}\n        {snippet}{more}")
+}
+
 /// A semantic code-chunk hit: `(score) location`, then an indented one-line
 /// snippet of the chunk.
 pub fn code_chunk_lines(score: f32, location: &str, text: &str) -> String {
@@ -87,6 +99,16 @@ mod tests {
     fn code_location_appends_the_line_only_when_known() {
         assert_eq!(code_location("/r", "src/a.rs", Some(7)), "/r/src/a.rs:7");
         assert_eq!(code_location("/r", "src/a.rs", None), "/r/src/a.rs");
+    }
+
+    #[test]
+    fn code_text_lines_shows_location_then_bounded_line() {
+        assert_eq!(
+            code_text_lines("/r/a.rs:3", "let x = 1;"),
+            "/r/a.rs:3\n        let x = 1;"
+        );
+        let long = code_text_lines("/r/a.rs:3", &"y".repeat(200));
+        assert!(long.ends_with(&format!("{}...", "y".repeat(CODE_SNIPPET_CHARS))));
     }
 
     #[test]

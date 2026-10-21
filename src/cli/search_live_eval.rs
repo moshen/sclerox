@@ -59,6 +59,7 @@ fn label(r: &SearchResult) -> String {
         SearchResult::Investigation { slug, .. } => format!("research:{slug}"),
         SearchResult::Repo { name, .. } => format!("repo:{name}"),
         SearchResult::Symbol { name, .. } => format!("symbol:{name}"),
+        SearchResult::CodeText { file_path, .. } => format!("code:{file_path}"),
         SearchResult::CodeChunk { file_path, .. } => format!("code:{file_path}"),
     }
 }
@@ -75,6 +76,7 @@ fn title(r: &SearchResult) -> &str {
         SearchResult::Symbol {
             signature, name, ..
         } => signature.as_deref().unwrap_or(name),
+        SearchResult::CodeText { text, .. } => text,
         SearchResult::CodeChunk { snippet, .. } => snippet,
     }
 }
@@ -157,9 +159,26 @@ fn search_live_eval() {
 
     let (mut today_m, mut ranked_m) = (Metrics::default(), Metrics::default());
     for q in &eval.query {
-        let today = search_hits(&db, &q.q, threshold, margin, OLD_SEMANTIC_LIMIT).unwrap();
-        let ranked =
-            rank(search_hits(&db, &q.q, threshold, margin, s.search.semantic_limit).unwrap());
+        let today = search_hits(
+            &db,
+            &q.q,
+            threshold,
+            margin,
+            OLD_SEMANTIC_LIMIT,
+            s.search.code_text_limit,
+        )
+        .unwrap();
+        let ranked = rank(
+            search_hits(
+                &db,
+                &q.q,
+                threshold,
+                margin,
+                s.search.semantic_limit,
+                s.search.code_text_limit,
+            )
+            .unwrap(),
+        );
         let relevant: HashSet<&str> = q.relevant.iter().map(String::as_str).collect();
 
         println!("\n{}", q.q);

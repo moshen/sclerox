@@ -52,12 +52,13 @@ reasoning, not just the verdict. If the decision reverses an earlier one, use
 When searching for symbols, functions, types, or callers in ANY indexed repo,
 use `sclerox code` BEFORE reaching for Grep or Glob. It is pre-indexed (no directory
 walk), cross-repo (finds callers in OTHER repos Grep can't see), structural
-(matches symbols, not raw strings), and call-graph aware. Fall back to Grep
-only when the repo is not indexed (`sclerox repo list`) or the query is free text
-rather than a symbol.
+(matches symbols), call-graph aware, and also full-text: it finds any line of
+an indexed file holding the query, comments and strings included. Fall back to
+Grep only when the repo is not indexed (`sclerox repo list`) or you need a
+regex.
 
 ```bash
-sclerox code search "X"                  # where is X defined?
+sclerox code search "X"                  # where is X defined / written?
 sclerox code refs X                      # what calls X? (impact analysis, cross-repo)
 sclerox code calls X                     # what does X call?
 sclerox code graph X --depth 4           # BFS call graph

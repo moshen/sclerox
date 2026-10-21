@@ -69,6 +69,13 @@ const CHUNKER_VERSION: u32 = 1;
 /// repo_meta key recording which chunker cut a repo's index.
 const CHUNKER_META_KEY: &str = "chunker";
 
+/// repo_meta key recording that every indexed file's full text is in
+/// `files_fts`. An index from before that table (or one whose fill was cut
+/// short) lacks it, and its next index run fills in the files it skips as
+/// unchanged.
+pub const TEXT_INDEX_META_KEY: &str = "text_index";
+const TEXT_INDEX_VERSION: &str = "1";
+
 /// The chunker an index was cut with. An index recording a different value,
 /// or none, is re-chunked in full on its next index run.
 fn chunker_signature() -> String {
@@ -255,6 +262,9 @@ impl<'a> RepoIndexer<'a> {
         // redundant. A subfolder that explicitly opted out keeps its own index.
         retract_nested_child_indexes(db, repo_root)?;
 
+        let text_backfill =
+            repo_db.get_meta(TEXT_INDEX_META_KEY)?.as_deref() != Some(TEXT_INDEX_VERSION);
+
         let mut result = IndexResult::default();
         let mut rechunk_complete = true;
 
@@ -315,6 +325,9 @@ impl<'a> RepoIndexer<'a> {
                 embed_here && hash_matches && !repo_db.file_chunks_all_embedded(&rel_path)?;
 
             if hash_matches && !needs_embed && !rechunk {
+                if text_backfill {
+                    repo_db.set_file_text(&rel_path, &source)?;
+                }
                 result.skipped += 1;
                 continue;
             }
@@ -338,6 +351,9 @@ impl<'a> RepoIndexer<'a> {
                             && s.end_line == Some(c.end_line as i64)
                     });
                 if same {
+                    if text_backfill {
+                        repo_db.set_file_text(&rel_path, &source)?;
+                    }
                     result.skipped += 1;
                     continue;
                 }
@@ -348,6 +364,7 @@ impl<'a> RepoIndexer<'a> {
             // an edit costs only the chunks it actually changed.
             let kept_vectors = repo_db.file_chunk_vectors(file_id)?;
             repo_db.delete_file_data(file_id)?;
+            repo_db.set_file_text(&rel_path, &source)?;
 
             // Insert symbols and build a name→id map for resolving call edges.
             let mut name_to_id: std::collections::HashMap<String, i64> =
@@ -411,6 +428,9 @@ impl<'a> RepoIndexer<'a> {
 
         if rechunk && rechunk_complete {
             repo_db.set_meta(CHUNKER_META_KEY, &chunker)?;
+        }
+        if text_backfill {
+            repo_db.set_meta(TEXT_INDEX_META_KEY, TEXT_INDEX_VERSION)?;
         }
 
         log::info!(
@@ -882,6 +902,45 @@ mod tests {
         let beta = state.iter().find(|(t, _)| t.contains("beta")).unwrap();
         assert!(alpha.1, "unchanged chunk kept its vector: {state:?}");
         assert!(!beta.1, "changed chunk waits for a new vector: {state:?}");
+    }
+
+    #[test]
+    fn whole_file_text_is_searchable_and_backfilled_once() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("lib.rs"),
+            "//! Frobnicates widgets.\nuse std::io;\n\nfn alpha() {}\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        let found = |q: &str| rdb.search_text(repo.path(), q, 10).unwrap().len();
+        assert_eq!(found("frobnicates"), 1, "a line no chunk holds");
+        assert_eq!(found("std::io"), 1);
+        assert_eq!(
+            rdb.get_meta(TEXT_INDEX_META_KEY).unwrap().as_deref(),
+            Some(TEXT_INDEX_VERSION)
+        );
+
+        // An index from before the full-text table: the unchanged file is not
+        // re-indexed, but its text is filled in, and only once.
+        rdb.conn
+            .execute_batch(
+                "INSERT INTO files_fts(files_fts) VALUES('delete-all');
+                 DELETE FROM repo_meta WHERE key = 'text_index';",
+            )
+            .unwrap();
+        assert_eq!(found("frobnicates"), 0);
+        let result = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(result.files_indexed, 0, "hash skip still applies");
+        assert_eq!(found("frobnicates"), 1, "text backfilled");
+        assert_eq!(
+            rdb.get_meta(TEXT_INDEX_META_KEY).unwrap().as_deref(),
+            Some(TEXT_INDEX_VERSION)
+        );
     }
 
     #[test]

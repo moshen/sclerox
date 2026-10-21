@@ -70,15 +70,20 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Repos whose name or description matches `query` in full text (word
+    /// prefixes), or whose name, description or path holds it as a substring.
     pub fn repo_search(&self, query: &str) -> Result<Vec<RepoEntry>> {
-        let query = fts::sanitize(query);
+        let fts_query = fts::sanitize(query);
+        let like_pat = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
             "SELECT id, path, name, description, db_path, last_indexed, created_at
              FROM repos
              WHERE id IN (SELECT rowid FROM repos_fts WHERE repos_fts MATCH ?1)
+                OR name LIKE ?2 ESCAPE '\\' OR description LIKE ?2 ESCAPE '\\'
+                OR path LIKE ?2 ESCAPE '\\'
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![query], row_to_repo)?;
+        let rows = stmt.query_map(params![fts_query, like_pat], row_to_repo)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -339,6 +344,22 @@ mod tests {
         let results = db.repo_search("OAuth").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "auth-service");
+
+        // Mid-word substrings of the name, description and path match too.
+        for q in ["service", "tripe", "/b"] {
+            let names: Vec<_> = db
+                .repo_search(q)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            let want = if q == "service" {
+                "auth-service"
+            } else {
+                "payment-api"
+            };
+            assert_eq!(names, [want], "query {q:?}");
+        }
     }
 
     #[test]

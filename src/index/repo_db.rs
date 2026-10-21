@@ -43,6 +43,17 @@ pub struct Symbol {
     pub end_line: i64,
 }
 
+/// One line of an indexed file that matches a full-text query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMatch {
+    pub file_path: String,
+    pub line: i64,
+    pub text: String,
+}
+
+/// Matching lines reported per file, so one file can't fill every slot.
+const TEXT_MATCH_LINES_PER_FILE: usize = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarChunk {
     pub file_path: String,
@@ -277,7 +288,73 @@ impl RepoDb {
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         self.conn
             .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+        self.conn
+            .execute("DELETE FROM files_fts WHERE rowid = ?1", params![file_id])?;
         Ok(())
+    }
+
+    /// Replace the full-text index entry of the stored file at `path` with
+    /// `text`, its whole contents. Does nothing for a path not in `files`.
+    pub fn set_file_text(&self, path: &str, text: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = (SELECT id FROM files WHERE path = ?1)",
+            params![path],
+        )?;
+        self.conn.execute(
+            "INSERT INTO files_fts (rowid, body) SELECT id, ?2 FROM files WHERE path = ?1",
+            params![path, text],
+        )?;
+        Ok(())
+    }
+
+    /// Lines of indexed files under `root` that hold every term of `query`
+    /// (any case, anywhere in a word), best-ranked files first, at most
+    /// `limit` lines in all and [`TEXT_MATCH_LINES_PER_FILE`] per file. The index finds the files; the lines are read
+    /// from the files on disk, so a file edited since it was indexed reports
+    /// what it says now. Terms under three characters can't be looked up in
+    /// the trigram index: they only narrow the lines, and a query of nothing
+    /// but such terms matches nothing.
+    pub fn search_text(&self, root: &Path, query: &str, limit: usize) -> Result<Vec<TextMatch>> {
+        let Some(fts_query) = fts::trigram_query(query) else {
+            return Ok(Vec::new());
+        };
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let phrase = terms.join(" ");
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path FROM files_fts JOIN files f ON f.id = files_fts.rowid
+             WHERE files_fts MATCH ?1
+             ORDER BY files_fts.rank",
+        )?;
+        let mut rows = stmt.query(params![fts_query])?;
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let file_path: String = row.get(0)?;
+            let Ok(source) = std::fs::read_to_string(root.join(&file_path)) else {
+                continue;
+            };
+            // Lines holding every term; those with the terms as one phrase
+            // first (the sort is stable, so each group stays in file order).
+            let mut lines: Vec<(bool, usize, &str)> = source
+                .lines()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let lower = l.to_lowercase();
+                    terms
+                        .iter()
+                        .all(|t| lower.contains(t.as_str()))
+                        .then(|| (!lower.contains(&phrase), i, l))
+                })
+                .collect();
+            lines.sort_by_key(|&(not_phrase, _, _)| not_phrase);
+            let room = (limit - out.len()).min(TEXT_MATCH_LINES_PER_FILE);
+            out.extend(lines.into_iter().take(room).map(|(_, i, l)| TextMatch {
+                file_path: file_path.clone(),
+                line: i as i64 + 1,
+                text: l.trim().to_string(),
+            }));
+        }
+        Ok(out)
     }
 
     pub fn insert_symbol(
@@ -685,6 +762,64 @@ mod tests {
             db.file_hash("src/main.rs").unwrap().as_deref(),
             Some("deadbeef")
         );
+    }
+
+    #[test]
+    fn search_text_finds_lines_anywhere_in_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let src = "//! Frobnicate widgets.\nuse std::io;\n\nfn go() {\n    let x = frob_widget(1);\n    // the frob widget phrase\n}\n";
+        std::fs::write(root.path().join("a.rs"), src).unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn other() {}\n").unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        for (path, text) in [("a.rs", src), ("b.rs", "fn other() {}\n")] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, text).unwrap();
+        }
+        let lines = |q: &str| -> Vec<(String, i64)> {
+            db.search_text(root.path(), q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.file_path, m.line))
+                .collect()
+        };
+        let a = |line| ("a.rs".to_string(), line);
+
+        // Doc comments and imports, which no chunk holds; any case.
+        assert_eq!(lines("FROBNICATE"), [a(1)]);
+        assert_eq!(lines("std::io"), [a(2)]);
+        // A mid-identifier substring.
+        assert_eq!(lines("b_wid"), [a(5)]);
+        // Every term, on one line; the phrase first.
+        assert_eq!(lines("frob widget"), [a(6), a(1), a(5)]);
+        // Short terms only narrow the lines; alone they can't be looked up.
+        assert_eq!(lines("x frob"), [a(5)]);
+        assert!(lines("fn").is_empty());
+        assert!(lines("nowhere").is_empty());
+        // The per-file and overall caps.
+        assert_eq!(lines("widget").len(), TEXT_MATCH_LINES_PER_FILE);
+        assert_eq!(db.search_text(root.path(), "widget", 1).unwrap().len(), 1);
+
+        // Re-indexing a file drops its old text.
+        let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
+        db.delete_file_data(id).unwrap();
+        assert!(lines("frobnicate").is_empty());
+    }
+
+    #[test]
+    fn migration_v8_adds_the_full_text_index() {
+        crate::db::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(REPO_SCHEMA).unwrap();
+        conn.execute_batch("DROP TABLE files_fts; PRAGMA user_version = 7")
+            .unwrap();
+        let db = RepoDb { conn };
+        db.init().unwrap();
+        assert_eq!(db.user_version().unwrap(), REPO_VERSION);
+        db.upsert_file("a.rs", None, "h", None).unwrap();
+        db.set_file_text("a.rs", "hello there").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "hello there").unwrap();
+        assert_eq!(db.search_text(root.path(), "hello", 5).unwrap().len(), 1);
     }
 
     /// A repo database at v4 (before the model was recorded), with one chunk

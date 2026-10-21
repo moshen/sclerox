@@ -92,6 +92,8 @@ return; add `--wait` to follow it to the end.
 
 Unset similarity thresholds follow the model, since each scores on its own
 scale (`sclerox config show` prints the effective values).
+`search.code_text_limit` caps the code lines `code search` and `sclerox search`
+show for matching the query word for word (default 20).
 `search.semantic_margin` drops semantic hits scoring more than that below the
 best hit for the query (Granite default 0.05; `1.0` turns it off). Granite small does
 not merge near-duplicates on score until its thresholds are calibrated; it

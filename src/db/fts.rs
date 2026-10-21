@@ -17,6 +17,19 @@ pub fn sanitize(query: &str) -> String {
         .join(" ")
 }
 
+/// A MATCH query for a `tokenize='trigram'` FTS5 table: every term of
+/// `query` as a quoted (so literal) substring, all required. The trigram
+/// index can't look up a term under three characters, so those are left out;
+/// `None` when that leaves nothing to look up.
+pub fn trigram_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| t.chars().count() >= 3)
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 /// A `LIKE ... ESCAPE '\\'` pattern matching `query` as a literal substring.
 ///
 /// `%` and `_` are LIKE wildcards, so an unescaped `_` matched every row and a
@@ -99,6 +112,17 @@ mod tests {
     #[test]
     fn test_strips_embedded_quotes() {
         assert_eq!(sanitize("hello\"world"), "\"helloworld\"*");
+    }
+
+    #[test]
+    fn trigram_query_quotes_terms_and_drops_short_ones() {
+        assert_eq!(trigram_query("fn sanitize"), Some("\"sanitize\"".into()));
+        assert_eq!(
+            trigram_query(r#"a"b"c x_y.z"#),
+            Some(r#""a""b""c" "x_y.z""#.into())
+        );
+        assert_eq!(trigram_query("fn if"), None);
+        assert_eq!(trigram_query(""), None);
     }
 
     #[test]
