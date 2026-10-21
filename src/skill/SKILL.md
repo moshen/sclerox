@@ -132,10 +132,11 @@ When two updated hits disagree, the newer one is usually current.
 Every command takes `--output json` (a global flag, not `--format`) for
 scripting: stdout is then exactly one JSON document - the records for reads,
 the resulting record (or `{"deleted": ...}`) for writes, `{"error": "..."}`
-for a miss such as "not found". Progress lines go to stderr. Searches that
-combine keyword and semantic tiers return `{"fts": [...], "semantic": [...]}`;
-`sclerox search`, `code search` and `repo search-symbols` return a flat list
-tagged by `type`.
+for a miss such as "not found". Progress lines go to stderr. `todo`,
+`meeting`, `research` and `repo search` return `{"fts": [...], "semantic": [...]}`;
+`memory search`, `people search` and `project search` return a flat list of
+entries; `sclerox search`, `code search` and `repo search-symbols` return a
+flat list tagged by `type`.
 
 For an area's full commands and its workflow, read the matching file on demand:
 

@@ -423,17 +423,15 @@ fn call_graph(repos: &[(String, RepoDb)], seed: &str, max_depth: usize) -> Vec<G
         }
 
         if depth < max_depth {
-            // Collect outbound edges from all repos that have this symbol
-            for (_repo_name, sym) in &sym_info {
-                // Find the repo_db that owns this symbol
-                for (_rname, rdb) in repos {
-                    if let Ok(callees) = rdb.callees(sym.id) {
-                        for (to_name, kind, _, _confidence) in callees {
-                            if !visited.contains(&to_name) {
-                                queue.push_back((to_name, depth + 1, kind));
-                            }
-                        }
-                        break; // symbol found in this repo, don't double-count
+            // Collect outbound edges from every repo that has this symbol,
+            // each looked up in the repo that owns it (ids are per repo).
+            for (owner, sym) in &sym_info {
+                let Some((_, rdb)) = repos.iter().find(|(root, _)| root == owner) else {
+                    continue;
+                };
+                for (to_name, kind, _, _confidence) in rdb.callees(sym.id).unwrap_or_default() {
+                    if !visited.contains(&to_name) {
+                        queue.push_back((to_name, depth + 1, kind));
                     }
                 }
             }
