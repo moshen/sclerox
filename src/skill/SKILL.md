@@ -123,7 +123,8 @@ list` at session start - they're already visible. Use `sclerox memory get <key>`
 
 ## Reference
 
-Global search across everything: `sclerox search "<query>"`. Hits carry a UTC
+Global search across everything: `sclerox search "<query>"`. Hits come best first
+across all types (people, projects and symbols last). They carry a UTC
 time: `(updated ...)` is when a memory, todo, person, project or research item
 last changed; meetings and repos show only `(created ...)`; code hits have none.
 When two updated hits disagree, the newer one is usually current. For an area's full

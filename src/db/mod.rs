@@ -347,6 +347,41 @@ impl Database {
         snapshot_read(&self.conn, || self.semantic_ready(), read)
     }
 
+    /// Cosine similarity of each row in `ids` to `query_embedding`, from the
+    /// vectors already stored for it: the best chunk for meetings, todos and
+    /// research. Rows without a vector are left out, as is everything when
+    /// this database's vectors are from another model.
+    pub fn cosine_scores(
+        &self,
+        table: ScoredTable,
+        ids: &[i64],
+        query_embedding: &[f32],
+    ) -> Result<std::collections::HashMap<i64, f32>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.semantic_read(|| {
+            let (key, column, from) = match table {
+                ScoredTable::Memory => ("id", "embedding", "memory"),
+                ScoredTable::Meeting => ("meeting_id", "embedding", "meeting_chunks"),
+                ScoredTable::Todo => ("todo_id", "embedding", "todo_chunks"),
+                ScoredTable::Investigation => {
+                    ("investigation_id", "embedding", "investigation_chunks")
+                }
+                ScoredTable::Repo => ("id", "description_embedding", "repos"),
+            };
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT {key}, MAX(1 - vec_distance_cosine({column}, ?1)) FROM {from}
+                 WHERE {key} IN ({list}) AND {column} IS NOT NULL GROUP BY {key}"
+            ))?;
+            let rows = stmt.query_map([embedding_to_bytes(query_embedding)], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+            })?;
+            rows.collect::<Result<_, _>>().map_err(Into::into)
+        })
+    }
+
     /// Run `write`, telling it whether it may store vectors. False means store
     /// the row without them: mixing vectors from two models makes every score
     /// meaningless. The first vector records the configured model. Pass
@@ -446,6 +481,16 @@ pub(crate) fn claimed_write<T>(
     Ok(out)
 }
 
+/// The tables [`Database::cosine_scores`] can score.
+#[derive(Debug, Clone, Copy)]
+pub enum ScoredTable {
+    Memory,
+    Meeting,
+    Todo,
+    Investigation,
+    Repo,
+}
+
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -453,6 +498,46 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosine_scores_from_stored_vectors() {
+        let db = Database::open_in_memory().unwrap();
+        let unit = |i: usize| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = 1.0;
+            v
+        };
+        db.memory_set("a", "alpha", "project", None).unwrap();
+        db.memory_set("b", "beta", "project", None).unwrap();
+        db.memory_set("c", "gamma", "project", None).unwrap();
+        db.memory_set_embedding("a", &unit(0)).unwrap();
+        db.memory_set_embedding("b", &unit(1)).unwrap();
+        let ids: Vec<i64> = ["a", "b", "c"]
+            .iter()
+            .map(|k| db.memory_get(k).unwrap().unwrap().id)
+            .collect();
+        let scores = db
+            .cosine_scores(ScoredTable::Memory, &ids, &unit(0))
+            .unwrap();
+        assert!((scores[&ids[0]] - 1.0).abs() < 1e-5);
+        assert!(scores[&ids[1]].abs() < 1e-5);
+        assert!(!scores.contains_key(&ids[2]), "no vector, no score");
+
+        // A meeting scores as its best chunk.
+        let m = db.meeting_add("Talk", None, None, None).unwrap();
+        db.meeting_store_chunks(
+            m,
+            &[
+                ("one".to_string(), Some(unit(1))),
+                ("two".to_string(), Some(unit(0))),
+            ],
+        )
+        .unwrap();
+        let scores = db
+            .cosine_scores(ScoredTable::Meeting, &[m], &unit(0))
+            .unwrap();
+        assert!((scores[&m] - 1.0).abs() < 1e-5);
+    }
 
     #[test]
     fn test_open_in_memory() {

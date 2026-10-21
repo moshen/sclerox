@@ -130,7 +130,7 @@ pub fn config_template() -> String {
          # model scores on its own scale:\n\
          {model_thresholds}\
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
-         # semantic_limit = {sem_lim}                 # max semantic hits per entity type\n\
+         # semantic_limit = {sem_lim}                # max semantic hits per entity type\n\
          # semantic_margin = {sem_margin}            # drop hits this far below the best one; 1.0 = off\n\
          \n\
          [dedup]\n\
@@ -547,7 +547,7 @@ mod tests {
         assert!(upgraded.contains("semantic_threshold = 0.9"));
         assert!(upgraded.contains("command = \"opencode run --pure\""));
         // Untouched keys remain commented at their defaults (docs refreshed).
-        assert!(upgraded.contains("# semantic_limit = 5"));
+        assert!(upgraded.contains("# semantic_limit = 25"));
         assert!(upgraded.contains("# cosine_threshold = 0.9"));
         // A newer key absent from the old file now appears (commented).
         assert!(upgraded.contains("# max_file_bytes ="));
@@ -556,7 +556,7 @@ mod tests {
         let s = Settings::from_toml_str(&upgraded).unwrap();
         assert_eq!(s.search.semantic_threshold, Some(0.9));
         assert_eq!(s.ai.command.as_deref(), Some("opencode run --pure"));
-        assert_eq!(s.search.semantic_limit, 5); // still default
+        assert_eq!(s.search.semantic_limit, 25); // still default
     }
 
     #[test]
