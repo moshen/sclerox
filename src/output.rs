@@ -34,6 +34,37 @@ where
     }
 }
 
+/// Report a miss that isn't a failure ("not found", "no changes"): the message
+/// as-is in text, `{"error": msg}` in JSON. The exit status is unchanged.
+pub fn print_miss(format: OutputFormat, msg: &str) {
+    print_output(format, &serde_json::json!({ "error": msg }), || {
+        println!("{msg}")
+    });
+}
+
+static FORMAT: std::sync::OnceLock<OutputFormat> = std::sync::OnceLock::new();
+
+/// Record the `--output` format for the process, so helpers deep in a command
+/// can keep stdout clean for JSON without threading it through. Set once, by
+/// the CLI entry point.
+pub fn set_format(format: OutputFormat) {
+    let _ = FORMAT.set(format);
+}
+
+/// The `--output` format the process was started with.
+pub fn format() -> OutputFormat {
+    FORMAT.get().copied().unwrap_or_default()
+}
+
+/// Print a progress or diagnostic line. Under `--output json` it goes to
+/// stderr, so stdout stays a single JSON document.
+pub fn progress(msg: impl fmt::Display) {
+    match format() {
+        OutputFormat::Json => eprintln!("{msg}"),
+        OutputFormat::Text => println!("{msg}"),
+    }
+}
+
 /// Largest byte index `<= max` that lands on a UTF-8 char boundary (stable-Rust
 /// stand-in for the unstable `str::floor_char_boundary`).
 pub fn floor_char_boundary(s: &str, max: usize) -> usize {

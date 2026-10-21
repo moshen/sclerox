@@ -2,8 +2,9 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::cli::text_chunks;
+use crate::db::meetings::{Meeting, MeetingPerson};
 use crate::db::Database;
-use crate::output::truncate;
+use crate::output::{floor_char_boundary, print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum MeetingCommand {
@@ -72,7 +73,7 @@ pub enum MeetingPeopleCmd {
     List { meeting_id: i64 },
 }
 
-pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
+pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<()> {
     match cmd {
         MeetingCommand::Add {
             title,
@@ -98,47 +99,35 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                 text_chunks::meeting_source(transcript.as_deref(), notes.as_deref());
             store_chunks(db, id, &text_to_chunk, no_embed)?;
 
-            println!("Added meeting #{id}: {title}");
+            let m = db.meeting_get(id)?;
+            print_output(format, &m, || println!("Added meeting #{id}: {title}"));
         }
 
         MeetingCommand::Get { id } => match db.meeting_get(id)? {
             Some(m) => {
-                println!("ID:    #{}", m.id);
-                println!("Title: {}", m.title);
-                println!("Date:  {}", m.meeting_date.as_deref().unwrap_or("-"));
-                if let Some(notes) = &m.notes {
-                    println!("Notes:\n{notes}");
-                }
-                if let Some(transcript) = &m.transcript {
-                    println!("Transcript ({} chars):", transcript.len());
-                    println!("{}", &transcript[..transcript.len().min(500)]);
-                    if transcript.len() > 500 {
-                        println!("... [truncated]");
-                    }
-                }
                 let people = db.meeting_people(id)?;
-                if !people.is_empty() {
-                    println!("People:");
-                    for p in &people {
-                        let role = p.role.as_deref().unwrap_or("attendee");
-                        println!("  - {} ({})", p.person_name, role);
-                    }
-                }
+                print_output(
+                    format,
+                    &serde_json::json!({"meeting": m, "people": people}),
+                    || print_meeting(&m, &people),
+                );
             }
-            None => println!("Meeting #{id} not found"),
+            None => print_miss(format, &format!("Meeting #{id} not found")),
         },
 
         MeetingCommand::List { from, to } => {
             let meetings = db.meeting_list(from.as_deref(), to.as_deref())?;
-            if meetings.is_empty() {
-                println!("No meetings found.");
-            } else {
-                for m in &meetings {
-                    let date = m.meeting_date.as_deref().unwrap_or("no date");
-                    println!("#{} [{}] {}", m.id, date, m.title);
+            print_output(format, &meetings, || {
+                if meetings.is_empty() {
+                    println!("No meetings found.");
+                } else {
+                    for m in &meetings {
+                        let date = m.meeting_date.as_deref().unwrap_or("no date");
+                        println!("#{} [{}] {}", m.id, date, m.title);
+                    }
+                    println!("\n{} meetings", meetings.len());
                 }
-                println!("\n{} meetings", meetings.len());
-            }
+            });
         }
 
         MeetingCommand::Search { query } => {
@@ -146,23 +135,30 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
             let fts_hits = db.meeting_search(&query)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
 
-            for m in &fts_hits {
-                let date = m.meeting_date.as_deref().unwrap_or("no date");
-                let at = crate::cli::format::stamp("created", &m.created_at);
-                println!("#{} [{}] {}  {at}", m.id, date, m.title);
-            }
-
             // Semantic results - appended, deduped against FTS hits
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
-            if let Some(query_emb) = query_emb {
-                let similar = db.meeting_similar(&query_emb, 5).unwrap_or_default();
-                let semantic: Vec<_> = similar
-                    .iter()
-                    .filter(|r| !fts_ids.contains(&r.meeting.id))
-                    .collect();
-                if !semantic.is_empty() {
-                    if !fts_hits.is_empty() {
+            let semantic: Vec<_> = query_emb
+                .map(|qe| db.meeting_similar(&qe, 5).unwrap_or_default())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| !fts_ids.contains(&r.meeting.id))
+                .collect();
+
+            print_output(
+                format,
+                &serde_json::json!({"fts": fts_hits, "semantic": semantic}),
+                || {
+                    if fts_hits.is_empty() && semantic.is_empty() {
+                        println!("No matches for: {query}");
+                        return;
+                    }
+                    for m in &fts_hits {
+                        let date = m.meeting_date.as_deref().unwrap_or("no date");
+                        let at = crate::cli::format::stamp("created", &m.created_at);
+                        println!("#{} [{}] {}  {at}", m.id, date, m.title);
+                    }
+                    if !semantic.is_empty() && !fts_hits.is_empty() {
                         println!();
                     }
                     for r in &semantic {
@@ -177,12 +173,8 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                         );
                         println!("  > {}", truncate(&r.matched_chunk, 100));
                     }
-                }
-            }
-
-            if fts_hits.is_empty() {
-                println!("No matches for: {query}");
-            }
+                },
+            );
         }
 
         MeetingCommand::Update {
@@ -205,14 +197,15 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                 transcript.as_deref(),
             )?;
             if !changed {
-                println!("Meeting #{id} not found or no changes");
+                print_miss(format, &format!("Meeting #{id} not found or no changes"));
                 return Ok(());
             }
             // A new transcript replaces the stored chunks + embeddings.
             if let Some(t) = transcript.as_deref() {
                 store_chunks(db, id, t, no_embed)?;
             }
-            println!("Updated meeting #{id}");
+            let m = db.meeting_get(id)?;
+            print_output(format, &m, || println!("Updated meeting #{id}"));
         }
 
         MeetingCommand::People(sub) => match sub {
@@ -222,36 +215,46 @@ pub fn run(db: &Database, cmd: MeetingCommand) -> Result<()> {
                 role,
             } => {
                 db.meeting_link_person(meeting_id, person_id, role.as_deref())?;
-                println!("Linked person #{person_id} to meeting #{meeting_id}");
+                let people = db.meeting_people(meeting_id)?;
+                print_output(format, &people, || {
+                    println!("Linked person #{person_id} to meeting #{meeting_id}")
+                });
             }
             MeetingPeopleCmd::Remove {
                 meeting_id,
                 person_id,
             } => {
                 if db.meeting_unlink_person(meeting_id, person_id)? {
-                    println!("Removed person #{person_id} from meeting #{meeting_id}");
+                    let people = db.meeting_people(meeting_id)?;
+                    print_output(format, &people, || {
+                        println!("Removed person #{person_id} from meeting #{meeting_id}")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             MeetingPeopleCmd::List { meeting_id } => {
                 let people = db.meeting_people(meeting_id)?;
-                if people.is_empty() {
-                    println!("No people linked to meeting #{meeting_id}");
-                } else {
-                    for p in &people {
-                        let role = p.role.as_deref().unwrap_or("attendee");
-                        println!("#{} {} ({})", p.person_id, p.person_name, role);
+                print_output(format, &people, || {
+                    if people.is_empty() {
+                        println!("No people linked to meeting #{meeting_id}");
+                    } else {
+                        for p in &people {
+                            let role = p.role.as_deref().unwrap_or("attendee");
+                            println!("#{} {} ({})", p.person_id, p.person_name, role);
+                        }
                     }
-                }
+                });
             }
         },
 
         MeetingCommand::Delete { id } => {
             if db.meeting_delete(id)? {
-                println!("Deleted meeting #{id}");
+                print_output(format, &serde_json::json!({"deleted": id}), || {
+                    println!("Deleted meeting #{id}")
+                });
             } else {
-                println!("Meeting #{id} not found");
+                print_miss(format, &format!("Meeting #{id} not found"));
             }
         }
     }
@@ -285,4 +288,27 @@ fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> R
     db.meeting_store_chunks(meeting_id, &chunks)?;
     text_chunks::note(db);
     Ok(())
+}
+
+fn print_meeting(m: &Meeting, people: &[MeetingPerson]) {
+    println!("ID:    #{}", m.id);
+    println!("Title: {}", m.title);
+    println!("Date:  {}", m.meeting_date.as_deref().unwrap_or("-"));
+    if let Some(notes) = &m.notes {
+        println!("Notes:\n{notes}");
+    }
+    if let Some(transcript) = &m.transcript {
+        println!("Transcript ({} chars):", transcript.len());
+        println!("{}", &transcript[..floor_char_boundary(transcript, 500)]);
+        if transcript.len() > 500 {
+            println!("... [truncated]");
+        }
+    }
+    if !people.is_empty() {
+        println!("People:");
+        for p in people {
+            let role = p.role.as_deref().unwrap_or("attendee");
+            println!("  - {} ({})", p.person_name, role);
+        }
+    }
 }

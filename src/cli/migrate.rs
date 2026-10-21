@@ -15,6 +15,7 @@
 //! hooks spawn background processes). Dry-run capable and prints every
 //! action, mirroring `install.rs`.
 
+use crate::output::{print_output, progress, OutputFormat};
 use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -28,28 +29,35 @@ pub struct MigrateArgs {
     dry_run: bool,
 }
 
-pub fn run_migrate(args: MigrateArgs) -> Result<()> {
+pub fn run_migrate(args: MigrateArgs, format: OutputFormat) -> Result<()> {
     let mut did_anything = false;
 
     match legacy_home_dir() {
         Some(legacy_home) => {
             did_anything |= migrate_global_paths(&legacy_home, args.dry_run)?;
         }
-        None => println!("No home directory found; skipping global path migration."),
+        None => progress("No home directory found; skipping global path migration."),
     }
 
     did_anything |= strip_legacy_integrations(args.dry_run)?;
     did_anything |= migrate_registered_repos(args.dry_run)?;
 
     if !did_anything {
-        println!("Nothing to migrate - already on the sclerox / XDG layout.");
+        progress("Nothing to migrate - already on the sclerox / XDG layout.");
     } else if args.dry_run {
-        println!("\n(dry-run: nothing was written)");
+        progress("\n(dry-run: nothing was written)");
     } else {
-        println!("\nMigration complete.");
+        progress("\nMigration complete.");
     }
 
     warn_about_stale_ol_binary();
+    if format == OutputFormat::Json {
+        print_output(
+            format,
+            &serde_json::json!({"migrated": did_anything, "dry_run": args.dry_run}),
+            || {},
+        );
+    }
     Ok(())
 }
 
@@ -60,7 +68,7 @@ fn warn_about_stale_ol_binary() {
     let Some(path) = stale_ol_binary() else {
         return;
     };
-    println!(
+    progress(format_args!(
         "\nWarning: an old `ol` binary is still on your PATH:\n  \
          {}\n\
          Its database has moved. Running it now does not fail - it creates a new\n\
@@ -69,7 +77,7 @@ fn warn_about_stale_ol_binary() {
          Remove it once you are happy with this migration, and update any of your\n\
          own docs, skills, or aliases that still invoke `ol` to use `sclerox`.",
         path.display()
-    );
+    ));
 }
 
 /// `~/.ol`, the pre-rename flat layout every real install actually wrote
@@ -269,18 +277,18 @@ fn migrate_ancestor_dirs(repo_paths: &[String], dry_run: bool) -> Result<bool> {
     let mut did_anything = false;
     for dir in legacy_ancestor_dirs(repo_paths) {
         if dry_run {
-            println!(
+            progress(format_args!(
                 "  would migrate folder config: {}/.ol -> .sclerox",
                 dir.display()
-            );
+            ));
             did_anything = true;
             continue;
         }
         if crate::migrate::migrate_legacy_repo_dir(&dir) {
-            println!(
+            progress(format_args!(
                 "  migrated folder config: {}/.ol -> .sclerox",
                 dir.display()
-            );
+            ));
             did_anything = true;
         }
     }
@@ -315,7 +323,10 @@ fn migrate_registered_repos(dry_run: bool) -> Result<bool> {
     for repo in &legacy {
         let new_db = repo.new_db_path.to_string_lossy().into_owned();
         if dry_run {
-            println!("  would migrate repo index: {}/.ol -> .sclerox", repo.path);
+            progress(format_args!(
+                "  would migrate repo index: {}/.ol -> .sclerox",
+                repo.path
+            ));
             did_anything = true;
             continue;
         }
@@ -329,28 +340,37 @@ fn migrate_registered_repos(dry_run: bool) -> Result<bool> {
             // (a stale registry row `sclerox repo sync` prunes), versus present
             // but missing its index (which a re-index rebuilds).
             if Path::new(&repo.path).exists() {
-                println!(
+                progress(format_args!(
                     "  skipped repo index {}: no .sclerox/repo.db after rename \
                      (rebuild with `sclerox repo index {}`)",
                     repo.name, repo.path
-                );
+                ));
             } else {
-                println!(
+                progress(format_args!(
                     "  skipped repo index {}: directory no longer exists \
                      (stale registry entry; prune with `sclerox repo sync`)",
                     repo.name
-                );
+                ));
             }
             continue;
         }
         if let Some(db) = &db {
             match db.repo_set_db_path(&repo.path, &new_db) {
                 Ok(true) => {
-                    println!("  migrated repo index: {} -> .sclerox", repo.name);
+                    progress(format_args!(
+                        "  migrated repo index: {} -> .sclerox",
+                        repo.name
+                    ));
                     did_anything = true;
                 }
-                Ok(false) => println!("  repo {} not in registry; left as-is", repo.name),
-                Err(e) => println!("  repo {}: failed to update registry ({e})", repo.name),
+                Ok(false) => progress(format_args!(
+                    "  repo {} not in registry; left as-is",
+                    repo.name
+                )),
+                Err(e) => progress(format_args!(
+                    "  repo {}: failed to update registry ({e})",
+                    repo.name
+                )),
             }
         }
     }
@@ -461,30 +481,30 @@ fn migrate_config_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
     match pristine {
         Some(true) => {
             if dry_run {
-                println!(
+                progress(format_args!(
                     "  would replace generated default {} with {}",
                     dst.display(),
                     src.display()
-                );
+                ));
                 return Ok(true);
             }
             replace_file(src, dst)?;
-            println!(
+            progress(format_args!(
                 "  moved {} -> {} (replaced a generated default with nothing set in it)",
                 src.display(),
                 dst.display()
-            );
+            ));
             Ok(true)
         }
         // Edited, or unparseable so its contents are unknown. Either way it is
         // not ours to overwrite.
         _ => {
-            println!(
+            progress(format_args!(
                 "  kept {} - it has settings of its own, so {} was left in place.",
                 dst.display(),
                 src.display()
-            );
-            println!("    Merge the two by hand, then delete the old file.");
+            ));
+            progress("    Merge the two by hand, then delete the old file.");
             Ok(false)
         }
     }
@@ -512,15 +532,19 @@ fn move_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
         return Ok(false);
     }
     if dst.exists() {
-        println!(
+        progress(format_args!(
             "  kept existing {} - left old {} in place (remove it manually once you've confirmed the new one is correct)",
             dst.display(),
             src.display()
-        );
+        ));
         return Ok(false);
     }
     if dry_run {
-        println!("  would move {} -> {}", src.display(), dst.display());
+        progress(format_args!(
+            "  would move {} -> {}",
+            src.display(),
+            dst.display()
+        ));
         return Ok(true);
     }
     if let Some(parent) = dst.parent() {
@@ -533,7 +557,11 @@ fn move_file(src: &Path, dst: &Path, dry_run: bool) -> Result<bool> {
             .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
         std::fs::remove_file(src).with_context(|| format!("removing {}", src.display()))?;
     }
-    println!("  moved {} -> {}", src.display(), dst.display());
+    progress(format_args!(
+        "  moved {} -> {}",
+        src.display(),
+        dst.display()
+    ));
     Ok(true)
 }
 
@@ -590,11 +618,17 @@ fn strip_legacy_skill(skills_dir: &Path, dry_run: bool) -> Result<bool> {
         return Ok(false);
     }
     if dry_run {
-        println!("  would remove legacy skill: {}/", legacy.display());
+        progress(format_args!(
+            "  would remove legacy skill: {}/",
+            legacy.display()
+        ));
     } else {
         std::fs::remove_dir_all(&legacy)
             .with_context(|| format!("failed to remove {}", legacy.display()))?;
-        println!("  removed legacy skill: {}/", legacy.display());
+        progress(format_args!(
+            "  removed legacy skill: {}/",
+            legacy.display()
+        ));
     }
     Ok(true)
 }
@@ -604,11 +638,14 @@ fn strip_legacy_file(path: &Path, dry_run: bool) -> Result<bool> {
         return Ok(false);
     }
     if dry_run {
-        println!("  would remove legacy file: {}", path.display());
+        progress(format_args!(
+            "  would remove legacy file: {}",
+            path.display()
+        ));
     } else {
         std::fs::remove_file(path)
             .with_context(|| format!("failed to remove {}", path.display()))?;
-        println!("  removed legacy file: {}", path.display());
+        progress(format_args!("  removed legacy file: {}", path.display()));
     }
     Ok(true)
 }
@@ -649,13 +686,16 @@ fn strip_legacy_hook(claude_dir: &Path, dry_run: bool) -> Result<bool> {
         return Ok(false);
     }
     if dry_run {
-        println!(
+        progress(format_args!(
             "  would remove legacy SessionStart + Stop hooks from: {}",
             settings_path.display()
-        );
+        ));
     } else {
         write_json(&settings_path, &settings)?;
-        println!("  removed legacy hooks: {}", settings_path.display());
+        progress(format_args!(
+            "  removed legacy hooks: {}",
+            settings_path.display()
+        ));
     }
     Ok(true)
 }
@@ -673,10 +713,10 @@ fn strip_legacy_section(path: &Path, dry_run: bool) -> Result<bool> {
         return Ok(false);
     };
     if dry_run {
-        println!(
+        progress(format_args!(
             "  would remove legacy knowledge-base section from {}",
             path.display()
-        );
+        ));
         return Ok(true);
     }
     let before = content[..start].trim_end();
@@ -692,10 +732,10 @@ fn strip_legacy_section(path: &Path, dry_run: bool) -> Result<bool> {
         (false, false) => format!("{before}\n\n{after}\n"),
     };
     std::fs::write(path, rebuilt)?;
-    println!(
+    progress(format_args!(
         "  removed legacy knowledge-base section from {}",
         path.display()
-    );
+    ));
     Ok(true)
 }
 

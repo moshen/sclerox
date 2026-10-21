@@ -1,3 +1,4 @@
+use crate::output::{print_output, progress, OutputFormat};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use serde_json::Value;
@@ -44,10 +45,11 @@ pub struct InstallArgs {
     dry_run: bool,
 }
 
-pub fn run_install(args: InstallArgs) -> Result<()> {
+pub fn run_install(args: InstallArgs, format: OutputFormat) -> Result<()> {
     let sclerox_bin = current_binary_path()?;
-    for target in resolve_targets(args.target) {
-        println!("Installing for {}...", target_name(target));
+    let targets = resolve_targets(args.target);
+    for &target in &targets {
+        progress(format_args!("Installing for {}...", target_name(target)));
         install_for_target(target, &sclerox_bin, &args)?;
     }
     install_shell_completions(args.dry_run)?;
@@ -70,16 +72,26 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         reembed_on_install(args.dry_run, args.wait);
     }
     if super::migrate::legacy_data_present() {
-        println!(
-            "\nDetected an old `ol` install at ~/.ol - run `sclerox migrate` to move it over."
+        progress(
+            "\nDetected an old `ol` install at ~/.ol - run `sclerox migrate` to move it over.",
         );
     }
     if args.dry_run {
-        println!("\n(dry-run: nothing was written)");
+        progress("\n(dry-run: nothing was written)");
     } else {
-        println!("\nDone. Reload any open sessions to pick up the new skill.");
+        progress("\nDone. Reload any open sessions to pick up the new skill.");
+    }
+    if format == OutputFormat::Json {
+        print_output(format, &targets_summary(&targets, args.dry_run), || {});
     }
     Ok(())
+}
+
+/// What install / uninstall report under `--output json`; their narration
+/// goes to stderr.
+fn targets_summary(targets: &[InstallTarget], dry_run: bool) -> Value {
+    let names: Vec<&str> = targets.iter().map(|&t| target_name(t)).collect();
+    serde_json::json!({ "targets": names, "dry_run": dry_run })
 }
 
 /// Download the embedding model and the token-counting tokenizer now, so the
@@ -90,27 +102,29 @@ fn prefetch_embedding_model(dry_run: bool) {
     let dir = crate::embed::model_cache_dir();
     let tokenizer = crate::embed::models::TOKEN_COUNTER;
     if crate::embed::is_downloaded(spec) && tokenizer.is_cached() {
-        println!(
+        progress(format_args!(
             "embedding model: {} already in {}",
             spec.name,
             dir.display()
-        );
+        ));
     } else if dry_run {
-        println!(
+        progress(format_args!(
             "  would download embedding model {} and tokenizer to {}",
             spec.name,
             dir.display()
-        );
+        ));
     } else {
         let fetched = crate::embed::ensure_downloaded(spec)
             .and_then(|_| tokenizer.fetch("the token-counting tokenizer"));
         match fetched {
-            Ok(_) => println!(
+            Ok(_) => progress(format_args!(
                 "embedding model: downloaded {} to {}",
                 spec.name,
                 dir.display()
-            ),
-            Err(e) => println!("embedding model: download failed, will retry on first use ({e:#})"),
+            )),
+            Err(e) => progress(format_args!(
+                "embedding model: download failed, will retry on first use ({e:#})"
+            )),
         }
     }
 }
@@ -119,14 +133,19 @@ fn prefetch_embedding_model(dry_run: bool) {
 fn prefetch_tokenizer(dry_run: bool) {
     let tokenizer = crate::embed::models::TOKEN_COUNTER;
     let dir = crate::embed::model_cache_dir();
-    println!("embedding model: skipped (embed.enabled = false)");
+    progress("embedding model: skipped (embed.enabled = false)");
     if tokenizer.is_cached() {
         return;
     }
     if dry_run {
-        println!("  would download the tokenizer to {}", dir.display());
+        progress(format_args!(
+            "  would download the tokenizer to {}",
+            dir.display()
+        ));
     } else if let Err(e) = tokenizer.fetch("the token-counting tokenizer") {
-        println!("tokenizer: download failed, will retry on first use ({e:#})");
+        progress(format_args!(
+            "tokenizer: download failed, will retry on first use ({e:#})"
+        ));
     }
 }
 
@@ -143,25 +162,30 @@ fn reembed_on_install(dry_run: bool, wait: bool) {
     if dry_run {
         // Opening the database migrates it, which a dry run must not do, so
         // whether anything is stale can't be checked here.
-        println!("  would re-embed any database recorded under another embedding model");
+        progress("  would re-embed any database recorded under another embedding model");
         return;
     }
     let db = match crate::db::Database::open(path) {
         Ok(db) => db,
         Err(e) => {
-            println!("embeddings: could not open {} ({e:#})", path.display());
+            progress(format_args!(
+                "embeddings: could not open {} ({e:#})",
+                path.display()
+            ));
             return;
         }
     };
     if !super::db::embeddings_need_work(&db) {
         return;
     }
-    println!(
+    progress(format_args!(
         "\nUpdating embeddings for {} (large repos take minutes)...",
         crate::config::settings().embed.model
-    );
+    ));
     if let Err(e) = super::db::reembed_or_queue(&db, false, wait) {
-        println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
+        progress(format_args!(
+            "embeddings: {e:#}; run `sclerox db reembed` to retry"
+        ));
     }
 }
 
@@ -177,36 +201,40 @@ fn report_reembed_needed() {
     };
     if let Ok(crate::embed::models::ModelCheck::Mismatch { recorded }) = db.embedding_model_check()
     {
-        println!(
+        progress(format_args!(
             "\nYour knowledge base was embedded with '{}'. Run `sclerox db reembed` to \
              switch it to '{}'; until then semantic search and dedup are off for it.",
             crate::embed::models::display_id(&recorded),
             crate::config::settings().embed.model
-        );
+        ));
     }
     if super::text_chunks::stale(&db) {
-        println!(
+        progress(format_args!(
             "\nMeeting, todo and research text was chunked at other sizes than \
              [embed] sets. Run `sclerox db reembed` to re-chunk it."
-        );
+        ));
     }
 }
 
-pub fn run_uninstall(args: InstallArgs) -> Result<()> {
-    for target in resolve_targets(args.target) {
-        println!("Uninstalling for {}...", target_name(target));
+pub fn run_uninstall(args: InstallArgs, format: OutputFormat) -> Result<()> {
+    let targets = resolve_targets(args.target);
+    for &target in &targets {
+        progress(format_args!("Uninstalling for {}...", target_name(target)));
         uninstall_for_target(target, &args)?;
     }
     // Deliberately keep ~/.config/sclerox/config.toml - it holds user edits.
     let cfg = crate::config::config_path();
     if cfg.exists() {
-        println!(
+        progress(format_args!(
             "config: kept {} (remove it manually if desired)",
             cfg.display()
-        );
+        ));
     }
     if args.dry_run {
-        println!("\n(dry-run: nothing was written)");
+        progress("\n(dry-run: nothing was written)");
+    }
+    if format == OutputFormat::Json {
+        print_output(format, &targets_summary(&targets, args.dry_run), || {});
     }
     Ok(())
 }
@@ -346,7 +374,7 @@ fn global_gitignore_path() -> Option<std::path::PathBuf> {
 
 fn install_global_gitignore(dry_run: bool) -> Result<()> {
     let Some(path) = global_gitignore_path() else {
-        println!("Global gitignore: could not determine path");
+        progress("Global gitignore: could not determine path");
         return Ok(());
     };
 
@@ -366,10 +394,10 @@ fn install_global_gitignore(dry_run: bool) -> Result<()> {
             || l == ".sclerox/**"
     }) {
         if dry_run {
-            println!(
+            progress(format_args!(
                 "Global gitignore: .sclerox already present in {}",
                 path.display()
-            );
+            ));
         }
         return Ok(());
     }
@@ -377,16 +405,19 @@ fn install_global_gitignore(dry_run: bool) -> Result<()> {
     let entry = "\n# sclerox - Sclerox CLI\n.sclerox/\n";
 
     if dry_run {
-        println!(
+        progress(format_args!(
             "Global gitignore: would append '.sclerox/' to {}",
             path.display()
-        );
+        ));
     } else {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, format!("{}{}", existing.trim_end(), entry))?;
-        println!("Global gitignore: added '.sclerox/' to {}", path.display());
+        progress(format_args!(
+            "Global gitignore: added '.sclerox/' to {}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -426,10 +457,10 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
     let shell_name = match detect_shell() {
         Some(s) => s,
         None => {
-            println!(
+            progress(format_args!(
                 "Completions: unknown shell (set $SHELL). \
                  Run `sclerox completions <bash|zsh|fish>` manually."
-            );
+            ));
             return Ok(());
         }
     };
@@ -448,8 +479,8 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
             let fpath_line = "fpath=(~/.zsh/completions $fpath)";
 
             if dry_run {
-                println!("Completions (zsh):");
-                println!("  would write: {}", comp_file.display());
+                progress("Completions (zsh):");
+                progress(format_args!("  would write: {}", comp_file.display()));
                 // Check if fpath line already present
                 let existing = if zshrc.exists() {
                     std::fs::read_to_string(&zshrc).unwrap_or_default()
@@ -458,12 +489,12 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
                 };
                 let already = existing.contains(fpath_line);
                 if !already {
-                    println!("  would append to ~/.zshrc: {fpath_line}");
+                    progress(format_args!("  would append to ~/.zshrc: {fpath_line}"));
                 }
             } else {
                 std::fs::create_dir_all(&comp_dir)?;
                 std::fs::write(&comp_file, &content)?;
-                println!("Completions (zsh): {}", comp_file.display());
+                progress(format_args!("Completions (zsh): {}", comp_file.display()));
 
                 // Append fpath setup to .zshrc if not already present
                 let zshrc_content = if zshrc.exists() {
@@ -476,8 +507,8 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
                         "\n# sclerox completions\n{fpath_line}\nautoload -Uz compinit && compinit\n"
                     );
                     std::fs::write(&zshrc, format!("{}{}", zshrc_content.trim_end(), append))?;
-                    println!("  appended fpath setup to ~/.zshrc");
-                    println!("  run: source ~/.zshrc");
+                    progress("  appended fpath setup to ~/.zshrc");
+                    progress("  run: source ~/.zshrc");
                 }
             }
         }
@@ -486,24 +517,30 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
             let comp_dir = home.join(".local/share/bash-completion/completions");
             let comp_file = comp_dir.join("sclerox");
             if dry_run {
-                println!("Completions (bash): would write {}", comp_file.display());
+                progress(format_args!(
+                    "Completions (bash): would write {}",
+                    comp_file.display()
+                ));
             } else {
                 std::fs::create_dir_all(&comp_dir)?;
                 std::fs::write(&comp_file, &content)?;
-                println!("Completions (bash): {}", comp_file.display());
-                println!("  run: source ~/.bashrc  (or open a new shell)");
+                progress(format_args!("Completions (bash): {}", comp_file.display()));
+                progress("  run: source ~/.bashrc  (or open a new shell)");
             }
         }
         "fish" => {
             let comp_dir = home.join(".config/fish/completions");
             let comp_file = comp_dir.join("sclerox.fish");
             if dry_run {
-                println!("Completions (fish): would write {}", comp_file.display());
+                progress(format_args!(
+                    "Completions (fish): would write {}",
+                    comp_file.display()
+                ));
             } else {
                 std::fs::create_dir_all(&comp_dir)?;
                 std::fs::write(&comp_file, &content)?;
-                println!("Completions (fish): {}", comp_file.display());
-                println!("  completions active in new fish sessions automatically");
+                progress(format_args!("Completions (fish): {}", comp_file.display()));
+                progress("  completions active in new fish sessions automatically");
             }
         }
         "powershell" => {
@@ -513,17 +550,20 @@ fn install_shell_completions(dry_run: bool) -> Result<()> {
             let comp_dir = crate::xdg::data_home().join("sclerox").join("completions");
             let comp_file = comp_dir.join("sclerox.ps1");
             if dry_run {
-                println!(
+                progress(format_args!(
                     "Completions (powershell): would write {}",
                     comp_file.display()
-                );
-                println!("  then dot-source it from $PROFILE");
+                ));
+                progress("  then dot-source it from $PROFILE");
             } else {
                 std::fs::create_dir_all(&comp_dir)?;
                 std::fs::write(&comp_file, &content)?;
-                println!("Completions (powershell): {}", comp_file.display());
-                println!("  add this line to your $PROFILE, then restart PowerShell:");
-                println!("    . \"{}\"", comp_file.display());
+                progress(format_args!(
+                    "Completions (powershell): {}",
+                    comp_file.display()
+                ));
+                progress("  add this line to your $PROFILE, then restart PowerShell:");
+                progress(format_args!("    . \"{}\"", comp_file.display()));
             }
         }
         _ => {}
@@ -539,20 +579,23 @@ fn install_skill(skills_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()
     // Protect a customized skill: if the current dir or the legacy flat file is
     // present and overwrite is off, leave everything as-is.
     if !overwrite && (skill_root.exists() || legacy.exists()) {
-        println!(
+        progress(format_args!(
             "  skill: kept existing {}/ (install.overwrite_skill = false)",
             skill_root.display()
-        );
+        ));
         return Ok(());
     }
 
     if dry_run {
-        println!(
+        progress(format_args!(
             "  would write skill: {}/ (SKILL.md + reference/)",
             skill_root.display()
-        );
+        ));
         if legacy.exists() {
-            println!("  would remove legacy skill file: {}", legacy.display());
+            progress(format_args!(
+                "  would remove legacy skill file: {}",
+                legacy.display()
+            ));
         }
         return Ok(());
     }
@@ -561,7 +604,10 @@ fn install_skill(skills_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()
     if legacy.exists() {
         std::fs::remove_file(&legacy)
             .with_context(|| format!("failed to remove {}", legacy.display()))?;
-        println!("  removed legacy skill file: {}", legacy.display());
+        progress(format_args!(
+            "  removed legacy skill file: {}",
+            legacy.display()
+        ));
     }
 
     for (rel, content) in skill_files() {
@@ -573,7 +619,7 @@ fn install_skill(skills_dir: &Path, overwrite: bool, dry_run: bool) -> Result<()
         std::fs::write(&path, content)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
-    println!("  wrote skill: {}/", skill_root.display());
+    progress(format_args!("  wrote skill: {}/", skill_root.display()));
     Ok(())
 }
 
@@ -586,11 +632,11 @@ fn remove_skill(skills_dir: &Path, dry_run: bool) -> Result<()> {
     if skill_root.exists() {
         found = true;
         if dry_run {
-            println!("  would remove: {}/", skill_root.display());
+            progress(format_args!("  would remove: {}/", skill_root.display()));
         } else {
             std::fs::remove_dir_all(&skill_root)
                 .with_context(|| format!("failed to remove {}", skill_root.display()))?;
-            println!("  removed: {}/", skill_root.display());
+            progress(format_args!("  removed: {}/", skill_root.display()));
         }
     }
     if legacy.exists() {
@@ -598,7 +644,10 @@ fn remove_skill(skills_dir: &Path, dry_run: bool) -> Result<()> {
         remove_if_exists(&legacy, dry_run)?;
     }
     if !found {
-        println!("  skill: nothing to remove in {}", skills_dir.display());
+        progress(format_args!(
+            "  skill: nothing to remove in {}",
+            skills_dir.display()
+        ));
     }
     Ok(())
 }
@@ -606,13 +655,13 @@ fn remove_skill(skills_dir: &Path, dry_run: bool) -> Result<()> {
 fn remove_if_exists(path: &Path, dry_run: bool) -> Result<()> {
     if path.exists() {
         if dry_run {
-            println!("  would remove: {}", path.display());
+            progress(format_args!("  would remove: {}", path.display()));
         } else {
             std::fs::remove_file(path)?;
-            println!("  removed: {}", path.display());
+            progress(format_args!("  removed: {}", path.display()));
         }
     } else {
-        println!("  not found: {}", path.display());
+        progress(format_args!("  not found: {}", path.display()));
     }
     Ok(())
 }
@@ -629,10 +678,10 @@ fn install_claude_hook(
     let mut settings = read_json(&settings_path)?;
 
     if !overwrite && sclerox_hook_present(&settings) {
-        println!(
+        progress(format_args!(
             "  hooks: kept existing in {} (install.overwrite_hooks = false)",
             settings_path.display()
-        );
+        ));
         return Ok(());
     }
 
@@ -667,16 +716,16 @@ fn install_claude_hook(
     stop_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": stop_cmd }] }));
 
     if dry_run {
-        println!(
+        progress(format_args!(
             "  would add SessionStart + Stop hooks to: {}",
             settings_path.display()
-        );
+        ));
     } else {
         write_json(&settings_path, &settings)?;
-        println!(
+        progress(format_args!(
             "  added SessionStart + Stop hooks: {}",
             settings_path.display()
-        );
+        ));
     }
     Ok(())
 }
@@ -684,7 +733,7 @@ fn install_claude_hook(
 fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     let settings_path = claude_dir.join("settings.json");
     if !settings_path.exists() {
-        println!("  no settings.json found");
+        progress("  no settings.json found");
         return Ok(());
     }
     let mut settings = read_json(&settings_path)?;
@@ -703,16 +752,16 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
 
     if modified {
         if dry_run {
-            println!(
+            progress(format_args!(
                 "  would remove SessionStart + Stop hooks from: {}",
                 settings_path.display()
-            );
+            ));
         } else {
             write_json(&settings_path, &settings)?;
-            println!("  removed hooks: {}", settings_path.display());
+            progress(format_args!("  removed hooks: {}", settings_path.display()));
         }
     } else {
-        println!("  no sclerox hooks found");
+        progress("  no sclerox hooks found");
     }
     Ok(())
 }
@@ -770,21 +819,27 @@ fn install_opencode_plugin(opencode_dir: &Path, overwrite: bool, dry_run: bool) 
     let content = opencode_plugin_content();
 
     if !overwrite && plugin_path.exists() {
-        println!(
+        progress(format_args!(
             "  plugin: kept existing {} (install.overwrite_hooks = false)",
             plugin_path.display()
-        );
+        ));
         return Ok(());
     }
 
     if dry_run {
-        println!("  would write OpenCode plugin: {}", plugin_path.display());
+        progress(format_args!(
+            "  would write OpenCode plugin: {}",
+            plugin_path.display()
+        ));
     } else {
         std::fs::create_dir_all(&plugins_dir)
             .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
         std::fs::write(&plugin_path, content)
             .with_context(|| format!("failed to write {}", plugin_path.display()))?;
-        println!("  wrote OpenCode plugin: {}", plugin_path.display());
+        progress(format_args!(
+            "  wrote OpenCode plugin: {}",
+            plugin_path.display()
+        ));
     }
     Ok(())
 }
@@ -849,28 +904,37 @@ fn append_or_create_section(
     // Protect a customized section when asked. A fresh file (no marker yet) is
     // still created - the policy only guards an existing sclerox-kb section.
     if !overwrite && existing.contains(SECTION_MARKER) {
-        println!(
+        progress(format_args!(
             "  {}: kept existing sclerox-kb section (install.overwrite_instructions = false)",
             path.display()
-        );
+        ));
         return Ok(());
     }
     let updated = rebuild_section(&existing, block);
 
     if existed && updated == existing {
-        println!("  {}: sclerox-kb section up to date", path.display());
+        progress(format_args!(
+            "  {}: sclerox-kb section up to date",
+            path.display()
+        ));
         return Ok(());
     }
     let verb = if existed { "update" } else { "create" };
     if dry_run {
-        println!("  would {verb} sclerox-kb section in: {}", path.display());
+        progress(format_args!(
+            "  would {verb} sclerox-kb section in: {}",
+            path.display()
+        ));
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, &updated)?;
-    println!("  {verb}d sclerox-kb section in: {}", path.display());
+    progress(format_args!(
+        "  {verb}d sclerox-kb section in: {}",
+        path.display()
+    ));
     Ok(())
 }
 
@@ -914,16 +978,18 @@ fn rebuild_section(existing: &str, block: &str) -> String {
 fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
     let path = PathBuf::from(filename);
     if !path.exists() {
-        println!("  {filename}: not found");
+        progress(format_args!("  {filename}: not found"));
         return Ok(());
     }
     let content = std::fs::read_to_string(&path)?;
     let Some(start) = content.find(SECTION_MARKER) else {
-        println!("  {filename}: no sclerox-kb section");
+        progress(format_args!("  {filename}: no sclerox-kb section"));
         return Ok(());
     };
     if dry_run {
-        println!("  would remove sclerox-kb section from {filename}");
+        progress(format_args!(
+            "  would remove sclerox-kb section from {filename}"
+        ));
         return Ok(());
     }
     // Remove start..end-marker (new format) or start..EOF (legacy), keeping the
@@ -941,7 +1007,7 @@ fn uninstall_section(filename: &str, dry_run: bool) -> Result<()> {
         (false, false) => format!("{before}\n\n{after}\n"),
     };
     std::fs::write(&path, rebuilt)?;
-    println!("  removed sclerox-kb section from {filename}");
+    progress(format_args!("  removed sclerox-kb section from {filename}"));
     Ok(())
 }
 

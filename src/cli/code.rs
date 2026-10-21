@@ -4,8 +4,11 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::cli::format::{code_chunk_lines, code_location, symbol_line};
+use crate::db::repos::RepoEntry;
 use crate::db::Database;
-use crate::index::repo_db::RepoDb;
+use crate::index::repo_db::{RepoDb, SimilarChunk, Symbol};
+use crate::output::{print_output, OutputFormat};
+use crate::search::SearchResult;
 
 #[derive(Subcommand)]
 pub enum CodeCommand {
@@ -40,13 +43,15 @@ pub enum CodeCommand {
     },
 }
 
-pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
+pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> {
     match cmd {
         CodeCommand::Search { needle, repo } => {
             db.repo_prune_gone()?;
             let repos = db.repo_list()?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `sclerox repo index [path]` first.");
+                print_output(format, &Vec::<SearchResult>::new(), || {
+                    println!("No repos indexed. Run `sclerox repo index [path]` first.")
+                });
                 return Ok(());
             }
 
@@ -58,9 +63,10 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
             let sem = &crate::config::settings().search;
             let floor = crate::config::settings().semantic_threshold() as f32;
 
-            let mut any = false;
-            let mut code_chunks: Vec<(f32, String, crate::index::repo_db::SimilarChunk)> =
-                Vec::new();
+            // Results as `sclerox search` emits them: symbols, then the
+            // semantic code-chunk matches.
+            let mut results: Vec<SearchResult> = Vec::new();
+            let mut code_chunks: Vec<(&RepoEntry, SimilarChunk)> = Vec::new();
             for entry in &repos {
                 if let Some(filter) = &repo {
                     if !entry.name.to_lowercase().contains(&filter.to_lowercase()) {
@@ -78,10 +84,15 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 };
 
                 for s in repo_db.search_symbols(&needle)? {
-                    let sig = s.signature.as_deref().unwrap_or(&s.name);
-                    let loc = code_location(&entry.path, &s.file_path, Some(s.start_line));
-                    println!("{}", symbol_line(&s.kind, sig, &loc));
-                    any = true;
+                    results.push(SearchResult::Symbol {
+                        repo_name: entry.name.clone(),
+                        repo_path: entry.path.clone(),
+                        kind: s.kind,
+                        name: s.name,
+                        signature: s.signature,
+                        file_path: s.file_path,
+                        start_line: s.start_line,
+                    });
                 }
 
                 if let Some(ref qe) = query_emb {
@@ -90,7 +101,7 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                         .unwrap_or_default()
                     {
                         if c.score >= floor {
-                            code_chunks.push((c.score, entry.path.clone(), c));
+                            code_chunks.push((entry, c));
                         }
                     }
                 }
@@ -102,104 +113,185 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
                 .semantic_margin()
                 .map(|m| m as f32);
             let cut = crate::embed::models::semantic_cutoff(
-                code_chunks.iter().map(|(s, _, _)| *s),
+                code_chunks.iter().map(|(_, c)| c.score),
                 floor,
                 margin,
             );
-            code_chunks.retain(|(s, _, _)| *s >= cut);
-            code_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            code_chunks.retain(|(_, c)| c.score >= cut);
+            code_chunks.sort_by(|a, b| {
+                b.1.score
+                    .partial_cmp(&a.1.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             code_chunks.truncate(sem.semantic_limit);
-            if !code_chunks.is_empty() {
-                println!("\nSemantic matches:");
-                for (score, root, c) in code_chunks {
-                    let loc = code_location(&root, &c.file_path, c.start_line);
-                    println!("  {}", code_chunk_lines(score, &loc, &c.chunk_text));
-                    any = true;
-                }
-            }
+            results.extend(
+                code_chunks
+                    .into_iter()
+                    .map(|(entry, c)| SearchResult::CodeChunk {
+                        repo_name: entry.name.clone(),
+                        repo_path: entry.path.clone(),
+                        file_path: c.file_path,
+                        start_line: c.start_line,
+                        score: c.score,
+                        snippet: c.chunk_text,
+                    }),
+            );
 
-            if !any {
-                let scope = repo
-                    .as_deref()
-                    .map(|r| format!(" in repos matching '{r}'"))
-                    .unwrap_or_default();
-                println!("No matches for '{needle}'{scope}");
-            }
+            print_output(format, &results, || {
+                let mut semantic_header = false;
+                for r in &results {
+                    match r {
+                        SearchResult::Symbol {
+                            repo_path,
+                            kind,
+                            name,
+                            signature,
+                            file_path,
+                            start_line,
+                            ..
+                        } => {
+                            let sig = signature.as_deref().unwrap_or(name);
+                            let loc = code_location(repo_path, file_path, Some(*start_line));
+                            println!("{}", symbol_line(kind, sig, &loc));
+                        }
+                        SearchResult::CodeChunk {
+                            repo_path,
+                            file_path,
+                            start_line,
+                            score,
+                            snippet,
+                            ..
+                        } => {
+                            if !semantic_header {
+                                println!("\nSemantic matches:");
+                                semantic_header = true;
+                            }
+                            let loc = code_location(repo_path, file_path, *start_line);
+                            println!("  {}", code_chunk_lines(*score, &loc, snippet));
+                        }
+                        _ => {}
+                    }
+                }
+                if results.is_empty() {
+                    let scope = repo
+                        .as_deref()
+                        .map(|r| format!(" in repos matching '{r}'"))
+                        .unwrap_or_default();
+                    println!("No matches for '{needle}'{scope}");
+                }
+            });
         }
 
         CodeCommand::Calls { symbol, repo } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `sclerox repo index [path]` first.");
+                no_repos(format);
                 return Ok(());
             }
 
-            let mut any = false;
+            let mut found: Vec<SymbolEdges> = Vec::new();
             for (root, repo_db) in &repos {
                 // Find the symbol
                 let syms = repo_db.symbol_by_name(&symbol)?;
-                for sym in &syms {
+                for sym in syms {
                     let callees = repo_db.callees(sym.id)?;
                     if callees.is_empty() {
                         continue;
                     }
-                    let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                    let loc = code_location(root, &sym.file_path, Some(sym.start_line));
-                    println!("{sig} ({loc})");
-                    for (to_name, kind, line, confidence) in &callees {
-                        let resolved = repo_db
-                            .symbol_by_name(to_name)
-                            .ok()
-                            .and_then(|v| v.into_iter().next());
-                        let conf_tag = confidence_tag(confidence);
-                        if let Some(target) = resolved {
-                            let loc =
-                                code_location(root, &target.file_path, Some(target.start_line));
-                            println!("  {} {}{} ({loc})", kind_arrow(kind), to_name, conf_tag);
-                        } else {
-                            println!(
-                                "  {} {}{} [unresolved, line {}]",
-                                kind_arrow(kind),
-                                to_name,
-                                conf_tag,
-                                line
-                            );
-                        }
-                    }
-                    any = true;
+                    let edges = callees
+                        .into_iter()
+                        .map(|(to_name, kind, line, confidence)| {
+                            let target = repo_db
+                                .symbol_by_name(&to_name)
+                                .ok()
+                                .and_then(|v| v.into_iter().next());
+                            Edge {
+                                name: to_name,
+                                kind,
+                                line,
+                                confidence,
+                                symbol: target,
+                            }
+                        })
+                        .collect();
+                    found.push(SymbolEdges {
+                        repo_path: root.clone(),
+                        symbol: sym,
+                        edges,
+                    });
                 }
             }
 
-            if !any {
-                println!("Symbol '{symbol}' not found or has no recorded outbound edges.");
-                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
-            }
+            print_output(format, &found, || {
+                for f in &found {
+                    let sig = f.symbol.signature.as_deref().unwrap_or(&f.symbol.name);
+                    let loc =
+                        code_location(&f.repo_path, &f.symbol.file_path, Some(f.symbol.start_line));
+                    println!("{sig} ({loc})");
+                    for e in &f.edges {
+                        let conf_tag = confidence_tag(&e.confidence);
+                        if let Some(target) = &e.symbol {
+                            let loc = code_location(
+                                &f.repo_path,
+                                &target.file_path,
+                                Some(target.start_line),
+                            );
+                            println!("  {} {}{} ({loc})", kind_arrow(&e.kind), e.name, conf_tag);
+                        } else {
+                            println!(
+                                "  {} {}{} [unresolved, line {}]",
+                                kind_arrow(&e.kind),
+                                e.name,
+                                conf_tag,
+                                e.line
+                            );
+                        }
+                    }
+                }
+                if found.is_empty() {
+                    println!("Symbol '{symbol}' not found or has no recorded outbound edges.");
+                    println!(
+                        "Tip: re-index with `sclerox repo index` to capture call graph edges."
+                    );
+                }
+            });
         }
 
         CodeCommand::Refs { symbol, repo } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `sclerox repo index [path]` first.");
+                no_repos(format);
                 return Ok(());
             }
 
-            let mut any = false;
+            let mut refs: Vec<Reference> = Vec::new();
             for (root, repo_db) in &repos {
-                let callers = repo_db.callers(&symbol)?;
-                for (caller_sym, kind, _line, confidence) in &callers {
-                    let sig = caller_sym.signature.as_deref().unwrap_or(&caller_sym.name);
-                    let conf_tag = confidence_tag(confidence);
-                    let loc =
-                        code_location(root, &caller_sym.file_path, Some(caller_sym.start_line));
-                    println!("  {} {}{} ({loc})", kind_arrow(kind), sig, conf_tag);
-                    any = true;
+                for (caller, kind, line, confidence) in repo_db.callers(&symbol)? {
+                    refs.push(Reference {
+                        repo_path: root.clone(),
+                        kind,
+                        line,
+                        confidence,
+                        caller,
+                    });
                 }
             }
 
-            if !any {
-                println!("No recorded references to '{symbol}'.");
-                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
-            }
+            print_output(format, &refs, || {
+                for r in &refs {
+                    let sig = r.caller.signature.as_deref().unwrap_or(&r.caller.name);
+                    let conf_tag = confidence_tag(&r.confidence);
+                    let loc =
+                        code_location(&r.repo_path, &r.caller.file_path, Some(r.caller.start_line));
+                    println!("  {} {}{} ({loc})", kind_arrow(&r.kind), sig, conf_tag);
+                }
+                if refs.is_empty() {
+                    println!("No recorded references to '{symbol}'.");
+                    println!(
+                        "Tip: re-index with `sclerox repo index` to capture call graph edges."
+                    );
+                }
+            });
         }
 
         CodeCommand::Graph {
@@ -209,87 +301,145 @@ pub fn run(db: &Database, cmd: CodeCommand) -> Result<()> {
         } => {
             let repos = open_matching_repos(db, repo.as_deref())?;
             if repos.is_empty() {
-                println!("No repos indexed. Run `sclerox repo index [path]` first.");
+                no_repos(format);
                 return Ok(());
             }
 
-            // BFS: (name, depth, edge_kind_from_parent)
-            let mut queue: VecDeque<(String, usize, String)> = VecDeque::new();
-            queue.push_back((symbol.clone(), 0, String::new()));
+            let nodes = call_graph(&repos, &symbol, max_depth);
+            let found_seed = nodes.first().is_some_and(|n| n.symbol.is_some());
 
-            let mut visited: HashSet<String> = HashSet::new();
-            let mut found_seed = false;
-
-            while let Some((name, depth, edge_kind)) = queue.pop_front() {
-                if visited.contains(&name) {
-                    continue;
-                }
-                visited.insert(name.clone());
-
-                // Look up symbol info across all repos
-                let sym_info = find_across_repos(&repos, &name);
-
-                let indent = "  ".repeat(depth);
-                if depth == 0 {
-                    match sym_info.first() {
-                        Some((root, sym)) => {
+            print_output(format, &nodes, || {
+                for n in &nodes {
+                    let indent = "  ".repeat(n.depth);
+                    match (n.depth, &n.repo_path, &n.symbol) {
+                        (0, Some(root), Some(sym)) => {
                             let loc = code_location(root, &sym.file_path, Some(sym.start_line));
                             println!("{} [{}] ({loc})", sym.name, sym.kind);
-                            found_seed = true;
                         }
-                        None => {
-                            println!("{} [not indexed]", name);
-                            break;
-                        }
-                    }
-                } else {
-                    match sym_info.first() {
-                        Some((root, sym)) => {
+                        (0, _, _) => println!("{} [not indexed]", n.name),
+                        (_, Some(root), Some(sym)) => {
                             let loc = code_location(root, &sym.file_path, Some(sym.start_line));
                             println!(
                                 "{indent}  {} {} [{}] ({loc})",
-                                kind_arrow(&edge_kind),
+                                kind_arrow(&n.edge),
                                 sym.name,
                                 sym.kind
                             );
                         }
-                        None => {
-                            println!(
-                                "{}  {} {} [unresolved]",
-                                indent,
-                                kind_arrow(&edge_kind),
-                                name
-                            );
-                            continue; // can't follow edges from unresolved
-                        }
+                        _ => println!("{indent}  {} {} [unresolved]", kind_arrow(&n.edge), n.name),
                     }
                 }
-
-                if depth < max_depth {
-                    // Collect outbound edges from all repos that have this symbol
-                    for (_repo_name, sym) in &sym_info {
-                        // Find the repo_db that owns this symbol
-                        for (_rname, rdb) in &repos {
-                            if let Ok(callees) = rdb.callees(sym.id) {
-                                for (to_name, kind, _, _confidence) in callees {
-                                    if !visited.contains(&to_name) {
-                                        queue.push_back((to_name, depth + 1, kind));
-                                    }
-                                }
-                                break; // symbol found in this repo, don't double-count
-                            }
-                        }
-                    }
+                if !found_seed {
+                    println!("Symbol '{symbol}' not found in any indexed repo.");
+                    println!(
+                        "Tip: re-index with `sclerox repo index` to capture call graph edges."
+                    );
                 }
-            }
-
-            if !found_seed && queue.is_empty() {
-                println!("Symbol '{symbol}' not found in any indexed repo.");
-                println!("Tip: re-index with `sclerox repo index` to capture call graph edges.");
-            }
+            });
         }
     }
     Ok(())
+}
+
+fn no_repos(format: OutputFormat) {
+    print_output(format, &Vec::<()>::new(), || {
+        println!("No repos indexed. Run `sclerox repo index [path]` first.")
+    });
+}
+
+/// A symbol and its outbound edges (`code calls`).
+#[derive(serde::Serialize)]
+struct SymbolEdges {
+    repo_path: String,
+    #[serde(flatten)]
+    symbol: Symbol,
+    edges: Vec<Edge>,
+}
+
+/// One outbound edge; `symbol` is its target when it resolves in the repo.
+#[derive(serde::Serialize)]
+struct Edge {
+    name: String,
+    kind: String,
+    line: i64,
+    confidence: String,
+    symbol: Option<Symbol>,
+}
+
+/// A symbol that calls / uses the one asked about (`code refs`).
+#[derive(serde::Serialize)]
+struct Reference {
+    repo_path: String,
+    kind: String,
+    line: i64,
+    confidence: String,
+    caller: Symbol,
+}
+
+/// A node of `code graph`, in breadth-first order. `edge` is the kind of edge
+/// from its parent (empty for the seed); `symbol` is unset when it doesn't
+/// resolve in any repo.
+#[derive(serde::Serialize)]
+struct GraphNode {
+    name: String,
+    depth: usize,
+    edge: String,
+    repo_path: Option<String>,
+    symbol: Option<Symbol>,
+}
+
+/// Breadth-first call graph from `seed`, up to `max_depth` edges out. An
+/// unresolved seed is the only node.
+fn call_graph(repos: &[(String, RepoDb)], seed: &str, max_depth: usize) -> Vec<GraphNode> {
+    // BFS: (name, depth, edge_kind_from_parent)
+    let mut queue: VecDeque<(String, usize, String)> = VecDeque::new();
+    queue.push_back((seed.to_string(), 0, String::new()));
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut nodes = Vec::new();
+
+    while let Some((name, depth, edge_kind)) = queue.pop_front() {
+        if visited.contains(&name) {
+            continue;
+        }
+        visited.insert(name.clone());
+
+        // Look up symbol info across all repos
+        let sym_info = find_across_repos(repos, &name);
+        let first = sym_info.first();
+        nodes.push(GraphNode {
+            name: name.clone(),
+            depth,
+            edge: edge_kind,
+            repo_path: first.map(|(root, _)| root.to_string()),
+            symbol: first.map(|(_, sym)| sym.clone()),
+        });
+        if first.is_none() {
+            // Can't follow edges from unresolved; an unresolved seed ends it.
+            if depth == 0 {
+                break;
+            }
+            continue;
+        }
+
+        if depth < max_depth {
+            // Collect outbound edges from all repos that have this symbol
+            for (_repo_name, sym) in &sym_info {
+                // Find the repo_db that owns this symbol
+                for (_rname, rdb) in repos {
+                    if let Ok(callees) = rdb.callees(sym.id) {
+                        for (to_name, kind, _, _confidence) in callees {
+                            if !visited.contains(&to_name) {
+                                queue.push_back((to_name, depth + 1, kind));
+                            }
+                        }
+                        break; // symbol found in this repo, don't double-count
+                    }
+                }
+            }
+        }
+    }
+    nodes
 }
 
 /// Open all repo DBs, optionally filtered by name, with each repo's root path.
@@ -315,10 +465,7 @@ fn open_matching_repos(db: &Database, repo_filter: Option<&str>) -> Result<Vec<(
 }
 
 /// Find a symbol by exact name across a set of open repo DBs.
-fn find_across_repos<'a>(
-    repos: &'a [(String, RepoDb)],
-    name: &str,
-) -> Vec<(&'a str, crate::index::repo_db::Symbol)> {
+fn find_across_repos<'a>(repos: &'a [(String, RepoDb)], name: &str) -> Vec<(&'a str, Symbol)> {
     let mut results = Vec::new();
     for (root, rdb) in repos {
         if let Ok(syms) = rdb.symbol_by_name(name) {
