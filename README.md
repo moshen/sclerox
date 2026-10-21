@@ -263,7 +263,7 @@ Environment variables still work and override the file:
 | `SCLEROX_LOG` | off | Log level: `error\|warn\|info\|debug` -> `~/.local/state/sclerox/logs/sclerox-YYYY-MM-DD.log` |
 | `SCLEROX_AI_COMMAND` | agent default | Full distillation command (prompt appended last) |
 | `SCLEROX_AI_MODEL` | agent default | Model appended to the default command |
-| `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
+| `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter; plain-text files of other types larger than this are not indexed |
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
 | `SCLEROX_EMBED_MODEL` | `granite-small-r2` | Embedding model (`granite-small-r2\|minilm-l6-v2`) |
 | `SCLEROX_EMBED_ENABLED` | `true` | `false` turns embeddings off (`[embed] enabled`) |

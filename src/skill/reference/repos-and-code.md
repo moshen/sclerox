@@ -13,6 +13,13 @@ sclerox repo sync                         # heal registry: remove stale/nested, 
 sclerox repo reembed [--repo <name>] [--force]  # backfill embeddings for indexed chunks
 ```
 
+What gets indexed: every file not excluded by `.gitignore`. Source and
+Markdown files are parsed into symbols and chunks (searchable by name, word for
+word, and by meaning). Every other plain-text file (config, YAML, JSON,
+lockfiles, `Dockerfile`, `.txt`, ...) is searchable word for word only - no
+symbols or embeddings - and is skipped if over `index.max_file_bytes`. Binary
+and non-UTF-8 files are skipped.
+
 Only git repos are auto-indexed (a folder needs a `.git`). Indexing happens at
 the git root; nested git repos each get their own index (one per `.git` level),
 and indexing a parent also indexes the nested repos it contains. Opt a folder

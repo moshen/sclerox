@@ -178,7 +178,8 @@ pub struct ServerSettings {
 #[serde(default)]
 pub struct IndexSettings {
     /// Files larger than this skip tree-sitter symbol extraction (still indexed
-    /// via line chunks). Env: `SCLEROX_MAX_INDEX_FILE_BYTES`.
+    /// via line chunks); plain-text files of no known language larger than
+    /// this are not indexed at all. Env: `SCLEROX_MAX_INDEX_FILE_BYTES`.
     pub max_file_bytes: usize,
     /// Automatic (session-hook) indexing policy: `"git"` indexes the session's
     /// git repo root only; `"off"` disables auto-indexing entirely. Explicit

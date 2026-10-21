@@ -185,7 +185,7 @@ pub fn config_template() -> String {
          # hard_memory_mb = {hard_memory_mb}              # over this (MB), it exits after the request in progress, even mid bulk work; 0: no limit. env: SCLEROX_SERVER_HARD_MEMORY_MB\n\
          \n\
          [index]\n\
-         # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
+         # max_file_bytes = {max_bytes}           # bigger: no tree-sitter; other plain text: skipped. env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
          # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
          # max_files = {max_files}                    # reject folders over this many files (--force to override); env: SCLEROX_MAX_INDEX_FILES\n\
          # chunk_chars = {code_chars}                # chars per embedded code chunk; changing it re-chunks on the next index. env: SCLEROX_CODE_CHUNK_CHARS\n\
