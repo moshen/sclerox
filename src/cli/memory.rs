@@ -4,7 +4,7 @@ use clap::Subcommand;
 use crate::config::settings;
 use crate::db::Database;
 use crate::embed::Embedder;
-use crate::output::{print_output, OutputFormat};
+use crate::output::{print_miss, print_output, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum MemoryCommand {
@@ -194,7 +194,8 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     embed_and_store(db, &mut embedder, &key, &value);
                 }
             }
-            println!("Set: {key}");
+            let entry = db.memory_get(&key)?;
+            print_output(format, &entry, || println!("Set: {key}"));
         }
 
         MemoryCommand::Get { key, history } => {
@@ -256,7 +257,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                             println!("Updated: {}", entry.updated_at);
                         });
                     }
-                    None => println!("Not found: {key}"),
+                    None => print_miss(format, &format!("Not found: {key}")),
                 }
             }
         }
@@ -340,17 +341,20 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
 
         MemoryCommand::Delete { key } => {
             if db.memory_delete(&key)? {
-                println!("Deleted: {key}");
+                print_output(format, &serde_json::json!({"deleted": key}), || {
+                    println!("Deleted: {key}")
+                });
             } else {
-                println!("Not found: {key}");
+                print_miss(format, &format!("Not found: {key}"));
             }
         }
 
         MemoryCommand::Stale { key, reason } => {
             if db.memory_stale(&key, reason.as_deref())? {
-                println!("Marked stale: {key}");
+                let entry = db.memory_get(&key)?;
+                print_output(format, &entry, || println!("Marked stale: {key}"));
             } else {
-                println!("Not found or already stale: {key}");
+                print_miss(format, &format!("Not found or already stale: {key}"));
             }
         }
 
@@ -365,9 +369,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &new_key, &new_value);
                 }
-                println!("Superseded '{old_key}' → '{new_key}'");
+                let entry = db.memory_get(&new_key)?;
+                print_output(format, &entry, || {
+                    println!("Superseded '{old_key}' → '{new_key}'")
+                });
             } else {
-                println!("No active memory found: {old_key}");
+                print_miss(format, &format!("No active memory found: {old_key}"));
             }
         }
 
@@ -390,7 +397,11 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 db.memory_needing_embedding()?
             };
             if targets.is_empty() {
-                println!("All active memories already embedded.");
+                print_output(
+                    format,
+                    &serde_json::json!({"embedded": 0, "total": 0}),
+                    || println!("All active memories already embedded."),
+                );
                 return Ok(());
             }
             if crate::embed::enabled() {
@@ -417,6 +428,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     } else {
                         super::queue::report(&queued);
                     }
+                    if format == OutputFormat::Json {
+                        print_output(format, &super::queue::summary(&queued, wait), || {});
+                    }
                     return Ok(());
                 }
             }
@@ -427,14 +441,19 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     done += 1;
                 }
             }
-            println!("Embedded {done} of {} memories.", targets.len());
+            print_output(
+                format,
+                &serde_json::json!({"embedded": done, "total": targets.len()}),
+                || println!("Embedded {done} of {} memories.", targets.len()),
+            );
         }
 
         MemoryCommand::Review { key } => {
             if db.memory_review(&key)? {
-                println!("Marked reviewed: {key}");
+                let entry = db.memory_get(&key)?;
+                print_output(format, &entry, || println!("Marked reviewed: {key}"));
             } else {
-                println!("Not found: {key}");
+                print_miss(format, &format!("Not found: {key}"));
             }
         }
 
@@ -520,17 +539,22 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             // resolves the old/new key relationship explicitly below.
             let memories = distill_with_ai(&argv, &text, "")?;
 
+            let result = serde_json::json!({"memories": memories, "saved": !dry_run});
             if memories.is_empty() {
-                println!("No memories extracted.");
+                print_output(format, &result, || println!("No memories extracted."));
                 return Ok(());
             }
 
-            for m in &memories {
-                println!("[{}] {} - {}", m.memory_type, m.key, truncate(&m.value, 80));
+            if format == OutputFormat::Text {
+                for m in &memories {
+                    println!("[{}] {} - {}", m.memory_type, m.key, truncate(&m.value, 80));
+                }
             }
 
             if dry_run {
-                println!("\n{} memories (dry-run: nothing written)", memories.len());
+                print_output(format, &result, || {
+                    println!("\n{} memories (dry-run: nothing written)", memories.len())
+                });
             } else {
                 let mut embedder = crate::embed::optional(db.semantic_ready());
                 for m in &memories {
@@ -561,7 +585,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         embed_and_store(db, e, &m.key, &m.value);
                     }
                 }
-                println!("\nSaved {} memories.", memories.len());
+                print_output(format, &result, || {
+                    println!("\nSaved {} memories.", memories.len())
+                });
             }
         }
 
@@ -571,7 +597,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             dry_run,
         } => {
             let resolved = resolve_import_path(path.as_deref(), agent.as_deref())?;
-            import_memories(db, &resolved, dry_run)?;
+            import_memories(db, &resolved, dry_run, format)?;
         }
 
         MemoryCommand::Distinct(sub) => match sub {
@@ -590,7 +616,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     anyhow::bail!("'{key_a}' and '{key_b}' are the same memory");
                 }
                 db.memory_distinct_add(a.id, b.id, reason.as_deref())?;
-                println!("Marked distinct: '{key_a}' and '{key_b}'");
+                let pairs = db.memory_distinct_list()?;
+                print_output(format, &pairs, || {
+                    println!("Marked distinct: '{key_a}' and '{key_b}'")
+                });
             }
             MemoryDistinctCmd::Remove { key_a, key_b } => {
                 let a = db
@@ -600,9 +629,15 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     .memory_get(&key_b)?
                     .ok_or_else(|| anyhow::anyhow!("no active memory: {key_b}"))?;
                 if db.memory_distinct_remove(a.id, b.id)? {
-                    println!("Removed distinct marking: '{key_a}' and '{key_b}'");
+                    let pairs = db.memory_distinct_list()?;
+                    print_output(format, &pairs, || {
+                        println!("Removed distinct marking: '{key_a}' and '{key_b}'")
+                    });
                 } else {
-                    println!("Not marked distinct: '{key_a}' and '{key_b}'");
+                    print_miss(
+                        format,
+                        &format!("Not marked distinct: '{key_a}' and '{key_b}'"),
+                    );
                 }
             }
             MemoryDistinctCmd::List => {
@@ -627,16 +662,22 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         MemoryCommand::People(sub) => match sub {
             MemoryPeopleCmd::Add { key, person_id } => {
                 if db.memory_link_person(&key, person_id)? {
-                    println!("Linked person #{person_id} to memory '{key}'");
+                    let people = db.memory_people(&key)?;
+                    print_output(format, &people, || {
+                        println!("Linked person #{person_id} to memory '{key}'")
+                    });
                 } else {
-                    println!("Memory key '{key}' not found");
+                    print_miss(format, &format!("Memory key '{key}' not found"));
                 }
             }
             MemoryPeopleCmd::Remove { key, person_id } => {
                 if db.memory_unlink_person(&key, person_id)? {
-                    println!("Removed person #{person_id} from memory '{key}'");
+                    let people = db.memory_people(&key)?;
+                    print_output(format, &people, || {
+                        println!("Removed person #{person_id} from memory '{key}'")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             MemoryPeopleCmd::List { key } => {
@@ -809,19 +850,26 @@ fn import_memories(
     db: &crate::db::Database,
     root: &std::path::Path,
     dry_run: bool,
+    format: OutputFormat,
 ) -> anyhow::Result<()> {
     if !root.exists() {
-        println!("Path not found: {}", root.display());
-        println!("Tip: use --path <dir> to point at any directory of .md memory files.");
+        print_miss(format, &format!("Path not found: {}", root.display()));
+        if format == OutputFormat::Text {
+            println!("Tip: use --path <dir> to point at any directory of .md memory files.");
+        }
         return Ok(());
     }
 
     let files = collect_md_files(root);
     if files.is_empty() {
-        println!("No .md files found under {}", root.display());
+        print_miss(
+            format,
+            &format!("No .md files found under {}", root.display()),
+        );
         return Ok(());
     }
 
+    let mut keys: Vec<String> = Vec::new();
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut embedder = if dry_run {
@@ -836,8 +884,11 @@ fn import_memories(
         };
 
         if dry_run {
-            println!("[would import] {key} ({memory_type})");
-            println!("  {}", truncate(&value, 80));
+            if format == OutputFormat::Text {
+                println!("[would import] {key} ({memory_type})");
+                println!("  {}", truncate(&value, 80));
+            }
+            keys.push(key);
             imported += 1;
         } else {
             if db.memory_get(&key)?.is_some() {
@@ -849,23 +900,32 @@ fn import_memories(
             if let Some(e) = embedder.as_mut() {
                 embed_and_store(db, e, &key, &value);
             }
+            keys.push(key);
             imported += 1;
         }
     }
 
-    if dry_run {
-        println!("\n{imported} entries would be imported (dry-run: nothing written)");
-    } else {
-        println!("Imported {imported} entries, skipped {skipped} (already exist)");
-        if imported > 0 {
-            println!("Run `sclerox memory list` to see imported entries.");
+    let result = serde_json::json!({
+        "imported": keys,
+        "skipped": skipped,
+        "dry_run": dry_run,
+    });
+    print_output(format, &result, || {
+        if dry_run {
+            println!("\n{imported} entries would be imported (dry-run: nothing written)");
+        } else {
+            println!("Imported {imported} entries, skipped {skipped} (already exist)");
+            if imported > 0 {
+                println!("Run `sclerox memory list` to see imported entries.");
+            }
         }
-    }
+    });
     Ok(())
 }
 
 // ─── AI distillation ─────────────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct DistilledMemory {
     pub key: String,
     pub value: String,

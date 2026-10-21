@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::db::Database;
+use crate::output::{print_output, progress, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum DbCommand {
@@ -68,11 +69,17 @@ pub enum DbCommand {
     },
 }
 
-pub fn run(db: &Database, cmd: DbCommand) -> Result<()> {
+pub fn run(db: &Database, cmd: DbCommand, format: OutputFormat) -> Result<()> {
     match cmd {
-        DbCommand::Migrate { repos } => migrate(db, repos),
-        DbCommand::Export { dir } => export(db, &dir),
-        DbCommand::Reembed { force, wait } => reembed_or_queue(db, force, wait),
+        DbCommand::Migrate { repos } => migrate(db, repos, format),
+        DbCommand::Export { dir } => export(db, &dir, format),
+        DbCommand::Reembed { force, wait } => {
+            let result = reembed_or_queue(db, force, wait)?;
+            if format == OutputFormat::Json {
+                print_output(format, &result, || {});
+            }
+            Ok(())
+        }
     }
 }
 
@@ -99,19 +106,23 @@ pub(crate) fn embeddings_need_work(db: &Database) -> bool {
 
 /// Re-embed every database recorded under another model (all of them with
 /// `force`), and embed main-database rows left without a vector. Shared by
-/// `sclerox db reembed` and `sclerox install`.
-pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
+/// `sclerox db reembed` and `sclerox install`. Returns the result
+/// `--output json` reports.
+pub(crate) fn reembed(db: &Database, force: bool) -> Result<serde_json::Value> {
     use crate::index::repo_db::RepoDb;
 
     let mut embedder = crate::embed::required()?;
     let model = embedder.model();
-    println!("Embedding model: {} ({})", model.name, model.id);
+    progress(format_args!(
+        "Embedding model: {} ({})",
+        model.name, model.id
+    ));
 
     let mut rebuilt = 0usize;
     let mut failed = 0usize;
 
     let main_state = db.embedding_model_check()?;
-    println!("\nMain database:");
+    progress("\nMain database:");
     let mut main_ok = true;
     let mut main_done = false;
     // Re-cut text chunks first. On the configured model the new chunks are
@@ -143,7 +154,9 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
                 text_chunks_embedded = !mismatched;
             }
             Err(e) => {
-                println!("  could not re-chunk text (run again to retry): {e:#}");
+                progress(format_args!(
+                    "  could not re-chunk text (run again to retry): {e:#}"
+                ));
                 main_ok = false;
             }
         }
@@ -152,11 +165,11 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     // on top of that.
     let rebuild_main = main_ok && needs_rebuild(&main_state, force);
     if rebuild_main && !wait_for_distillations() {
-        println!(
+        progress(format_args!(
             "  skipped: a session distillation is still running and could write \
              vectors from the old model after the switch; run `sclerox db reembed` \
              once it finishes"
-        );
+        ));
         main_ok = false;
     } else if rebuild_main {
         let skip: &[&str] = if text_chunks_embedded {
@@ -168,11 +181,11 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
             db.reembed_all_except(id, skip, embed, progress)
         }) {
             Ok(n) => {
-                println!("  re-embedded: {n} vectors");
+                progress(format_args!("  re-embedded: {n} vectors"));
                 main_done = true;
             }
             Err(e) => {
-                println!("  failed, left on its previous model: {e:#}");
+                progress(format_args!("  failed, left on its previous model: {e:#}"));
                 main_ok = false;
             }
         }
@@ -181,16 +194,18 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     // or the database mismatched, with --no-embed, or during the rebuild.
     let missing = if main_ok { db.missing_vectors()? } else { 0 };
     if missing > 0 {
-        println!("  {missing} item(s) without a vector:");
+        progress(format_args!("  {missing} item(s) without a vector:"));
         match rebuild_one(&mut embedder, |id, embed, progress| {
             db.fill_missing_vectors(id, embed, progress)
         }) {
             Ok(n) => {
-                println!("  filled: {n} vectors");
+                progress(format_args!("  filled: {n} vectors"));
                 main_done = true;
             }
             Err(e) => {
-                println!("  could not embed them (run again to retry): {e:#}");
+                progress(format_args!(
+                    "  could not embed them (run again to retry): {e:#}"
+                ));
                 main_ok = false;
             }
         }
@@ -198,27 +213,33 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
     match (main_ok, main_done) {
         (false, _) => failed += 1,
         (true, true) => rebuilt += 1,
-        (true, false) => println!("  {}", describe_skip(&main_state)),
+        (true, false) => progress(format_args!("  {}", describe_skip(&main_state))),
     }
 
     let pruned = db.repo_prune_gone()?;
     let repos = db.repo_list()?;
     if !repos.is_empty() || !pruned.is_empty() {
-        println!("\nRepo indexes:");
+        progress("\nRepo indexes:");
     }
     for repo in &pruned {
-        println!("  {}: removed stale entry (directory gone)", repo.name);
+        progress(format_args!(
+            "  {}: removed stale entry (directory gone)",
+            repo.name
+        ));
     }
     for repo in &repos {
         let db_path = PathBuf::from(&repo.db_path);
         if !db_path.exists() {
-            println!("  {}: index missing ({})", repo.name, repo.db_path);
+            progress(format_args!(
+                "  {}: index missing ({})",
+                repo.name, repo.db_path
+            ));
             continue;
         }
         let rdb = match RepoDb::open(&db_path) {
             Ok(r) => r,
             Err(e) => {
-                println!("  {}: could not open ({e})", repo.name);
+                progress(format_args!("  {}: could not open ({e})", repo.name));
                 failed += 1;
                 continue;
             }
@@ -226,43 +247,47 @@ pub(crate) fn reembed(db: &Database, force: bool) -> Result<()> {
         let state = match rdb.embedding_model_check() {
             Ok(s) => s,
             Err(e) => {
-                println!(
+                progress(format_args!(
                     "  {}: could not read its embedding model ({e:#})",
                     repo.name
-                );
+                ));
                 failed += 1;
                 continue;
             }
         };
         if !needs_rebuild(&state, force) {
-            println!("  {}: {}", repo.name, describe_skip(&state));
+            progress(format_args!("  {}: {}", repo.name, describe_skip(&state)));
             continue;
         }
-        println!("  {}:", repo.name);
+        progress(format_args!("  {}:", repo.name));
         match rebuild_one(&mut embedder, |id, embed, progress| {
             rdb.reembed_all(id, embed, progress)
         }) {
             Ok(n) => {
-                println!("    done: {n} vectors");
+                progress(format_args!("    done: {n} vectors"));
                 rebuilt += 1;
             }
             Err(e) => {
-                println!("    failed, left on its previous model: {e:#}");
+                progress(format_args!(
+                    "    failed, left on its previous model: {e:#}"
+                ));
                 failed += 1;
             }
         }
     }
 
-    println!();
+    progress("");
     match (rebuilt, failed) {
-        (0, 0) => println!("Nothing to re-embed."),
-        (n, 0) => println!("Updated {n} database(s) with {}.", model.name),
+        (0, 0) => progress("Nothing to re-embed."),
+        (n, 0) => progress(format_args!("Updated {n} database(s) with {}.", model.name)),
         (n, f) => {
-            println!("Updated {n} database(s); {f} failed. Run again to retry them.");
+            progress(format_args!(
+                "Updated {n} database(s); {f} failed. Run again to retry them."
+            ));
             anyhow::bail!("{f} database(s) could not be re-embedded");
         }
     }
-    Ok(())
+    Ok(serde_json::json!({"model": model.id, "updated": rebuilt}))
 }
 
 /// How long a rebuild of the main database waits for session distillations.
@@ -285,11 +310,11 @@ pub(crate) fn wait_for_distillations() -> bool {
             return false;
         }
         if !told {
-            println!(
+            progress(format_args!(
                 "  waiting for {running} session distillation(s) to finish first \
                  (up to {} min)...",
                 DISTILL_WAIT.as_secs() / 60
-            );
+            ));
             told = true;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -298,29 +323,33 @@ pub(crate) fn wait_for_distillations() -> bool {
 
 fn print_rechunked(r: &super::text_chunks::Rechunked) {
     let cfg = &crate::config::settings().embed;
-    println!(
+    progress(format_args!(
         "  re-chunked {} meeting(s), {} todo(s) and {} research item(s) \
          at chunk_size {}, overlap {}",
         r.meetings, r.todos, r.research, cfg.chunk_size, cfg.chunk_overlap
-    );
+    ));
     if r.replaced.recut > 0 {
-        println!(
+        progress(format_args!(
             "  {} item(s) edited meanwhile were cut from their new text",
             r.replaced.recut
-        );
+        ));
     }
     if r.replaced.gone > 0 {
-        println!(
+        progress(format_args!(
             "  {} item(s) deleted meanwhile were skipped",
             r.replaced.gone
-        );
+        ));
     }
 }
 
 /// [`reembed`], through the model server when it runs: re-cut text chunks
 /// here, queue the embedding for the server, and return unless `wait`.
 /// Shared by `sclerox db reembed` and `sclerox install`.
-pub(crate) fn reembed_or_queue(db: &Database, force: bool, wait: bool) -> Result<()> {
+pub(crate) fn reembed_or_queue(
+    db: &Database,
+    force: bool,
+    wait: bool,
+) -> Result<serde_json::Value> {
     if !crate::embed::enabled() {
         // Says why.
         return reembed(db, force);
@@ -337,16 +366,16 @@ fn queue_reembed(
     spec: &'static crate::embed::ModelSpec,
     force: bool,
     wait: bool,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     use crate::db::jobs::{DbKind, Kind};
     use crate::index::repo_db::RepoDb;
 
-    println!("Embedding model: {} ({})", spec.name, spec.id);
+    progress(format_args!("Embedding model: {} ({})", spec.name, spec.id));
     let mut queued = Vec::new();
     let mut failed = 0usize;
 
     let main_state = db.embedding_model_check()?;
-    println!("\nMain database:");
+    progress("\nMain database:");
     let mut main_ok = true;
     let mut rechunked = false;
     // The new chunks go in without vectors; the server embeds them below.
@@ -357,7 +386,9 @@ fn queue_reembed(
                 rechunked = true;
             }
             Err(e) => {
-                println!("  could not re-chunk text (run again to retry): {e:#}");
+                progress(format_args!(
+                    "  could not re-chunk text (run again to retry): {e:#}"
+                ));
                 main_ok = false;
                 failed += 1;
             }
@@ -372,7 +403,7 @@ fn queue_reembed(
             todo.push((Kind::Fill, None));
         }
         if todo.is_empty() {
-            println!("  {}", describe_skip(&main_state));
+            progress(format_args!("  {}", describe_skip(&main_state)));
         } else {
             queued.push(super::queue::submit(
                 &db.conn,
@@ -387,21 +418,27 @@ fn queue_reembed(
     let pruned = db.repo_prune_gone()?;
     let repos = db.repo_list()?;
     if !repos.is_empty() || !pruned.is_empty() {
-        println!("\nRepo indexes:");
+        progress("\nRepo indexes:");
     }
     for repo in &pruned {
-        println!("  {}: removed stale entry (directory gone)", repo.name);
+        progress(format_args!(
+            "  {}: removed stale entry (directory gone)",
+            repo.name
+        ));
     }
     for repo in &repos {
         let db_path = PathBuf::from(&repo.db_path);
         if !db_path.exists() {
-            println!("  {}: index missing ({})", repo.name, repo.db_path);
+            progress(format_args!(
+                "  {}: index missing ({})",
+                repo.name, repo.db_path
+            ));
             continue;
         }
         let rdb = match RepoDb::open(&db_path) {
             Ok(r) => r,
             Err(e) => {
-                println!("  {}: could not open ({e})", repo.name);
+                progress(format_args!("  {}: could not open ({e})", repo.name));
                 failed += 1;
                 continue;
             }
@@ -416,23 +453,23 @@ fn queue_reembed(
                     &[(Kind::Rebuild, None)],
                 )?);
             }
-            Ok(state) => println!("  {}: {}", repo.name, describe_skip(&state)),
+            Ok(state) => progress(format_args!("  {}: {}", repo.name, describe_skip(&state))),
             Err(e) => {
-                println!(
+                progress(format_args!(
                     "  {}: could not read its embedding model ({e:#})",
                     repo.name
-                );
+                ));
                 failed += 1;
             }
         }
     }
 
     if queued.is_empty() && failed == 0 {
-        println!("\nNothing to re-embed.");
-        return Ok(());
+        progress("\nNothing to re-embed.");
+        return Ok(super::queue::summary(&queued, wait));
     }
     if wait {
-        println!();
+        progress("");
         super::queue::wait(spec, &queued)?;
     } else {
         super::queue::report(&queued);
@@ -440,7 +477,7 @@ fn queue_reembed(
     if failed > 0 {
         anyhow::bail!("{failed} database(s) could not be queued; run again to retry");
     }
-    Ok(())
+    Ok(super::queue::summary(&queued, wait))
 }
 
 /// A mismatch always needs a rebuild. A database with nothing recorded has
@@ -475,78 +512,118 @@ fn rebuild_one(
     use std::io::{IsTerminal, Write};
 
     let model_id = embedder.model().id;
-    let interactive = std::io::stdout().is_terminal();
+    // Under --output json, progress goes to stderr; stdout carries the result.
+    let json = crate::output::format() == OutputFormat::Json;
+    let interactive = if json {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
     let started = std::time::Instant::now();
     let mut embed = |texts: &[&str]| embedder.embed_each(texts);
-    let mut progress = |label: &str, done: usize, total: usize| {
+    let mut on_progress = |label: &str, done: usize, total: usize| {
         if interactive {
             let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
-            print!("\r    {label}: {done}/{total} ({rate:.0}/s)   ");
-            if done == total {
-                println!();
+            let line = format!("\r    {label}: {done}/{total} ({rate:.0}/s)   ");
+            let end = if done == total { "\n" } else { "" };
+            if json {
+                eprint!("{line}{end}");
+                let _ = std::io::stderr().flush();
+            } else {
+                print!("{line}{end}");
+                let _ = std::io::stdout().flush();
             }
-            let _ = std::io::stdout().flush();
         } else if done == total {
-            println!("    {label}: {total}");
+            progress(format_args!("    {label}: {total}"));
         }
     };
-    run(model_id, &mut embed, &mut progress)
+    run(model_id, &mut embed, &mut on_progress)
 }
 
 // ---------- migrate ----------
 
-fn migrate(db: &Database, show_repos: bool) -> Result<()> {
+fn migrate(db: &Database, show_repos: bool, format: OutputFormat) -> Result<()> {
     let (current, target, pending) = db.migration_status()?;
+    let embeddings = describe_model(db.embedding_model().ok().flatten());
 
-    println!("Primary database (~/.local/share/sclerox/sclerox.db)");
-    println!("  schema version : {current}");
-    println!("  binary expects : {target}");
-    if pending == 0 {
-        println!("  status         : up to date");
-    } else {
-        println!("  status         : {pending} migration(s) will apply on next open");
-    }
-    println!(
-        "  embeddings     : {}",
-        describe_model(db.embedding_model().ok().flatten())
-    );
-
+    // One line of status per repo database, with its JSON form.
+    let mut repos: Vec<(String, serde_json::Value)> = Vec::new();
     if show_repos {
         use crate::index::repo_db::RepoDb;
 
-        let repos = db.repo_list()?;
-        if repos.is_empty() {
-            println!("\nNo repos indexed.");
-        } else {
-            println!("\nRepo databases:");
-            for repo in &repos {
-                let db_path = PathBuf::from(&repo.db_path);
-                if !db_path.exists() {
-                    println!("  {} - db missing ({})", repo.name, repo.db_path);
-                    continue;
-                }
-                match RepoDb::open(&db_path) {
-                    Ok(rdb) => match rdb.migration_status() {
-                        Ok((cur, tgt, pend)) => {
-                            let status = if pend == 0 {
-                                "up to date".to_string()
-                            } else {
-                                format!("{pend} pending")
-                            };
-                            let model = describe_model(rdb.embedding_model().ok().flatten());
-                            println!(
+        for repo in db.repo_list()? {
+            let db_path = PathBuf::from(&repo.db_path);
+            repos.push(if !db_path.exists() {
+                (
+                    format!("  {} - db missing ({})", repo.name, repo.db_path),
+                    serde_json::json!({"name": repo.name, "error": "db missing", "db_path": repo.db_path}),
+                )
+            } else {
+                match RepoDb::open(&db_path).map(|rdb| (rdb.migration_status(), rdb)) {
+                    Ok((Ok((cur, tgt, pend)), rdb)) => {
+                        let status = if pend == 0 {
+                            "up to date".to_string()
+                        } else {
+                            format!("{pend} pending")
+                        };
+                        let model = describe_model(rdb.embedding_model().ok().flatten());
+                        (
+                            format!(
                                 "  {} v{cur}/{tgt} ({status}; embeddings: {model})",
                                 repo.name
-                            );
-                        }
-                        Err(e) => println!("  {} - error: {e}", repo.name),
-                    },
-                    Err(e) => println!("  {} - could not open: {e}", repo.name),
+                            ),
+                            serde_json::json!({
+                                "name": repo.name,
+                                "schema_version": cur,
+                                "expected_version": tgt,
+                                "pending": pend,
+                                "embeddings": model,
+                            }),
+                        )
+                    }
+                    Ok((Err(e), _)) => (
+                        format!("  {} - error: {e}", repo.name),
+                        serde_json::json!({"name": repo.name, "error": e.to_string()}),
+                    ),
+                    Err(e) => (
+                        format!("  {} - could not open: {e}", repo.name),
+                        serde_json::json!({"name": repo.name, "error": format!("could not open: {e}")}),
+                    ),
                 }
-            }
+            });
         }
     }
 
+    let mut result = serde_json::json!({
+        "schema_version": current,
+        "expected_version": target,
+        "pending": pending,
+        "embeddings": embeddings,
+    });
+    if show_repos {
+        result["repos"] = repos.iter().map(|(_, j)| j.clone()).collect();
+    }
+    print_output(format, &result, || {
+        println!("Primary database (~/.local/share/sclerox/sclerox.db)");
+        println!("  schema version : {current}");
+        println!("  binary expects : {target}");
+        if pending == 0 {
+            println!("  status         : up to date");
+        } else {
+            println!("  status         : {pending} migration(s) will apply on next open");
+        }
+        println!("  embeddings     : {embeddings}");
+        if show_repos {
+            if repos.is_empty() {
+                println!("\nNo repos indexed.");
+            } else {
+                println!("\nRepo databases:");
+                for (line, _) in &repos {
+                    println!("{line}");
+                }
+            }
+        }
+    });
     Ok(())
 }
 
@@ -569,7 +646,7 @@ fn describe_model(recorded: Option<String>) -> String {
 
 // ---------- export ----------
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 struct ExportStats {
     memory: usize,
     people: usize,
@@ -584,7 +661,7 @@ const OWNED_SUBDIRS: &[&str] = &[
     "memory", "people", "projects", "meetings", "todos", "research", "repos",
 ];
 
-fn export(db: &Database, dir: &Path) -> Result<()> {
+fn export(db: &Database, dir: &Path, format: OutputFormat) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating export dir {}", dir.display()))?;
 
     // Wipe owned subdirs so deleted records vanish on re-export.
@@ -605,16 +682,22 @@ fn export(db: &Database, dir: &Path) -> Result<()> {
     export_repos(db, dir, &mut stats)?;
     write_index(dir, &stats)?;
 
-    println!("Exported to {}", dir.display());
-    println!(
-        "  {} memory, {} people, {} projects, {} meetings, {} todos, {} research, {} repos",
-        stats.memory,
-        stats.people,
-        stats.projects,
-        stats.meetings,
-        stats.todos,
-        stats.research,
-        stats.repos,
+    print_output(
+        format,
+        &serde_json::json!({"dir": dir, "exported": stats}),
+        || {
+            println!("Exported to {}", dir.display());
+            println!(
+                "  {} memory, {} people, {} projects, {} meetings, {} todos, {} research, {} repos",
+                stats.memory,
+                stats.people,
+                stats.projects,
+                stats.meetings,
+                stats.todos,
+                stats.research,
+                stats.repos,
+            );
+        },
     );
     Ok(())
 }
@@ -1198,7 +1281,7 @@ mod tests {
             None,
         );
 
-        export(&db, dir.path()).unwrap();
+        export(&db, dir.path(), OutputFormat::Text).unwrap();
 
         assert!(dir.path().join("people").exists());
         assert!(dir.path().join("memory").exists());
@@ -1209,7 +1292,7 @@ mod tests {
 
         // Re-run after deleting the person - their file should vanish.
         let _ = db.people_delete(pid);
-        export(&db, dir.path()).unwrap();
+        export(&db, dir.path(), OutputFormat::Text).unwrap();
         assert!(!dir.path().join("people/jane-doe.md").exists());
         assert!(user_file.exists(), "user file must survive re-export");
     }
@@ -1220,7 +1303,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("research/graphify/finding", "use rust", "project", None)
             .unwrap();
-        export(&db, dir.path()).unwrap();
+        export(&db, dir.path(), OutputFormat::Text).unwrap();
         let expected = dir.path().join("memory/research/graphify/finding.md");
         assert!(expected.exists(), "expected {}", expected.display());
         let content = fs::read_to_string(&expected).unwrap();

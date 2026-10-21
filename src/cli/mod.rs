@@ -122,11 +122,12 @@ pub enum Commands {
 
 pub fn run(cli: Cli) -> Result<()> {
     let format = cli.output;
+    crate::output::set_format(format);
 
     match cli.command {
-        Commands::Install(args) => install::run_install(args),
-        Commands::Uninstall(args) => install::run_uninstall(args),
-        Commands::Migrate(args) => migrate::run_migrate(args),
+        Commands::Install(args) => install::run_install(args, format),
+        Commands::Uninstall(args) => install::run_uninstall(args, format),
+        Commands::Migrate(args) => migrate::run_migrate(args, format),
         Commands::Completions(args) => completions::run(args),
         Commands::Config(cmd) => config_cmd::run(cmd, format),
         Commands::Server(cmd) => server::run(cmd, format),
@@ -144,13 +145,13 @@ pub fn run(cli: Cli) -> Result<()> {
             match cmd {
                 Commands::Memory(c) => memory::run(&db, c, format),
                 Commands::People(c) => people::run(&db, c, format),
-                Commands::Meeting(c) => meetings::run(&db, c),
-                Commands::Project(c) => projects::run(&db, c),
+                Commands::Meeting(c) => meetings::run(&db, c, format),
+                Commands::Project(c) => projects::run(&db, c, format),
                 Commands::Todo(c) => todos::run(&db, c, format),
                 Commands::Research(c) => research::run(&db, c, format),
-                Commands::Repo(c) => repos::run(&db, c),
-                Commands::Code(c) => code::run(&db, c),
-                Commands::Db(c) => db::run(&db, c),
+                Commands::Repo(c) => repos::run(&db, c, format),
+                Commands::Code(c) => code::run(&db, c, format),
+                Commands::Db(c) => db::run(&db, c, format),
                 Commands::Search(a) => search::run(&db, a, format),
                 Commands::Install(_)
                 | Commands::Uninstall(_)

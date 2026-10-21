@@ -127,8 +127,18 @@ Global search across everything: `sclerox search "<query>"`. Hits come best firs
 across all types (people, projects and symbols last). They carry a UTC
 time: `(updated ...)` is when a memory, todo, person, project or research item
 last changed; meetings and repos show only `(created ...)`; code hits have none.
-When two updated hits disagree, the newer one is usually current. For an area's full
-commands and its workflow, read the matching file on demand:
+When two updated hits disagree, the newer one is usually current.
+
+Every command takes `--output json` (a global flag, not `--format`) for
+scripting: stdout is then exactly one JSON document - the records for reads,
+the resulting record (or `{"deleted": ...}`) for writes, `{"error": "..."}`
+for a miss such as "not found". Progress lines go to stderr. `todo`,
+`meeting`, `research` and `repo search` return `{"fts": [...], "semantic": [...]}`;
+`memory search`, `people search` and `project search` return a flat list of
+entries; `sclerox search`, `code search` and `repo search-symbols` return a
+flat list tagged by `type`.
+
+For an area's full commands and its workflow, read the matching file on demand:
 
 - [reference/memory.md](reference/memory.md) - set/get/search, stale, supersede, review, distill, import
 - [reference/people.md](reference/people.md) - people and their identifiers

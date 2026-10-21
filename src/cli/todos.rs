@@ -4,7 +4,7 @@ use clap::Subcommand;
 use crate::cli::text_chunks;
 use crate::config::settings;
 use crate::db::{todos::TodoStatus, Database};
-use crate::output::{print_output, truncate, OutputFormat};
+use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum TodoCommand {
@@ -165,15 +165,16 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                         embed_todo(db, id, &t.title, t.notes.as_deref());
                     }
                 }
-                println!("Updated todo #{id}");
+                let t = db.todo_get(id)?;
+                print_output(format, &t, || println!("Updated todo #{id}"));
             } else {
-                println!("Todo #{id} not found or no changes");
+                print_miss(format, &format!("Todo #{id} not found or no changes"));
             }
         }
 
         TodoCommand::Get { id } => match db.todo_get(id)? {
             Some(t) => print_output(format, &t, || print_todo_detail(&t)),
-            None => println!("Todo #{id} not found"),
+            None => print_miss(format, &format!("Todo #{id} not found")),
         },
 
         TodoCommand::List {
@@ -279,23 +280,25 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                     println!("Done: #{id}");
                 }
             } else {
-                println!("Todo #{id} not found or already done");
+                print_miss(format, &format!("Todo #{id} not found or already done"));
             }
         }
 
         TodoCommand::Watch { id } => {
             if db.todo_set_status(id, TodoStatus::Watch)? {
-                println!("Watching: #{id}");
+                let t = db.todo_get(id)?;
+                print_output(format, &t, || println!("Watching: #{id}"));
             } else {
-                println!("Todo #{id} not found");
+                print_miss(format, &format!("Todo #{id} not found"));
             }
         }
 
         TodoCommand::Reopen { id } => {
             if db.todo_set_status(id, TodoStatus::Open)? {
-                println!("Reopened: #{id}");
+                let t = db.todo_get(id)?;
+                print_output(format, &t, || println!("Reopened: #{id}"));
             } else {
-                println!("Todo #{id} not found");
+                print_miss(format, &format!("Todo #{id} not found"));
             }
         }
 
@@ -316,22 +319,30 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
 
         TodoCommand::Delete { id } => {
             if db.todo_delete(id)? {
-                println!("Deleted #{id}");
+                print_output(format, &serde_json::json!({"deleted": id}), || {
+                    println!("Deleted #{id}")
+                });
             } else {
-                println!("Todo #{id} not found");
+                print_miss(format, &format!("Todo #{id} not found"));
             }
         }
 
         TodoCommand::People(sub) => match sub {
             PeopleCmd::Add { todo_id, person_id } => {
                 db.todo_link_person(todo_id, person_id)?;
-                println!("Linked person #{person_id} to todo #{todo_id}");
+                let people = db.todo_people(todo_id)?;
+                print_output(format, &people, || {
+                    println!("Linked person #{person_id} to todo #{todo_id}")
+                });
             }
             PeopleCmd::Remove { todo_id, person_id } => {
                 if db.todo_unlink_person(todo_id, person_id)? {
-                    println!("Removed person #{person_id} from todo #{todo_id}");
+                    let people = db.todo_people(todo_id)?;
+                    print_output(format, &people, || {
+                        println!("Removed person #{person_id} from todo #{todo_id}")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             PeopleCmd::List { todo_id } => {
@@ -354,16 +365,22 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                 project_id,
             } => {
                 db.todo_link_project(todo_id, project_id)?;
-                println!("Linked project #{project_id} to todo #{todo_id}");
+                let projects = db.todo_projects(todo_id)?;
+                print_output(format, &projects, || {
+                    println!("Linked project #{project_id} to todo #{todo_id}")
+                });
             }
             TodoProjectsCmd::Remove {
                 todo_id,
                 project_id,
             } => {
                 if db.todo_unlink_project(todo_id, project_id)? {
-                    println!("Removed project #{project_id} from todo #{todo_id}");
+                    let projects = db.todo_projects(todo_id)?;
+                    print_output(format, &projects, || {
+                        println!("Removed project #{project_id} from todo #{todo_id}")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             TodoProjectsCmd::List { todo_id } => {

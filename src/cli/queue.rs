@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::jobs::{self, DbKind, Job, Kind};
 use crate::embed::{server, ModelSpec};
+use crate::output::{progress, OutputFormat};
 
 /// One database's jobs, handed to the server.
 pub struct Queued {
@@ -49,9 +50,11 @@ pub fn submit(
         })
         .collect();
     if server::enqueue(spec, &path, kind) {
-        println!("  {label}: queued ({})", what.join(", then "));
+        progress(format_args!("  {label}: queued ({})", what.join(", then ")));
     } else {
-        println!("  {label}: the model server is unavailable; embedding here");
+        progress(format_args!(
+            "  {label}: the model server is unavailable; embedding here"
+        ));
         run_here(conn, kind)?;
     }
     Ok(Queued {
@@ -98,18 +101,34 @@ pub fn report(queued: &[Queued]) {
     if queued.is_empty() {
         return;
     }
-    println!(
+    progress(format_args!(
         "\nQueued for the model server, which embeds in the background: {}.",
         queued
             .iter()
             .map(|q| q.label.as_str())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    ));
+    progress(
         "Until then, keyword search still finds what has no vector yet. Follow it with \
-         `sclerox server status`, or run with --wait."
+         `sclerox server status`, or run with --wait.",
     );
+}
+
+/// What was handed to the server, as a command's JSON result. `done` is
+/// whether the command waited for it to finish.
+pub fn summary(queued: &[Queued], done: bool) -> serde_json::Value {
+    let dbs: Vec<_> = queued
+        .iter()
+        .map(|q| {
+            serde_json::json!({
+                "label": q.label,
+                "path": q.path,
+                "jobs": q.jobs,
+            })
+        })
+        .collect();
+    serde_json::json!({ "queued": dbs, "done": done })
 }
 
 /// How often `--wait` looks at the jobs, and at the server.
@@ -122,7 +141,13 @@ const CHECK_SERVER: Duration = Duration::from_secs(2);
 pub fn wait(spec: &'static ModelSpec, queued: &[Queued]) -> Result<()> {
     use std::io::{IsTerminal, Write};
 
-    let interactive = std::io::stdout().is_terminal();
+    // Under --output json, progress goes to stderr; stdout carries the result.
+    let json = crate::output::format() == OutputFormat::Json;
+    let interactive = if json {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
     let mut conns = Vec::new();
     for q in queued {
         conns.push(q.kind.open(&q.path)?);
@@ -156,24 +181,27 @@ pub fn wait(spec: &'static ModelSpec, queued: &[Queued]) -> Result<()> {
         }
         if pending.is_empty() {
             if interactive && !shown.is_empty() {
-                println!();
+                progress("");
             }
             for f in &failed {
-                println!("  {f}");
+                progress(format_args!("  {f}"));
             }
             if !failed.is_empty() {
                 anyhow::bail!("{} embedding job(s) didn't finish", failed.len());
             }
-            println!("Embedding done.");
+            progress("Embedding done.");
             return Ok(());
         }
         let line = lines.join("; ");
         if line != shown {
-            if interactive {
+            if !interactive {
+                progress(format_args!("  {line}"));
+            } else if json {
+                eprint!("\r  {line}\x1b[K");
+                let _ = std::io::stderr().flush();
+            } else {
                 print!("\r  {line}\x1b[K");
                 let _ = std::io::stdout().flush();
-            } else {
-                println!("  {line}");
             }
             shown = line;
         }
@@ -190,10 +218,10 @@ pub fn wait(spec: &'static ModelSpec, queued: &[Queued]) -> Result<()> {
                 let path = std::fs::canonicalize(&q.path).unwrap_or_else(|_| q.path.clone());
                 let owned = working.as_ref().is_some_and(|w| w.contains(&path));
                 if pending.contains(&q.label) && !owned && !server::enqueue(spec, &q.path, q.kind) {
-                    println!(
+                    progress(format_args!(
                         "\n  {}: the model server is unavailable; embedding here",
                         q.label
-                    );
+                    ));
                     run_here(conn, q.kind)?;
                 }
             }

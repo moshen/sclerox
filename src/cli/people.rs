@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 
 use crate::db::{people::PersonUpdate, Database};
-use crate::output::{print_output, OutputFormat};
+use crate::output::{print_miss, print_output, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum PeopleCommand {
@@ -116,7 +116,9 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                 db.people_identifier_set(id, t, v)?;
             }
 
-            println!("Added person #{id}: {name}");
+            print_output(format, &person_json(db, id)?, || {
+                println!("Added person #{id}: {name}")
+            });
         }
 
         PeopleCommand::Get { id } => match db.people_get(id)? {
@@ -128,7 +130,7 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                     || print_person(&p, &idents),
                 );
             }
-            None => println!("Person #{id} not found"),
+            None => print_miss(format, &format!("Person #{id} not found")),
         },
 
         PeopleCommand::List => {
@@ -172,17 +174,21 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                 notes: notes.map(Some),
             };
             if db.people_update(id, update)? {
-                println!("Updated person #{id}");
+                print_output(format, &person_json(db, id)?, || {
+                    println!("Updated person #{id}")
+                });
             } else {
-                println!("Person #{id} not found or no changes");
+                print_miss(format, &format!("Person #{id} not found or no changes"));
             }
         }
 
         PeopleCommand::Delete { id } => {
             if db.people_delete(id)? {
-                println!("Deleted person #{id}");
+                print_output(format, &serde_json::json!({"deleted": id}), || {
+                    println!("Deleted person #{id}")
+                });
             } else {
-                println!("Person #{id} not found");
+                print_miss(format, &format!("Person #{id} not found"));
             }
         }
 
@@ -200,49 +206,76 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                     );
                 }
                 db.people_identifier_set(person_id, &identifier_type, &value)?;
-                println!("Set {identifier_type}={value} on person #{person_id}");
+                let idents = db.people_identifiers_for(person_id)?;
+                print_output(format, &idents, || {
+                    println!("Set {identifier_type}={value} on person #{person_id}")
+                });
             }
             IdentifierCmd::Remove {
                 person_id,
                 identifier_type,
             } => {
                 if db.people_identifier_remove(person_id, &identifier_type)? {
-                    println!("Removed {identifier_type} from person #{person_id}");
+                    let idents = db.people_identifiers_for(person_id)?;
+                    print_output(format, &idents, || {
+                        println!("Removed {identifier_type} from person #{person_id}")
+                    });
                 } else {
-                    println!("No {identifier_type} identifier found on person #{person_id}");
+                    print_miss(
+                        format,
+                        &format!("No {identifier_type} identifier found on person #{person_id}"),
+                    );
                 }
             }
             IdentifierCmd::List { person_id } => {
                 let idents = db.people_identifiers_for(person_id)?;
-                if idents.is_empty() {
-                    println!("No identifiers for person #{person_id}");
-                } else {
-                    for i in &idents {
-                        println!("  {}: {}", i.identifier_type, i.identifier);
+                print_output(format, &idents, || {
+                    if idents.is_empty() {
+                        println!("No identifiers for person #{person_id}");
+                    } else {
+                        for i in &idents {
+                            println!("  {}: {}", i.identifier_type, i.identifier);
+                        }
                     }
-                }
+                });
             }
         },
 
         PeopleCommand::Types(sub) => match sub {
             IdentifierTypeCmd::List => {
                 let types = db.identifier_types_list()?;
-                for t in &types {
-                    let desc = t.description.as_deref().unwrap_or("");
-                    println!("  {}  {}", t.name, desc);
-                }
+                print_output(format, &types, || {
+                    for t in &types {
+                        let desc = t.description.as_deref().unwrap_or("");
+                        println!("  {}  {}", t.name, desc);
+                    }
+                });
             }
             IdentifierTypeCmd::Add { name, description } => {
                 if db.identifier_type_exists(&name)? {
-                    println!("Type '{name}' already exists");
+                    print_miss(format, &format!("Type '{name}' already exists"));
                 } else {
                     db.identifier_type_add(&name, description.as_deref())?;
-                    println!("Added identifier type '{name}'");
+                    let added = db
+                        .identifier_types_list()?
+                        .into_iter()
+                        .find(|t| t.name == name);
+                    print_output(format, &added, || {
+                        println!("Added identifier type '{name}'")
+                    });
                 }
             }
         },
     }
     Ok(())
+}
+
+/// A person with their identifiers, the JSON shape `get` and the mutations emit.
+fn person_json(db: &Database, id: i64) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "person": db.people_get(id)?,
+        "identifiers": db.people_identifiers_for(id)?,
+    }))
 }
 
 fn print_person(p: &crate::db::people::Person, idents: &[crate::db::people::PersonIdentifier]) {

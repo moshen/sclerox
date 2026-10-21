@@ -3,7 +3,7 @@ use clap::Subcommand;
 use std::path::Path;
 
 use crate::config::{config_path, settings, Settings};
-use crate::output::{print_output, OutputFormat};
+use crate::output::{print_output, progress, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -24,17 +24,27 @@ pub fn run(cmd: ConfigCommand, format: OutputFormat) -> Result<()> {
         ConfigCommand::Show => show(format),
         ConfigCommand::Init { force } => {
             let path = config_path();
-            write_config_template(&path, force, false)?;
+            let written = write_config_template(&path, force, false)?;
+            if format == OutputFormat::Json {
+                print_output(
+                    format,
+                    &serde_json::json!({"path": path, "written": written}),
+                    || {},
+                );
+            }
             Ok(())
         }
         ConfigCommand::Path => {
             let path = config_path();
-            let exists = if path.exists() {
-                "exists"
-            } else {
-                "not created yet"
-            };
-            println!("{} ({exists})", path.display());
+            let exists = path.exists();
+            print_output(
+                format,
+                &serde_json::json!({"path": path, "exists": exists}),
+                || {
+                    let state = if exists { "exists" } else { "not created yet" };
+                    println!("{} ({state})", path.display());
+                },
+            );
             Ok(())
         }
     }
@@ -280,22 +290,23 @@ fn model_limits_doc() -> String {
 }
 
 /// Write the template to `path`. If the file exists and `overwrite` is false,
-/// leaves it untouched. Used by `sclerox config init`.
-pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Result<()> {
+/// leaves it untouched. Used by `sclerox config init`. Returns whether it
+/// wrote the file.
+pub fn write_config_template(path: &Path, overwrite: bool, dry_run: bool) -> Result<bool> {
     if path.exists() && !overwrite {
-        println!(
+        progress(format_args!(
             "config: {} already exists, leaving it untouched (run `sclerox install` to upgrade it)",
             path.display()
-        );
-        return Ok(());
+        ));
+        return Ok(false);
     }
     if dry_run {
-        println!("  would create: {}", path.display());
-        return Ok(());
+        progress(format_args!("  would create: {}", path.display()));
+        return Ok(false);
     }
     write(path, &config_template())?;
-    println!("config: wrote {}", path.display());
-    Ok(())
+    progress(format_args!("config: wrote {}", path.display()));
+    Ok(true)
 }
 
 /// Install-time helper: create the config if missing, or UPGRADE it in place -
@@ -318,29 +329,29 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
         // below so the template refreshes around the values it carried.
         match super::migrate::pending_legacy_config() {
             Some(legacy) if dry_run => {
-                println!(
+                progress(format_args!(
                     "  would move {} -> {} (adopting your existing settings)",
                     legacy.display(),
                     path.display()
-                );
+                ));
                 return Ok(());
             }
             Some(legacy) => {
                 super::migrate::adopt_legacy_config(&legacy, &path)?;
-                println!(
+                progress(format_args!(
                     "config: moved {} -> {} (adopted your existing settings)",
                     legacy.display(),
                     path.display()
-                );
+                ));
                 // Falls through to the upgrade path below.
             }
             None if dry_run => {
-                println!("  would create: {}", path.display());
+                progress(format_args!("  would create: {}", path.display()));
                 return Ok(());
             }
             None => {
                 write(&path, &config_template())?;
-                println!("config: wrote {}", path.display());
+                progress(format_args!("config: wrote {}", path.display()));
                 return Ok(());
             }
         }
@@ -349,25 +360,28 @@ pub fn install_default_config(dry_run: bool) -> Result<()> {
     let existing =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let Some(values) = flatten_user_values(&existing) else {
-        println!(
+        progress(format_args!(
             "config: {} could not be parsed, leaving it untouched \
              (fix it or run `sclerox config init --force`)",
             path.display()
-        );
+        ));
         return Ok(());
     };
 
     let upgraded = render_with_overrides(&values);
     if upgraded == existing {
-        println!("config: {} is up to date", path.display());
+        progress(format_args!("config: {} is up to date", path.display()));
     } else if dry_run {
-        println!(
+        progress(format_args!(
             "  would upgrade: {} (preserving your settings)",
             path.display()
-        );
+        ));
     } else {
         write(&path, &upgraded)?;
-        println!("config: upgraded {} (kept your settings)", path.display());
+        progress(format_args!(
+            "config: upgraded {} (kept your settings)",
+            path.display()
+        ));
     }
     Ok(())
 }

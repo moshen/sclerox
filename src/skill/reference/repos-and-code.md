@@ -33,6 +33,9 @@ sclerox code graph <symbol> --depth 4            # BFS call graph
 
 Compose with ast-grep for structural matching: `sclerox code` finds the files,
 ast-grep matches the pattern. NOTE the flag is `--output json` (not `--format`).
+`code search` emits a list of `{"type": "Symbol" | "CodeChunk", ...}` hits;
+`code calls`, `code refs` and `code graph` emit their edges and nodes with
+`repo_path` and the resolved symbol.
 
 ```bash
 sclerox code search "<symbol>" --output json \

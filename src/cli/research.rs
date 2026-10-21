@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::cli::text_chunks;
 use crate::db::Database;
-use crate::output::{print_output, truncate, OutputFormat};
+use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum ResearchCommand {
@@ -141,7 +141,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         },
                     );
                 }
-                None => println!("Investigation '{}' not found", id_or_slug),
+                None => print_miss(format, &format!("Investigation '{id_or_slug}' not found")),
             }
         }
 
@@ -164,25 +164,32 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             let fts_hits = db.investigation_search(&query)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
 
-            for inv in &fts_hits {
-                let at = crate::cli::format::stamp("updated", &inv.updated_at);
-                println!("{}  {at}", research_line(inv));
-                if let Some(f) = &inv.findings {
-                    println!("  {}", truncate(f, 100));
-                }
-            }
-
             // Semantic results - appended, deduped against FTS hits
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
-            if let Some(query_emb) = query_emb {
-                let similar = db.investigation_similar(&query_emb, 5).unwrap_or_default();
-                let semantic: Vec<_> = similar
-                    .iter()
-                    .filter(|r| !fts_ids.contains(&r.investigation.id))
-                    .collect();
-                if !semantic.is_empty() {
-                    if !fts_hits.is_empty() {
+            let semantic: Vec<_> = query_emb
+                .map(|qe| db.investigation_similar(&qe, 5).unwrap_or_default())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| !fts_ids.contains(&r.investigation.id))
+                .collect();
+
+            print_output(
+                format,
+                &serde_json::json!({"fts": fts_hits, "semantic": semantic}),
+                || {
+                    if fts_hits.is_empty() && semantic.is_empty() {
+                        println!("No matches for: {query}");
+                        return;
+                    }
+                    for inv in &fts_hits {
+                        let at = crate::cli::format::stamp("updated", &inv.updated_at);
+                        println!("{}  {at}", research_line(inv));
+                        if let Some(f) = &inv.findings {
+                            println!("  {}", truncate(f, 100));
+                        }
+                    }
+                    if !semantic.is_empty() && !fts_hits.is_empty() {
                         println!();
                     }
                     for r in &semantic {
@@ -194,12 +201,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         );
                         println!("  > {}", truncate(&r.matched_chunk, 100));
                     }
-                }
-            }
-
-            if fts_hits.is_empty() {
-                println!("No matches for: {query}");
-            }
+                },
+            );
         }
 
         ResearchCommand::Update {
@@ -221,17 +224,22 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                         embed_investigation(db, id, inv.plan.as_deref(), inv.findings.as_deref())?;
                     }
                 }
-                println!("Updated investigation #{id}");
+                let inv = db.investigation_get(id)?;
+                print_output(format, &inv, || println!("Updated investigation #{id}"));
             } else {
-                println!("Investigation #{id} not found or no changes");
+                print_miss(
+                    format,
+                    &format!("Investigation #{id} not found or no changes"),
+                );
             }
         }
 
         ResearchCommand::Reopen { id } => {
             if db.investigation_reopen(id)? {
-                println!("Investigation #{id} reopened");
+                let inv = db.investigation_get(id)?;
+                print_output(format, &inv, || println!("Investigation #{id} reopened"));
             } else {
-                println!("Investigation #{id} not found");
+                print_miss(format, &format!("Investigation #{id} not found"));
             }
         }
 
@@ -239,18 +247,16 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             if db.investigation_conclude(id, &findings)? {
                 if let Some(inv) = db.investigation_get(id)? {
                     embed_investigation(db, id, inv.plan.as_deref(), Some(&findings))?;
-                    if format == OutputFormat::Json {
-                        println!("{}", serde_json::to_string_pretty(&inv)?);
-                    } else {
+                    print_output(format, &inv, || {
                         println!("Investigation #{id} concluded.");
                         println!(
                             "\nFindings recorded. Consider saving key conclusions as memories:"
                         );
                         println!("  sclerox memory set \"research/{id}/finding\" \"<key finding>\" --type project");
-                    }
+                    });
                 }
             } else {
-                println!("Investigation #{id} not found");
+                print_miss(format, &format!("Investigation #{id} not found"));
             }
         }
 
@@ -262,12 +268,18 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
         } => {
             let source_id =
                 db.investigation_add_source(id, &url, label.as_deref(), notes.as_deref())?;
-            println!("Added source #{source_id} to investigation #{id}");
-            if let Some(l) = &label {
-                println!("  [{l}] {url}");
-            } else {
-                println!("  {url}");
-            }
+            let source = db
+                .investigation_sources(id)?
+                .into_iter()
+                .find(|s| s.id == source_id);
+            print_output(format, &source, || {
+                println!("Added source #{source_id} to investigation #{id}");
+                if let Some(l) = &label {
+                    println!("  [{l}] {url}");
+                } else {
+                    println!("  {url}");
+                }
+            });
         }
 
         ResearchCommand::Sources { id } => {
@@ -289,22 +301,30 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
 
         ResearchCommand::Delete { id } => {
             if db.investigation_delete(id)? {
-                println!("Deleted investigation #{id}");
+                print_output(format, &serde_json::json!({"deleted": id}), || {
+                    println!("Deleted investigation #{id}")
+                });
             } else {
-                println!("Investigation #{id} not found");
+                print_miss(format, &format!("Investigation #{id} not found"));
             }
         }
 
         ResearchCommand::People(sub) => match sub {
             ResearchPeopleCmd::Add { id, person_id } => {
                 db.investigation_link_person(id, person_id)?;
-                println!("Linked person #{person_id} to investigation #{id}");
+                let people = db.investigation_people(id)?;
+                print_output(format, &people, || {
+                    println!("Linked person #{person_id} to investigation #{id}")
+                });
             }
             ResearchPeopleCmd::Remove { id, person_id } => {
                 if db.investigation_unlink_person(id, person_id)? {
-                    println!("Removed person #{person_id} from investigation #{id}");
+                    let people = db.investigation_people(id)?;
+                    print_output(format, &people, || {
+                        println!("Removed person #{person_id} from investigation #{id}")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             ResearchPeopleCmd::List { id } => {
@@ -324,13 +344,19 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
         ResearchCommand::Projects(sub) => match sub {
             ResearchProjectsCmd::Add { id, project_id } => {
                 db.investigation_link_project(id, project_id)?;
-                println!("Linked project #{project_id} to investigation #{id}");
+                let projects = db.investigation_projects(id)?;
+                print_output(format, &projects, || {
+                    println!("Linked project #{project_id} to investigation #{id}")
+                });
             }
             ResearchProjectsCmd::Remove { id, project_id } => {
                 if db.investigation_unlink_project(id, project_id)? {
-                    println!("Removed project #{project_id} from investigation #{id}");
+                    let projects = db.investigation_projects(id)?;
+                    print_output(format, &projects, || {
+                        println!("Removed project #{project_id} from investigation #{id}")
+                    });
                 } else {
-                    println!("Link not found");
+                    print_miss(format, "Link not found");
                 }
             }
             ResearchProjectsCmd::List { id } => {
