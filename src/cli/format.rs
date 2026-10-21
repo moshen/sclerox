@@ -64,29 +64,35 @@ pub fn symbol_line(kind: &str, signature: &str, location: &str) -> String {
     format!("[{kind}] {signature} ({location})")
 }
 
+/// `text` cut to the snippet length, with `...` when cut, safe to print:
+/// repo content is untrusted, so a control character (an escape sequence
+/// could rewrite the terminal) is shown escaped, and a tab as a space.
+fn snippet(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars().take(CODE_SNIPPET_CHARS) {
+        match c {
+            '\t' => out.push(' '),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    if text.chars().nth(CODE_SNIPPET_CHARS).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
 /// A full-text code hit: `location`, then the matching line, indented and
 /// cut to the snippet length.
 pub fn code_text_lines(location: &str, text: &str) -> String {
-    let snippet: String = text.chars().take(CODE_SNIPPET_CHARS).collect();
-    let more = if text.chars().count() > CODE_SNIPPET_CHARS {
-        "..."
-    } else {
-        ""
-    };
-    format!("{location}\n        {snippet}{more}")
+    format!("{location}\n        {}", snippet(text))
 }
 
 /// A semantic code-chunk hit: `(score) location`, then an indented one-line
 /// snippet of the chunk.
 pub fn code_chunk_lines(score: f32, location: &str, text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet: String = flat.chars().take(CODE_SNIPPET_CHARS).collect();
-    let more = if flat.chars().count() > CODE_SNIPPET_CHARS {
-        "..."
-    } else {
-        ""
-    };
-    format!("({score:.2}) {location}\n        {snippet}{more}")
+    format!("({score:.2}) {location}\n        {}", snippet(&flat))
 }
 
 const CODE_SNIPPET_CHARS: usize = 100;
@@ -109,6 +115,16 @@ mod tests {
         );
         let long = code_text_lines("/r/a.rs:3", &"y".repeat(200));
         assert!(long.ends_with(&format!("{}...", "y".repeat(CODE_SNIPPET_CHARS))));
+    }
+
+    #[test]
+    fn snippets_escape_control_characters() {
+        let line = "a\tb \u{1b}[2Jgone\u{7}";
+        assert_eq!(
+            code_text_lines("/r/a.rs:1", line),
+            "/r/a.rs:1\n        a b \\u{1b}[2Jgone\\u{7}"
+        );
+        assert!(!code_chunk_lines(0.5, "/r/a.rs:1", line).contains('\u{1b}'));
     }
 
     #[test]
