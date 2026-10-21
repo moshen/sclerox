@@ -70,7 +70,10 @@ fn run_here(conn: &rusqlite::Connection, kind: DbKind) -> Result<()> {
         if loaded.as_ref().is_none_or(|e| e.model().id != model_id) {
             let spec = crate::embed::models::by_id(model_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown embedding model '{model_id}'"))?;
-            loaded = Some(crate::embed::Embedder::with_model(spec)?);
+            loaded = Some(crate::embed::Embedder::with_model(
+                spec,
+                crate::embed::server::Lane::Bulk,
+            )?);
         }
         loaded.as_mut().expect("loaded above").embed_each(texts)
     };

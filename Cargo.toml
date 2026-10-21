@@ -24,6 +24,9 @@ anyhow = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 fastembed = { version = "5", features = ["online"] }
+# The onnxruntime fastembed runs on, at the version it pins. Named here to pick
+# execution providers (see src/embed/device.rs); no extra compile.
+ort = { version = "=2.0.0-rc.12", default-features = false }
 # Same version fastembed already pins, so no extra compile. Used for exact
 # token counts with MiniLM's tokenizer (see src/embed/tokens.rs).
 tokenizers = "0.22"
@@ -56,6 +59,15 @@ tree-sitter-lua = "0.5.0"
 sqlite-vec = "0.1.9"
 interprocess = "2"
 postcard = { version = "1", features = ["use-std"] }
+
+# CoreML ships with macOS and in the macOS onnxruntime build.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml"] }
+
+# DirectML ships with Windows and in the Windows onnxruntime build (see
+# build.rs); fastembed's feature also sets the session options it needs.
+[target.'cfg(windows)'.dependencies]
+fastembed = { version = "5", features = ["online", "directml"] }
 
 [patch.crates-io]
 esaxx-rs = { path = "vendor/esaxx-rs" }

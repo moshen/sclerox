@@ -62,11 +62,13 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
             prefetch_tokenizer(args.dry_run);
         }
     } else if args.no_model_download {
+        choose_model(args.dry_run);
         if !args.dry_run {
             report_reembed_needed();
         }
     } else {
-        prefetch_embedding_model(args.dry_run);
+        let spec = choose_model(args.dry_run);
+        prefetch_embedding_model(spec, args.dry_run);
         reembed_on_install(args.dry_run, args.wait);
     }
     if super::migrate::legacy_data_present() {
@@ -82,11 +84,72 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// Look for an accelerator to embed on and pick the knowledge base's model:
+/// Granite at full precision where one starts. Unless `embed.model` names
+/// one, the model is the one the main database records (see
+/// `config::init`), so switching it means re-embedding, which
+/// [`reembed_on_install`] then does. Never switches back to int8 without an
+/// accelerator: full precision still works on the CPU, and a database shared
+/// with a machine that has one would otherwise flip back and forth.
+fn choose_model(dry_run: bool) -> &'static crate::embed::ModelSpec {
+    use crate::embed::{device, models};
+
+    let found = device::detect(device::configured());
+    match found {
+        Some(d) => println!("embedding device: {d}"),
+        None => println!("embedding device: cpu (no accelerator found)"),
+    }
+    let current = models::configured().unwrap_or_else(|_| models::default_model());
+    if crate::config::settings().embed.model.is_some() {
+        println!("embedding model: {} (set by embed.model)", current.name);
+        return current;
+    }
+    let target = model_for(current, found.is_some());
+    if target == current {
+        println!("embedding model: {}", current.name);
+        return current;
+    }
+    if dry_run {
+        println!("  would switch the embedding model to {}", target.name);
+        return target;
+    }
+    println!(
+        "embedding model: {} (to run on the accelerator)",
+        target.name
+    );
+    crate::config::use_default_model(target.name);
+    // A database with no vectors yet takes it now; one with vectors switches
+    // when its re-embed finishes.
+    let path = &crate::config::settings().db_path;
+    match crate::db::Database::open(path) {
+        Ok(db) => {
+            if let Err(e) = db.claim_embedding_model() {
+                println!("embedding model: couldn't record it ({e:#})");
+            }
+        }
+        Err(e) => println!("embedding model: could not open {} ({e:#})", path.display()),
+    }
+    target
+}
+
+/// The model to switch from `current` to: Granite at full precision with an
+/// accelerator, else no change.
+fn model_for(
+    current: &'static crate::embed::ModelSpec,
+    accelerator: bool,
+) -> &'static crate::embed::ModelSpec {
+    use crate::embed::models::{GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32};
+    if accelerator && current == &GRANITE_SMALL_R2 {
+        &GRANITE_SMALL_R2_FP32
+    } else {
+        current
+    }
+}
+
 /// Download the embedding model and the token-counting tokenizer now, so the
 /// first session hook to need them is not the one stalled by the download.
 /// Best-effort: a failure only means the download is retried on first use.
-fn prefetch_embedding_model(dry_run: bool) {
-    let spec = crate::config::settings().embed_model();
+fn prefetch_embedding_model(spec: &'static crate::embed::ModelSpec, dry_run: bool) {
     let dir = crate::embed::model_cache_dir();
     let tokenizer = crate::embed::models::TOKEN_COUNTER;
     if crate::embed::is_downloaded(spec) && tokenizer.is_cached() {
@@ -158,10 +221,12 @@ fn reembed_on_install(dry_run: bool, wait: bool) {
     }
     println!(
         "\nUpdating embeddings for {} (large repos take minutes)...",
-        crate::config::settings().embed.model
+        crate::embed::models::display_id(crate::embed::models::configured_id())
     );
     if let Err(e) = super::db::reembed_or_queue(&db, false, wait) {
-        println!("embeddings: {e:#}; run `sclerox db reembed` to retry");
+        // Not `db reembed`: a switch to fp32 lives only in this process until
+        // the re-embed finishes, so only install retries it.
+        println!("embeddings: {e:#}; run `sclerox install` again to retry");
     }
 }
 
@@ -177,11 +242,18 @@ fn report_reembed_needed() {
     };
     if let Ok(crate::embed::models::ModelCheck::Mismatch { recorded }) = db.embedding_model_check()
     {
+        use crate::embed::models;
+        // A model the knowledge base stays on is still the one commands use
+        // until the switch finishes; any other no longer is.
+        let meanwhile = match models::by_id(&recorded) {
+            Some(m) if models::KEPT.contains(&m) => "search keeps using it meanwhile",
+            _ => "until then semantic search and dedup are off for it",
+        };
         println!(
-            "\nYour knowledge base was embedded with '{}'. Run `sclerox db reembed` to \
-             switch it to '{}'; until then semantic search and dedup are off for it.",
-            crate::embed::models::display_id(&recorded),
-            crate::config::settings().embed.model
+            "\nYour knowledge base was embedded with '{}'. Run `sclerox install` without \
+             --no-model-download to switch it to '{}'; {meanwhile}.",
+            models::display_id(&recorded),
+            models::display_id(models::configured_id())
         );
     }
     if super::text_chunks::stale(&db) {
@@ -1232,6 +1304,19 @@ mod tests {
             legacy.exists(),
             "legacy file preserved when overwrite disabled"
         );
+    }
+
+    #[test]
+    fn install_switches_to_full_precision_only_with_an_accelerator() {
+        use crate::embed::models::{GRANITE_SMALL_R2, GRANITE_SMALL_R2_FP32, MINILM_L6_V2};
+        assert_eq!(model_for(&GRANITE_SMALL_R2, true), &GRANITE_SMALL_R2_FP32);
+        assert_eq!(model_for(&GRANITE_SMALL_R2, false), &GRANITE_SMALL_R2);
+        // Never back to int8, and never off a model chosen some other way.
+        assert_eq!(
+            model_for(&GRANITE_SMALL_R2_FP32, false),
+            &GRANITE_SMALL_R2_FP32
+        );
+        assert_eq!(model_for(&MINILM_L6_V2, true), &MINILM_L6_V2);
     }
 
     #[test]

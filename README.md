@@ -65,7 +65,7 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 - `~/.claude/skills/sclerox-kb/` - skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
 - `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories
 - `~/.config/git/ignore` - excludes `.sclerox/` from all repos
-- `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, downloaded once and hash-checked; `--no-model-download` defers it to first use)
+- `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, or ~200 MB for the full-precision model where an accelerator is found; downloaded once and hash-checked; `--no-model-download` defers it to first use)
 
 ## Quick start
 
@@ -220,8 +220,14 @@ model and sizes (`chunk_size`, `chunk_overlap`, `memory_chars`), `[index]`
 
 ### Embedding model
 
-`[embed] model` selects the embedding model: `granite-small-r2` (default) or
-`minilm-l6-v2`. Models download once into `$XDG_CACHE_HOME/sclerox/models/`
+`[embed] model` selects the embedding model: `granite-small-r2`,
+`granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the Granite model the
+knowledge base was embedded with, else `granite-small-r2` (for a new one, or
+one still on MiniLM from an older version, which install converts). Where
+`sclerox install` finds an accelerator (CoreML on Apple Silicon, DirectML on a
+Windows GPU) it switches the knowledge base to the full-precision Granite;
+it never switches back. `[embed] device` (`auto|cpu|coreml|directml`) picks where it runs; `auto` uses
+the accelerator for the model server and bulk work. Models download once into `$XDG_CACHE_HOME/sclerox/models/`
 (`~/.cache/sclerox/models/`), never into the shared `~/.cache/huggingface/`.
 Every file is pinned to a Hugging Face commit and checked against a sha256
 built into sclerox; a file that fails the check is never used. Set
@@ -265,7 +271,8 @@ Environment variables still work and override the file:
 | `SCLEROX_AI_MODEL` | agent default | Model appended to the default command |
 | `SCLEROX_MAX_INDEX_FILE_BYTES` | `1000000` | Files larger than this use line-based chunking instead of tree-sitter |
 | `SCLEROX_MAX_INDEX_FILES` | `50000` | Reject folders over this many files (`--force` to override) |
-| `SCLEROX_EMBED_MODEL` | `granite-small-r2` | Embedding model (`granite-small-r2\|minilm-l6-v2`) |
+| `SCLEROX_EMBED_MODEL` | the knowledge base's | Embedding model (`granite-small-r2\|granite-small-r2-fp32\|minilm-l6-v2`) |
+| `SCLEROX_EMBED_DEVICE` | `auto` | Where the model runs (`auto\|cpu\|coreml\|directml`) |
 | `SCLEROX_EMBED_ENABLED` | `true` | `false` turns embeddings off (`[embed] enabled`) |
 | `SCLEROX_EMBED_MEMORY_CHARS` | per model | Characters of each memory embedded (`[embed] memory_chars`) |
 | `SCLEROX_CODE_CHUNK_CHARS` | `800` | Characters per embedded code chunk (`[index] chunk_chars`) |

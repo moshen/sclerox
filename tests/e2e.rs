@@ -38,6 +38,13 @@ impl Env {
         // must not leave a server running in the developer's state directory.
         // Server tests turn it back on with their own state directory.
         c.env("SCLEROX_EMBED_SERVER", "off");
+        // The default model `sclerox install` recorded for the developer's
+        // machine lives in the state directory: use the test's own, and the
+        // model and device the tests expect. Tests that need a state
+        // directory or a model set their own.
+        c.env("XDG_STATE_HOME", self.config.with_file_name("state"));
+        c.env_remove("SCLEROX_EMBED_MODEL");
+        c.env_remove("SCLEROX_EMBED_DEVICE");
         // cargo test points LD_LIBRARY_PATH at two dozen build directories,
         // which the dynamic loader searches for every system library before
         // main runs: on a slow filesystem that adds ~170 ms to each command,
@@ -139,7 +146,7 @@ fn config_show_lists_only_real_env_overrides() {
     // Every one of these is copied into an env var at startup for library code.
     std::fs::write(
         &e.config,
-        "[embed]\nmodel = \"minilm-l6-v2\"\nenabled = false\nmemory_chars = 600\n\
+        "[embed]\nmodel = \"minilm-l6-v2\"\nenabled = false\nmemory_chars = 600\ndevice = \"cpu\"\n\
          [index]\nmax_file_bytes = 5000\nmax_files = 10\nchunk_chars = 1200\nchunk_lines = 20\n",
     )
     .unwrap();
@@ -157,6 +164,7 @@ fn config_show_lists_only_real_env_overrides() {
         "SCLEROX_EMBED_MODEL",
         "SCLEROX_EMBED_ENABLED",
         "SCLEROX_EMBED_MEMORY_CHARS",
+        "SCLEROX_EMBED_DEVICE",
         "SCLEROX_MAX_INDEX_FILE_BYTES",
         "SCLEROX_MAX_INDEX_FILES",
         "SCLEROX_CODE_CHUNK_CHARS",
@@ -170,10 +178,12 @@ fn config_show_lists_only_real_env_overrides() {
         .cmd()
         .env("SCLEROX_CODE_CHUNK_CHARS", "900")
         .env("SCLEROX_MAX_INDEX_FILES", "20")
+        .env("SCLEROX_EMBED_DEVICE", "auto")
         .args(["config", "show"])
         .output()
         .unwrap();
     let line = overrides(&String::from_utf8_lossy(&out.stdout));
+    assert!(line.contains("SCLEROX_EMBED_DEVICE"), "{line}");
     assert!(line.contains("SCLEROX_CODE_CHUNK_CHARS"), "{line}");
     assert!(line.contains("SCLEROX_MAX_INDEX_FILES"), "{line}");
     assert!(!line.contains("SCLEROX_EMBED_MODEL"), "{line}");
@@ -1476,6 +1486,136 @@ fn install_never_overwrites_an_edited_config() {
         "the edited value is untouched, got:\n{contents}"
     );
     assert!(legacy.exists(), "legacy config kept for a manual merge");
+}
+
+/// `sclerox` with every path pinned into `home`.
+fn sclerox_in(home: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("sclerox").unwrap();
+    c.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("SCLEROX_LOG", "off")
+        .env("SCLEROX_EMBED_SERVER", "off")
+        .env_remove("SCLEROX_DB")
+        .env_remove("SCLEROX_CONFIG")
+        .env_remove("SCLEROX_EMBED_MODEL")
+        .env_remove("SCLEROX_EMBED_DEVICE");
+    c
+}
+
+/// The embedding model a test home's main database records.
+fn recorded_model(home: &std::path::Path) -> Option<String> {
+    let db = home.join(".local/share/sclerox/sclerox.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'embedding_model'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Without an accelerator install leaves the model alone; with one it
+/// switches a new knowledge base to full precision.
+#[test]
+fn install_picks_the_model_for_the_device() {
+    let home = TempDir::new().unwrap();
+    sclerox_in(home.path())
+        .env("SCLEROX_EMBED_DEVICE", "cpu")
+        .args(["install", "--target", "claude", "--no-model-download"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "embedding device: cpu (no accelerator found)",
+        ))
+        .stdout(predicate::str::contains(
+            "embedding model: granite-small-r2\n",
+        ));
+    assert_eq!(recorded_model(home.path()), None, "nothing to record");
+
+    // Whatever this machine has: full precision exactly where an
+    // accelerator started.
+    let out = sclerox_in(home.path())
+        .args(["install", "--target", "claude", "--no-model-download"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fp32 = "onnx-community/granite-embedding-small-english-r2-ONNX:model";
+    if stdout.contains("embedding device: cpu") {
+        assert_eq!(recorded_model(home.path()), None, "{stdout}");
+    } else {
+        assert_eq!(
+            recorded_model(home.path()).as_deref(),
+            Some(fp32),
+            "{stdout}"
+        );
+    }
+}
+
+/// With `embed.model` unset, commands use the model the main database
+/// records, if it is one of the Granite models; `embed.model` overrides it.
+#[test]
+fn the_model_follows_the_database_unless_configured() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join(".local/share/sclerox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("sclerox.db")).unwrap();
+    conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    let record = |id: &str| {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('embedding_model', ?1)",
+            [id],
+        )
+        .unwrap();
+    };
+    let effective = |home: &std::path::Path, model: &str| {
+        sclerox_in(home)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "effective thresholds for {model}:"
+            )))
+            .stdout(predicate::str::contains(format!("model = \"{model}\"")));
+    };
+
+    record("onnx-community/granite-embedding-small-english-r2-ONNX:model");
+    effective(home.path(), "granite-small-r2-fp32");
+    // An empty or unknown env value doesn't hide it.
+    for value in ["", "bert-giant"] {
+        sclerox_in(home.path())
+            .env("SCLEROX_EMBED_MODEL", value)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "effective thresholds for granite-small-r2-fp32:",
+            ));
+    }
+
+    // A database left on MiniLM by an older version moves to the default.
+    record("Qdrant/all-MiniLM-L6-v2-onnx:model");
+    effective(home.path(), "granite-small-r2");
+
+    // `embed.model` wins, from the environment or config.toml.
+    sclerox_in(home.path())
+        .env("SCLEROX_EMBED_MODEL", "minilm-l6-v2")
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "effective thresholds for minilm-l6-v2:",
+        ));
+    let config = home.path().join(".config/sclerox/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
+    effective(home.path(), "minilm-l6-v2");
 }
 
 // ─── Model server ────────────────────────────────────────────────────────────

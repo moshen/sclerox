@@ -41,7 +41,10 @@ pub fn run(cmd: ConfigCommand, format: OutputFormat) -> Result<()> {
 }
 
 fn show(format: OutputFormat) -> Result<()> {
-    let s = settings();
+    // Unset, the model is this machine's default: show which.
+    let mut effective = settings().clone();
+    effective.embed.model = Some(effective.embed.model_name().to_string());
+    let s = &effective;
     print_output(format, s, || {
         let path = config_path();
         let source = if path.exists() {
@@ -60,7 +63,7 @@ fn show(format: OutputFormat) -> Result<()> {
         }
         println!(
             "# effective thresholds for {}: semantic {}, margin {}, dedup cosine {}, merge {}",
-            s.embed.model,
+            s.embed.model_name(),
             s.semantic_threshold(),
             off(s.semantic_margin()),
             s.dedup_cosine_threshold(),
@@ -87,6 +90,7 @@ fn active_env_overrides() -> Vec<&'static str> {
         "SCLEROX_CODE_CHUNK_CHARS",
         "SCLEROX_CODE_CHUNK_LINES",
         "SCLEROX_EMBED_SERVER",
+        "SCLEROX_EMBED_DEVICE",
         "SCLEROX_SERVER_IDLE_MINUTES",
         "SCLEROX_SERVER_MAX_MEMORY_MB",
         "SCLEROX_SERVER_HARD_MEMORY_MB",
@@ -159,7 +163,7 @@ pub fn config_template() -> String {
          \n\
          [embed]\n\
          # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
-         # model = \"{embed_model}\"   # {model_names}; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
+         # model = \"{embed_model}\"   # {model_names}; unset: the Granite model the knowledge base was embedded with, else {embed_model} (a MiniLM knowledge base is converted; set minilm-l6-v2 to keep it); `sclerox install` switches it to {fp32} where it finds an accelerator; switching needs `sclerox db reembed`. env: SCLEROX_EMBED_MODEL\n\
          # Text past a model's token limit is not embedded; sizes past its\n\
          # estimated char limit warn. Larger inputs cost more time and memory.\n\
          {model_limits}\
@@ -167,6 +171,7 @@ pub fn config_template() -> String {
          # chunk_overlap = {embed_overlap}               # chars repeated from the previous chunk\n\
          # memory_chars = {mem_chars}               # chars of each memory embedded; unset = the model's. env: SCLEROX_EMBED_MEMORY_CHARS\n\
          # server = \"{embed_server}\"               # auto: share one loaded model between commands via `sclerox server`; off: load it in each. env: SCLEROX_EMBED_SERVER\n\
+         # device = \"{embed_device}\"               # auto: an accelerator where found (CoreML on Apple Silicon, DirectML on Windows) for the model server and bulk work; or cpu|coreml|directml. env: SCLEROX_EMBED_DEVICE\n\
          \n\
          [server]\n\
          # idle_minutes = {idle_minutes}               # the model server exits after this long without requests. env: SCLEROX_SERVER_IDLE_MINUTES\n\
@@ -219,13 +224,15 @@ pub fn config_template() -> String {
         min_turns = d.distill.min_turns,
         min_new = d.distill.min_new_turns,
         ctx_mem = d.distill.context_memories,
-        embed_model = d.embed.model,
+        embed_model = crate::embed::models::DEFAULT_MODEL,
+        fp32 = crate::embed::models::GRANITE_SMALL_R2_FP32.name,
         model_names = crate::embed::models::names().join("|"),
         embed_size = d.embed.chunk_size,
         embed_overlap = d.embed.chunk_overlap,
         model_limits = model_limits_doc(),
         mem_chars = d.memory_embed_chars(),
         embed_server = d.embed.server,
+        embed_device = d.embed.device,
         idle_minutes = d.server.idle_minutes,
         max_memory_mb = d.server.max_memory_mb,
         hard_memory_mb = d.server.hard_memory_mb,
@@ -513,7 +520,7 @@ mod tests {
         let parsed = Settings::from_toml_str(&config_template()).unwrap();
         assert_eq!(parsed.search.semantic_threshold, None);
         assert_eq!(parsed.dedup.cosine_threshold, None);
-        assert_eq!(parsed.embed.model, "granite-small-r2");
+        assert_eq!(parsed.embed.model, None);
     }
 
     #[test]

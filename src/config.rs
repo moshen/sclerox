@@ -138,8 +138,11 @@ pub struct EmbedSettings {
     pub enabled: bool,
     /// Embedding model, by registry name (`embed::models`). Changing it means
     /// running `sclerox db reembed`; until then semantic search and dedup are
-    /// off for databases embedded with the old model. Env: `SCLEROX_EMBED_MODEL`.
-    pub model: String,
+    /// off for databases embedded with the old model. `None` = the model the
+    /// main database was embedded with (`sclerox install` switches it to
+    /// full precision where it finds an accelerator), else the default; see
+    /// [`EmbedSettings::model_name`]. Env: `SCLEROX_EMBED_MODEL`.
+    pub model: Option<String>,
     /// Most characters per embedded chunk of meeting, todo and research text.
     pub chunk_size: usize,
     /// Characters of the previous chunk repeated at the start of the next.
@@ -153,6 +156,25 @@ pub struct EmbedSettings {
     /// rather than in every command. `off`: each command loads the model
     /// itself. Env: `SCLEROX_EMBED_SERVER`.
     pub server: String,
+    /// Where the model runs (`embed::device`): `auto` uses an accelerator
+    /// where one is found and pays off, `cpu`, `coreml` or `directml` use that
+    /// one. Env: `SCLEROX_EMBED_DEVICE`.
+    pub device: String,
+}
+
+impl EmbedSettings {
+    /// The embedding model's name: `model`, else the one [`init`] found
+    /// recorded in the main database, else the default.
+    pub fn model_name(&self) -> &str {
+        match &self.model {
+            Some(name) => name,
+            None => {
+                crate::embed::models::configured()
+                    .unwrap_or_else(|_| crate::embed::models::default_model())
+                    .name
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,11 +321,12 @@ impl Default for EmbedSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: crate::embed::models::DEFAULT_MODEL.to_string(),
+            model: None,
             chunk_size: 800,
             chunk_overlap: 200,
             memory_chars: None,
             server: "auto".to_string(),
+            device: "auto".to_string(),
         }
     }
 }
@@ -449,7 +472,7 @@ impl Settings {
         }
         if let Ok(m) = std::env::var(crate::embed::models::MODEL_ENV) {
             if !m.is_empty() {
-                self.embed.model = m;
+                self.embed.model = Some(m);
             }
         }
         if let Ok(v) = std::env::var(crate::embed::ENABLED_ENV) {
@@ -465,6 +488,11 @@ impl Settings {
         if let Ok(v) = std::env::var(crate::embed::server::MODE_ENV) {
             if !v.is_empty() {
                 self.embed.server = v;
+            }
+        }
+        if let Ok(v) = std::env::var(crate::embed::device::DEVICE_ENV) {
+            if !v.is_empty() {
+                self.embed.device = v;
             }
         }
         for (var, field) in [
@@ -495,12 +523,18 @@ impl Settings {
         clamp_unit_opt("dedup.merge_threshold", &mut self.dedup.merge_threshold);
 
         // The embedding model must be one the registry knows.
-        if let Err(e) = crate::embed::models::lookup(&self.embed.model) {
+        if let Some(Err(e)) = self
+            .embed
+            .model
+            .as_deref()
+            .map(crate::embed::models::lookup)
+        {
             eprintln!(
-                "warning: embed.model: {e}; using {}",
-                crate::embed::models::DEFAULT_MODEL
+                "warning: embed.model: {e}; using the knowledge base's model, or {} \
+                 for a new one",
+                crate::embed::models::default_model().name
             );
-            self.embed.model = crate::embed::models::DEFAULT_MODEL.to_string();
+            self.embed.model = None;
         }
 
         require_positive("search.semantic_limit", &mut self.search.semantic_limit, 25);
@@ -600,6 +634,26 @@ impl Settings {
                 self.embed.server = "auto".to_string();
             }
         }
+        match crate::embed::device::parse_choice(&self.embed.device) {
+            Some(crate::embed::device::Choice::Auto) => self.embed.device = "auto".to_string(),
+            Some(crate::embed::device::Choice::Only(d)) => {
+                if !d.built_in() {
+                    eprintln!(
+                        "warning: embed.device = \"{d}\" isn't available on this platform; \
+                         embedding will fail until it is auto or cpu"
+                    );
+                }
+                self.embed.device = d.name().to_string();
+            }
+            None => {
+                eprintln!(
+                    "warning: embed.device = \"{}\" is not valid (auto|cpu|coreml|directml); \
+                     using auto",
+                    self.embed.device
+                );
+                self.embed.device = "auto".to_string();
+            }
+        }
         if self.server.idle_minutes == 0 {
             eprintln!("warning: server.idle_minutes must be > 0; using default 15");
             self.server.idle_minutes = 15;
@@ -667,7 +721,7 @@ fn require_positive(name: &str, v: &mut usize, default: usize) {
 impl Settings {
     /// The configured embedding model's registry entry.
     pub fn embed_model(&self) -> &'static crate::embed::ModelSpec {
-        crate::embed::models::lookup(&self.embed.model)
+        crate::embed::models::lookup(self.embed.model_name())
             .unwrap_or_else(|_| crate::embed::models::default_model())
     }
 
@@ -755,11 +809,60 @@ static BRIDGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec:
 /// Set `var` for library code and remember that config, not the user, set it.
 fn bridge(var: &'static str, value: &str) {
     // SAFETY: called only from `init`, at single-threaded startup, before any
-    // thread is spawned.
+    // thread is spawned, and from `use_default_model`, likewise.
     unsafe {
         std::env::set_var(var, value);
     }
     BRIDGED.lock().unwrap_or_else(|e| e.into_inner()).push(var);
+}
+
+/// The embedding model the database at `path` records, if it exists and
+/// records one it stays on (see `embed::models::KEPT`). Opened read-only, so
+/// it is never created or migrated just to look.
+fn recorded_model(path: &std::path::Path) -> Option<&'static crate::embed::ModelSpec> {
+    use rusqlite::{Connection, OpenFlags};
+    if !path.exists() {
+        return None;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match Connection::open_with_flags(path, flags) {
+        Ok(conn) => conn,
+        Err(e) => {
+            log::warn!(
+                "couldn't read the embedding model of {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let found = conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [crate::embed::models::META_KEY],
+        |r| r.get::<_, String>(0),
+    );
+    let id = match found {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
+            // No `meta` table yet, say: not migrated since before it existed.
+            log::debug!(
+                "couldn't read the embedding model of {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let model = crate::embed::models::by_id(&id)?;
+    crate::embed::models::KEPT.contains(&model).then_some(model)
+}
+
+/// Point library code at `name` as the embedding model when `embed.model`
+/// is unset: for `sclerox install`, once it has chosen the model to switch
+/// the main database to. Call only while no other thread runs.
+pub fn use_default_model(name: &str) {
+    if settings().embed.model.is_none() {
+        bridge(crate::embed::models::MODEL_ENV, name);
+    }
 }
 
 /// Whether `var` holds a value [`init`] bridged from config rather than one
@@ -787,9 +890,38 @@ pub fn init() {
         );
     }
     // The embedder (library code) reads the model name from the env var.
-    let model_is_default = s.embed.model == EmbedSettings::default().model;
-    if !model_is_default && std::env::var(crate::embed::models::MODEL_ENV).is_err() {
-        bridge(crate::embed::models::MODEL_ENV, &s.embed.model);
+    // Unset in config, it is the model the main database records, so that
+    // database's vectors stay comparable whichever machine opens it.
+    // An empty or unknown env value was ignored when settings resolved, so
+    // it is replaced here rather than left for the library to read.
+    let model_env = std::env::var(crate::embed::models::MODEL_ENV).ok();
+    let model_env_valid = model_env
+        .as_deref()
+        .is_some_and(|v| crate::embed::models::lookup(v).is_ok());
+    if !model_env_valid {
+        let model = match &s.embed.model {
+            Some(model) => Some(model.as_str()),
+            None => recorded_model(&s.db_path).map(|m| m.name),
+        };
+        match model {
+            Some(model) => bridge(crate::embed::models::MODEL_ENV, model),
+            // The library reads empty as the default, not anything else.
+            None if model_env.is_some_and(|v| !v.is_empty()) => bridge(
+                crate::embed::models::MODEL_ENV,
+                crate::embed::models::default_model().name,
+            ),
+            None => {}
+        }
+    }
+    // ...and where to run it. Unset reads as auto, as does an env value that
+    // isn't a device, which settings ignored too.
+    let device_env = std::env::var(crate::embed::device::DEVICE_ENV).ok();
+    let device_env_valid = device_env
+        .as_deref()
+        .and_then(crate::embed::device::parse_choice)
+        .is_some();
+    if s.embed.device != "auto" && !device_env_valid {
+        bridge(crate::embed::device::DEVICE_ENV, &s.embed.device);
     }
     // ...and whether embeddings are on at all.
     let env = std::env::var(crate::embed::ENABLED_ENV).ok();
@@ -853,7 +985,7 @@ mod tests {
         assert_eq!(s.search.semantic_threshold, None);
         assert_eq!(s.search.semantic_limit, 25);
         assert_eq!(s.dedup.cosine_threshold, None);
-        assert_eq!(s.embed.model, "granite-small-r2");
+        assert_eq!(s.embed.model, None);
         assert_eq!(s.memory.max_value_chars, 800);
         assert_eq!(s.session_context.max_chars, 3000);
         assert_eq!(s.embed.chunk_size, 800);
@@ -890,9 +1022,13 @@ semantic_threshold = 0.7
         assert_eq!(s.search.semantic_threshold, Some(1.0));
     }
 
+    /// Names the model, which unset would follow the developer's
+    /// `SCLEROX_EMBED_MODEL` (see `EmbedSettings::model_name`).
+    const GRANITE: &str = "[embed]\nmodel = \"granite-small-r2\"\n";
+
     #[test]
     fn size_settings_follow_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         assert_eq!(granite.memory_embed_chars(), 4000);
         assert_eq!(granite.index.chunk_chars, 800);
         assert_eq!(granite.index.chunk_lines, 15);
@@ -909,9 +1045,10 @@ semantic_threshold = 0.7
         assert_eq!(set.index.chunk_lines, 30);
 
         // Zero is repaired to the default rather than disabling embedding.
-        let mut zero =
-            Settings::from_toml_str("[embed]\nmemory_chars = 0\n[index]\nchunk_chars = 0\n")
-                .unwrap();
+        let mut zero = Settings::from_toml_str(&format!(
+            "{GRANITE}memory_chars = 0\n[index]\nchunk_chars = 0\n"
+        ))
+        .unwrap();
         zero.validate();
         assert_eq!(zero.memory_embed_chars(), 4000);
         assert_eq!(zero.index.chunk_chars, 800);
@@ -919,7 +1056,7 @@ semantic_threshold = 0.7
 
     #[test]
     fn thresholds_follow_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         let t = crate::embed::models::GRANITE_SMALL_R2.thresholds;
         assert_eq!(granite.semantic_threshold(), t.semantic);
         assert_eq!(granite.dedup_cosine_threshold(), t.dedup_cosine);
@@ -943,7 +1080,7 @@ semantic_threshold = 0.7
 
     #[test]
     fn semantic_margin_follows_the_model_unless_overridden() {
-        let granite = Settings::from_toml_str("").unwrap();
+        let granite = Settings::from_toml_str(GRANITE).unwrap();
         assert_eq!(granite.semantic_margin(), Some(0.05));
         let minilm = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         assert_eq!(minilm.semantic_margin(), None);
@@ -969,11 +1106,11 @@ semantic_threshold = 0.7
     fn validate_rejects_unknown_model() {
         let mut s = Settings::from_toml_str("[embed]\nmodel = \"bert-giant\"\n").unwrap();
         s.validate();
-        assert_eq!(s.embed.model, "granite-small-r2");
+        assert_eq!(s.embed.model, None, "falls back to the default");
 
         let mut ok = Settings::from_toml_str("[embed]\nmodel = \"minilm-l6-v2\"\n").unwrap();
         ok.validate();
-        assert_eq!(ok.embed.model, "minilm-l6-v2");
+        assert_eq!(ok.embed.model_name(), "minilm-l6-v2");
     }
 
     #[test]
@@ -982,7 +1119,7 @@ semantic_threshold = 0.7
         let off = Settings::from_toml_str("[embed]\nenabled = false\n").unwrap();
         assert!(!off.embed.enabled);
         // The model choice is kept, so turning them back on needs no re-embed.
-        assert_eq!(off.embed.model, "granite-small-r2");
+        assert_eq!(off.embed.model, None);
     }
 
     #[test]
@@ -997,6 +1134,62 @@ semantic_threshold = 0.7
         assert_eq!(enabled_bridge(true, None), None);
         assert_eq!(enabled_bridge(true, Some("yes")), None);
         assert_eq!(enabled_bridge(true, Some("maybe")), None);
+    }
+
+    #[test]
+    fn device_defaults_to_auto_and_validates() {
+        let mut s = Settings::from_toml_str("").unwrap();
+        s.validate();
+        assert_eq!(s.embed.device, "auto");
+        let mut cpu = Settings::from_toml_str("[embed]\ndevice = \"CPU\"\n").unwrap();
+        cpu.validate();
+        assert_eq!(cpu.embed.device, "cpu");
+        let mut bad = Settings::from_toml_str("[embed]\ndevice = \"cuda\"\n").unwrap();
+        bad.validate();
+        assert_eq!(bad.embed.device, "auto");
+    }
+
+    #[test]
+    fn an_unset_model_is_the_default_until_a_database_records_one() {
+        let unset = Settings::from_toml_str("").unwrap();
+        assert_eq!(unset.embed.model, None);
+        // `init` puts the database's model in the env var, which tests can't
+        // set safely while others run, so compare with what it resolves to.
+        let resolved = crate::embed::models::configured()
+            .unwrap_or_else(|_| crate::embed::models::default_model());
+        assert_eq!(unset.embed.model_name(), resolved.name);
+        let set = Settings::from_toml_str("[embed]\nmodel = \"granite-small-r2\"\n").unwrap();
+        assert_eq!(set.embed.model.as_deref(), Some("granite-small-r2"));
+    }
+
+    #[test]
+    fn the_recorded_model_is_read_without_creating_anything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sclerox.db");
+        assert_eq!(recorded_model(&path), None);
+        assert!(!path.exists(), "looking must not create the database");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        assert_eq!(recorded_model(&path), None);
+        let record = |id: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES (?1, ?2)",
+                [crate::embed::models::META_KEY, id],
+            )
+            .unwrap();
+        };
+        record(crate::embed::models::GRANITE_SMALL_R2_FP32.id);
+        assert_eq!(
+            recorded_model(&path),
+            Some(&crate::embed::models::GRANITE_SMALL_R2_FP32)
+        );
+        record("some-model-this-build-doesnt-know");
+        assert_eq!(recorded_model(&path), None);
+        // MiniLM is from older versions: the default replaces it.
+        record(crate::embed::models::MINILM_L6_V2.id);
+        assert_eq!(recorded_model(&path), None);
     }
 
     #[test]

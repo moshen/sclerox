@@ -381,7 +381,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     "this database's vectors came from '{}', not the configured '{}'; \
                      run `sclerox db reembed` to switch all of it",
                     crate::embed::models::display_id(&recorded),
-                    crate::config::settings().embed.model
+                    crate::config::settings().embed.model_name()
                 );
             }
             let targets = if force {

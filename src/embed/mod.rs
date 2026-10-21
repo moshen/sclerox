@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+pub mod device;
 pub mod download;
 pub mod models;
 pub mod server;
@@ -41,7 +42,7 @@ pub fn required() -> Result<Embedder> {
              turn them on to embed"
         );
     }
-    Ok(Embedder::new()?.bulk())
+    Embedder::new(server::Lane::Bulk)
 }
 
 /// The embedder for everything else, where vectors are a bonus on top of
@@ -53,10 +54,19 @@ pub fn required() -> Result<Embedder> {
 /// Uses the model server when `embed.server` allows it (see [`server`]),
 /// starting one if needed; otherwise loads the model in-process.
 pub fn optional(ready: bool) -> Option<Embedder> {
+    optional_in(ready, server::Lane::Query)
+}
+
+/// [`optional`], for bulk work (see [`Embedder::new`]).
+pub fn optional_bulk(ready: bool) -> Option<Embedder> {
+    optional_in(ready, server::Lane::Bulk)
+}
+
+fn optional_in(ready: bool, lane: server::Lane) -> Option<Embedder> {
     if !enabled() || !ready {
         return None;
     }
-    match Embedder::new() {
+    match Embedder::new(lane) {
         Ok(e) => Some(e),
         Err(e) => {
             let msg = format!("embedding model unavailable, continuing without vectors: {e:#}");
@@ -67,9 +77,10 @@ pub fn optional(ready: bool) -> Option<Embedder> {
     }
 }
 
-/// Where an [`Embedder`] runs the model.
+/// Where an [`Embedder`] runs the model: here, on a device, or in the
+/// model server.
 enum Backend {
-    Local(Box<fastembed::TextEmbedding>),
+    Local(Box<LocalModel>),
     Server(server::Client),
 }
 
@@ -85,8 +96,10 @@ impl Embedder {
     /// The model selected by `embed.model` (bridged through
     /// `SCLEROX_EMBED_MODEL`): through the model server when it is on and
     /// running (or can be started), else loaded here, downloading it on
-    /// first use.
-    fn new() -> Result<Self> {
+    /// first use. With [`server::Lane::Bulk`], the server runs other
+    /// commands' queries before this one's work and takes turns between bulk
+    /// commands, and a model loaded here may go on an accelerator.
+    fn new(lane: server::Lane) -> Result<Self> {
         let spec = models::configured()?;
         spec.check_supported()?;
         if server::mode() == server::Mode::Auto {
@@ -94,33 +107,36 @@ impl Embedder {
                 return Ok(Self {
                     backend: Backend::Server(client),
                     spec,
-                    lane: server::Lane::Query,
+                    lane,
                 });
             }
         }
-        Self::with_model(spec)
+        Self::with_model(spec, lane)
     }
 
     /// Load `spec` in-process, downloading its files into the sclerox model
     /// cache (`$XDG_CACHE_HOME/sclerox/models/`) if they are not there yet.
-    pub fn with_model(spec: &'static ModelSpec) -> Result<Self> {
+    pub fn with_model(spec: &'static ModelSpec, lane: server::Lane) -> Result<Self> {
+        let model = load_model(spec, lane == server::Lane::Bulk)?;
         Ok(Self {
-            backend: Backend::Local(Box::new(load_model(spec)?)),
+            backend: Backend::Local(Box::new(model)),
             spec,
-            lane: server::Lane::Query,
+            lane,
         })
-    }
-
-    /// Mark this embedder's work as bulk: the model server runs other
-    /// commands' queries before it, and takes turns between bulk commands.
-    pub fn bulk(mut self) -> Self {
-        self.lane = server::Lane::Bulk;
-        self
     }
 
     /// The model this embedder runs.
     pub fn model(&self) -> &'static ModelSpec {
         self.spec
+    }
+
+    /// The device the model runs on: here, or in the model server, which
+    /// reports it. `None` when the server doesn't say.
+    pub fn device(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Local(model) => Some(model.device().to_string()),
+            Backend::Server(_) => server::device_of(self.spec),
+        }
     }
 
     /// Embed text that will be stored and searched against.
@@ -192,14 +208,13 @@ impl Embedder {
                 }
             }
             log::warn!("model server failed, loading the model in-process: {e:#}");
-            self.backend = Backend::Local(Box::new(load_model(self.spec)?));
+            let model = load_model(self.spec, self.lane == server::Lane::Bulk)?;
+            self.backend = Backend::Local(Box::new(model));
         }
         let Backend::Local(model) = &mut self.backend else {
             unreachable!("the server backend was just replaced");
         };
-        let rest = model
-            .embed(&texts[vectors.len()..], Some(1))
-            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+        let rest = model.embed(&texts[vectors.len()..])?;
         vectors.extend(rest);
         Ok(vectors)
     }
@@ -214,6 +229,7 @@ impl Embedder {
             anyhow::bail!("batch embedding needs the model in-process");
         };
         model
+            .model
             .embed(&prefixed, None)
             .map_err(|e| anyhow::anyhow!("batch embedding failed: {e}"))
     }
@@ -273,14 +289,104 @@ pub fn ensure_downloaded(spec: &ModelSpec) -> Result<Vec<(&'static str, PathBuf)
     Ok(spec.files.iter().map(|f| f.path).zip(paths).collect())
 }
 
-/// Load `spec` in this process, downloading its files first if needed.
-pub(crate) fn load_model(spec: &'static ModelSpec) -> Result<fastembed::TextEmbedding> {
-    spec.check_supported()?;
-    let files = ensure_downloaded(spec)?;
-    load(spec, &files).with_context(|| format!("failed to load embedding model '{}'", spec.name))
+/// A model loaded in this process, on a device.
+pub(crate) struct LocalModel {
+    model: fastembed::TextEmbedding,
+    device: device::Device,
+    spec: &'static ModelSpec,
 }
 
-fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed::TextEmbedding> {
+/// Models whose accelerator failed to embed in this process, which load on
+/// the CPU from then on.
+static FAILED_ON: std::sync::Mutex<Vec<(&str, device::Device)>> = std::sync::Mutex::new(Vec::new());
+
+impl LocalModel {
+    pub(crate) fn device(&self) -> device::Device {
+        self.device
+    }
+
+    /// Embed `texts` one at a time (see [`Embedder::embed_each`]). An
+    /// accelerator can start yet fail on some inputs; then the model moves to
+    /// the CPU for good and embeds them there.
+    pub(crate) fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let failed = match self.model.embed(texts, Some(1)) {
+            Ok(vectors) => return Ok(vectors),
+            Err(e) => e,
+        };
+        if self.device == device::Device::Cpu {
+            anyhow::bail!("embedding failed: {failed}");
+        }
+        log::warn!(
+            "{} failed on {}, moving it to the cpu: {failed}",
+            self.spec.name,
+            self.device
+        );
+        FAILED_ON
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.spec.name, self.device));
+        let files = ensure_downloaded(self.spec)?;
+        self.model = load(self.spec, &files, device::Device::Cpu)
+            .with_context(|| format!("failed to load '{}' on the cpu", self.spec.name))?;
+        self.device = device::Device::Cpu;
+        self.model
+            .embed(texts, Some(1))
+            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))
+    }
+}
+
+/// Load `spec` in this process, downloading its files first if needed, on
+/// the first device of `embed.device`'s [`device::candidates`] that starts.
+/// `long_lived` is for a model that will embed many texts: the model
+/// server's, or bulk work.
+pub(crate) fn load_model(spec: &'static ModelSpec, long_lived: bool) -> Result<LocalModel> {
+    spec.check_supported()?;
+    let mut devices = device::candidates(device::configured(), spec, long_lived)?;
+    {
+        let failed = FAILED_ON.lock().unwrap_or_else(|e| e.into_inner());
+        devices.retain(|d| !failed.contains(&(spec.name, *d)));
+    }
+    if devices.is_empty() {
+        // A named accelerator that failed: only the CPU is left.
+        devices.push(device::Device::Cpu);
+    }
+    let files = ensure_downloaded(spec)?;
+    let mut failed = None;
+    for device in devices {
+        match load(spec, &files, device) {
+            Ok(model) => {
+                log::info!("loaded {} on {device}", spec.name);
+                return Ok(LocalModel {
+                    model,
+                    device,
+                    spec,
+                });
+            }
+            Err(e) => {
+                log::warn!("couldn't load {} on {device}: {e:#}", spec.name);
+                failed = Some(e);
+            }
+        }
+    }
+    let e = failed.unwrap_or_else(|| anyhow::anyhow!("no device to load it on"));
+    Err(e.context(format!("failed to load embedding model '{}'", spec.name)))
+}
+
+fn load(
+    spec: &ModelSpec,
+    files: &[(&'static str, PathBuf)],
+    device: device::Device,
+) -> Result<fastembed::TextEmbedding> {
+    load_with(spec, files, device, device.provider())
+}
+
+/// [`load`] with `provider` in place of `device`'s own.
+fn load_with(
+    spec: &ModelSpec,
+    files: &[(&'static str, PathBuf)],
+    device: device::Device,
+    provider: Option<fastembed::ExecutionProviderDispatch>,
+) -> Result<fastembed::TextEmbedding> {
     use fastembed::{
         InitOptionsUserDefined, OutputKey, QuantizationMode, TokenizerFiles,
         UserDefinedEmbeddingModel,
@@ -296,8 +402,20 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
     };
 
     let [tokenizer, config, special_tokens_map, tokenizer_config] = models::TOKENIZER_FILES;
+    let mut onnx = read(spec.onnx_file)?;
+    if device == device::Device::CoreMl {
+        // Name the compiled model after the graph and weights it was
+        // compiled from.
+        let hash = |path: &str| {
+            let file = spec.files.iter().find(|f| f.path == path);
+            file.map_or("", |f| &f.sha256[..16])
+        };
+        let weights = spec.external_data.first().map_or("", |w| hash(w));
+        let key = format!("{}{}{weights}", spec.name, hash(spec.onnx_file));
+        onnx = device::with_coreml_cache_key(onnx, &key);
+    }
     let mut model_def = UserDefinedEmbeddingModel::new(
-        read(spec.onnx_file)?,
+        onnx,
         TokenizerFiles {
             tokenizer_file: read(tokenizer)?,
             config_file: read(config)?,
@@ -319,7 +437,10 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         model_def = model_def.with_external_initializer(graph_name.to_string(), read(data)?);
     }
 
-    let options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    let mut options = InitOptionsUserDefined::new().with_max_length(spec.max_tokens);
+    if let Some(ep) = provider {
+        options = options.with_execution_providers(vec![ep]);
+    }
     fastembed::TextEmbedding::try_new_from_user_defined(model_def, options)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -436,6 +557,63 @@ mod tests {
         dot / (norm(a) * norm(b))
     }
 
+    /// A session of its own on `onnx` and its external `weights`, for the
+    /// benchmarks: on `ep`, with inputs fixed at 1 x `length` tokens when
+    /// given. `directml` sets the session options DirectML needs, as
+    /// fastembed does; `no_fusion` also turns off its graph fusion.
+    fn bench_session(
+        onnx: &[u8],
+        weights: (&std::ffi::OsStr, &'static [u8]),
+        length: Option<usize>,
+        ep: Option<fastembed::ExecutionProviderDispatch>,
+        directml: bool,
+        no_fusion: bool,
+    ) -> ort::Result<ort::session::Session> {
+        let mut builder = ort::session::Session::builder()?;
+        if let Some(ep) = ep {
+            builder = builder.with_execution_providers([ep])?;
+        }
+        if directml {
+            builder = builder
+                .with_memory_pattern(false)?
+                .with_parallel_execution(false)?;
+        }
+        if no_fusion {
+            builder = builder.with_config_entry("ep.dml.disable_graph_fusion", "1")?;
+        }
+        if let Some(length) = length {
+            builder = builder
+                .with_dimension_override("batch_size", 1)?
+                .with_dimension_override("sequence_length", length as i64)?
+                .with_dimension_override("total_sequence_length", length as i64)?;
+        }
+        builder
+            .with_external_initializer_file_in_memory(weights.0, weights.1.into())?
+            .commit_from_memory(onnx)
+    }
+
+    /// Granite's vector for one encoded text from a [`bench_session`]: the
+    /// first token's state (CLS pooling).
+    fn bench_embed(
+        session: &mut ort::session::Session,
+        encoding: &tokenizers::Encoding,
+        dim: usize,
+    ) -> Result<Vec<f32>> {
+        let length = encoding.get_ids().len();
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+        let mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let outputs = session.run(ort::inputs![
+            "input_ids" => ort::value::Tensor::from_array(([1usize, length], ids))?,
+            "attention_mask" => ort::value::Tensor::from_array(([1usize, length], mask))?,
+        ])?;
+        let (_, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+        Ok(hidden[..dim].to_vec())
+    }
+
     /// Granite through fastembed must match onnxruntime in Python on the same
     /// int8 model. Cosines all near 0.6-0.7 would mean mean pooling crept in
     /// where CLS belongs.
@@ -448,7 +626,7 @@ mod tests {
     #[test]
     #[ignore = "downloads Granite small (~52 MB) into the model cache"]
     fn granite_parity_with_reference() {
-        let mut e = Embedder::with_model(&models::GRANITE_SMALL_R2).unwrap();
+        let mut e = Embedder::with_model(&models::GRANITE_SMALL_R2, server::Lane::Query).unwrap();
         let queries = ["Who made the song My achy breaky heart?", "summit define"];
         let passages = [
             "Achy Breaky Heart is a country song written by Don Von Tress. Originally \
@@ -473,10 +651,498 @@ mod tests {
         }
     }
 
+    /// Full-precision Granite ranks like the int8 reference and scores a
+    /// little higher (see its thresholds in `models`).
+    #[test]
+    #[ignore = "downloads Granite small at full precision (~195 MB) into the model cache"]
+    fn granite_fp32_is_close_to_int8() {
+        let mut e =
+            Embedder::with_model(&models::GRANITE_SMALL_R2_FP32, server::Lane::Query).unwrap();
+        let queries = ["Who made the song My achy breaky heart?", "summit define"];
+        let passages = [
+            "Achy Breaky Heart is a country song written by Don Von Tress. Originally \
+             titled Don't Tell My Heart and performed by The Marcy Brothers in 1991.",
+            "Definition of summit for English Language Learners. : 1 the highest point \
+             of a mountain : the top of a mountain. : 2 the highest level.",
+        ];
+        let reference = [[0.888, 0.638], [0.686, 0.826]];
+        let q = e.embed_each(&queries).unwrap();
+        let p = e.embed_each(&passages).unwrap();
+        for (i, qv) in q.iter().enumerate() {
+            for (j, pv) in p.iter().enumerate() {
+                let got = cosine(qv, pv);
+                eprintln!("query {i} / passage {j}: {got:.4}");
+                assert!(
+                    (got - reference[i][j]).abs() <= 0.03,
+                    "query {i} / passage {j}: got {got:.4}, int8 reference {}",
+                    reference[i][j]
+                );
+            }
+        }
+    }
+
+    /// How fast full-precision Granite embeds on this machine's accelerator
+    /// once loaded and reused, as the model server uses it, against the
+    /// CPU running it and running int8 Granite, what sclerox uses without an
+    /// accelerator. Run on an Apple Silicon Mac or on Windows:
+    ///   cargo test --release --lib accelerator_benchmark -- --ignored --nocapture 2>/dev/null
+    /// (results go to stdout; CoreML logs a lot to stderr).
+    #[test]
+    #[ignore = "benchmark: needs an accelerator and Granite fp32 (~195 MB); takes minutes"]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), windows))]
+    fn accelerator_benchmark() {
+        use std::time::{Duration, Instant};
+
+        let spec = &models::GRANITE_SMALL_R2_FP32;
+        let files = ensure_downloaded(spec).unwrap();
+
+        // Lengths spread like stored text: mostly short memories and
+        // code-sized chunks, some long ones, a few near the token limit.
+        // Fixed seed, so every run and machine gets the same texts.
+        // Real text, the same on every machine: sclerox's own code and docs.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(root.join("src"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs" || x == "md"))
+            .collect();
+        paths.push(root.join("README.md"));
+        paths.sort();
+        let corpus: Vec<char> = paths
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .chars()
+            .collect();
+        let mut offset = 0;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut lengths = |n: usize| -> Vec<usize> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    match seed % 10 {
+                        0..=4 => 40 + (seed >> 8) as usize % 400,
+                        5..=7 => 400 + (seed >> 8) as usize % 1200,
+                        8 => 1600 + (seed >> 8) as usize % 2400,
+                        _ => 4000 + (seed >> 8) as usize % 4000,
+                    }
+                })
+                .collect()
+        };
+        // Consecutive pieces of the corpus, so no two texts are the same.
+        let mut text = |chars: usize| -> String {
+            let piece: String = corpus.iter().cycle().skip(offset).take(chars).collect();
+            offset = (offset + chars) % corpus.len();
+            piece
+        };
+        let warm: Vec<String> = lengths(100).into_iter().map(&mut text).collect();
+        let fresh: Vec<String> = lengths(100).into_iter().map(|n| text(n + 1)).collect();
+        let chars: usize = warm.iter().map(|t| t.chars().count()).sum();
+        println!(
+            "{} texts from {} files, {chars} chars per pass",
+            warm.len(),
+            paths.len()
+        );
+
+        // Each step is announced first, flushed, so a crash shows where.
+        let step = |what: &str| {
+            use std::io::Write;
+            print!("{what}... ");
+            let _ = std::io::stdout().flush();
+        };
+        step("loading fp32 on the cpu");
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        println!("ok");
+        // For the sessions of sclerox's own below: the CPU's tokenizer, which
+        // cuts at the model's limit, without its padding.
+        #[cfg(windows)]
+        let (tokenizer, pad) = {
+            let mut tokenizer = cpu.tokenizer.clone();
+            let pad = tokenizer.get_padding().cloned().unwrap_or_default();
+            tokenizer.with_padding(None);
+            (tokenizer, pad)
+        };
+        let mut reference = Vec::new();
+        for (n, text) in warm.iter().enumerate() {
+            step(&format!("reference {n} ({} chars)", text.chars().count()));
+            reference.extend(cpu.embed(std::slice::from_ref(text), Some(1)).unwrap());
+            print!("\r\x1b[K");
+        }
+        println!("reference vectors ok");
+
+        // Several passes over the same texts, then one over lengths not
+        // seen yet: a device that compiles per input shape is slow there.
+        let run =
+            |name: &str, embed: &mut dyn FnMut(&String) -> Result<Vec<f32>>, loaded: Duration| {
+                let mut passes = Vec::new();
+                let mut worst = 1.0f32;
+                let mut failed = 0;
+                for _ in 0..4 {
+                    let started = Instant::now();
+                    for (text, cpu_vector) in warm.iter().zip(&reference) {
+                        match embed(text) {
+                            Ok(v) => worst = worst.min(cosine(&v, cpu_vector)),
+                            Err(_) => failed += 1,
+                        }
+                    }
+                    passes.push(started.elapsed());
+                }
+                let started = Instant::now();
+                for text in &fresh {
+                    if embed(text).is_err() {
+                        failed += 1;
+                    }
+                }
+                let new_lengths = started.elapsed();
+                let secs: Vec<String> = passes
+                    .iter()
+                    .map(|d| format!("{:.2}", d.as_secs_f64()))
+                    .collect();
+                println!(
+                    "{name:<36} load {:>5.2}s | passes {} s | new lengths {:.2}s | \
+                 failed {failed} | lowest cosine to cpu {worst:.4}",
+                    loaded.as_secs_f64(),
+                    secs.join(" "),
+                    new_lengths.as_secs_f64()
+                );
+            };
+
+        // One text at a time through fastembed, as sclerox embeds.
+        fn one(
+            model: &mut fastembed::TextEmbedding,
+        ) -> impl FnMut(&String) -> Result<Vec<f32>> + '_ {
+            |text| {
+                let mut v = model
+                    .embed(std::slice::from_ref(text), Some(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(v.remove(0))
+            }
+        }
+
+        let started = Instant::now();
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        run("cpu fp32", &mut one(&mut cpu), started.elapsed());
+        drop(cpu);
+
+        // What sclerox runs without an accelerator: Granite int8 on the CPU.
+        // Another model, so its cosine to fp32 shows only that it's close.
+        let int8 = &models::GRANITE_SMALL_R2;
+        let int8_files = ensure_downloaded(int8).unwrap();
+        let started = Instant::now();
+        let mut cpu_int8 = load(int8, &int8_files, device::Device::Cpu).unwrap();
+        run(
+            "cpu int8 (other model)",
+            &mut one(&mut cpu_int8),
+            started.elapsed(),
+        );
+        drop(cpu_int8);
+
+        let mut variants: Vec<(String, device::Device, fastembed::ExecutionProviderDispatch)> =
+            Vec::new();
+        // Each CoreML variant gets its own compiled-model cache, kept until
+        // the loads below are done.
+        #[cfg(target_os = "macos")]
+        let caches = tempfile::TempDir::new().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            for (format_name, format) in [
+                ("NeuralNetwork", ModelFormat::NeuralNetwork),
+                ("MLProgram", ModelFormat::MLProgram),
+            ] {
+                for (units_name, unit) in [
+                    ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
+                    ("CPUAndGPU", ComputeUnits::CPUAndGPU),
+                    ("All", ComputeUnits::All),
+                ] {
+                    let name = format!("coreml {format_name} + {units_name}");
+                    let cache = caches.path().join(name.replace(' ', "_"));
+                    let ep = ort::ep::CoreML::default()
+                        .with_model_format(format)
+                        .with_compute_units(unit)
+                        .with_model_cache_dir(cache.display())
+                        .build()
+                        .error_on_failure();
+                    variants.push((name, device::Device::CoreMl, ep));
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let ep = device::Device::DirectMl
+                .provider()
+                .expect("DirectML provider");
+            variants.push(("directml".to_string(), device::Device::DirectMl, ep));
+        }
+        for (name, device, ep) in variants {
+            let started = Instant::now();
+            match load_with(spec, &files, device, Some(ep)) {
+                Ok(mut model) => run(&name, &mut one(&mut model), started.elapsed()),
+                Err(e) => println!("{name}: load failed: {e:#}"),
+            }
+        }
+
+        // DirectML without graph fusion, in sessions of sclerox's own, since
+        // fastembed can't turn it off: first at each text's own length, then
+        // padded to the smallest of a few fixed lengths that holds it, one
+        // session per length.
+        #[cfg(windows)]
+        {
+            let read = |name: &str| {
+                let (_, path) = files.iter().find(|(f, _)| *f == name).unwrap();
+                std::fs::read(path).unwrap()
+            };
+            let onnx = read(spec.onnx_file);
+            let weights: &'static [u8] = Box::leak(read(spec.external_data[0]).into_boxed_slice());
+            let weights = (
+                Path::new(spec.external_data[0]).file_name().unwrap(),
+                weights,
+            );
+            let encode = |text: &String| {
+                tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(anyhow::Error::msg)
+            };
+            let directml = || device::Device::DirectMl.provider();
+
+            let name = "directml, no graph fusion";
+            let started = Instant::now();
+            match bench_session(&onnx, weights, None, directml(), true, true) {
+                Ok(mut session) => run(
+                    name,
+                    &mut |text| bench_embed(&mut session, &encode(text)?, spec.dim),
+                    started.elapsed(),
+                ),
+                Err(e) => println!("{name}: load failed: {e}"),
+            }
+
+            // The model reads at most 2048 tokens, so the last length holds
+            // every text.
+            const LENGTHS: [usize; 5] = [128, 256, 512, 1024, 2048];
+            let name = "directml, no fusion, fixed lengths";
+            let started = Instant::now();
+            let sessions: ort::Result<Vec<_>> = LENGTHS
+                .iter()
+                .map(|&n| bench_session(&onnx, weights, Some(n), directml(), true, true))
+                .collect();
+            match sessions {
+                Ok(mut sessions) => run(
+                    name,
+                    &mut |text| {
+                        let mut encoding = encode(text)?;
+                        let i = LENGTHS
+                            .iter()
+                            .position(|&n| encoding.len() <= n)
+                            .context("text longer than the longest length")?;
+                        encoding.pad(
+                            LENGTHS[i],
+                            pad.pad_id,
+                            pad.pad_type_id,
+                            &pad.pad_token,
+                            pad.direction,
+                        );
+                        bench_embed(&mut sessions[i], &encoding, spec.dim)
+                    },
+                    started.elapsed(),
+                ),
+                Err(e) => println!("{name}: load failed: {e}"),
+            }
+        }
+    }
+
+    /// Whether fixing the input length lets an accelerator beat the CPU:
+    /// texts padded to a fixed number of tokens, run by a session whose
+    /// input shape never changes, against the CPU embedding them unpadded as
+    /// sclerox does. Padding must leave the vectors as they were. Runs the
+    /// CPU anywhere, CoreML on an Apple Silicon Mac and DirectML on Windows:
+    ///   cargo test --release --lib fixed_length_benchmark -- --ignored --nocapture 2>/dev/null
+    #[test]
+    #[ignore = "benchmark: needs Granite fp32 (~195 MB); takes minutes"]
+    fn fixed_length_benchmark() {
+        use std::time::Instant;
+        use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
+
+        let spec = &models::GRANITE_SMALL_R2_FP32;
+        let files = ensure_downloaded(spec).unwrap();
+        let read = |name: &str| {
+            let (_, path) = files.iter().find(|(f, _)| *f == name).unwrap();
+            std::fs::read(path).unwrap()
+        };
+        let onnx = read(spec.onnx_file);
+        let weights: &'static [u8] = Box::leak(read(spec.external_data[0]).into_boxed_slice());
+        let weights_name = Path::new(spec.external_data[0]).file_name().unwrap();
+
+        // Real text, the same on every machine: sclerox's own code and docs,
+        // cut into pieces of many lengths.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(root.join("src"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs" || x == "md"))
+            .collect();
+        paths.sort();
+        let corpus: Vec<char> = paths
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .chars()
+            .collect();
+        let mut offset = 0;
+        let pieces: Vec<String> = (0..800)
+            .map(|i| {
+                let chars = 40 + (i * 37) % 9000;
+                let piece: String = corpus.iter().cycle().skip(offset).take(chars).collect();
+                offset = (offset + chars) % corpus.len();
+                piece
+            })
+            .collect();
+
+        let mut cpu = load(spec, &files, device::Device::Cpu).unwrap();
+        let tokens = |text: &str| {
+            let mut t = cpu.tokenizer.clone();
+            t.with_padding(None);
+            t.encode(text, true).unwrap().len()
+        };
+        let counts: Vec<usize> = pieces.iter().map(|p| tokens(p)).collect();
+
+        for length in [512usize, 1024, 2048] {
+            // The texts that fit this length, as a bucket would hold them.
+            let texts: Vec<&String> = pieces
+                .iter()
+                .zip(&counts)
+                // Buckets double, so a text is at most half padding.
+                .filter(|(_, &n)| n <= length && n > length / 2)
+                .map(|(p, _)| p)
+                .take(40)
+                .collect();
+            let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+            let reference = cpu.embed(&owned, Some(1)).unwrap();
+            let started = Instant::now();
+            for _ in 0..3 {
+                cpu.embed(&owned, Some(1)).unwrap();
+            }
+            println!(
+                "\n{length} tokens, {} texts: cpu unpadded {:.2}s per pass",
+                texts.len(),
+                started.elapsed().as_secs_f64() / 3.0
+            );
+
+            let mut tokenizer = cpu.tokenizer.clone();
+            tokenizer.with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::Fixed(length),
+                ..cpu.tokenizer.get_padding().cloned().unwrap_or_default()
+            }));
+            tokenizer
+                .with_truncation(Some(TruncationParams {
+                    max_length: length,
+                    ..Default::default()
+                }))
+                .unwrap();
+            let encoded: Vec<_> = texts
+                .iter()
+                .map(|t| tokenizer.encode(t.as_str(), true).unwrap())
+                .collect();
+
+            // Only the CPU off a Mac or Windows, so nothing is pushed there.
+            #[cfg_attr(
+                not(any(all(target_os = "macos", target_arch = "aarch64"), windows)),
+                allow(unused_mut)
+            )]
+            let mut variants: Vec<(
+                String,
+                Option<fastembed::ExecutionProviderDispatch>,
+                bool,
+                bool,
+            )> = vec![("cpu fixed".to_string(), None, false, false)];
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                use ort::ep::coreml::{ComputeUnits, ModelFormat};
+                // NeuralNetwork was two to three times slower at 128 and
+                // 512 tokens.
+                for (format_name, format) in [("MLProgram", ModelFormat::MLProgram)] {
+                    for (units_name, unit) in [
+                        ("CPUAndNeuralEngine", ComputeUnits::CPUAndNeuralEngine),
+                        ("CPUAndGPU", ComputeUnits::CPUAndGPU),
+                        ("All", ComputeUnits::All),
+                    ] {
+                        let ep = ort::ep::CoreML::default()
+                            .with_model_format(format)
+                            .with_compute_units(unit)
+                            .with_static_input_shapes(true)
+                            .build()
+                            .error_on_failure();
+                        variants.push((
+                            format!("coreml {format_name} + {units_name}"),
+                            Some(ep),
+                            false,
+                            false,
+                        ));
+                    }
+                }
+            }
+            #[cfg(windows)]
+            for (name, no_fusion) in [("directml", false), ("directml, no graph fusion", true)] {
+                variants.push((
+                    name.to_string(),
+                    device::Device::DirectMl.provider(),
+                    true,
+                    no_fusion,
+                ));
+            }
+            for (name, ep, directml, no_fusion) in variants {
+                let started = Instant::now();
+                let session = bench_session(
+                    &onnx,
+                    (weights_name, weights),
+                    Some(length),
+                    ep,
+                    directml,
+                    no_fusion,
+                );
+                let mut session = match session {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("  {name}: load failed: {e}");
+                        continue;
+                    }
+                };
+                let loaded = started.elapsed();
+                let mut embed = |e| bench_embed(&mut session, e, spec.dim);
+                // One pass to warm up, then three timed.
+                let mut worst = 1.0f32;
+                let mut failed = 0;
+                for (e, r) in encoded.iter().zip(&reference) {
+                    match embed(e) {
+                        Ok(v) => worst = worst.min(cosine(&v, r)),
+                        Err(_) => failed += 1,
+                    }
+                }
+                let started = Instant::now();
+                for _ in 0..3 {
+                    for e in &encoded {
+                        let _ = embed(e);
+                    }
+                }
+                println!(
+                    "  {name:<36} load {:>5.2}s | {:.2}s per pass | failed {failed} | \
+                     lowest cosine to cpu {worst:.4}",
+                    loaded.as_secs_f64(),
+                    started.elapsed().as_secs_f64() / 3.0
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "downloads MiniLM (~90 MB) into the model cache"]
     fn minilm_still_loads() {
-        let mut e = Embedder::with_model(&models::MINILM_L6_V2).unwrap();
+        let mut e = Embedder::with_model(&models::MINILM_L6_V2, server::Lane::Query).unwrap();
         let a = e.embed_one("the cat sat on the mat").unwrap();
         let b = e.embed_one("a cat was sitting on a mat").unwrap();
         let c = e.embed_one("quarterly revenue projections").unwrap();

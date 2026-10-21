@@ -49,7 +49,15 @@ Larger inputs also cost more: on one CPU core Granite takes about 0.2 s for
 ## Embedding model
 
 `embed.model` picks the model behind semantic search and dedup:
-`granite-small-r2` (default) or `minilm-l6-v2`. It downloads once, on first use
+`granite-small-r2`, `granite-small-r2-fp32` or `minilm-l6-v2`. Unset, it is the
+Granite model the knowledge base was embedded with, so its vectors stay
+comparable whichever machine opens it. A new knowledge base starts on the int8
+`granite-small-r2`, the faster one on the CPU, and one still on MiniLM from an
+older version moves to it; keeping MiniLM takes `embed.model = "minilm-l6-v2"`. Where `sclerox install` finds an accelerator
+(CoreML on Apple Silicon, DirectML on a Windows GPU) it switches the
+knowledge base to Granite at full precision (`-fp32`), re-embedding it; search
+keeps using the old vectors until that finishes. It never switches back:
+full precision still works on the CPU. It downloads once, on first use
 or during `sclerox install`, into `$XDG_CACHE_HOME/sclerox/models/`
 (`~/.cache/sclerox/models/` by default), along with the tokenizer used for
 token budgets. Every file is pinned to a commit and hash-checked before use;
@@ -96,6 +104,17 @@ scale (`sclerox config show` prints the effective values).
 best hit for the query (Granite default 0.05; `1.0` turns it off). Granite small does
 not merge near-duplicates on score until its thresholds are calibrated; it
 flags them in `sclerox memory conflicts` instead.
+
+## Device
+
+`embed.device` (env `SCLEROX_EMBED_DEVICE`) picks where the model runs:
+`auto` (default), `cpu`, `coreml` or `directml`. Starting an accelerator takes
+longer than embedding a search query on the CPU, so `auto` uses one only for
+the model server, which starts once, and for bulk work run without it, and
+only for a full-precision model; the int8 Granite stays on the CPU. If the
+accelerator fails to start, the model loads on the CPU. A named device is used
+for everything and fails where it's missing. `sclerox server status` and
+`sclerox db reembed` show the device in use.
 
 ## Model server
 

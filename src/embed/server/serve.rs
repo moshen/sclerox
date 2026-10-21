@@ -55,8 +55,6 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_EVERY: Duration = Duration::from_secs(30);
 /// How long a model that failed to load is refused before it is tried again.
 const RETRY_LOAD: Duration = Duration::from_secs(5 * 60);
-/// Where models run, until `embed.device` exists.
-const DEVICE: &str = "cpu";
 /// How long a server over its soft memory limit waits with no connections
 /// and no requests before exiting.
 const RESTART_QUIET: Duration = Duration::from_secs(60);
@@ -358,11 +356,13 @@ struct Slot {
     last_used: Mutex<Instant>,
     /// Its row in `model_loads`, once loaded.
     load_id: AtomicI64,
+    /// What it runs on, once loaded.
+    device: Mutex<&'static str>,
 }
 
 enum Loaded {
     No,
-    Yes(Box<fastembed::TextEmbedding>),
+    Yes(Box<crate::embed::LocalModel>),
     Failed(Instant),
 }
 
@@ -404,6 +404,7 @@ impl State {
             requests: AtomicU64::new(0),
             last_used: Mutex::new(Instant::now()),
             load_id: AtomicI64::new(0),
+            device: Mutex::new("cpu"),
         });
         models.push(Arc::clone(&slot));
         slot
@@ -414,7 +415,7 @@ impl State {
     fn with_model<R>(
         &self,
         spec: &'static ModelSpec,
-        f: impl FnOnce(&mut fastembed::TextEmbedding) -> R,
+        f: impl FnOnce(&mut crate::embed::LocalModel) -> R,
     ) -> std::result::Result<R, String> {
         let slot = self.slot(spec);
         let mut model = lock(&slot.model);
@@ -427,7 +428,12 @@ impl State {
             *model = self.load(&slot);
         }
         match &mut *model {
-            Loaded::Yes(m) => Ok(f(m)),
+            Loaded::Yes(m) => {
+                let result = f(m);
+                // Embedding may have moved it off a failing accelerator.
+                *lock(&slot.device) = m.device().name();
+                Ok(result)
+            }
             _ => Err(lock(&slot.error).clone().unwrap_or_default()),
         }
     }
@@ -436,18 +442,26 @@ impl State {
         let spec = slot.spec;
         let before = rss_mb();
         let started = Instant::now();
-        let result = crate::embed::load_model(spec);
+        // Loaded for the server's lifetime, so where `embed.device` is
+        // `auto` it may go on an accelerator.
+        let result = crate::embed::load_model(spec, true);
         let took = started.elapsed();
+        let device = match &result {
+            Ok(model) => model.device().name(),
+            Err(_) => "none",
+        };
         let record = Load {
             model: spec.name,
-            device: DEVICE,
+            device,
             max_tokens: spec.max_tokens,
         };
         match result {
             Ok(model) => {
+                let device = model.device();
+                *lock(&slot.device) = device.name();
                 let mb = rss_mb().saturating_sub(before);
                 log::info!(
-                    "model server loaded {} in {} ms, {mb} MB",
+                    "model server loaded {} on {device} in {} ms, {mb} MB",
                     spec.name,
                     took.as_millis()
                 );
@@ -565,11 +579,11 @@ impl State {
                 let _turn = self.gate.enter(lane);
                 // One at a time, as the in-process embedder runs them, so
                 // the vectors come out identical.
-                match self.with_model(spec, |m| m.embed(std::slice::from_ref(text), Some(1))) {
+                match self.with_model(spec, |m| m.embed(std::slice::from_ref(text))) {
                     Ok(Ok(v)) => vectors.extend(v),
                     Ok(Err(e)) => {
-                        log::error!("model server embedding failed: {e}");
-                        return Response::Error(format!("embedding failed: {e}"));
+                        log::error!("model server {e:#}");
+                        return Response::Error(format!("{e:#}"));
                     }
                     Err(e) => return Response::Error(e),
                 }
@@ -606,7 +620,7 @@ impl State {
                 }
                 Some(ModelStatus {
                     name: slot.spec.name.to_string(),
-                    device: DEVICE.to_string(),
+                    device: lock(&slot.device).to_string(),
                     loaded_mb: slot.loaded_mb.load(Ordering::Relaxed),
                     requests: slot.requests.load(Ordering::Relaxed),
                     idle_secs: lock(&slot.last_used).elapsed().as_secs(),
