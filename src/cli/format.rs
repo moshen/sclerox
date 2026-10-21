@@ -54,28 +54,39 @@ pub fn status_checkbox(status: &str) -> &'static str {
 
 /// A code hit's location, `<repo root>/<file>:<line>`: a path that can be
 /// opened directly and that tells clones of one repo apart.
+/// Made [`terminal_safe`], since a file name may hold control characters.
 pub fn code_location(repo_root: &str, file_path: &str, line: Option<i64>) -> String {
     let line = line.map(|l| format!(":{l}")).unwrap_or_default();
-    format!("{repo_root}/{file_path}{line}")
+    terminal_safe(&format!("{repo_root}/{file_path}{line}"))
 }
 
-/// A symbol hit: `[kind] signature (location)`.
+/// A symbol hit: `[kind] signature (location)`, made [`terminal_safe`] (a
+/// signature is source text).
 pub fn symbol_line(kind: &str, signature: &str, location: &str) -> String {
-    format!("[{kind}] {signature} ({location})")
+    terminal_safe(&format!("[{kind}] {signature} ({location})"))
 }
 
-/// `text` cut to the snippet length, with `...` when cut, safe to print:
-/// repo content is untrusted, so a control character (an escape sequence
-/// could rewrite the terminal) is shown escaped, and a tab as a space.
-fn snippet(text: &str) -> String {
-    let mut out = String::new();
-    for c in text.chars().take(CODE_SNIPPET_CHARS) {
+/// `text` safe to print: repo content (file names, source) is untrusted, so
+/// a control character, which as part of an escape sequence could rewrite the
+/// terminal, is shown escaped, and a tab as a space. Its output holds no
+/// control characters, so applying it twice changes nothing.
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
         match c {
             '\t' => out.push(' '),
             c if c.is_control() => out.extend(c.escape_default()),
             c => out.push(c),
         }
     }
+    out
+}
+
+/// `text` cut to the snippet length, with `...` when cut, and made
+/// [`terminal_safe`].
+fn snippet(text: &str) -> String {
+    let cut: String = text.chars().take(CODE_SNIPPET_CHARS).collect();
+    let mut out = terminal_safe(&cut);
     if text.chars().nth(CODE_SNIPPET_CHARS).is_some() {
         out.push_str("...");
     }
@@ -125,6 +136,13 @@ mod tests {
             "/r/a.rs:1\n        a b \\u{1b}[2Jgone\\u{7}"
         );
         assert!(!code_chunk_lines(0.5, "/r/a.rs:1", line).contains('\u{1b}'));
+
+        // File names and signatures are repo content too.
+        let loc = code_location("/r", "x\u{1b}]0;pwned\u{7}.rs", Some(3));
+        assert_eq!(loc, "/r/x\\u{1b}]0;pwned\\u{7}.rs:3");
+        assert_eq!(terminal_safe(&loc), loc, "idempotent");
+        let sym = symbol_line("fn", "fn a() { \"\u{1b}[2J\" }", &loc);
+        assert!(!sym.chars().any(char::is_control), "{sym}");
     }
 
     #[test]
