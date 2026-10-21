@@ -455,10 +455,14 @@ pub fn search_hits(
             }
         }
     }
-    results.extend(code_text.into_iter().map(|result| Hit {
-        score: None,
-        result,
-    }));
+    results.extend(
+        rank_code_text(code_text, code_text_limit)
+            .into_iter()
+            .map(|result| Hit {
+                score: None,
+                result,
+            }),
+    );
     // Rank code chunks across all repos and keep the global top N, dropping
     // any too far below the best of them.
     let cut = cutoff(&mut code_chunks.iter().map(|(s, _, _)| *s));
@@ -482,31 +486,44 @@ pub fn search_hits(
     Ok(results)
 }
 
-/// Add `repo`'s lines holding `query` word for word to `out`, as
-/// [`SearchResult::CodeText`], until `out` holds `limit`. Repos are taken in
-/// turn, so the cap is shared across all of them. A failed lookup is logged
-/// and leaves the other search tiers running.
+/// A line holding the query word for word, from one repo, before the lines
+/// of all repos are ranked together by [`rank_code_text`].
+pub struct CodeTextHit {
+    phrase: bool,
+    result: SearchResult,
+}
+
+/// Add up to `limit` of `repo`'s lines holding `query` word for word to
+/// `out`; [`rank_code_text`] then applies `limit` across all repos. Each line
+/// is cut to a snippet, as a minified file can hold megabytes on one. A
+/// failed lookup is logged and leaves the other search tiers running.
 pub fn code_text_hits(
-    out: &mut Vec<SearchResult>,
+    out: &mut Vec<CodeTextHit>,
     repo: &crate::db::repos::RepoEntry,
     repo_db: &crate::index::repo_db::RepoDb,
     query: &str,
     limit: usize,
 ) {
-    let room = limit.saturating_sub(out.len());
-    if room == 0 {
-        return;
-    }
-    match repo_db.search_text(std::path::Path::new(&repo.path), query, room) {
-        Ok(lines) => out.extend(lines.into_iter().map(|m| SearchResult::CodeText {
-            repo_name: repo.name.clone(),
-            repo_path: repo.path.clone(),
-            file_path: m.file_path,
-            line: m.line,
-            text: m.text,
+    match repo_db.search_text(std::path::Path::new(&repo.path), query, limit) {
+        Ok(lines) => out.extend(lines.into_iter().map(|m| CodeTextHit {
+            phrase: m.phrase,
+            result: SearchResult::CodeText {
+                repo_name: repo.name.clone(),
+                repo_path: repo.path.clone(),
+                file_path: m.file_path,
+                line: m.line,
+                text: truncate(&m.text, 120),
+            },
         })),
         Err(e) => log::error!("full-text search failed for repo '{}': {e:#}", repo.name),
     }
+}
+
+/// The best `limit` of every repo's [`code_text_hits`]: lines holding the
+/// query as one phrase first, wherever they are, each group in repo order.
+pub fn rank_code_text(mut hits: Vec<CodeTextHit>, limit: usize) -> Vec<SearchResult> {
+    hits.sort_by_key(|h| !h.phrase);
+    hits.into_iter().take(limit).map(|h| h.result).collect()
 }
 
 #[cfg(test)]
@@ -536,6 +553,29 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, [4, 2, 1, 3]);
+    }
+
+    #[test]
+    fn rank_code_text_puts_phrase_lines_first_across_repos() {
+        let hit = |repo: &str, phrase| CodeTextHit {
+            phrase,
+            result: SearchResult::CodeText {
+                repo_name: repo.into(),
+                repo_path: String::new(),
+                file_path: String::new(),
+                line: 1,
+                text: String::new(),
+            },
+        };
+        let repos: Vec<String> =
+            rank_code_text(vec![hit("a1", false), hit("a2", false), hit("b1", true)], 2)
+                .into_iter()
+                .map(|r| match r {
+                    SearchResult::CodeText { repo_name, .. } => repo_name,
+                    _ => unreachable!(),
+                })
+                .collect();
+        assert_eq!(repos, ["b1", "a1"]);
     }
 
     #[test]

@@ -267,6 +267,7 @@ impl<'a> RepoIndexer<'a> {
 
         let mut result = IndexResult::default();
         let mut rechunk_complete = true;
+        let mut text_backfill_complete = true;
 
         for path in &files {
             let path = path.as_path();
@@ -292,11 +293,12 @@ impl<'a> RepoIndexer<'a> {
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(_) => {
-                    // A file the old chunker cut that can't be read now keeps
-                    // its old chunks, so leave the chunker unrecorded and
-                    // retry the pass next run.
-                    if rechunk && repo_db.file_hash(&rel_path)?.is_some() {
-                        rechunk_complete = false;
+                    // A file the old chunker cut, or the text backfill needs,
+                    // that can't be read now keeps its old rows, so leave
+                    // that pass unrecorded and retry it next run.
+                    if repo_db.file_hash(&rel_path)?.is_some() {
+                        rechunk_complete &= !rechunk;
+                        text_backfill_complete &= !text_backfill;
                     }
                     continue;
                 }
@@ -429,7 +431,7 @@ impl<'a> RepoIndexer<'a> {
         if rechunk && rechunk_complete {
             repo_db.set_meta(CHUNKER_META_KEY, &chunker)?;
         }
-        if text_backfill {
+        if text_backfill && text_backfill_complete {
             repo_db.set_meta(TEXT_INDEX_META_KEY, TEXT_INDEX_VERSION)?;
         }
 
@@ -1032,6 +1034,35 @@ mod tests {
             rdb.get_meta(CHUNKER_META_KEY).unwrap(),
             Some(chunker_signature())
         );
+    }
+
+    #[test]
+    fn an_unreadable_indexed_file_holds_the_text_backfill_open() {
+        let repo = TempDir::new().unwrap();
+        let lib = repo.path().join("lib.rs");
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        let text_index = || rdb.get_meta(TEXT_INDEX_META_KEY).unwrap();
+
+        // An index from before the full-text table, with a file that can't
+        // be read: the backfill is not recorded until it can be.
+        rdb.conn
+            .execute_batch(
+                "INSERT INTO files_fts(files_fts) VALUES('delete-all');
+                 DELETE FROM repo_meta WHERE key = 'text_index';",
+            )
+            .unwrap();
+        std::fs::write(&lib, b"fn caf\xe9() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(text_index(), None);
+
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(text_index().as_deref(), Some(TEXT_INDEX_VERSION));
+        assert_eq!(rdb.search_text(repo.path(), "alpha", 5).unwrap().len(), 1);
     }
 
     #[test]

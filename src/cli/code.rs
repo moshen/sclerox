@@ -67,7 +67,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
             // holding the query word for word, then the semantic code-chunk
             // matches.
             let mut results: Vec<SearchResult> = Vec::new();
-            let mut code_text: Vec<SearchResult> = Vec::new();
+            let mut code_text = Vec::new();
             let mut code_chunks: Vec<(&RepoEntry, SimilarChunk)> = Vec::new();
             for entry in &repos {
                 if let Some(filter) = &repo {
@@ -134,7 +134,10 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             code_chunks.truncate(sem.semantic_limit);
-            results.extend(code_text);
+            results.extend(crate::search::rank_code_text(
+                code_text,
+                sem.code_text_limit,
+            ));
             results.extend(
                 code_chunks
                     .into_iter()

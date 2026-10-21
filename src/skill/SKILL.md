@@ -54,8 +54,9 @@ use `sclerox code` BEFORE reaching for Grep or Glob. It is pre-indexed (no direc
 walk), cross-repo (finds callers in OTHER repos Grep can't see), structural
 (matches symbols), call-graph aware, and also full-text: it finds any line of
 an indexed file holding the query, comments and strings included. Fall back to
-Grep only when the repo is not indexed (`sclerox repo list`) or you need a
-regex.
+Grep only when the repo is not indexed (`sclerox repo list`), you need a
+regex, or every word of a text query is under three characters (e.g. `id`),
+which the text index can't look up.
 
 ```bash
 sclerox code search "X"                  # where is X defined / written?

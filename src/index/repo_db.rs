@@ -49,6 +49,8 @@ pub struct TextMatch {
     pub file_path: String,
     pub line: i64,
     pub text: String,
+    /// The line holds the query's words as one phrase, not just each word.
+    pub phrase: bool,
 }
 
 /// Matching lines reported per file, so one file can't fill every slot.
@@ -308,8 +310,10 @@ impl RepoDb {
     }
 
     /// Lines of indexed files under `root` that hold every term of `query`
-    /// (any case, anywhere in a word), best-ranked files first, at most
-    /// `limit` lines in all and [`TEXT_MATCH_LINES_PER_FILE`] per file. The index finds the files; the lines are read
+    /// (any case, anywhere in a word), at most `limit` lines in all and
+    /// [`TEXT_MATCH_LINES_PER_FILE`] per file. Files holding the terms as one
+    /// phrase come first, then the best-ranked, and within a file the phrase
+    /// lines lead. The index finds the files; the lines are read
     /// from the files on disk, so a file edited since it was indexed reports
     /// what it says now. Terms under three characters can't be looked up in
     /// the trigram index: they only narrow the lines, and a query of nothing
@@ -320,12 +324,15 @@ impl RepoDb {
         };
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let phrase = terms.join(" ");
+        let phrase_query = format!("\"{}\"", phrase.replace('"', "\"\""));
         let mut stmt = self.conn.prepare(
             "SELECT f.path FROM files_fts JOIN files f ON f.id = files_fts.rowid
              WHERE files_fts MATCH ?1
-             ORDER BY files_fts.rank",
+             ORDER BY files_fts.rowid NOT IN
+                      (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
+                      files_fts.rank",
         )?;
-        let mut rows = stmt.query(params![fts_query])?;
+        let mut rows = stmt.query(params![fts_query, phrase_query])?;
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
@@ -348,11 +355,17 @@ impl RepoDb {
                 .collect();
             lines.sort_by_key(|&(not_phrase, _, _)| not_phrase);
             let room = (limit - out.len()).min(TEXT_MATCH_LINES_PER_FILE);
-            out.extend(lines.into_iter().take(room).map(|(_, i, l)| TextMatch {
-                file_path: file_path.clone(),
-                line: i as i64 + 1,
-                text: l.trim().to_string(),
-            }));
+            out.extend(
+                lines
+                    .into_iter()
+                    .take(room)
+                    .map(|(not_phrase, i, l)| TextMatch {
+                        file_path: file_path.clone(),
+                        line: i as i64 + 1,
+                        text: l.trim().to_string(),
+                        phrase: !not_phrase,
+                    }),
+            );
         }
         Ok(out)
     }
@@ -798,6 +811,24 @@ mod tests {
         // The per-file and overall caps.
         assert_eq!(lines("widget").len(), TEXT_MATCH_LINES_PER_FILE);
         assert_eq!(db.search_text(root.path(), "widget", 1).unwrap().len(), 1);
+
+        // A file holding the phrase leads a better-ranked one that holds
+        // only the words, even when the limit leaves room for one file.
+        std::fs::write(root.path().join("c.rs"), "// gamma delta\n").unwrap();
+        std::fs::write(
+            root.path().join("d.rs"),
+            "// delta gamma\n// delta gamma\n// delta gamma\n",
+        )
+        .unwrap();
+        for (path, text) in [
+            ("c.rs", "// gamma delta\n"),
+            ("d.rs", "// delta gamma\n// delta gamma\n// delta gamma\n"),
+        ] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, text).unwrap();
+        }
+        let top = db.search_text(root.path(), "gamma delta", 1).unwrap();
+        assert_eq!((top[0].file_path.as_str(), top[0].phrase), ("c.rs", true));
 
         // Re-indexing a file drops its old text.
         let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
