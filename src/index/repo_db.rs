@@ -337,6 +337,15 @@ impl RepoDb {
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
             let file_path: String = row.get(0)?;
+            // Stored paths are repo-relative; one that would leave the repo
+            // (a tampered or shipped repo.db) is never read.
+            let inside = Path::new(&file_path)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !inside {
+                log::warn!("skipping indexed path outside the repo: {file_path}");
+                continue;
+            }
             let Ok(source) = std::fs::read_to_string(root.join(&file_path)) else {
                 continue;
             };
@@ -829,6 +838,26 @@ mod tests {
         }
         let top = db.search_text(root.path(), "gamma delta", 1).unwrap();
         assert_eq!((top[0].file_path.as_str(), top[0].phrase), ("c.rs", true));
+
+        // A stored path that leaves the repo is never read.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "frobnicate secret\n").unwrap();
+        let escape = format!(
+            "../{}/secret.txt",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        for path in [
+            escape.as_str(),
+            outside.path().join("secret.txt").to_str().unwrap(),
+        ] {
+            db.upsert_file(path, None, "h", None).unwrap();
+            db.set_file_text(path, "frobnicate secret\n").unwrap();
+        }
+        assert!(root.path().join(&escape).exists(), "the escape resolves");
+        assert!(db
+            .search_text(root.path(), "secret", 10)
+            .unwrap()
+            .is_empty());
 
         // Re-indexing a file drops its old text.
         let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
