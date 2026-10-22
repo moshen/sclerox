@@ -3,7 +3,7 @@ use clap::Subcommand;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
-use crate::cli::format::{code_chunk_lines, code_location, symbol_line};
+use crate::cli::format::{code_chunk_lines, code_location, code_text_lines, symbol_line};
 use crate::db::repos::RepoEntry;
 use crate::db::Database;
 use crate::index::repo_db::{RepoDb, SimilarChunk, Symbol};
@@ -12,7 +12,7 @@ use crate::search::SearchResult;
 
 #[derive(Subcommand)]
 pub enum CodeCommand {
-    /// Search symbols and code across all indexed repos
+    /// Search symbols and code text across all indexed repos
     Search {
         /// Symbol name, class, or keyword to look for
         needle: String,
@@ -57,15 +57,17 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
 
             // Embed the query once for the semantic tier (best-effort - skipped
             // if embeddings are off or the model is unavailable; each repo DB
-            // checks its own model). FTS symbol search always runs.
+            // checks its own model). Symbol and full-text search always run.
             let query_emb =
                 crate::embed::optional(true).and_then(|mut e| e.embed_query(&needle).ok());
             let sem = &crate::config::settings().search;
             let floor = crate::config::settings().semantic_threshold() as f32;
 
-            // Results as `sclerox search` emits them: symbols, then the
-            // semantic code-chunk matches.
+            // Results as `sclerox search` emits them: symbols, then lines
+            // holding the query word for word, then the semantic code-chunk
+            // matches.
             let mut results: Vec<SearchResult> = Vec::new();
+            let mut code_text = Vec::new();
             let mut code_chunks: Vec<(&RepoEntry, SimilarChunk)> = Vec::new();
             for entry in &repos {
                 if let Some(filter) = &repo {
@@ -94,6 +96,14 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                         start_line: s.start_line,
                     });
                 }
+
+                crate::search::code_text_hits(
+                    &mut code_text,
+                    entry,
+                    &repo_db,
+                    &needle,
+                    sem.code_text_limit,
+                );
 
                 if let Some(ref qe) = query_emb {
                     for c in repo_db
@@ -124,6 +134,10 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             code_chunks.truncate(sem.semantic_limit);
+            results.extend(crate::search::rank_code_text(
+                code_text,
+                sem.code_text_limit,
+            ));
             results.extend(
                 code_chunks
                     .into_iter()
@@ -138,6 +152,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
             );
 
             print_output(format, &results, || {
+                let mut text_header = false;
                 let mut semantic_header = false;
                 for r in &results {
                     match r {
@@ -153,6 +168,20 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                             let sig = signature.as_deref().unwrap_or(name);
                             let loc = code_location(repo_path, file_path, Some(*start_line));
                             println!("{}", symbol_line(kind, sig, &loc));
+                        }
+                        SearchResult::CodeText {
+                            repo_path,
+                            file_path,
+                            line,
+                            text,
+                            ..
+                        } => {
+                            if !text_header {
+                                println!("\nText matches:");
+                                text_header = true;
+                            }
+                            let loc = code_location(repo_path, file_path, Some(*line));
+                            println!("  {}", code_text_lines(&loc, text));
                         }
                         SearchResult::CodeChunk {
                             repo_path,

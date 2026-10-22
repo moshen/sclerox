@@ -57,6 +57,9 @@ pub struct SearchSettings {
     /// same query; 1.0 turns it off. `None` = the embedding model's own
     /// default (see `Settings::semantic_margin`).
     pub semantic_margin: Option<f64>,
+    /// Max lines of code that hold the query word for word, across all
+    /// indexed repos.
+    pub code_text_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +178,8 @@ pub struct ServerSettings {
 #[serde(default)]
 pub struct IndexSettings {
     /// Files larger than this skip tree-sitter symbol extraction (still indexed
-    /// via line chunks). Env: `SCLEROX_MAX_INDEX_FILE_BYTES`.
+    /// via line chunks); plain-text files of no known language larger than
+    /// this are not indexed at all. Env: `SCLEROX_MAX_INDEX_FILE_BYTES`.
     pub max_file_bytes: usize,
     /// Automatic (session-hook) indexing policy: `"git"` indexes the session's
     /// git repo root only; `"off"` disables auto-indexing entirely. Explicit
@@ -247,6 +251,7 @@ impl Default for SearchSettings {
             semantic_threshold: None,
             semantic_limit: 25,
             semantic_margin: None,
+            code_text_limit: 20,
         }
     }
 }
@@ -504,6 +509,11 @@ impl Settings {
         }
 
         require_positive("search.semantic_limit", &mut self.search.semantic_limit, 25);
+        require_positive(
+            "search.code_text_limit",
+            &mut self.search.code_text_limit,
+            20,
+        );
         require_positive(
             "memory.max_value_chars",
             &mut self.memory.max_value_chars,

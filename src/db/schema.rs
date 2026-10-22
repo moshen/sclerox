@@ -795,11 +795,34 @@ CREATE TABLE IF NOT EXISTS embed_jobs (
     };
 }
 
+/// Trigram full-text index over whole file contents, keyed by `files.id`;
+/// see `REPO_MIGRATION_V8`.
+macro_rules! files_fts_table {
+    () => {
+        "
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    body,
+    content='', contentless_delete=1, tokenize='trigram'
+);
+"
+    };
+}
+
 /// Migration v15: queue embedding work for the model server.
 pub const MIGRATION_V15: &str = embed_jobs_table!();
 
 /// Migration v7: queue embedding work for the model server.
 pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
+
+/// Migration v8: full-text index over each indexed file's whole contents.
+///
+/// Chunks leave out doc comments, imports and other top-level lines, and are
+/// only searched by vector, so keyword search over code missed text it held.
+/// `files_fts` is a trigram index (substring matching, any case), contentless
+/// so the source is not stored twice: hits are read back from the file on
+/// disk. Its rowid is `files.id`. Existing files are filled in by the next
+/// index run (see `index::TEXT_INDEX_META_KEY`).
+pub const REPO_MIGRATION_V8: &str = files_fts_table!();
 
 pub const REPO_SCHEMA: &str = concat!(
     "
@@ -896,5 +919,6 @@ CREATE TABLE IF NOT EXISTS symbol_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_from ON symbol_edges(from_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
 ",
-    embed_jobs_table!()
+    embed_jobs_table!(),
+    files_fts_table!()
 );

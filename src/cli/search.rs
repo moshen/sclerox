@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::cli::format::{code_chunk_lines, code_location, stamp, symbol_line};
+use crate::cli::format::{code_chunk_lines, code_location, code_text_lines, stamp, symbol_line};
 use crate::db::Database;
 use crate::output::{print_output, OutputFormat};
 use crate::search::{global_search, SearchResult};
@@ -19,6 +19,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
         s.semantic_threshold() as f32,
         s.semantic_margin().map(|m| m as f32),
         s.search.semantic_limit,
+        s.search.code_text_limit,
     )?;
     print_output(format, &results, || {
         if results.is_empty() {
@@ -124,6 +125,16 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
                     let sig = signature.as_deref().unwrap_or(name);
                     let loc = code_location(repo_path, file_path, Some(*start_line));
                     println!("[symbol] {}", symbol_line(kind, sig, &loc));
+                }
+                SearchResult::CodeText {
+                    repo_path,
+                    file_path,
+                    line,
+                    text,
+                    ..
+                } => {
+                    let loc = code_location(repo_path, file_path, Some(*line));
+                    println!("[code] {}", code_text_lines(&loc, text));
                 }
                 SearchResult::CodeChunk {
                     repo_path,

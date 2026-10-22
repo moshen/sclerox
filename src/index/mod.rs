@@ -69,6 +69,13 @@ const CHUNKER_VERSION: u32 = 1;
 /// repo_meta key recording which chunker cut a repo's index.
 const CHUNKER_META_KEY: &str = "chunker";
 
+/// repo_meta key recording that every indexed file's full text is in
+/// `files_fts`. An index from before that table (or one whose fill was cut
+/// short) lacks it, and its next index run fills in the files it skips as
+/// unchanged.
+pub const TEXT_INDEX_META_KEY: &str = "text_index";
+const TEXT_INDEX_VERSION: &str = "1";
+
 /// The chunker an index was cut with. An index recording a different value,
 /// or none, is re-chunked in full on its next index run.
 fn chunker_signature() -> String {
@@ -255,8 +262,12 @@ impl<'a> RepoIndexer<'a> {
         // redundant. A subfolder that explicitly opted out keeps its own index.
         retract_nested_child_indexes(db, repo_root)?;
 
+        let text_backfill =
+            repo_db.get_meta(TEXT_INDEX_META_KEY)?.as_deref() != Some(TEXT_INDEX_VERSION);
+
         let mut result = IndexResult::default();
         let mut rechunk_complete = true;
+        let mut text_backfill_complete = true;
 
         for path in &files {
             let path = path.as_path();
@@ -274,37 +285,59 @@ impl<'a> RepoIndexer<'a> {
                 Err(_) => continue,
             };
 
-            let lang = match detect_language(path) {
-                Some(l) => l,
-                None => continue,
-            };
+            // A file of no known language is still indexed when it is plain
+            // text, for full-text search only: no symbols, chunks or vectors,
+            // so lockfiles and generated data don't flood semantic search.
+            // Over the size cap it is more likely data than prose, and skipped
+            // before it is read. One indexed before that no longer qualifies
+            // (grown, or no longer text) is dropped from the index.
+            let lang = detect_language(path);
+            if lang.is_none()
+                && std::fs::metadata(path)
+                    .map_or(true, |m| m.len() > max_tree_sitter_bytes() as u64)
+            {
+                repo_db.remove_file(&rel_path)?;
+                continue;
+            }
 
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
+                Err(_) if lang.is_none() => {
+                    repo_db.remove_file(&rel_path)?; // not UTF-8, so not text
+                    continue;
+                }
                 Err(_) => {
-                    // A file the old chunker cut that can't be read now keeps
-                    // its old chunks, so leave the chunker unrecorded and
-                    // retry the pass next run.
-                    if rechunk && repo_db.file_hash(&rel_path)?.is_some() {
-                        rechunk_complete = false;
+                    // A file the old chunker cut, or the text backfill needs,
+                    // that can't be read now keeps its old rows, so leave
+                    // that pass unrecorded and retry it next run.
+                    if repo_db.file_hash(&rel_path)?.is_some() {
+                        rechunk_complete &= !rechunk;
+                        text_backfill_complete &= !text_backfill;
                     }
                     continue;
                 }
             };
 
+            if lang.is_none() && source.contains('\0') {
+                repo_db.remove_file(&rel_path)?; // valid UTF-8, but binary
+                continue;
+            }
+
             // For very large files, skip tree-sitter to avoid unbounded memory
             // usage (tree-sitter requires the whole file in memory at once).
             // The file is still indexed via line-based chunking - it will be
             // searchable but without symbol extraction.
-            let effective_lang = if source.len() > max_tree_sitter_bytes() {
-                log::debug!(
-                    "{rel_path} is {}KB, skipping tree-sitter (line-based only)",
-                    source.len() / 1024
-                );
-                "text" // no tree-sitter grammar → falls back to chunk_by_lines
-            } else {
-                lang
-            };
+            let effective_lang = lang.map(|lang| {
+                if source.len() > max_tree_sitter_bytes() {
+                    log::debug!(
+                        "{rel_path} is {}KB, skipping tree-sitter (line-based only)",
+                        source.len() / 1024
+                    );
+                    "text" // no tree-sitter grammar → falls back to chunk_by_lines
+                } else {
+                    lang
+                }
+            });
 
             let hash = sha256_hex(source.as_bytes());
 
@@ -315,11 +348,17 @@ impl<'a> RepoIndexer<'a> {
                 embed_here && hash_matches && !repo_db.file_chunks_all_embedded(&rel_path)?;
 
             if hash_matches && !needs_embed && !rechunk {
+                if text_backfill {
+                    repo_db.set_file_text(&rel_path, &source)?;
+                }
                 result.skipped += 1;
                 continue;
             }
 
-            let (symbols, raw_chunks, edges) = parse_file(&source, effective_lang, chunk_lines());
+            let (symbols, raw_chunks, edges) = match effective_lang {
+                Some(lang) => parse_file(&source, lang, chunk_lines()),
+                None => Default::default(),
+            };
 
             // Split any chunk that exceeds the embedding model's context window.
             let chunks: Vec<parser::CodeChunk> = raw_chunks
@@ -338,16 +377,20 @@ impl<'a> RepoIndexer<'a> {
                             && s.end_line == Some(c.end_line as i64)
                     });
                 if same {
+                    if text_backfill {
+                        repo_db.set_file_text(&rel_path, &source)?;
+                    }
                     result.skipped += 1;
                     continue;
                 }
             }
 
-            let file_id = repo_db.upsert_file(&rel_path, Some(lang), &hash, None)?;
+            let file_id = repo_db.upsert_file(&rel_path, lang, &hash, None)?;
             // Keep the vectors of chunks whose text survives the re-chunk, so
             // an edit costs only the chunks it actually changed.
             let kept_vectors = repo_db.file_chunk_vectors(file_id)?;
             repo_db.delete_file_data(file_id)?;
+            repo_db.set_file_text(&rel_path, &source)?;
 
             // Insert symbols and build a name→id map for resolving call edges.
             let mut name_to_id: std::collections::HashMap<String, i64> =
@@ -402,7 +445,7 @@ impl<'a> RepoIndexer<'a> {
             log::debug!(
                 "indexed {} ({}, {} symbols, {} chunks, {} edges)",
                 rel_path,
-                lang,
+                lang.unwrap_or("plain text"),
                 symbols.len(),
                 chunks.len(),
                 edges.len(),
@@ -411,6 +454,9 @@ impl<'a> RepoIndexer<'a> {
 
         if rechunk && rechunk_complete {
             repo_db.set_meta(CHUNKER_META_KEY, &chunker)?;
+        }
+        if text_backfill && text_backfill_complete {
+            repo_db.set_meta(TEXT_INDEX_META_KEY, TEXT_INDEX_VERSION)?;
         }
 
         log::info!(
@@ -885,6 +931,45 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_text_is_searchable_and_backfilled_once() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("lib.rs"),
+            "//! Frobnicates widgets.\nuse std::io;\n\nfn alpha() {}\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        let found = |q: &str| rdb.search_text(repo.path(), q, 10).unwrap().len();
+        assert_eq!(found("frobnicates"), 1, "a line no chunk holds");
+        assert_eq!(found("std::io"), 1);
+        assert_eq!(
+            rdb.get_meta(TEXT_INDEX_META_KEY).unwrap().as_deref(),
+            Some(TEXT_INDEX_VERSION)
+        );
+
+        // An index from before the full-text table: the unchanged file is not
+        // re-indexed, but its text is filled in, and only once.
+        rdb.conn
+            .execute_batch(
+                "INSERT INTO files_fts(files_fts) VALUES('delete-all');
+                 DELETE FROM repo_meta WHERE key = 'text_index';",
+            )
+            .unwrap();
+        assert_eq!(found("frobnicates"), 0);
+        let result = indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(result.files_indexed, 0, "hash skip still applies");
+        assert_eq!(found("frobnicates"), 1, "text backfilled");
+        assert_eq!(
+            rdb.get_meta(TEXT_INDEX_META_KEY).unwrap().as_deref(),
+            Some(TEXT_INDEX_VERSION)
+        );
+    }
+
+    #[test]
     fn a_chunker_change_rechunks_unchanged_files_once() {
         let repo = TempDir::new().unwrap();
         std::fs::write(repo.path().join("lib.rs"), "fn alpha() {}\n").unwrap();
@@ -973,6 +1058,102 @@ mod tests {
             rdb.get_meta(CHUNKER_META_KEY).unwrap(),
             Some(chunker_signature())
         );
+    }
+
+    #[test]
+    fn plain_text_files_of_any_type_are_indexed_for_full_text_only() {
+        let repo = TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::write(p.join("Cargo.toml"), "[package]\nname = \"zebra-crate\"\n").unwrap();
+        std::fs::write(p.join("ci.yml"), "jobs:\n  zebra-job: {}\n").unwrap();
+        std::fs::write(p.join("Dockerfile"), "FROM zebra:1\n").unwrap();
+        std::fs::write(p.join("notes.txt"), "zebra notes\n").unwrap();
+        // Not plain text: binary (NUL), not UTF-8, or over the size cap.
+        std::fs::write(p.join("blob.dat"), b"zebra\0\x01\x02").unwrap();
+        std::fs::write(p.join("latin1.txt"), b"zebra caf\xe9\n").unwrap();
+        std::fs::write(
+            p.join("huge.json"),
+            format!("\"zebra{}\"", "x".repeat(DEFAULT_MAX_TREE_SITTER_BYTES)),
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let result = RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        assert_eq!(result.files_indexed, 4);
+        assert_eq!(result.chunks, 0, "no chunks, so nothing to embed");
+
+        let rdb = RepoDb::open(&p.join(".sclerox").join("repo.db")).unwrap();
+        let mut files: Vec<String> = rdb
+            .search_text(p, "zebra", 20)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.file_path)
+            .collect();
+        files.sort();
+        assert_eq!(files, ["Cargo.toml", "Dockerfile", "ci.yml", "notes.txt"]);
+        let languages: Vec<Option<String>> = rdb
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.language)
+            .collect();
+        assert!(languages.iter().all(Option::is_none), "{languages:?}");
+
+        // Unchanged on the next run.
+        let again = RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        assert_eq!((again.files_indexed, again.skipped), (0, 4));
+
+        // Files that stop being plain text, or outgrow the cap, leave the
+        // index; one that qualifies again comes back.
+        std::fs::write(p.join("ci.yml"), b"zebra\0binary").unwrap();
+        std::fs::write(p.join("notes.txt"), b"zebra caf\xe9\n").unwrap();
+        std::fs::write(
+            p.join("Dockerfile"),
+            format!("FROM zebra{}", "x".repeat(DEFAULT_MAX_TREE_SITTER_BYTES)),
+        )
+        .unwrap();
+        RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        let paths = || -> Vec<String> {
+            rdb.list_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        assert_eq!(paths(), ["Cargo.toml"]);
+        assert_eq!(rdb.search_text(p, "zebra", 20).unwrap().len(), 1);
+        std::fs::write(p.join("notes.txt"), "zebra notes\n").unwrap();
+        RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
+        assert_eq!(paths(), ["Cargo.toml", "notes.txt"]);
+    }
+
+    #[test]
+    fn an_unreadable_indexed_file_holds_the_text_backfill_open() {
+        let repo = TempDir::new().unwrap();
+        let lib = repo.path().join("lib.rs");
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        let text_index = || rdb.get_meta(TEXT_INDEX_META_KEY).unwrap();
+
+        // An index from before the full-text table, with a file that can't
+        // be read: the backfill is not recorded until it can be.
+        rdb.conn
+            .execute_batch(
+                "INSERT INTO files_fts(files_fts) VALUES('delete-all');
+                 DELETE FROM repo_meta WHERE key = 'text_index';",
+            )
+            .unwrap();
+        std::fs::write(&lib, b"fn caf\xe9() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(text_index(), None);
+
+        std::fs::write(&lib, "fn alpha() {}\n").unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        assert_eq!(text_index().as_deref(), Some(TEXT_INDEX_VERSION));
+        assert_eq!(rdb.search_text(repo.path(), "alpha", 5).unwrap().len(), 1);
     }
 
     #[test]
@@ -1098,10 +1279,11 @@ class Handler:
 
     #[test]
     fn test_empty_folder_creates_no_index() {
-        // A folder with no indexable source files must not leave a stub repo.db
-        // or a registry entry behind.
+        // A folder with no indexable files - neither source nor plain text -
+        // must not leave a stub repo.db or a registry entry behind.
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("README"), "just prose, no code\n").unwrap();
+        std::fs::write(dir.path().join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0").unwrap();
+        std::fs::write(dir.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
 
         let primary_db = Database::open_in_memory().unwrap();
         let mut indexer = RepoIndexer::new(None);

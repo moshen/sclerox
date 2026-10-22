@@ -142,6 +142,7 @@ pub fn config_template() -> String {
          # semantic_threshold = {sem_thr}          # cosine floor for semantic search hits\n\
          # semantic_limit = {sem_lim}                # max semantic hits per entity type\n\
          # semantic_margin = {sem_margin}            # drop hits this far below the best one; 1.0 = off\n\
+         # code_text_limit = {code_text_lim}               # max code lines matching the query word for word\n\
          \n\
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
@@ -184,7 +185,7 @@ pub fn config_template() -> String {
          # hard_memory_mb = {hard_memory_mb}              # over this (MB), it exits after the request in progress, even mid bulk work; 0: no limit. env: SCLEROX_SERVER_HARD_MEMORY_MB\n\
          \n\
          [index]\n\
-         # max_file_bytes = {max_bytes}           # env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
+         # max_file_bytes = {max_bytes}           # bigger: no tree-sitter; other plain text: skipped. env: SCLEROX_MAX_INDEX_FILE_BYTES\n\
          # auto = \"{auto}\"                          # session-hook indexing: git|off\n\
          # max_files = {max_files}                    # reject folders over this many files (--force to override); env: SCLEROX_MAX_INDEX_FILES\n\
          # chunk_chars = {code_chars}                # chars per embedded code chunk; changing it re-chunks on the next index. env: SCLEROX_CODE_CHUNK_CHARS\n\
@@ -203,6 +204,7 @@ pub fn config_template() -> String {
         model_thresholds = model_thresholds_doc(),
         sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
+        code_text_lim = d.search.code_text_limit,
         // MiniLM has no margin; show Granite's as the example value.
         sem_margin = dm
             .top_margin

@@ -4,7 +4,7 @@
 
 ```bash
 sclerox repo list                         # all indexed repos
-sclerox repo search "<query>"             # find repos by name/description
+sclerox repo search "<query>"             # find repos by name/description/path
 sclerox repo index [path]                 # index a repo (embeddings on by default)
 sclerox repo index --no-embed [path]      # index without generating embeddings
 sclerox repo index --force [path]         # index even if over the max-files cap
@@ -12,6 +12,13 @@ sclerox repo show [path] [--symbols "<query>"]
 sclerox repo sync                         # heal registry: remove stale/nested, reindex missing
 sclerox repo reembed [--repo <name>] [--force]  # backfill embeddings for indexed chunks
 ```
+
+What gets indexed: every file not excluded by `.gitignore`. Source and
+Markdown files are parsed into symbols and chunks (searchable by name, word for
+word, and by meaning). Every other plain-text file (config, YAML, JSON,
+lockfiles, `Dockerfile`, `.txt`, ...) is searchable word for word only - no
+symbols or embeddings - and is skipped if over `index.max_file_bytes`. Binary
+and non-UTF-8 files are skipped.
 
 Only git repos are auto-indexed (a folder needs a `.git`). Indexing happens at
 the git root; nested git repos each get their own index (one per `.git` level),
@@ -24,16 +31,24 @@ SessionStart hook and `sclerox repo index` both skip it.
 Prefer `sclerox code` over Grep/Glob for symbols (see the rule in SKILL.md).
 
 ```bash
-sclerox code search "<query>"                    # find symbols by name
+sclerox code search "<query>"                    # symbols by name, then lines holding the query
 sclerox code search --repo "<name>" "<query>"    # scope to one repo
 sclerox code refs <symbol>                       # what calls/uses this symbol?
 sclerox code calls <symbol>                      # what does this symbol call?
 sclerox code graph <symbol> --depth 4            # BFS call graph
 ```
 
+`code search` returns, in order: symbols whose name or signature contains the
+query; text matches - lines of any indexed file (comments, strings, imports
+included) holding every word of the query, as substrings in any case, the
+exact phrase first (up to `search.code_text_limit` lines, 3 per file; words
+under three characters only narrow the lines, so a query of only those finds
+no text); and, with embeddings, semantic matches.
+
 Compose with ast-grep for structural matching: `sclerox code` finds the files,
 ast-grep matches the pattern. NOTE the flag is `--output json` (not `--format`).
-`code search` emits a list of `{"type": "Symbol" | "CodeChunk", ...}` hits;
+`code search` emits a list of `{"type": "Symbol" | "CodeText" | "CodeChunk", ...}`
+hits (`CodeText` has `file_path`, `line` and `text`);
 `code calls`, `code refs` and `code graph` emit their edges and nodes with
 `repo_path` and the resolved symbol.
 

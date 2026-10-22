@@ -43,6 +43,19 @@ pub struct Symbol {
     pub end_line: i64,
 }
 
+/// One line of an indexed file that matches a full-text query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMatch {
+    pub file_path: String,
+    pub line: i64,
+    pub text: String,
+    /// The line holds the query's words as one phrase, not just each word.
+    pub phrase: bool,
+}
+
+/// Matching lines reported per file, so one file can't fill every slot.
+const TEXT_MATCH_LINES_PER_FILE: usize = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarChunk {
     pub file_path: String,
@@ -272,12 +285,117 @@ impl RepoDb {
         Ok(out)
     }
 
+    /// Drop the file at `path` from the index: its row (so its hash, and an
+    /// unchanged file is indexed afresh if it qualifies again), its symbols
+    /// and chunks (by cascade) and its full text. Does nothing for a path not
+    /// in `files`.
+    pub fn remove_file(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = (SELECT id FROM files WHERE path = ?1)",
+            params![path],
+        )?;
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         self.conn
             .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+        self.conn
+            .execute("DELETE FROM files_fts WHERE rowid = ?1", params![file_id])?;
         Ok(())
+    }
+
+    /// Replace the full-text index entry of the stored file at `path` with
+    /// `text`, its whole contents. Does nothing for a path not in `files`.
+    pub fn set_file_text(&self, path: &str, text: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = (SELECT id FROM files WHERE path = ?1)",
+            params![path],
+        )?;
+        self.conn.execute(
+            "INSERT INTO files_fts (rowid, body) SELECT id, ?2 FROM files WHERE path = ?1",
+            params![path, text],
+        )?;
+        Ok(())
+    }
+
+    /// Lines of indexed files under `root` that hold every term of `query`
+    /// (any case, anywhere in a word), at most `limit` lines in all and
+    /// [`TEXT_MATCH_LINES_PER_FILE`] per file. Files holding the terms as one
+    /// phrase come first, then the best-ranked, and within a file the phrase
+    /// lines lead. The index finds the files; the lines are read
+    /// from the files on disk, so a file edited since it was indexed reports
+    /// what it says now. Terms under three characters can't be looked up in
+    /// the trigram index: they only narrow the lines, and a query of nothing
+    /// but such terms matches nothing.
+    pub fn search_text(&self, root: &Path, query: &str, limit: usize) -> Result<Vec<TextMatch>> {
+        let Some(fts_query) = fts::trigram_query(query) else {
+            return Ok(Vec::new());
+        };
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let phrase = terms.join(" ");
+        let phrase_query = format!("\"{}\"", phrase.replace('"', "\"\""));
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path FROM files_fts JOIN files f ON f.id = files_fts.rowid
+             WHERE files_fts MATCH ?1
+             ORDER BY files_fts.rowid NOT IN
+                      (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
+                      files_fts.rank",
+        )?;
+        // Every read must resolve inside the repo; see below.
+        let Ok(root) = root.canonicalize() else {
+            return Ok(Vec::new());
+        };
+        let mut rows = stmt.query(params![fts_query, phrase_query])?;
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let file_path: String = row.get(0)?;
+            // A path that resolves outside the repo is never read: a `../`
+            // or absolute one from a tampered or shipped repo.db, or an
+            // indexed file since replaced by a symlink pointing out.
+            let Ok(target) = root.join(&file_path).canonicalize() else {
+                continue;
+            };
+            if !target.starts_with(&root) {
+                log::warn!("skipping indexed path that resolves outside the repo: {file_path}");
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&target) else {
+                continue;
+            };
+            // Lines holding every term; those with the terms as one phrase
+            // first (the sort is stable, so each group stays in file order).
+            let mut lines: Vec<(bool, usize, &str)> = source
+                .lines()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let lower = l.to_lowercase();
+                    terms
+                        .iter()
+                        .all(|t| lower.contains(t.as_str()))
+                        .then(|| (!lower.contains(&phrase), i, l))
+                })
+                .collect();
+            lines.sort_by_key(|&(not_phrase, _, _)| not_phrase);
+            let room = (limit - out.len()).min(TEXT_MATCH_LINES_PER_FILE);
+            out.extend(
+                lines
+                    .into_iter()
+                    .take(room)
+                    .map(|(not_phrase, i, l)| TextMatch {
+                        file_path: file_path.clone(),
+                        line: i as i64 + 1,
+                        text: l.trim().to_string(),
+                        phrase: !not_phrase,
+                    }),
+            );
+        }
+        Ok(out)
     }
 
     pub fn insert_symbol(
@@ -685,6 +803,130 @@ mod tests {
             db.file_hash("src/main.rs").unwrap().as_deref(),
             Some("deadbeef")
         );
+    }
+
+    #[test]
+    fn search_text_finds_lines_anywhere_in_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let src = "//! Frobnicate widgets.\nuse std::io;\n\nfn go() {\n    let x = frob_widget(1);\n    // the frob widget phrase\n}\n";
+        std::fs::write(root.path().join("a.rs"), src).unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn other() {}\n").unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        for (path, text) in [("a.rs", src), ("b.rs", "fn other() {}\n")] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, text).unwrap();
+        }
+        let lines = |q: &str| -> Vec<(String, i64)> {
+            db.search_text(root.path(), q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.file_path, m.line))
+                .collect()
+        };
+        let a = |line| ("a.rs".to_string(), line);
+
+        // Doc comments and imports, which no chunk holds; any case.
+        assert_eq!(lines("FROBNICATE"), [a(1)]);
+        assert_eq!(lines("std::io"), [a(2)]);
+        // A mid-identifier substring.
+        assert_eq!(lines("b_wid"), [a(5)]);
+        // Every term, on one line; the phrase first.
+        assert_eq!(lines("frob widget"), [a(6), a(1), a(5)]);
+        // Short terms only narrow the lines; alone they can't be looked up.
+        assert_eq!(lines("x frob"), [a(5)]);
+        assert!(lines("fn").is_empty());
+        assert!(lines("nowhere").is_empty());
+        // The per-file and overall caps.
+        assert_eq!(lines("widget").len(), TEXT_MATCH_LINES_PER_FILE);
+        assert_eq!(db.search_text(root.path(), "widget", 1).unwrap().len(), 1);
+
+        // A file holding the phrase leads a better-ranked one that holds
+        // only the words, even when the limit leaves room for one file.
+        std::fs::write(root.path().join("c.rs"), "// gamma delta\n").unwrap();
+        std::fs::write(
+            root.path().join("d.rs"),
+            "// delta gamma\n// delta gamma\n// delta gamma\n",
+        )
+        .unwrap();
+        for (path, text) in [
+            ("c.rs", "// gamma delta\n"),
+            ("d.rs", "// delta gamma\n// delta gamma\n// delta gamma\n"),
+        ] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, text).unwrap();
+        }
+        let top = db.search_text(root.path(), "gamma delta", 1).unwrap();
+        assert_eq!((top[0].file_path.as_str(), top[0].phrase), ("c.rs", true));
+
+        // A stored path that leaves the repo is never read.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "frobnicate secret\n").unwrap();
+        let escape = format!(
+            "../{}/secret.txt",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        for path in [
+            escape.as_str(),
+            outside.path().join("secret.txt").to_str().unwrap(),
+        ] {
+            db.upsert_file(path, None, "h", None).unwrap();
+            db.set_file_text(path, "frobnicate secret\n").unwrap();
+        }
+        assert!(root.path().join(&escape).exists(), "the escape resolves");
+        assert!(db
+            .search_text(root.path(), "secret", 10)
+            .unwrap()
+            .is_empty());
+
+        // Re-indexing a file drops its old text.
+        let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
+        db.delete_file_data(id).unwrap();
+        assert!(lines("frobnicate").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_text_does_not_follow_a_symlink_out_of_the_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "frobnicate secret\n").unwrap();
+        std::fs::write(root.path().join("inner.txt"), "frobnicate inside\n").unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        for path in ["a.rs", "in.rs"] {
+            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.set_file_text(path, "frobnicate secret inside\n")
+                .unwrap();
+        }
+        // Indexed files since replaced by symlinks: one out of the repo, one
+        // to another file inside it.
+        std::os::unix::fs::symlink(&secret, root.path().join("a.rs")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("inner.txt"), root.path().join("in.rs"))
+            .unwrap();
+        let found: Vec<String> = db
+            .search_text(root.path(), "frobnicate", 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(found, ["frobnicate inside"]);
+    }
+
+    #[test]
+    fn migration_v8_adds_the_full_text_index() {
+        crate::db::register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(REPO_SCHEMA).unwrap();
+        conn.execute_batch("DROP TABLE files_fts; PRAGMA user_version = 7")
+            .unwrap();
+        let db = RepoDb { conn };
+        db.init().unwrap();
+        assert_eq!(db.user_version().unwrap(), REPO_VERSION);
+        db.upsert_file("a.rs", None, "h", None).unwrap();
+        db.set_file_text("a.rs", "hello there").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "hello there").unwrap();
+        assert_eq!(db.search_text(root.path(), "hello", 5).unwrap().len(), 1);
     }
 
     /// A repo database at v4 (before the model was recorded), with one chunk

@@ -62,13 +62,15 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Search people by name/notes (FTS) or by identifier value (LIKE).
+    /// Search people by name/notes (FTS, or a substring of either) or by
+    /// identifier value (LIKE).
     pub fn people_search(&self, query: &str) -> Result<Vec<Person>> {
         let fts_query = fts::sanitize(query);
         let like_pat = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
             "SELECT id, name, notes, created_at, updated_at FROM people
              WHERE id IN (SELECT rowid FROM people_fts WHERE people_fts MATCH ?1)
+                OR name LIKE ?2 ESCAPE '\\' OR notes LIKE ?2 ESCAPE '\\'
                 OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?2 ESCAPE '\\')
              ORDER BY name",
         )?;
@@ -323,6 +325,11 @@ mod tests {
         make_person(&db, "Bob");
 
         let results = db.people_search("alice").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Alice");
+
+        // A mid-word substring of the name matches too.
+        let results = db.people_search("lic").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Alice");
     }
