@@ -144,6 +144,10 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                value      = excluded.value,
+               -- A vector of the old value is wrong for the new one; clear it
+               -- so the backfill re-embeds it.
+               embedding  = CASE WHEN memory.value IS excluded.value
+                                 THEN memory.embedding END,
                memory_type = excluded.memory_type,
                tags       = excluded.tags,
                updated_at = datetime('now')
@@ -584,6 +588,8 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                    value = excluded.value,
+                   embedding = CASE WHEN memory.value IS excluded.value
+                                    THEN memory.embedding END,
                    memory_type = excluded.memory_type,
                    updated_at = datetime('now')
                  {}",
@@ -726,34 +732,43 @@ impl Database {
     /// since become duplicates. Rows with no score, or whose memories are
     /// missing a vector or carry one of another width, are left alone: there
     /// is nothing to compare, and silence is not evidence that they agree.
+    /// An edit clears the memory's vector until it is re-embedded, so a pair
+    /// is never judged on the value it used to hold. Nothing is re-scored
+    /// while the vectors come from a model other than the configured one.
     fn rescore_conflicts(&self, floor: f64) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, a.embedding, b.embedding
-               FROM memory_conflicts c
-               JOIN memory a ON a.id = c.memory_id
-               JOIN memory b ON b.id = c.matched_id
-              WHERE c.score IS NOT NULL
-                AND a.embedding IS NOT NULL
-                AND b.embedding IS NOT NULL",
-        )?;
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        // The floor is calibrated for the configured model; vectors from
+        // another one would be judged on the wrong scale.
+        if !self.semantic_ready() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let rows: Vec<(i64, f64, Vec<u8>, Vec<u8>)> = tx
+            .prepare(
+                "SELECT c.id, c.score, a.embedding, b.embedding
+                   FROM memory_conflicts c
+                   JOIN memory a ON a.id = c.memory_id
+                   JOIN memory b ON b.id = c.matched_id
+                  WHERE c.score IS NOT NULL
+                    AND a.embedding IS NOT NULL
+                    AND b.embedding IS NOT NULL",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (id, a, b) in rows {
-            let Some(score) = cosine_of_bytes(&a, &b) else {
+        for (id, stored, a, b) in rows {
+            let Some(score) = cosine_of_bytes(&a, &b).map(f64::from) else {
                 continue;
             };
-            if (score as f64) < floor {
-                self.conn
-                    .execute("DELETE FROM memory_conflicts WHERE id = ?1", params![id])?;
-            } else {
-                self.conn.execute(
+            if score < floor {
+                tx.execute("DELETE FROM memory_conflicts WHERE id = ?1", params![id])?;
+            } else if (score - stored).abs() > 1e-6 {
+                tx.execute(
                     "UPDATE memory_conflicts SET score = ?1 WHERE id = ?2",
-                    params![score as f64, id],
+                    params![score, id],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1475,6 +1490,45 @@ mod tests {
         assert!(db.memory_needing_embedding().unwrap().len() >= 2);
         let _ = (a, b);
         assert_eq!(db.memory_conflicts(Some(0.99)).unwrap().len(), 1);
+    }
+
+    /// An edit leaves no vector of the old value behind to be judged on.
+    #[test]
+    fn editing_a_memory_clears_its_vector_and_keeps_the_conflict() {
+        let db = Database::open_in_memory().unwrap();
+        let (a, b) = pair_at(&db, 0.10);
+        db.memory_conflict_add(a, b, Some(0.95)).unwrap();
+
+        db.memory_set("alpha", "first fact, restated", "project", None)
+            .unwrap();
+        let needing: Vec<_> = db
+            .memory_needing_embedding()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(needing, ["alpha"]);
+        assert_eq!(db.memory_conflicts(Some(0.93)).unwrap().len(), 1);
+
+        // Rewriting the same value keeps the vector.
+        db.memory_set("beta", "second fact", "project", None)
+            .unwrap();
+        assert_eq!(db.memory_needing_embedding().unwrap().len(), 1);
+    }
+
+    /// The floor belongs to the configured model; vectors from another one
+    /// are not judged against it.
+    #[test]
+    fn conflicts_are_not_rescored_under_another_model() {
+        let db = Database::open_in_memory().unwrap();
+        let (a, b) = pair_at(&db, 0.10);
+        db.memory_conflict_add(a, b, Some(0.95)).unwrap();
+        db.set_meta(crate::embed::models::META_KEY, "other-model")
+            .unwrap();
+
+        let conflicts = db.memory_conflicts(Some(0.93)).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].score, Some(0.95), "score left as filed");
     }
 
     #[test]
