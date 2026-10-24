@@ -741,7 +741,9 @@ impl Database {
         if !self.semantic_ready() {
             return Ok(());
         }
-        let tx = self.conn.unchecked_transaction()?;
+        // Take the write lock before reading, so a commit from another
+        // connection can't invalidate the snapshot the writes depend on.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, f64, Vec<u8>, Vec<u8>)> = tx
             .prepare(
                 "SELECT c.id, c.score, a.embedding, b.embedding
