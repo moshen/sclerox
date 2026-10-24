@@ -164,7 +164,7 @@ pub const GRANITE_SMALL_R2: ModelSpec = ModelSpec {
     // hits are still ranked and capped by `search.semantic_limit`.
     //
     // Dedup, over all 9.4M pairs of a 4,343-memory knowledge base: unrelated
-    // pairs score median 0.770, p99 0.851, p99.9 0.896. Reading 86 of the
+    // pairs score median 0.770, p99 0.851, p99.9 0.896. Reading 94 of the
     // pairs this flagged, by band: 0 duplicates in 14 read at 0.90-0.92,
     // 1 in 8 at 0.92-0.93, 6 in 12 at 0.93-0.95, 6 in 8 at 0.95-0.96,
     // 19 in 22 at 0.96-0.97, and 30 in 30 above 0.97. Granite scores pairs on
