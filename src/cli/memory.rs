@@ -458,7 +458,8 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         }
 
         MemoryCommand::Conflicts => {
-            let conflicts = db.memory_conflicts()?;
+            let conflicts =
+                db.memory_conflicts(Some(crate::config::settings().dedup_cosine_threshold()))?;
             print_output(format, &conflicts, || {
                 if conflicts.is_empty() {
                     println!("No unresolved memory conflicts.");
