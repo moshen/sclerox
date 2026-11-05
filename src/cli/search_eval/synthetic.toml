@@ -1,0 +1,313 @@
+# A small made-up knowledge base and questions about it, scored by
+# `synthetic.rs` on every `cargo test`. People, meetings, projects and todos
+# are numbered from 1 in the order listed here, which their labels use.
+
+[[memory]]
+key = "gpu-coreml"
+type = "decision"
+value = "Dropped CoreML as an execution provider: it was slower than the CPU for the Granite model and failed on dynamic input shapes. macOS runs on the CPU."
+
+[[memory]]
+key = "retry-policy"
+type = "decision"
+value = "Retry a failed embedding request three times, with exponential backoff starting at 200 ms."
+
+[[memory]]
+key = "sqlite-wal"
+type = "feedback"
+value = "Always open SQLite databases in WAL mode so readers never block the indexer."
+
+[[memory]]
+key = "release-cadence"
+type = "project"
+value = "Releases ship every second Tuesday, once CI is green on Linux, macOS and Windows."
+
+[[memory]]
+key = "invoice-parser-owner"
+type = "reference"
+value = "Priya owns the invoice parsing pipeline and reviews every change to FinancialDocument."
+
+[[memory]]
+key = "context-budget"
+type = "feedback"
+value = "Keep session context under 2000 tokens, counted with the MiniLM tokenizer."
+
+[[memory]]
+key = "lunch-orders"
+type = "reference"
+value = "Team lunch orders go through the shared spreadsheet on Fridays."
+
+[[memory]]
+key = "vector-dimension"
+type = "decision"
+value = "Every vec0 table is declared float[384]; models with another dimension are not supported."
+
+[[person]]
+name = "Priya Raman"
+notes = "Finance platform lead."
+
+[[person]]
+name = "Marcus Lee"
+notes = "Site reliability engineer; runs the on-call rotation."
+
+[[person]]
+name = "Ana Torres"
+notes = "Product designer."
+
+[[meeting]]
+title = "Q3 planning"
+date = "2026-07-01"
+notes = "Agreed to move search to Granite embeddings and retire MiniLM by October. Budget approved for two GPUs."
+
+[[meeting]]
+title = "Incident review: queue backlog"
+date = "2026-08-14"
+transcript = "Marcus: the embedding queue backed up because the server crashed on an oversized file. We will cap indexed files at 1 MB and add a dead-letter table for jobs that keep failing."
+
+[[meeting]]
+title = "Design sync"
+date = "2026-09-03"
+notes = "Ana showed the new onboarding screens. Dark mode colours need more contrast before launch."
+
+[[project]]
+name = "Invoice extraction"
+description = "Parse supplier invoices into FinancialDocument records."
+
+[[project]]
+name = "Search quality"
+description = "Measure and improve retrieval across the knowledge base."
+
+[[todo]]
+title = "Add retries to the model download"
+notes = "Downloads fail on flaky hotel wifi; retry with backoff."
+
+[[todo]]
+title = "Rotate the staging database password"
+notes = "The credentials leaked into a CI log on 2026-09-30."
+
+[[todo]]
+title = "Write an onboarding guide for new contributors"
+
+[[todo]]
+title = "Cap indexed file size at 1 MB"
+notes = "Follow-up from the queue backlog incident."
+
+[[research]]
+slug = "fts-stemming"
+name = "Stemming in full-text search"
+plan = "Compare the porter and unicode61 tokenizers on our queries."
+findings = "Porter stemming matches dropped for drop and retries for retry. It costs a rebuild of every full-text table."
+
+[[research]]
+slug = "gpu-providers"
+name = "GPU execution providers"
+findings = "DirectML is 2.9 times faster, but only with fixed-length sessions. CoreML was slower than the CPU."
+
+[[file]]
+path = "src/invoice.rs"
+content = '''
+/// A parsed supplier invoice with its line items and total.
+pub struct FinancialDocument {
+    pub supplier: String,
+    pub total_cents: i64,
+    pub lines: Vec<LineItem>,
+}
+
+/// One billed line of an invoice.
+pub struct LineItem {
+    pub description: String,
+    pub amount_cents: i64,
+}
+
+/// Parse raw invoice text into a FinancialDocument, or None when it has no
+/// supplier line.
+pub fn parse_invoice(text: &str) -> Option<FinancialDocument> {
+    let supplier = text.lines().find_map(|l| l.strip_prefix("Supplier: "))?;
+    let lines: Vec<LineItem> = text
+        .lines()
+        .filter_map(|l| {
+            let (description, amount) = l.rsplit_once(' ')?;
+            let amount_cents = amount.parse().ok()?;
+            Some(LineItem { description: description.to_string(), amount_cents })
+        })
+        .collect();
+    let total_cents = lines.iter().map(|l| l.amount_cents).sum();
+    Some(FinancialDocument { supplier: supplier.to_string(), total_cents, lines })
+}
+'''
+
+[[file]]
+path = "src/retry.rs"
+content = '''
+use std::{thread, time::Duration};
+
+/// Call `f` up to `attempts` times, sleeping base_ms, then twice as long,
+/// between failures. Returns the last error when every attempt fails.
+pub fn with_backoff<T>(
+    attempts: u32,
+    base_ms: u64,
+    mut f: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut delay = base_ms;
+    let mut last = String::new();
+    for _ in 0..attempts {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+        thread::sleep(Duration::from_millis(delay));
+        delay *= 2;
+    }
+    Err(last)
+}
+'''
+
+[[file]]
+path = "scripts/rotate_password.py"
+content = '''
+import secrets
+
+
+def rotate_password(env: str) -> str:
+    """Generate a new database password for env and store it in the vault."""
+    password = secrets.token_urlsafe(32)
+    store_secret(f"{env}/db-password", password)
+    return password
+
+
+def store_secret(path: str, value: str) -> None:
+    raise NotImplementedError("wire up the vault client")
+'''
+
+# --- Queries -----------------------------------------------------------------
+
+[[query]]
+q = "CoreML execution provider"
+kind = "known_item"
+relevant = ["memory:gpu-coreml", "research:gpu-providers"]
+
+[[query]]
+q = "queue backlog incident review"
+kind = "known_item"
+relevant = ["meeting:2", "todo:4"]
+
+[[query]]
+q = "Priya Raman"
+kind = "known_item"
+relevant = ["person:1"]
+
+[[query]]
+q = "invoice extraction project"
+kind = "known_item"
+relevant = ["project:1"]
+
+[[query]]
+q = "FinancialDocument"
+kind = "identifier"
+relevant = ["symbol:FinancialDocument", "code:src/invoice.rs", "memory:invoice-parser-owner", "project:1"]
+
+[[query]]
+q = "parse_invoice"
+kind = "identifier"
+relevant = ["symbol:parse_invoice", "code:src/invoice.rs"]
+
+[[query]]
+q = "with_backoff"
+kind = "identifier"
+relevant = ["symbol:with_backoff", "code:src/retry.rs"]
+
+[[query]]
+q = "float[384]"
+kind = "identifier"
+relevant = ["memory:vector-dimension"]
+
+[[query]]
+q = "rotate_password"
+kind = "identifier"
+relevant = ["symbol:rotate_password", "code:scripts/rotate_password.py"]
+
+[[query]]
+q = "why did we drop CoreML"
+kind = "natural_language"
+relevant = ["memory:gpu-coreml", "research:gpu-providers"]
+
+[[query]]
+q = "how many times do we retry failed requests"
+kind = "natural_language"
+relevant = ["memory:retry-policy", "code:src/retry.rs"]
+
+[[query]]
+q = "retries"
+kind = "natural_language"
+relevant = ["memory:retry-policy", "todo:1", "code:src/retry.rs"]
+
+[[query]]
+q = "financial document"
+kind = "natural_language"
+relevant = ["code:src/invoice.rs", "symbol:FinancialDocument", "memory:invoice-parser-owner", "project:1"]
+
+[[query]]
+q = "who owns the invoice parser"
+kind = "natural_language"
+relevant = ["memory:invoice-parser-owner", "person:1"]
+
+[[query]]
+q = "which mode should sqlite use so readers are not blocked"
+kind = "natural_language"
+relevant = ["memory:sqlite-wal"]
+
+[[query]]
+q = "what went wrong with the embedding queue"
+kind = "natural_language"
+relevant = ["meeting:2", "todo:4"]
+
+[[query]]
+q = "how long can the session context be"
+kind = "natural_language"
+relevant = ["memory:context-budget"]
+
+[[query]]
+q = "dark mode contrast"
+kind = "natural_language"
+relevant = ["meeting:3"]
+
+[[query]]
+q = "leaked credentials"
+kind = "natural_language"
+relevant = ["todo:2"]
+
+[[query]]
+q = "what did we decide at the Q3 planning meeting"
+kind = "temporal"
+relevant = ["meeting:1"]
+
+[[query]]
+q = "when do releases ship"
+kind = "temporal"
+relevant = ["memory:release-cadence"]
+
+[[query]]
+q = "what happened in August"
+kind = "temporal"
+relevant = ["meeting:2"]
+
+[[query]]
+q = "September design review"
+kind = "temporal"
+relevant = ["meeting:3"]
+
+[[query]]
+q = "kubernetes autoscaling"
+kind = "no_answer"
+
+[[query]]
+q = "quarterly tax filing deadline"
+kind = "no_answer"
+
+[[query]]
+q = "mobile app push notifications"
+kind = "no_answer"
+
+[[query]]
+q = "how do we hire interns"
+kind = "no_answer"
