@@ -85,7 +85,7 @@ struct File {
 
 /// Write the corpus into `db`, index its files as a repo under `dir`, and
 /// embed everything.
-fn build(db: &Database, dir: &Path) {
+fn build(db: &Database, dir: &Path, embedder: &mut crate::embed::Embedder) {
     let c: Corpus = toml::from_str(CORPUS).expect("parse synthetic.toml");
     for m in &c.memory {
         db.memory_set(&m.key, &m.value, &m.memory_type, None)
@@ -134,8 +134,7 @@ fn build(db: &Database, dir: &Path) {
         std::fs::write(&path, f.content.trim_start()).unwrap();
     }
     std::fs::create_dir_all(repo.join(".git")).unwrap();
-    let mut embedder = crate::embed::optional(true).expect("the synthetic eval needs the model");
-    crate::index::RepoIndexer::new(Some(&mut embedder))
+    crate::index::RepoIndexer::new(Some(embedder))
         .index_repo(db, &repo, None)
         .expect("index the synthetic repo");
     // Cuts meetings, todos and research into chunks and embeds every row.
@@ -174,13 +173,23 @@ fn compare(
 
 #[test]
 fn synthetic_search_eval() {
+    // Without the model (offline on a cold cache, say) there is nothing to
+    // measure. That skips the eval locally, but fails it in CI, which keeps
+    // the model cached, so a broken model load can't pass unnoticed.
+    let Some(mut embedder) = crate::embed::optional(true) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "the synthetic search eval needs the embedding model"
+        );
+        eprintln!("skipping synthetic_search_eval: the embedding model is unavailable");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("sclerox.db")).unwrap();
-    build(&db, dir.path());
+    build(&db, dir.path(), &mut embedder);
 
     let queries = parse_queries(CORPUS).unwrap();
     let settings = crate::config::Settings::from_toml_str("").unwrap();
-    let mut embedder = crate::embed::optional(true).expect("the synthetic eval needs the model");
     let ev = evaluate(
         &db,
         &queries,
