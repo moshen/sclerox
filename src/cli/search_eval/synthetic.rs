@@ -1,8 +1,7 @@
 //! A small made-up knowledge base and queries about it
 //! (`synthetic.toml`), scored on every `cargo test` against the committed
 //! `synthetic-baseline.toml`. A change that moves the numbers rewrites the
-//! baseline and commits it, so the diff shows the effect (written on Linux
-//! or macOS, which score alike; Windows only prints differences):
+//! baseline and commits it, so the diff shows the effect:
 //!
 //! ```text
 //! SCLEROX_EVAL_BLESS=1 cargo test --bin sclerox synthetic_search_eval -- --nocapture
@@ -20,9 +19,11 @@ use crate::db::Database;
 const CORPUS: &str = include_str!("synthetic.toml");
 const BASELINE: &str = include_str!("synthetic-baseline.toml");
 const BASELINE_PATH: &str = "src/cli/search_eval/synthetic-baseline.toml";
-/// How far a metric may move from the baseline before the test fails.
-/// Leaves room for small score differences between platforms.
-const TOLERANCE: f64 = 0.03;
+/// How far a metric over all queries may move from the baseline before the
+/// test fails. Scores differ slightly between CPUs (ONNX Runtime picks its
+/// SIMD code by CPU), enough to swap near-tied hits: on CI runners that
+/// moved these by up to 0.043.
+const TOLERANCE: f64 = 0.05;
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -141,10 +142,11 @@ fn build(db: &Database, dir: &Path, embedder: &mut crate::embed::Embedder) {
     crate::cli::db::reembed(db, true).expect("embed the synthetic corpus");
 }
 
-/// Metrics that moved more than [`TOLERANCE`], and keys only one side has.
+/// Metrics that moved more than `tolerance`, and keys only one side has.
 fn compare(
     expected: &BTreeMap<String, BTreeMap<String, f64>>,
     actual: &BTreeMap<String, BTreeMap<String, f64>>,
+    tolerance: f64,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for (group, metrics) in actual {
@@ -154,7 +156,7 @@ fn compare(
         };
         for (name, v) in metrics {
             match want.get(name) {
-                Some(w) if (v - w).abs() > TOLERANCE => {
+                Some(w) if (v - w).abs() > tolerance => {
                     out.push(format!("{group}.{name}: {w:.3} -> {v:.3}"));
                 }
                 Some(_) => {}
@@ -218,19 +220,20 @@ fn synthetic_search_eval() {
     }
     let expected: BTreeMap<String, BTreeMap<String, f64>> =
         toml::from_str(BASELINE).expect("parse synthetic-baseline.toml");
-    let moved = compare(&expected, &actual);
-    // ONNX Runtime's scores differ slightly on Windows, enough to swap
-    // near-tied hits; with a handful of queries per kind one swap moves a
-    // metric by 0.1 or more. The baseline is checked where it was written.
-    if cfg!(windows) {
-        if !moved.is_empty() {
-            println!(
-                "moved from the baseline (not checked on Windows):\n  {}",
-                moved.join("\n  ")
-            );
-        }
-        return;
+    // Over all queries, a change shows past the noise between CPUs. A kind
+    // has only a handful of queries, where one swapped near-tie moves a
+    // metric by 0.1 or more, so those are printed but not checked.
+    let (all, kinds): (BTreeMap<_, _>, BTreeMap<_, _>) = actual
+        .into_iter()
+        .partition(|(group, _)| group.ends_with(".all"));
+    let (expected_all, expected_kinds): (BTreeMap<_, _>, BTreeMap<_, _>) = expected
+        .into_iter()
+        .partition(|(group, _)| group.ends_with(".all"));
+    let shifted = compare(&expected_kinds, &kinds, 0.0);
+    if !shifted.is_empty() {
+        println!("per kind, not checked:\n  {}", shifted.join("\n  "));
     }
+    let moved = compare(&expected_all, &all, TOLERANCE);
     assert!(
         moved.is_empty(),
         "search results moved from {BASELINE_PATH}:\n  {}\n\
