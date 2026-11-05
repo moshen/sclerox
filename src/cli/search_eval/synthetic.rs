@@ -1,7 +1,8 @@
 //! A small made-up knowledge base and queries about it
 //! (`synthetic.toml`), scored on every `cargo test` against the committed
 //! `synthetic-baseline.toml`. A change that moves the numbers rewrites the
-//! baseline and commits it, so the diff shows the effect:
+//! baseline and commits it, so the diff shows the effect (written on Linux
+//! or macOS, which score alike; Windows only prints differences):
 //!
 //! ```text
 //! SCLEROX_EVAL_BLESS=1 cargo test --bin sclerox synthetic_search_eval -- --nocapture
@@ -209,6 +210,18 @@ fn synthetic_search_eval() {
     let expected: BTreeMap<String, BTreeMap<String, f64>> =
         toml::from_str(BASELINE).expect("parse synthetic-baseline.toml");
     let moved = compare(&expected, &actual);
+    // ONNX Runtime's scores differ slightly on Windows, enough to swap
+    // near-tied hits; with a handful of queries per kind one swap moves a
+    // metric by 0.1 or more. The baseline is checked where it was written.
+    if cfg!(windows) {
+        if !moved.is_empty() {
+            println!(
+                "moved from the baseline (not checked on Windows):\n  {}",
+                moved.join("\n  ")
+            );
+        }
+        return;
+    }
     assert!(
         moved.is_empty(),
         "search results moved from {BASELINE_PATH}:\n  {}\n\
