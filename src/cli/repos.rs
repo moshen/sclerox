@@ -229,6 +229,16 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                     }
                 },
             );
+            let logged: Vec<_> = fts_hits
+                .iter()
+                .map(|r| crate::cli::usage::keyword("repo", &r.name))
+                .chain(
+                    semantic
+                        .iter()
+                        .map(|r| crate::cli::usage::semantic("repo", &r.repo.name, r.score)),
+                )
+                .collect();
+            crate::cli::usage::search(db, "repo search", &query, &logged);
         }
 
         RepoCommand::Show { path, symbols } => {

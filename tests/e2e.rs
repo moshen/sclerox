@@ -1270,6 +1270,132 @@ fn global_search_json_output() {
     }
 }
 
+// ─── Usage logging ───────────────────────────────────────────────────────────
+
+/// The `(item_type, item_ref)` each JSON search result is recorded under.
+fn recorded_item(r: &serde_json::Value) -> (String, String) {
+    match r["type"].as_str().unwrap() {
+        "Memory" => ("memory".into(), r["key"].as_str().unwrap().into()),
+        "Todo" => ("todo".into(), r["id"].to_string()),
+        other => panic!("unexpected result type {other}: {r}"),
+    }
+}
+
+#[test]
+fn search_and_get_are_recorded_with_the_session() {
+    let e = Env::new();
+    e.run(&["memory", "set", "widget-note", "widgets are important"]);
+    e.run(&["todo", "add", "--title", "Fix widget rendering"]);
+
+    let out = e
+        .cmd()
+        .env("SCLEROX_SESSION_ID", "session-1")
+        .env("SCLEROX_AGENT", "e2e")
+        .args(["--output", "json", "search", "widget"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let shown: Vec<(String, String)> = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(recorded_item)
+        .collect();
+    assert!(shown.len() >= 2, "{shown:?}");
+
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    let (id, query, session, agent, count): (i64, String, String, String, i64) = conn
+        .query_row(
+            "SELECT id, query, session_id, agent, result_count FROM retrieval_events
+             WHERE command = 'search'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("one search event");
+    assert_eq!(
+        (query.as_str(), session.as_str(), agent.as_str(), count),
+        ("widget", "session-1", "e2e", shown.len() as i64)
+    );
+    let recorded: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT item_type, item_ref FROM retrieval_event_results
+             WHERE event_id = ?1 ORDER BY rank",
+        )
+        .unwrap()
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(recorded, shown, "results are recorded in the order shown");
+
+    e.cmd()
+        .env("SCLEROX_SESSION_ID", "session-1")
+        .args(["todo", "get", "1"])
+        .assert()
+        .success();
+    let read: (String, String, String) = conn
+        .query_row(
+            "SELECT command, item_type || ':' || item_ref, session_id FROM read_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        read,
+        ("todo get".into(), "todo:1".into(), "session-1".into())
+    );
+}
+
+#[test]
+fn usage_logging_can_be_turned_off() {
+    let e = Env::new();
+    std::fs::write(&e.config, "[usage]\nenabled = false\n").unwrap();
+    e.run(&["todo", "add", "--title", "Fix widget rendering"]);
+    e.run(&["search", "widget"]);
+    e.run(&["todo", "get", "1"]);
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!((count("retrieval_events"), count("read_events")), (0, 0));
+}
+
+#[test]
+fn a_failed_usage_write_changes_no_output_or_exit_code() {
+    let e = Env::new();
+    e.run(&["memory", "set", "widget-note", "widgets are important"]);
+    e.run(&["todo", "add", "--title", "Fix widget rendering"]);
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER no_search_log BEFORE INSERT ON retrieval_events
+             BEGIN SELECT RAISE(ABORT, 'usage write refused'); END;
+         CREATE TRIGGER no_read_log BEFORE INSERT ON read_events
+             BEGIN SELECT RAISE(ABORT, 'usage write refused'); END;",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let out = e.cmd().args(args).output().unwrap();
+        (out.status.code(), out.stdout, out.stderr)
+    };
+    let commands: [&[&str]; 3] = [
+        &["--output", "json", "search", "widget"],
+        &["--output", "json", "todo", "get", "1"],
+        &["--output", "json", "memory", "search", "widget"],
+    ];
+    let failing: Vec<_> = commands.iter().map(|a| run(a)).collect();
+    std::fs::write(&e.config, "[usage]\nenabled = false\n").unwrap();
+    let off: Vec<_> = commands.iter().map(|a| run(a)).collect();
+    for ((args, failing), off) in commands.iter().zip(&failing).zip(&off) {
+        assert_eq!(failing.0, Some(0), "{args:?}");
+        assert_eq!(failing.0, off.0, "{args:?} exit code");
+        assert_eq!(failing.1, off.1, "{args:?} stdout");
+        assert_eq!(failing.2, off.2, "{args:?} stderr");
+    }
+}
+
 // ─── Migration ────────────────────────────────────────────────────────────────
 
 #[test]

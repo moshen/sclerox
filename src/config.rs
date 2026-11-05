@@ -6,7 +6,7 @@
 //! every session start and must never be bricked by a bad file).
 //!
 //! `config.rs` is binary-only. Library modules (search, index, db) stay
-//! settings-free: `global_search` takes thresholds as parameters, the indexer
+//! settings-free: `search_hits` takes thresholds as parameters, the indexer
 //! reads its limit from an env var (bridged from config in `init`), and the db
 //! layer takes thresholds as call arguments. Only `cli/*` reads `settings()`.
 
@@ -30,6 +30,7 @@ pub struct Settings {
     pub server: ServerSettings,
     pub install: InstallSettings,
     pub log: LogSettings,
+    pub usage: UsageSettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -222,6 +223,17 @@ pub struct LogSettings {
     pub retain_days: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageSettings {
+    /// Record each search with its ranked results, each record read, and what
+    /// session start injects, in the main database (never exported). Used to
+    /// measure retrieval; see `cli::usage`.
+    pub enabled: bool,
+    /// Delete usage rows older than this many days (0 = keep forever).
+    pub retain_days: u32,
+}
+
 // ── Defaults ────────────────────────────────────────────────────────────────
 // These are the single source of truth for built-in values; the previously
 // scattered `const`s now live here.
@@ -241,6 +253,16 @@ impl Default for Settings {
             server: ServerSettings::default(),
             install: InstallSettings::default(),
             log: LogSettings::default(),
+            usage: UsageSettings::default(),
+        }
+    }
+}
+
+impl Default for UsageSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retain_days: 180,
         }
     }
 }

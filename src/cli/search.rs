@@ -4,7 +4,7 @@ use clap::Args;
 use crate::cli::format::{code_chunk_lines, code_location, code_text_lines, stamp, symbol_line};
 use crate::db::Database;
 use crate::output::{print_output, OutputFormat};
-use crate::search::{global_search, SearchResult};
+use crate::search::{rank, search_hits, SearchResult};
 
 #[derive(Args)]
 pub struct SearchArgs {
@@ -13,14 +13,16 @@ pub struct SearchArgs {
 
 pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> {
     let s = crate::config::settings();
-    let results = global_search(
+    let hits = rank(search_hits(
         db,
         &args.query,
         s.semantic_threshold() as f32,
         s.semantic_margin().map(|m| m as f32),
         s.search.semantic_limit,
         s.search.code_text_limit,
-    )?;
+    )?);
+    let logged: Vec<_> = hits.iter().map(crate::cli::usage::hit_item).collect();
+    let results: Vec<SearchResult> = hits.into_iter().map(|h| h.result).collect();
     print_output(format, &results, || {
         if results.is_empty() {
             println!("No matches for: {}", args.query);
@@ -31,6 +33,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
         }
         println!("\n{} results", results.len());
     });
+    crate::cli::usage::search(db, "search", &args.query, &logged);
     Ok(())
 }
 

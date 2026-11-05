@@ -108,12 +108,6 @@ impl SearchResult {
             | SearchResult::CodeChunk { file_path, .. } => ("code", file_path.clone()),
         }
     }
-
-    /// [`Self::item`] as one `<type>:<ref>` string, such as `todo:12`.
-    pub fn label(&self) -> String {
-        let (kind, item) = self.item();
-        format!("{kind}:{item}")
-    }
 }
 
 /// Which tier of [`search_hits`] found a hit.
@@ -135,31 +129,9 @@ pub struct Hit {
     pub source: HitSource,
 }
 
-/// Search every table for `query`, best first across types: hits with a
-/// cosine score by that score, then the ones without, in [`search_hits`]
-/// order. With no embedder nothing is scored, so that order is today's
-/// grouping by type.
-pub fn global_search(
-    db: &Database,
-    query: &str,
-    semantic_threshold: f32,
-    semantic_margin: Option<f32>,
-    semantic_limit: usize,
-    code_text_limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let hits = search_hits(
-        db,
-        query,
-        semantic_threshold,
-        semantic_margin,
-        semantic_limit,
-        code_text_limit,
-    )?;
-    Ok(rank(hits).into_iter().map(|h| h.result).collect())
-}
-
-/// Order `hits` best first: scored hits by score, then unscored hits in the
-/// order given.
+/// Order `hits` best first across types: scored hits by score, then
+/// unscored hits in the order given. With no embedder nothing is scored, so
+/// that order is [`search_hits`]' grouping by type.
 pub fn rank(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits.sort_by(|a, b| match (a.score, b.score) {
         (Some(a), Some(b)) => b.total_cmp(&a),
@@ -655,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_search_across_tables() {
+    fn test_search_across_tables() {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("rust-tip", "Rust lifetimes are key", "feedback", None)
             .unwrap();
@@ -681,7 +653,10 @@ mod tests {
         )
         .unwrap();
 
-        let results = global_search(&db, "Rust", 0.45, None, 5, 20).unwrap();
+        let results: Vec<SearchResult> = rank(search_hits(&db, "Rust", 0.45, None, 5, 20).unwrap())
+            .into_iter()
+            .map(|h| h.result)
+            .collect();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",

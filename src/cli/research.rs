@@ -140,6 +140,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                             }
                         },
                     );
+                    crate::cli::usage::read(db, "research get", "research", &inv.slug);
                 }
                 None => print_miss(format, &format!("Investigation '{id_or_slug}' not found")),
             }
@@ -203,6 +204,14 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     }
                 },
             );
+            let logged: Vec<_> = fts_hits
+                .iter()
+                .map(|i| crate::cli::usage::keyword("research", &i.slug))
+                .chain(semantic.iter().map(|r| {
+                    crate::cli::usage::semantic("research", &r.investigation.slug, r.score)
+                }))
+                .collect();
+            crate::cli::usage::search(db, "research search", &query, &logged);
         }
 
         ResearchCommand::Update {

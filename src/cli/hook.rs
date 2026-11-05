@@ -3,6 +3,7 @@ use clap::Subcommand;
 use std::cmp::Ordering;
 use std::io::Read;
 
+use crate::db::usage::UsageItem;
 use crate::db::Database;
 use crate::index::find_git_root;
 use crate::output::{floor_char_boundary, truncate};
@@ -113,6 +114,10 @@ fn run_start(db: &Database) -> Result<()> {
     // Consume stdin - SessionStart also sends JSON, ignore broken-pipe if not read.
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
+    let hook_session = serde_json::from_str::<serde_json::Value>(&buf)
+        .ok()
+        .and_then(|v| v["session_id"].as_str().map(str::to_string))
+        .filter(|id| !id.is_empty());
 
     let cwd = std::env::current_dir()?;
 
@@ -137,7 +142,7 @@ fn run_start(db: &Database) -> Result<()> {
     // Emit compact session context for Claude Code to inject (layer-1 index only).
     // Hard-capped at ~750 tokens so the agent knows what's available without
     // loading full content. It then fetches detail via `sclerox memory get`, etc.
-    if let Ok(ctx) = build_session_context(db, repo_name.as_deref()) {
+    if let Ok((ctx, items)) = session_context(db, repo_name.as_deref()) {
         if !ctx.is_empty() {
             let payload = serde_json::json!({
                 "hookSpecificOutput": {
@@ -146,6 +151,14 @@ fn run_start(db: &Database) -> Result<()> {
                 }
             });
             println!("{payload}");
+            // The session comes on stdin; the environment may not carry it.
+            let mut usage = crate::cli::usage::context();
+            if hook_session.is_some() {
+                usage.session_id = hook_session;
+            }
+            usage.agent.get_or_insert_with(|| "claude-code".to_string());
+            let query = repo_name.as_deref().unwrap_or_default();
+            crate::cli::usage::search_as(db, &usage, "hook start", query, &items);
         }
     }
 
@@ -156,9 +169,17 @@ fn run_start(db: &Database) -> Result<()> {
 /// what's available without loading every memory. The agent fetches detail
 /// on demand with `sclerox memory get`, `sclerox todo get`, etc. Section sizes and the
 /// overall budget come from `[session_context]` in config.
+#[cfg(test)]
 fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<String> {
+    Ok(session_context(db, repo_name)?.0)
+}
+
+/// [`build_session_context`], with the records it names in the order they
+/// appear, for the usage log.
+fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Vec<UsageItem>)> {
     let cfg = &crate::config::settings().session_context;
     let mut out = String::new();
+    let mut items = Vec::new();
     out.push_str("## sclerox context (run `sclerox memory get <key>` etc. for full content)\n\n");
 
     // Budget is enforced in real tokens (MiniLM tokenizer); max_chars is only a
@@ -178,7 +199,10 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
                 section.push_str(&format!("- #{} {}{}\n", t.id, t.title, due));
             }
             section.push('\n');
-            push_if_fits(&mut out, &section, budget);
+            if push_if_fits(&mut out, &section, budget) {
+                let shown = todos.iter().take(cfg.todos_shown);
+                items.extend(shown.map(|t| UsageItem::new("todo", t.id)));
+            }
         }
     }
 
@@ -190,7 +214,10 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
                 section.push_str(&format!("- #{} {} [{}]\n", inv.id, inv.name, inv.slug));
             }
             section.push('\n');
-            push_if_fits(&mut out, &section, budget);
+            if push_if_fits(&mut out, &section, budget) {
+                let shown = invs.iter().take(cfg.research_shown);
+                items.extend(shown.map(|i| UsageItem::new("research", &i.slug)));
+            }
         }
     }
 
@@ -226,7 +253,9 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
             section.push_str(&format!("- [{}] {}: {}\n", m.memory_type, m.key, val));
         }
         section.push('\n');
-        push_if_fits(&mut out, &section, budget);
+        if push_if_fits(&mut out, &section, budget) {
+            items.extend(relevant.iter().map(|m| UsageItem::new("memory", &m.key)));
+        }
     }
 
     // 4. Recent session memories (last 3) - chronological brief.
@@ -238,7 +267,10 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
                 section.push_str(&format!("- {}: {}\n", m.key, summary));
             }
             section.push('\n');
-            push_if_fits(&mut out, &section, budget);
+            if push_if_fits(&mut out, &section, budget) {
+                let shown = sessions.iter().take(cfg.sessions_shown);
+                items.extend(shown.map(|m| UsageItem::new("memory", &m.key)));
+            }
         }
     }
 
@@ -257,7 +289,9 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
                 others.len(),
                 others.join(", ")
             );
-            push_if_fits(&mut out, &section, budget);
+            if push_if_fits(&mut out, &section, budget) {
+                items.extend(others.iter().map(|k| UsageItem::new("memory", k)));
+            }
         }
     }
 
@@ -288,7 +322,7 @@ fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<Strin
         out.push_str(TRUNC_MARKER);
     }
 
-    Ok(out)
+    Ok((out, items))
 }
 
 /// Collect up to `limit` distinct active memories to surface with full values.
@@ -377,10 +411,13 @@ fn relevant_memories(
 /// Append `section` to `out` only if doing so keeps the payload within
 /// `budget_tokens` real tokens. Counts are additive across the join (a slight,
 /// safe over-count); with only a handful of sections the re-count is cheap.
-fn push_if_fits(out: &mut String, section: &str, budget_tokens: usize) {
-    if crate::embed::count_tokens(out) + crate::embed::count_tokens(section) <= budget_tokens {
+fn push_if_fits(out: &mut String, section: &str, budget_tokens: usize) -> bool {
+    let fits =
+        crate::embed::count_tokens(out) + crate::embed::count_tokens(section) <= budget_tokens;
+    if fits {
         out.push_str(section);
     }
+    fits
 }
 
 /// Truncate a value string to a single short line for use in the index.

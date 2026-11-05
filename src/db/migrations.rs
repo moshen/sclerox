@@ -8,7 +8,7 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 15;
+pub const PRIMARY_VERSION: u32 = 16;
 
 /// Current target schema version for per-repo databases.
 pub const REPO_VERSION: u32 = 8;
@@ -95,6 +95,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         version: 15,
         description: "embed_jobs: embedding work queued for the model server",
         sql: crate::db::schema::MIGRATION_V15,
+    },
+    Migration {
+        version: 16,
+        description: "usage logging: retrieval_events, retrieval_event_results, read_events",
+        sql: crate::db::schema::MIGRATION_V16,
     },
 ];
 

@@ -10,6 +10,7 @@ pub mod reembed;
 pub mod repos;
 pub mod schema;
 pub mod todos;
+pub mod usage;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};

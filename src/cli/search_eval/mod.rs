@@ -17,7 +17,7 @@
 //! kind = "no_answer"        # or expect_none = true with any kind
 //! ```
 //!
-//! A label is `<type>:<ref>` (see [`SearchResult::label`]): `memory:<key>`,
+//! A label is `<type>:<ref>` (see [`label`]): `memory:<key>`,
 //! `person:<id>`, `meeting:<id>`, `project:<id>`, `todo:<id>`,
 //! `research:<slug>`, `repo:<name>`, `symbol:<name>` and `code:<file>`, which
 //! matches any chunk or line of that file. `kind` is one of `known_item`,
@@ -40,6 +40,13 @@ use serde::Deserialize;
 
 use crate::db::Database;
 use crate::search::{rank, search_hits_embedded, HitSource, SearchResult};
+
+/// A result's [`SearchResult::item`] as one `<type>:<ref>` label, such as
+/// `todo:12`.
+pub fn label(r: &SearchResult) -> String {
+    let (kind, item) = r.item();
+    format!("{kind}:{item}")
+}
 
 /// What a query is testing, for breaking scores down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -225,7 +232,7 @@ pub fn score(
     render: &dyn Fn(&SearchResult) -> String,
 ) -> QueryScore {
     let relevant: HashSet<&str> = q.relevant.iter().map(String::as_str).collect();
-    let labels: Vec<String> = results.iter().map(SearchResult::label).collect();
+    let labels: Vec<String> = results.iter().map(label).collect();
     let mut s = QueryScore {
         false_result: q.expects_none() && !results.is_empty(),
         ..Default::default()
@@ -589,7 +596,7 @@ pub fn print_query(q: &EvalQuery, ev: &Evaluation, qi: usize) {
         let hits = &results[qi];
         println!("  {name} ({} hits)", hits.len());
         for (i, r) in hits.iter().take(SHOWN).enumerate() {
-            let label = r.label();
+            let label = label(r);
             let mark = if relevant.contains(label.as_str()) {
                 '*'
             } else {
@@ -636,7 +643,7 @@ pub fn pool(
     for (name, results) in ev.rankers.iter().zip(&ev.results) {
         for (rank, r) in results[qi].iter().take(depth).enumerate() {
             let e = by_label
-                .entry(r.label())
+                .entry(label(r))
                 .or_insert_with(|| (title(r), Vec::new(), rank));
             if !e.1.contains(name) {
                 e.1.push(name);
@@ -722,7 +729,7 @@ mod tests {
     #[test]
     fn tokens_count_up_to_the_first_relevant_hit() {
         let results = [memory("x"), memory("a"), memory("y")];
-        let s = score(&query(&["memory:a"]), &results, &|r| r.label());
+        let s = score(&query(&["memory:a"]), &results, &|r| label(r));
         let each = crate::embed::tokens::count_tokens("memory:x");
         assert_eq!(s.tokens_to_first, Some(2 * each));
         assert_eq!(s.tokens, 3 * each);
