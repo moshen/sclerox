@@ -17,6 +17,7 @@ pub mod search;
 pub mod server;
 pub mod text_chunks;
 pub mod todos;
+pub mod usage;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

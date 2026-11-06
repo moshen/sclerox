@@ -173,7 +173,10 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
         }
 
         TodoCommand::Get { id } => match db.todo_get(id)? {
-            Some(t) => print_output(format, &t, || print_todo_detail(&t)),
+            Some(t) => {
+                print_output(format, &t, || print_todo_detail(&t));
+                crate::cli::usage::read(db, "todo get", "todo", id);
+            }
             None => print_miss(format, &format!("Todo #{id} not found")),
         },
 
@@ -268,6 +271,16 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                     }
                 },
             );
+            let logged: Vec<_> = fts_results
+                .iter()
+                .map(|t| crate::cli::usage::keyword("todo", t.id))
+                .chain(
+                    semantic
+                        .iter()
+                        .map(|r| crate::cli::usage::semantic("todo", r.todo.id, r.score)),
+                )
+                .collect();
+            crate::cli::usage::search(db, "todo search", &query, &logged);
         }
 
         TodoCommand::Done { id, note } => {

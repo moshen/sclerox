@@ -200,7 +200,11 @@ pub fn config_template() -> String {
          \n\
          [log]\n\
          # level = \"{log_level}\"                     # off|error|warn|info|debug|trace → ~/.local/state/sclerox/logs/. env: SCLEROX_LOG\n\
-         # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n",
+         # retain_days = {retain_days}                   # delete daily logs older than this (0 = keep forever)\n\
+         \n\
+         [usage]\n\
+         # enabled = {usage_enabled}                   # record searches, their ranked results and record reads in the main database, to measure retrieval; never exported\n\
+         # retain_days = {usage_retain}               # delete usage rows older than this (0 = keep forever)\n",
         model_thresholds = model_thresholds_doc(),
         sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
@@ -251,6 +255,8 @@ pub fn config_template() -> String {
         ow_instr = d.install.overwrite_instructions,
         log_level = d.log.level,
         retain_days = d.log.retain_days,
+        usage_enabled = d.usage.enabled,
+        usage_retain = d.usage.retain_days,
     )
 }
 
@@ -546,6 +552,7 @@ mod tests {
             "[index]",
             "[server]",
             "[log]",
+            "[usage]",
         ] {
             assert!(t.contains(section), "template missing {section}");
         }

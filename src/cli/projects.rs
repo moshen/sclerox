@@ -115,6 +115,7 @@ pub fn run(db: &Database, cmd: ProjectCommand, format: OutputFormat) -> Result<(
                     &serde_json::json!({"project": p, "people": people}),
                     || print_project(&p, &people),
                 );
+                crate::cli::usage::read(db, "project get", "project", id);
             }
             None => print_miss(format, &format!("Project #{id} not found")),
         },
@@ -150,6 +151,11 @@ pub fn run(db: &Database, cmd: ProjectCommand, format: OutputFormat) -> Result<(
                     }
                 }
             });
+            let logged: Vec<_> = results
+                .iter()
+                .map(|p| crate::cli::usage::keyword("project", p.id))
+                .collect();
+            crate::cli::usage::search(db, "project search", &query, &logged);
         }
 
         ProjectCommand::Update {

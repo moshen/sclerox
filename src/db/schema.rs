@@ -811,6 +811,56 @@ CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
 /// Migration v15: queue embedding work for the model server.
 pub const MIGRATION_V15: &str = embed_jobs_table!();
 
+/// Migration v16: record searches and reads, to measure retrieval.
+///
+/// One `retrieval_events` row per search a command ran, with its results in
+/// order in `retrieval_event_results`; one `read_events` row per record a
+/// command opened. Items are named as `SearchResult::item` names them
+/// (`todo` and `12`), so a later read can be matched to the search that
+/// found it. `session_id` and `agent` come from the calling agent when it
+/// says (see `cli::usage`). Rows older than `usage.retain_days` are pruned
+/// on write. Nothing here is exported.
+pub const MIGRATION_V16: &str = "
+CREATE TABLE IF NOT EXISTS retrieval_events (
+    id           INTEGER PRIMARY KEY,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    command      TEXT NOT NULL,
+    query        TEXT NOT NULL,
+    session_id   TEXT,
+    agent        TEXT,
+    repo_path    TEXT,
+    result_count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS retrieval_events_created ON retrieval_events(created_at);
+CREATE INDEX IF NOT EXISTS retrieval_events_session ON retrieval_events(session_id);
+
+CREATE TABLE IF NOT EXISTS retrieval_event_results (
+    event_id   INTEGER NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+    rank       INTEGER NOT NULL,
+    item_type  TEXT NOT NULL,
+    item_ref   TEXT NOT NULL,
+    score      REAL,
+    tier       TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (event_id, rank)
+);
+CREATE INDEX IF NOT EXISTS retrieval_event_results_item
+    ON retrieval_event_results(item_type, item_ref);
+
+CREATE TABLE IF NOT EXISTS read_events (
+    id         INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    command    TEXT NOT NULL,
+    item_type  TEXT NOT NULL,
+    item_ref   TEXT NOT NULL,
+    session_id TEXT,
+    agent      TEXT,
+    repo_path  TEXT
+);
+CREATE INDEX IF NOT EXISTS read_events_created ON read_events(created_at);
+CREATE INDEX IF NOT EXISTS read_events_item ON read_events(item_type, item_ref);
+";
+
 /// Migration v7: queue embedding work for the model server.
 pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
 

@@ -144,3 +144,14 @@ progress, even in the middle of bulk work, which carries on with a new server
 A limit the loaded models alone exceed is ignored, as is the soft limit after
 three memory exits in 30 minutes. Env: `SCLEROX_SERVER_MAX_MEMORY_MB`,
 `SCLEROX_SERVER_HARD_MEMORY_MB`.
+
+## Usage log
+
+Searches are recorded in the main database to measure retrieval: the query,
+the results in the order shown, and each record opened with `get`. So are the
+records session start injects. Rows carry the agent session from
+`SCLEROX_SESSION_ID`, else Claude Code's `CLAUDE_CODE_SESSION_ID`, and the
+agent from `SCLEROX_AGENT`; another agent can set these to be told apart.
+Nothing here is exported, and recording never changes a command's output.
+`usage.enabled = false` turns it off; `usage.retain_days` (180; 0 keeps
+everything) prunes older rows.

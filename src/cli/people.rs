@@ -129,6 +129,7 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                     &serde_json::json!({"person": p, "identifiers": idents}),
                     || print_person(&p, &idents),
                 );
+                crate::cli::usage::read(db, "people get", "person", id);
             }
             None => print_miss(format, &format!("Person #{id} not found")),
         },
@@ -166,6 +167,11 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
                     }
                 }
             });
+            let logged: Vec<_> = results
+                .iter()
+                .map(|p| crate::cli::usage::keyword("person", p.id))
+                .collect();
+            crate::cli::usage::search(db, "people search", &query, &logged);
         }
 
         PeopleCommand::Update { id, name, notes } => {

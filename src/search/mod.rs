@@ -89,39 +89,49 @@ pub enum SearchResult {
     },
 }
 
+impl SearchResult {
+    /// The record type and reference that name this hit across runs, as in
+    /// `todo` and `12`: a memory by key, research by slug, a repo by name, a
+    /// symbol by name and code by file, so any chunk of a file is the same
+    /// item. Evaluation labels and usage logs both use it.
+    pub fn item(&self) -> (&'static str, String) {
+        match self {
+            SearchResult::Memory { key, .. } => ("memory", key.clone()),
+            SearchResult::Person { id, .. } => ("person", id.to_string()),
+            SearchResult::Meeting { id, .. } => ("meeting", id.to_string()),
+            SearchResult::Project { id, .. } => ("project", id.to_string()),
+            SearchResult::Todo { id, .. } => ("todo", id.to_string()),
+            SearchResult::Investigation { slug, .. } => ("research", slug.clone()),
+            SearchResult::Repo { name, .. } => ("repo", name.clone()),
+            SearchResult::Symbol { name, .. } => ("symbol", name.clone()),
+            SearchResult::CodeText { file_path, .. }
+            | SearchResult::CodeChunk { file_path, .. } => ("code", file_path.clone()),
+        }
+    }
+}
+
+/// Which tier of [`search_hits`] found a hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitSource {
+    /// Full-text or `LIKE` matching: memory, people, meetings, projects,
+    /// todos, research, repos, symbols and code lines.
+    Keyword,
+    /// Nearest neighbours of the query vector that the keyword tier missed.
+    Semantic,
+}
+
 /// A search result and its cosine similarity to the query, when it has one.
 /// People, projects, symbols and rows without a stored vector have none.
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub result: SearchResult,
     pub score: Option<f32>,
+    pub source: HitSource,
 }
 
-/// Search every table for `query`, best first across types: hits with a
-/// cosine score by that score, then the ones without, in [`search_hits`]
-/// order. With no embedder nothing is scored, so that order is today's
-/// grouping by type.
-pub fn global_search(
-    db: &Database,
-    query: &str,
-    semantic_threshold: f32,
-    semantic_margin: Option<f32>,
-    semantic_limit: usize,
-    code_text_limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let hits = search_hits(
-        db,
-        query,
-        semantic_threshold,
-        semantic_margin,
-        semantic_limit,
-        code_text_limit,
-    )?;
-    Ok(rank(hits).into_iter().map(|h| h.result).collect())
-}
-
-/// Order `hits` best first: scored hits by score, then unscored hits in the
-/// order given.
+/// Order `hits` best first across types: scored hits by score, then
+/// unscored hits in the order given. With no embedder nothing is scored, so
+/// that order is [`search_hits`]' grouping by type.
 pub fn rank(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits.sort_by(|a, b| match (a.score, b.score) {
         (Some(a), Some(b)) => b.total_cmp(&a),
@@ -149,20 +159,42 @@ pub fn search_hits(
     semantic_limit: usize,
     code_text_limit: usize,
 ) -> Result<Vec<Hit>> {
+    // None if the embedder is unavailable. Each database checks its own
+    // recorded model when searched.
+    let query_emb: Option<Vec<f32>> =
+        crate::embed::optional(true).and_then(|mut emb| emb.embed_query(query).ok());
+    search_hits_embedded(
+        db,
+        query,
+        query_emb.as_deref(),
+        semantic_threshold,
+        semantic_margin,
+        semantic_limit,
+        code_text_limit,
+    )
+}
+
+/// [`search_hits`] with the query already embedded, or `None` to search by
+/// keyword only. Evaluation embeds each query once and runs every ranking
+/// on that vector, instead of loading the model per search.
+pub fn search_hits_embedded(
+    db: &Database,
+    query: &str,
+    query_emb: Option<&[f32]>,
+    semantic_threshold: f32,
+    semantic_margin: Option<f32>,
+    semantic_limit: usize,
+    code_text_limit: usize,
+) -> Result<Vec<Hit>> {
     use crate::db::ScoredTable;
 
     let cutoff = |scores: &mut dyn Iterator<Item = f32>| {
         crate::embed::models::semantic_cutoff(scores, semantic_threshold, semantic_margin)
     };
     let mut results = Vec::new();
-
-    // Initialise embedder once; embed query once. Both are None if unavailable.
-    // Each database checks its own recorded model when searched.
-    let query_emb: Option<Vec<f32>> =
-        crate::embed::optional(true).and_then(|mut emb| emb.embed_query(query).ok());
     // Cosine of each keyword hit, from its stored vector, so it ranks with
     // the semantic hits.
-    let fts_scores = |table: ScoredTable, ids: &[i64]| match &query_emb {
+    let fts_scores = |table: ScoredTable, ids: &[i64]| match query_emb {
         Some(qe) => db.cosine_scores(table, ids, qe).unwrap_or_default(),
         None => Default::default(),
     };
@@ -176,6 +208,7 @@ pub fn search_hits(
     for m in memory_fts {
         results.push(Hit {
             score: scores.get(&m.id).copied(),
+            source: HitSource::Keyword,
             result: SearchResult::Memory {
                 id: m.id,
                 key: m.key,
@@ -185,13 +218,14 @@ pub fn search_hits(
             },
         });
     }
-    if let Some(ref qe) = query_emb {
+    if let Some(qe) = query_emb {
         let hits = db.memory_similar(qe, semantic_limit).unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !memory_fts_ids.contains(&r.entry.id) && r.score >= cut {
                 results.push(Hit {
                     score: Some(r.score),
+                    source: HitSource::Semantic,
                     result: SearchResult::Memory {
                         id: r.entry.id,
                         key: r.entry.key,
@@ -207,6 +241,7 @@ pub fn search_hits(
     for p in db.people_search(query)? {
         results.push(Hit {
             score: None,
+            source: HitSource::Keyword,
             result: SearchResult::Person {
                 id: p.id,
                 name: p.name,
@@ -232,6 +267,7 @@ pub fn search_hits(
             .unwrap_or_default();
         results.push(Hit {
             score: scores.get(&m.id).copied(),
+            source: HitSource::Keyword,
             result: SearchResult::Meeting {
                 id: m.id,
                 title: m.title,
@@ -241,13 +277,14 @@ pub fn search_hits(
             },
         });
     }
-    if let Some(ref qe) = query_emb {
+    if let Some(qe) = query_emb {
         let hits = db.meeting_similar(qe, semantic_limit).unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= cut {
                 results.push(Hit {
                     score: Some(r.score),
+                    source: HitSource::Semantic,
                     result: SearchResult::Meeting {
                         id: r.meeting.id,
                         title: r.meeting.title,
@@ -263,6 +300,7 @@ pub fn search_hits(
     for p in db.project_search(query)? {
         results.push(Hit {
             score: None,
+            source: HitSource::Keyword,
             result: SearchResult::Project {
                 id: p.id,
                 name: p.name,
@@ -282,6 +320,7 @@ pub fn search_hits(
     for t in todo_fts {
         results.push(Hit {
             score: scores.get(&t.id).copied(),
+            source: HitSource::Keyword,
             result: SearchResult::Todo {
                 id: t.id,
                 title: t.title,
@@ -292,13 +331,14 @@ pub fn search_hits(
             },
         });
     }
-    if let Some(ref qe) = query_emb {
+    if let Some(qe) = query_emb {
         let hits = db.todo_similar(qe, semantic_limit).unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !todo_fts_ids.contains(&r.todo.id) && r.score >= cut {
                 results.push(Hit {
                     score: Some(r.score),
+                    source: HitSource::Semantic,
                     result: SearchResult::Todo {
                         id: r.todo.id,
                         title: r.todo.title,
@@ -327,6 +367,7 @@ pub fn search_hits(
             .unwrap_or_default();
         results.push(Hit {
             score: scores.get(&i.id).copied(),
+            source: HitSource::Keyword,
             result: SearchResult::Investigation {
                 id: i.id,
                 name: i.name,
@@ -338,7 +379,7 @@ pub fn search_hits(
             },
         });
     }
-    if let Some(ref qe) = query_emb {
+    if let Some(qe) = query_emb {
         let hits = db
             .investigation_similar(qe, semantic_limit)
             .unwrap_or_default();
@@ -347,6 +388,7 @@ pub fn search_hits(
             if !inv_fts_ids.contains(&r.investigation.id) && r.score >= cut {
                 results.push(Hit {
                     score: Some(r.score),
+                    source: HitSource::Semantic,
                     result: SearchResult::Investigation {
                         id: r.investigation.id,
                         name: r.investigation.name,
@@ -372,6 +414,7 @@ pub fn search_hits(
     for r in repo_fts {
         results.push(Hit {
             score: scores.get(&r.id).copied(),
+            source: HitSource::Keyword,
             result: SearchResult::Repo {
                 id: r.id,
                 name: r.name,
@@ -381,13 +424,14 @@ pub fn search_hits(
             },
         });
     }
-    if let Some(ref qe) = query_emb {
+    if let Some(qe) = query_emb {
         let hits = db.repo_similar(qe, semantic_limit).unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !repo_fts_ids.contains(&r.repo.id) && r.score >= cut {
                 results.push(Hit {
                     score: Some(r.score),
+                    source: HitSource::Semantic,
                     result: SearchResult::Repo {
                         id: r.repo.id,
                         name: r.repo.name,
@@ -432,6 +476,7 @@ pub fn search_hits(
         for sym in symbols {
             results.push(Hit {
                 score: None,
+                source: HitSource::Keyword,
                 result: SearchResult::Symbol {
                     repo_name: repo.name.clone(),
                     repo_path: repo.path.clone(),
@@ -444,7 +489,7 @@ pub fn search_hits(
             });
         }
         code_text_hits(&mut code_text, &repo, &repo_db, query, code_text_limit);
-        if let Some(ref qe) = query_emb {
+        if let Some(qe) = query_emb {
             for c in repo_db
                 .similar_chunks(qe, semantic_limit)
                 .unwrap_or_default()
@@ -460,6 +505,7 @@ pub fn search_hits(
             .into_iter()
             .map(|result| Hit {
                 score: None,
+                source: HitSource::Keyword,
                 result,
             }),
     );
@@ -472,6 +518,7 @@ pub fn search_hits(
     for (score, repo, c) in code_chunks {
         results.push(Hit {
             score: Some(score),
+            source: HitSource::Semantic,
             result: SearchResult::CodeChunk {
                 repo_name: repo.name,
                 repo_path: repo.path,
@@ -534,6 +581,7 @@ mod tests {
     fn rank_puts_scored_hits_first_best_first() {
         let person = |id| Hit {
             score: None,
+            source: HitSource::Keyword,
             result: SearchResult::Person {
                 id,
                 name: String::new(),
@@ -579,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_search_across_tables() {
+    fn test_search_across_tables() {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("rust-tip", "Rust lifetimes are key", "feedback", None)
             .unwrap();
@@ -605,7 +653,10 @@ mod tests {
         )
         .unwrap();
 
-        let results = global_search(&db, "Rust", 0.45, None, 5, 20).unwrap();
+        let results: Vec<SearchResult> = rank(search_hits(&db, "Rust", 0.45, None, 5, 20).unwrap())
+            .into_iter()
+            .map(|h| h.result)
+            .collect();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",

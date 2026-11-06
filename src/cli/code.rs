@@ -209,6 +209,8 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     println!("No matches for '{needle}'{scope}");
                 }
             });
+            let logged: Vec<_> = results.iter().map(crate::cli::usage::result_item).collect();
+            crate::cli::usage::search(db, "code search", &needle, &logged);
         }
 
         CodeCommand::Calls { symbol, repo } => {

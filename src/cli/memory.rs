@@ -232,6 +232,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     }
                     println!("\n{} rows in history", entries.len());
                 });
+                if !entries.is_empty() {
+                    crate::cli::usage::read(db, "memory get --history", "memory", &key);
+                }
             } else {
                 match db.memory_get(&key)? {
                     Some(entry) => {
@@ -256,6 +259,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                             }
                             println!("Updated: {}", entry.updated_at);
                         });
+                        crate::cli::usage::read(db, "memory get", "memory", &key);
                     }
                     None => print_miss(format, &format!("Not found: {key}")),
                 }
@@ -296,6 +300,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             };
             // Add a semantic tier for active search: embeddings live only on
             // active rows, so this is skipped for --all (which includes stale).
+            let mut logged: Vec<_> = results
+                .iter()
+                .map(|m| crate::cli::usage::keyword("memory", &m.key))
+                .collect();
             if !all {
                 let seen: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
@@ -315,6 +323,11 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         );
                         for r in hits {
                             if !seen.contains(&r.entry.id) && r.score >= cut {
+                                logged.push(crate::cli::usage::semantic(
+                                    "memory",
+                                    &r.entry.key,
+                                    r.score,
+                                ));
                                 results.push(r.entry);
                             }
                         }
@@ -337,6 +350,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     println!("\n{} results", results.len());
                 }
             });
+            let command = if all {
+                "memory search --all"
+            } else {
+                "memory search"
+            };
+            crate::cli::usage::search(db, command, &query, &logged);
         }
 
         MemoryCommand::Delete { key } => {

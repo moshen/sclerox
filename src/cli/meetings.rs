@@ -111,6 +111,7 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
                     &serde_json::json!({"meeting": m, "people": people}),
                     || print_meeting(&m, &people),
                 );
+                crate::cli::usage::read(db, "meeting get", "meeting", id);
             }
             None => print_miss(format, &format!("Meeting #{id} not found")),
         },
@@ -175,6 +176,16 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
                     }
                 },
             );
+            let logged: Vec<_> = fts_hits
+                .iter()
+                .map(|m| crate::cli::usage::keyword("meeting", m.id))
+                .chain(
+                    semantic
+                        .iter()
+                        .map(|r| crate::cli::usage::semantic("meeting", r.meeting.id, r.score)),
+                )
+                .collect();
+            crate::cli::usage::search(db, "meeting search", &query, &logged);
         }
 
         MeetingCommand::Update {
