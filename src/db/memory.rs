@@ -164,6 +164,9 @@ impl Database {
                                  THEN memory.embedding END,
                memory_type = excluded.memory_type,
                tags       = excluded.tags,
+               -- Rewritten by hand, it is hand-written now, and guarded as such.
+               source     = CASE WHEN excluded.source = 'manual'
+                                 THEN 'manual' ELSE memory.source END,
                updated_at = datetime('now')
              {}",
             if guard.is_empty() {
@@ -605,6 +608,8 @@ impl Database {
                    embedding = CASE WHEN memory.value IS excluded.value
                                     THEN memory.embedding END,
                    memory_type = excluded.memory_type,
+                   source = CASE WHEN excluded.source = 'manual'
+                                 THEN 'manual' ELSE memory.source END,
                    updated_at = datetime('now')
                  {}",
                 if protect_manual {
@@ -1048,6 +1053,39 @@ mod tests {
         assert_eq!(entry.key, "test_key");
         assert_eq!(entry.value, "test value");
         assert_eq!(entry.memory_type, "general");
+    }
+
+    #[test]
+    fn a_hand_rewritten_distilled_memory_becomes_hand_written() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set_full("k", "distilled", "project", None, "session")
+            .unwrap();
+        db.memory_set("k", "corrected by hand", "project", None)
+            .unwrap();
+        let entry = db.memory_get("k").unwrap().unwrap();
+        assert_eq!(entry.source, "manual");
+        // ...so distillation can no longer overwrite it.
+        let refused = db
+            .memory_set_unless_manual("k", "distilled again", "project", None, "session")
+            .unwrap();
+        assert_eq!(refused, None);
+        assert_eq!(
+            db.memory_get("k").unwrap().unwrap().value,
+            "corrected by hand"
+        );
+        // The version it replaced keeps its own source.
+        let history = db.memory_history("k").unwrap();
+        let old = history.iter().find(|e| e.value == "distilled").unwrap();
+        assert_eq!(old.source, "session");
+
+        // Superseding into a distilled key by hand does the same.
+        db.memory_set_full("d", "auto", "project", None, "session")
+            .unwrap();
+        db.memory_set("old", "x", "project", None).unwrap();
+        assert!(db
+            .memory_supersede("old", "d", "by hand", "project", "manual")
+            .unwrap());
+        assert_eq!(db.memory_get("d").unwrap().unwrap().source, "manual");
     }
 
     #[test]

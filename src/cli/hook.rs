@@ -732,9 +732,13 @@ fn extract_opencode_turns(session_id: &str) -> Result<Vec<Turn>> {
     if !db_path.exists() {
         return Err(anyhow::anyhow!("opencode db not found"));
     }
+    read_opencode_turns(&db_path, session_id)
+}
 
+/// [`extract_opencode_turns`] from the database at `db_path`.
+fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Vec<Turn>> {
     let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
 
@@ -766,6 +770,8 @@ fn extract_opencode_turns(session_id: &str) -> Result<Vec<Turn>> {
             position += 1;
             last_id = id.clone();
         }
+        // As for Claude transcripts: secrets never reach the distiller.
+        let content = strip_private_sections(&content);
         if content.trim().is_empty() {
             continue;
         }
@@ -2114,6 +2120,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled-2");
+    }
+
+    #[test]
+    fn opencode_turns_drop_private_text_and_count_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+               CREATE TABLE part (message_id TEXT, data TEXT, time_created INTEGER);
+               INSERT INTO message VALUES
+                 ('m1', 's', '{"role":"user"}', 1000),
+                 ('m2', 's', '{"role":"assistant"}', 2000),
+                 ('m3', 's', '{"role":"user"}', 3000);
+               INSERT INTO part VALUES
+                 ('m1', '{"type":"text","text":"key is <private>hunter2</private> ok"}', 1),
+                 ('m2', '{"type":"text","text":"noted"}', 2),
+                 ('m3', '{"type":"text","text":"<private>only secret</private>"}', 3);"#,
+        )
+        .unwrap();
+        drop(conn);
+        let turns = read_opencode_turns(&path, "s").unwrap();
+        let got: Vec<_> = turns
+            .iter()
+            .map(|t| (t.line, t.id.as_deref(), t.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, Some("m1"), "User: key is  ok\n"),
+                (2, Some("m2"), "Assistant: noted\n"),
+            ]
+        );
+        assert_eq!(turns[0].at.as_deref(), Some("1970-01-01 00:00:01"));
     }
 
     #[test]

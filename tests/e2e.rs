@@ -587,7 +587,7 @@ fn a_hand_written_memory_records_its_repo_and_can_be_scoped_to_it() {
     std::fs::create_dir(&elsewhere).unwrap();
     assert!(!relevant_knowledge(&e, &elsewhere).contains("build-cmd"));
 
-    // --global drops the scope; a memory with no recorded source says so.
+    // --global drops the scope.
     e.run(&[
         "memory",
         "set",
