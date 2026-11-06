@@ -210,8 +210,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 }
             }
             warn_if_long(&key, &value);
+            // The memory, its source, scope and projects land together.
+            let tx = db.conn.unchecked_transaction()?;
             let id = db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
-            provenance::record(db, &key, &provenance::from_command("manual", here.as_ref()));
+            db.memory_provenance_add(id, &provenance::from_command("manual", here.as_ref()))?;
             if let (true, Some(here)) = (repo, &here) {
                 db.memory_scope_add(id, &here.scope())?;
             }
@@ -221,6 +223,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             for project in projects {
                 db.memory_link_project(id, project)?;
             }
+            tx.commit()?;
             if !no_embed {
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &key, &value);
@@ -601,8 +604,16 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             // it extracted before writing, and the single-key case already
             // resolves the old/new key relationship explicitly below.
             let here = RepoInfo::current(db);
+            // The repo the text belongs to: a file's own repo, if it is in
+            // one. A memory being compressed keeps the scope it has, so it
+            // gets none from here.
+            let text_repo = from.as_deref().and_then(|f| {
+                let dir = std::path::absolute(f).ok()?.parent()?.to_path_buf();
+                RepoInfo::at(db, &dir)
+            });
             let projects = context_projects(db);
-            let origin = format_origin_block(here.as_ref().map(|r| r.name.as_str()), &projects);
+            let origin =
+                format_origin_block(text_repo.as_ref().map(|r| r.name.as_str()), &projects);
             let memories = distill_with_ai(&argv, &text, &origin)?;
             let mut source = provenance::from_command("distill", here.as_ref());
             source.source_path = from.as_deref().map(absolute_path);
@@ -653,7 +664,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         embed_and_store(db, e, &m.key, &m.value);
                     }
                     provenance::record(db, &m.key, &source);
-                    apply_scope_and_project(db, &m.key, m, here.as_ref(), &projects);
+                    apply_scope_and_project(db, &m.key, m, text_repo.as_ref(), &projects);
                 }
                 print_output(format, &result, || {
                     println!("\nSaved {} memories.", memories.len())

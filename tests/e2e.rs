@@ -476,6 +476,13 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t")
+        // Not the user's or the system's config: no signing, hooks
+        // or default-branch settings leak in.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            std::env::temp_dir().join("sclerox-no-gitconfig"),
+        )
         .output()
         .unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -499,8 +506,8 @@ fn git_repo(parent: &std::path::Path) -> (PathBuf, String, String) {
     (repo, first, head)
 }
 
-/// The "Relevant knowledge" section of `hook start`'s context, run in `dir`.
-fn relevant_knowledge(e: &Env, dir: &std::path::Path) -> String {
+/// `hook start`'s context, run in `dir`.
+fn session_start_context(e: &Env, dir: &std::path::Path) -> String {
     let out = e
         .cmd()
         .args(["hook", "start"])
@@ -511,11 +518,16 @@ fn relevant_knowledge(e: &Env, dir: &std::path::Path) -> String {
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    let ctx = payload["hookSpecificOutput"]["additionalContext"]
+    payload["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap()
-        .to_string();
-    ctx.split("### ")
+        .to_string()
+}
+
+/// The "Relevant knowledge" section of `hook start`'s context, run in `dir`.
+fn relevant_knowledge(e: &Env, dir: &std::path::Path) -> String {
+    session_start_context(e, dir)
+        .split("### ")
         .find(|s| s.starts_with("Relevant knowledge"))
         .unwrap_or_default()
         .to_string()
@@ -585,7 +597,9 @@ fn a_hand_written_memory_records_its_repo_and_can_be_scoped_to_it() {
     assert!(relevant_knowledge(&e, &clone).contains(line));
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
-    assert!(!relevant_knowledge(&e, &elsewhere).contains("build-cmd"));
+    // Not in any section, the key list included.
+    let ctx = session_start_context(&e, &elsewhere);
+    assert!(!ctx.contains("build-cmd"), "{ctx}");
 
     // --global drops the scope.
     e.run(&[

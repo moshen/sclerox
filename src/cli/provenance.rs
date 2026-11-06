@@ -475,6 +475,13 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
+                // Not the user's or the system's config: no signing, hooks
+                // or default-branch settings leak in.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    std::env::temp_dir().join("sclerox-no-gitconfig"),
+                )
                 .output()
                 .unwrap();
             assert!(ok.status.success(), "{args:?}: {ok:?}");
@@ -545,6 +552,13 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
+                // Not the user's or the system's config: no signing, hooks
+                // or default-branch settings leak in.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    std::env::temp_dir().join("sclerox-no-gitconfig"),
+                )
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{args:?}: {out:?}");

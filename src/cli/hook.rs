@@ -271,8 +271,22 @@ fn session_context(db: &Database, repo: Option<&RepoScope>) -> Result<(String, V
         }
     }
 
+    // Memories scoped only to other repos stay out of the sections below too;
+    // if the scopes can't be read, so do all memories.
+    let elsewhere = match db.memory_scope_ids(repo) {
+        Ok((_, elsewhere)) => Some(elsewhere),
+        Err(e) => {
+            log::warn!("couldn't read memory scopes, so no memory keys are listed: {e:#}");
+            None
+        }
+    };
+    let shown_here = |m: &crate::db::memory::MemoryEntry| {
+        elsewhere.as_ref().is_some_and(|ids| !ids.contains(&m.id))
+    };
+
     // 4. Recent session memories (last 3) - chronological brief.
-    if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
+    if let Ok(mut sessions) = db.memory_list(Some("session"), Some("active")) {
+        sessions.retain(|m| shown_here(m));
         if !sessions.is_empty() {
             let mut section = String::from("### Recent sessions\n");
             for m in sessions.iter().take(cfg.sessions_shown) {
@@ -293,6 +307,7 @@ fn session_context(db: &Database, repo: Option<&RepoScope>) -> Result<(String, V
         let others: Vec<&str> = all
             .iter()
             .filter(|m| m.memory_type != "session" && !shown_keys.contains(&m.key))
+            .filter(|m| shown_here(m))
             .map(|m| m.key.as_str())
             .take(cfg.memory_keys_shown)
             .collect();
@@ -360,7 +375,14 @@ fn relevant_memories(
     let mut picked: Vec<MemoryEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let (scoped_here, scoped_elsewhere) = db.memory_scope_ids(repo).unwrap_or_default();
+    // Without scopes, a memory meant for another repo could show here.
+    let (scoped_here, scoped_elsewhere) = match db.memory_scope_ids(repo) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::warn!("couldn't read memory scopes, so no memories are shown: {e:#}");
+            return Vec::new();
+        }
+    };
     let with_source = db.memory_ids_with_provenance().unwrap_or_default();
     let active = db.memory_list(None, Some("active")).unwrap_or_default();
 
@@ -745,13 +767,17 @@ fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Ve
     let mut stmt = conn.prepare(
         "SELECT json_extract(m.data, '$.role') as role,
                 json_extract(p.data, '$.text') as text,
-                m.id, m.time_created
+                m.id, m.time_created,
+                (SELECT COUNT(*) FROM message e
+                  WHERE e.session_id = m.session_id
+                    AND (e.time_created < m.time_created
+                         OR (e.time_created = m.time_created AND e.id < m.id))) + 1
          FROM message m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id = ?1
            AND json_extract(p.data, '$.type') = 'text'
            AND json_extract(m.data, '$.role') IN ('user', 'assistant')
-         ORDER BY m.time_created, p.time_created",
+         ORDER BY m.time_created, m.id, p.time_created",
     )?;
 
     let rows = stmt.query_map([session_id], |row| {
@@ -759,17 +785,13 @@ fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Ve
         let content: String = row.get(1).unwrap_or_default();
         let id: Option<String> = row.get(2).ok();
         let created: Option<i64> = row.get(3).ok();
-        Ok((role, content, id, created))
+        let position: i64 = row.get(4)?;
+        Ok((role, content, id, created, position))
     })?;
 
     let mut turns = Vec::new();
-    let (mut position, mut last_id) = (0i64, None::<String>);
     for row in rows.flatten() {
-        let (role, content, id, created) = row;
-        if id.is_none() || id != last_id {
-            position += 1;
-            last_id = id.clone();
-        }
+        let (role, content, id, created, position) = row;
         // As for Claude transcripts: secrets never reach the distiller.
         let content = strip_private_sections(&content);
         if content.trim().is_empty() {
@@ -2132,12 +2154,17 @@ mod tests {
                CREATE TABLE part (message_id TEXT, data TEXT, time_created INTEGER);
                INSERT INTO message VALUES
                  ('m1', 's', '{"role":"user"}', 1000),
+                 ('m0', 's', '{"role":"assistant"}', 1500),
                  ('m2', 's', '{"role":"assistant"}', 2000),
+                 ('m2b', 's', '{"role":"user"}', 2000),
                  ('m3', 's', '{"role":"user"}', 3000);
                INSERT INTO part VALUES
                  ('m1', '{"type":"text","text":"key is <private>hunter2</private> ok"}', 1),
-                 ('m2', '{"type":"text","text":"noted"}', 2),
-                 ('m3', '{"type":"text","text":"<private>only secret</private>"}', 3);"#,
+                 ('m0', '{"type":"tool"}', 2),
+                 ('m2', '{"type":"text","text":"noted"}', 3),
+                 ('m2b', '{"type":"text","text":"a"}', 3),
+                 ('m2', '{"type":"text","text":"more"}', 4),
+                 ('m3', '{"type":"text","text":"<private>only secret</private>"}', 5);"#,
         )
         .unwrap();
         drop(conn);
@@ -2150,7 +2177,11 @@ mod tests {
             got,
             [
                 (1, Some("m1"), "User: key is  ok\n"),
-                (2, Some("m2"), "Assistant: noted\n"),
+                // m0, tool calls only, still holds position 2.
+                (3, Some("m2"), "Assistant: noted\n"),
+                (3, Some("m2"), "Assistant: more\n"),
+                // Sent in the same millisecond as m2: ordered by id, once.
+                (4, Some("m2b"), "User: a\n"),
             ]
         );
         assert_eq!(turns[0].at.as_deref(), Some("1970-01-01 00:00:01"));
