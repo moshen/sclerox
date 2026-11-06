@@ -638,6 +638,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 let mut embedder = crate::embed::optional(db.semantic_ready());
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
+                    // Each memory lands with its source, scope and project,
+                    // or not at all.
+                    let tx = db.conn.unchecked_transaction()?;
                     match &existing_key {
                         // Compressing a single existing entry: supersede it,
                         // or update in place when the AI kept the same key.
@@ -660,11 +663,14 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                             )?;
                         }
                     }
+                    if let Some(entry) = db.memory_get(&m.key)? {
+                        db.memory_provenance_add(entry.id, &source)?;
+                    }
+                    apply_scope_and_project(db, &m.key, m, text_repo.as_ref(), &projects)?;
+                    tx.commit()?;
                     if let Some(e) = embedder.as_mut() {
                         embed_and_store(db, e, &m.key, &m.value);
                     }
-                    provenance::record(db, &m.key, &source);
-                    apply_scope_and_project(db, &m.key, m, text_repo.as_ref(), &projects);
                 }
                 print_output(format, &result, || {
                     println!("\nSaved {} memories.", memories.len())
@@ -827,30 +833,29 @@ fn absolute_path(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Scope distilled memory `m` to `repo` and link its project, as the
-/// distiller asked. A project it wasn't shown is ignored.
+/// Scope distilled memory `key` to `repo` and link its project, as the
+/// distiller asked for `m`. A project it wasn't shown is ignored.
 pub(crate) fn apply_scope_and_project(
     db: &Database,
     key: &str,
     m: &DistilledMemory,
     repo: Option<&RepoInfo>,
     projects: &[(i64, String)],
-) {
-    let Ok(Some(entry)) = db.memory_get(key) else {
-        return;
+) -> Result<()> {
+    let Some(entry) = db.memory_get(key)? else {
+        return Ok(());
     };
     if let (true, Some(repo)) = (m.repo_scoped, repo) {
-        if let Err(e) = db.memory_scope_add(entry.id, &repo.scope()) {
-            log::warn!("couldn't scope memory '{key}' to {}: {e:#}", repo.name);
-        }
+        db.memory_scope_add(entry.id, &repo.scope())?;
     }
     if let Some(project) = m.project {
-        if !projects.iter().any(|(id, _)| *id == project) {
+        if projects.iter().any(|(id, _)| *id == project) {
+            db.memory_link_project(entry.id, project)?;
+        } else {
             log::info!("memory '{key}' named project #{project}, which it wasn't shown");
-        } else if let Err(e) = db.memory_link_project(entry.id, project) {
-            log::warn!("couldn't link memory '{key}' to project #{project}: {e:#}");
         }
     }
+    Ok(())
 }
 
 /// Resolve the search root from explicit --path or --agent shorthand.

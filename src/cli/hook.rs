@@ -765,14 +765,15 @@ fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Ve
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT json_extract(m.data, '$.role') as role,
+        "WITH m AS (
+             -- Every message's position, those without text included.
+             SELECT *, ROW_NUMBER() OVER (ORDER BY time_created, id) AS position
+             FROM message WHERE session_id = ?1
+         )
+         SELECT json_extract(m.data, '$.role') as role,
                 json_extract(p.data, '$.text') as text,
-                m.id, m.time_created,
-                (SELECT COUNT(*) FROM message e
-                  WHERE e.session_id = m.session_id
-                    AND (e.time_created < m.time_created
-                         OR (e.time_created = m.time_created AND e.id < m.id))) + 1
-         FROM message m
+                m.id, m.time_created, m.position
+         FROM m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id = ?1
            AND json_extract(p.data, '$.type') = 'text'
@@ -1155,13 +1156,16 @@ fn distill_chunked(
         // the distiller gave it.
         let note = |key: &str, m: &crate::cli::memory::DistilledMemory| {
             crate::cli::provenance::record(db, key, &chunk_source);
-            crate::cli::memory::apply_scope_and_project(
+            let scoped = crate::cli::memory::apply_scope_and_project(
                 db,
                 key,
                 m,
                 origin.repo.as_ref(),
                 &projects,
             );
+            if let Err(e) = scoped {
+                log::warn!("couldn't scope memory '{key}' or link its project: {e:#}");
+            }
         };
         // Show the distiller the memories this chunk is topically near, so it
         // can reuse an existing key instead of inventing a near-identical slug.

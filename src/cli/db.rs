@@ -1183,9 +1183,24 @@ impl Frontmatter {
     }
 }
 
+/// `s` as a YAML double-quoted scalar. Control characters are escaped, so a
+/// newline or tab in a value can't break the frontmatter.
 fn yaml_quote(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn write_md(path: &Path, frontmatter: &str, body: &str) -> Result<()> {
@@ -1252,6 +1267,8 @@ mod tests {
         assert_eq!(yaml_quote("hi"), "\"hi\"");
         assert_eq!(yaml_quote("a\"b"), "\"a\\\"b\"");
         assert_eq!(yaml_quote("path\\to"), "\"path\\\\to\"");
+        assert_eq!(yaml_quote("a\nb\tc"), r#""a\nb\tc""#);
+        assert_eq!(yaml_quote("bell\u{7}"), r#""bell\u0007""#);
     }
 
     #[test]
