@@ -835,6 +835,17 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
         fm.kv("type", &m.memory_type);
         fm.kv("status", &m.status);
         fm.kv("source", &m.source);
+        fm.kv("origin", m.origin());
+        let repos = db.memory_scopes(m.id).unwrap_or_default();
+        if !repos.is_empty() {
+            let names: Vec<String> = repos.iter().map(|r| r.repo_name.clone()).collect();
+            fm.list("repos", &names);
+        }
+        let projects = db.memory_projects(m.id).unwrap_or_default();
+        if !projects.is_empty() {
+            let names: Vec<String> = projects.iter().map(|(_, name)| slugify(name)).collect();
+            fm.list("projects", &names);
+        }
         if let Some(sb) = m.superseded_by {
             fm.kv("superseded_by", &sb.to_string());
         }
@@ -861,6 +872,15 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
             for p in &linked {
                 let s = slugify(&p.name);
                 body.push_str(&format!("- [[people/{s}|{}]]\n", p.name));
+            }
+        }
+
+        let sources = db.memory_provenance(m.id).unwrap_or_default();
+        if !sources.is_empty() {
+            body.push_str("\n## Sources\n\n");
+            for row in &sources {
+                let what = crate::cli::provenance::describe(&row.provenance);
+                body.push_str(&format!("- {}: {what}\n", row.created_at));
             }
         }
 

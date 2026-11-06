@@ -5,7 +5,10 @@ SKILL.md; do it immediately and unprompted.
 
 ```bash
 sclerox memory set <key> "<value>" --type user|feedback|project|reference|session
-sclerox memory get <key>
+sclerox memory set <key> "<value>" --repo        # scope it to the current git repo
+sclerox memory set <key> "<value>" --global      # drop its repo scope
+sclerox memory set <key> "<value>" --project <id>  # link it to a project (repeatable)
+sclerox memory get <key>                  # includes its origin, scope, projects and sources
 sclerox memory get <key> --history        # current value, every earlier value + supersession chain
 sclerox memory search "<query>"           # active only by default
 sclerox memory search "<query>" --all     # include stale/superseded
@@ -24,6 +27,22 @@ sclerox memory import --agent claude      # import from Claude Code auto-memory
 sclerox memory import --path <dir>        # import from any directory of .md files
 sclerox memory people add|remove|list <key> <person_id>
 ```
+
+## Where a memory came from
+
+`memory get` shows each memory's origin (hand-written, distilled or imported),
+its scope, linked projects, and every recorded source: the command or session
+that wrote it, the repo, commit and branch it ran in, and for a distilled
+memory the transcript and the line range it was read from (with the first and
+last message ids, in case the lines ever move). Sources are pointers, never
+copies of the transcript. Memories written before sources were recorded show
+them as unknown. A merged memory keeps the sources of everything merged into
+it, and `--history` rows keep the sources they had.
+
+A memory is global unless scoped. A scoped memory shows in session start only
+in its repo, recognised by the repo's first commit or its remote, so another
+clone of the same repo counts. Distillation scopes a memory to the session's
+repo when it only matters there, and may link it to a project.
 
 Supersede requires an ACTIVE old key and a DIFFERENT new key (a same-key
 update is `sclerox memory set`, which keeps the value it replaces in

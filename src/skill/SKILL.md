@@ -46,6 +46,8 @@ sclerox memory set "<area>-<decision-slug>" \
 Include the why and the rejected alternatives - future sessions need the
 reasoning, not just the verdict. If the decision reverses an earlier one, use
 `sclerox memory supersede <old_key> <new_key> "<new value>"` instead of a bare set.
+Add `--repo` when the decision only matters in the current repo, so session
+start shows it there (and not elsewhere) even if it never names the repo.
 
 ## Code search - prefer this over Grep/Glob
 

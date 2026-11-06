@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use super::provenance::{copy_links, copy_provenance};
 use super::{cosine_of_bytes, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +16,7 @@ pub struct MemoryEntry {
     pub updated_at: String,
     /// active | stale | superseded
     pub status: String,
-    /// manual | claude-auto | session
+    /// manual | session | distilled | imported (older rows: claude-auto)
     pub source: String,
     /// row id of the memory that replaced this one. Only non-active rows carry
     /// a pointer: keys repeat across history, so ids are the only stable link.
@@ -34,6 +35,19 @@ pub struct MemoryConflict {
     pub created_at: String,
     pub memory: MemoryEntry,
     pub matched: MemoryEntry,
+}
+
+impl MemoryEntry {
+    /// How the memory was written, from its `source`: `hand-written`,
+    /// `distilled` or `imported`.
+    pub fn origin(&self) -> &str {
+        match self.source.as_str() {
+            "manual" => "hand-written",
+            "session" | "distilled" => "distilled",
+            "imported" => "imported",
+            other => other,
+        }
+    }
 }
 
 const MEMORY_COLS: &str =
@@ -610,6 +624,10 @@ impl Database {
             params![new_key],
             |r| r.get(0),
         )?;
+        // The merged memory keeps every source, scope and project of the
+        // one it replaces.
+        copy_provenance(&tx, old_id, new_id)?;
+        copy_links(&tx, old_id, new_id)?;
         tx.execute(
             "UPDATE memory
              SET status = 'superseded',
@@ -997,13 +1015,23 @@ fn snapshot_active(
         }
     );
     let (is_set, tags) = (tags.is_some(), tags.flatten());
-    match distinct_from {
+    let copied = match distinct_from {
         Some(original) => conn.execute(
             &sql,
             params![key, value, memory_type, is_set, tags, original],
         )?,
         None => conn.execute(&sql, params![key, value, memory_type, is_set, tags])?,
     };
+    // The old version keeps the sources it had then.
+    if copied > 0 {
+        let snapshot = conn.last_insert_rowid();
+        let active: i64 = conn.query_row(
+            "SELECT superseded_by FROM memory WHERE id = ?1",
+            [snapshot],
+            |r| r.get(0),
+        )?;
+        copy_provenance(conn, active, snapshot)?;
+    }
     Ok(())
 }
 

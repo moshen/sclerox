@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::cli::provenance::{self, RepoInfo};
 use crate::config::settings;
 use crate::db::Database;
 use crate::embed::Embedder;
@@ -20,6 +21,15 @@ pub enum MemoryCommand {
         /// Skip computing the semantic embedding for this entry
         #[arg(long)]
         no_embed: bool,
+        /// Scope it to the current git repo: session start shows it first there
+        #[arg(long, conflicts_with = "global")]
+        repo: bool,
+        /// Make it global again, dropping any repo scope
+        #[arg(long)]
+        global: bool,
+        /// Link it to a project (by id); repeatable
+        #[arg(long = "project", value_name = "ID")]
+        projects: Vec<i64>,
     },
     /// Get a memory entry by key
     #[command(alias = "show")]
@@ -183,12 +193,34 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             r#type,
             tags,
             no_embed,
+            repo,
+            global,
+            projects,
         } => {
             let tag_list: Option<Vec<String>> = tags
                 .as_deref()
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+            let here = RepoInfo::current(db);
+            if repo && here.is_none() {
+                anyhow::bail!("--repo needs a git repo, and this directory isn't in one");
+            }
+            for &project in &projects {
+                if db.project_get(project)?.is_none() {
+                    anyhow::bail!("no project #{project}");
+                }
+            }
             warn_if_long(&key, &value);
-            db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
+            let id = db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
+            provenance::record(db, &key, &provenance::from_command("manual", here.as_ref()));
+            if let (true, Some(here)) = (repo, &here) {
+                db.memory_scope_add(id, &here.scope())?;
+            }
+            if global {
+                db.memory_scope_clear(id)?;
+            }
+            for project in projects {
+                db.memory_link_project(id, project)?;
+            }
             if !no_embed {
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &key, &value);
@@ -244,7 +276,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                                 .flatten()
                                 .map(|s| format!("{} (#{id})", s.key))
                         });
-                        print_output(format, &entry, || {
+                        let detail = provenance::MemoryDetail::load(db, entry)?;
+                        let entry = &detail.entry;
+                        print_output(format, &detail, || {
                             println!("Key:     {}", entry.key);
                             println!("Value:   {}", entry.value);
                             println!("Type:    {}", entry.memory_type);
@@ -258,6 +292,9 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                                 println!("Superseded by: {s}");
                             }
                             println!("Updated: {}", entry.updated_at);
+                            for line in detail.lines() {
+                                println!("{line}");
+                            }
                         });
                         crate::cli::usage::read(db, "memory get", "memory", &key);
                     }
@@ -385,6 +422,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         } => {
             warn_if_long(&new_key, &new_value);
             if db.memory_supersede(&old_key, &new_key, &new_value, &r#type, "manual")? {
+                let here = RepoInfo::current(db);
+                provenance::record(
+                    db,
+                    &new_key,
+                    &provenance::from_command("manual", here.as_ref()),
+                );
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     embed_and_store(db, &mut embedder, &new_key, &new_value);
                 }
@@ -557,7 +600,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             // No dedup context here: this path is user-driven and prints what
             // it extracted before writing, and the single-key case already
             // resolves the old/new key relationship explicitly below.
-            let memories = distill_with_ai(&argv, &text, "")?;
+            let here = RepoInfo::current(db);
+            let projects = context_projects(db);
+            let origin = format_origin_block(here.as_ref().map(|r| r.name.as_str()), &projects);
+            let memories = distill_with_ai(&argv, &text, &origin)?;
+            let mut source = provenance::from_command("distill", here.as_ref());
+            source.source_path = from.as_deref().map(absolute_path);
 
             let result = serde_json::json!({"memories": memories, "saved": !dry_run});
             if memories.is_empty() {
@@ -604,6 +652,8 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     if let Some(e) = embedder.as_mut() {
                         embed_and_store(db, e, &m.key, &m.value);
                     }
+                    provenance::record(db, &m.key, &source);
+                    apply_scope_and_project(db, &m.key, m, here.as_ref(), &projects);
                 }
                 print_output(format, &result, || {
                     println!("\nSaved {} memories.", memories.len())
@@ -755,6 +805,40 @@ pub(crate) fn embed_and_store(
     match embedder.embed_one(&crate::embed::memory_embed_text(value)) {
         Ok(emb) => db.memory_set_embedding(key, &emb).unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+/// `path` made absolute, so a recorded source still names the file from
+/// another directory.
+fn absolute_path(path: &str) -> String {
+    std::path::absolute(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Scope distilled memory `m` to `repo` and link its project, as the
+/// distiller asked. A project it wasn't shown is ignored.
+pub(crate) fn apply_scope_and_project(
+    db: &Database,
+    key: &str,
+    m: &DistilledMemory,
+    repo: Option<&RepoInfo>,
+    projects: &[(i64, String)],
+) {
+    let Ok(Some(entry)) = db.memory_get(key) else {
+        return;
+    };
+    if let (true, Some(repo)) = (m.repo_scoped, repo) {
+        if let Err(e) = db.memory_scope_add(entry.id, &repo.scope()) {
+            log::warn!("couldn't scope memory '{key}' to {}: {e:#}", repo.name);
+        }
+    }
+    if let Some(project) = m.project {
+        if !projects.iter().any(|(id, _)| *id == project) {
+            log::info!("memory '{key}' named project #{project}, which it wasn't shown");
+        } else if let Err(e) = db.memory_link_project(entry.id, project) {
+            log::warn!("couldn't link memory '{key}' to project #{project}: {e:#}");
+        }
     }
 }
 
@@ -920,6 +1004,9 @@ fn import_memories(
             if let Some(e) = embedder.as_mut() {
                 embed_and_store(db, e, &key, &value);
             }
+            let mut source = provenance::from_command("import", None);
+            source.source_path = Some(absolute_path(&path.to_string_lossy()));
+            provenance::record(db, &key, &source);
             keys.push(key);
             imported += 1;
         }
@@ -954,6 +1041,11 @@ pub struct DistilledMemory {
     /// that key and judged it the same fact. `None` means "new fact as far as
     /// the distiller could tell"; the similarity check still runs.
     pub supersedes: Option<String>,
+    /// True when the distiller judged it relevant only in the text's repo.
+    pub repo_scoped: bool,
+    /// Project id the distiller linked it to; checked against the projects
+    /// it was shown before use.
+    pub project: Option<i64>,
 }
 
 /// [`DISTILL_PROMPT`] with the configured memory length filled in.
@@ -988,6 +1080,10 @@ DO NOT record:
 
 Keep each "value" concise: 1-3 sentences and UNDER {max_value_chars} characters.
 
+When an entry records a decision, a preference or a constraint, say why in the
+value ("X, because Y"). The reason is what lets a reader tell when the decision
+stops applying; leave it out only when the text gives none.
+
 Keep ONE topic in ONE entry. Do not split a single finding across several
 entries (a fact entry, a source entry, a detail entry). If a coherent fact does
 not fit in {max_value_chars} characters, tighten the wording; only split when the text really
@@ -995,9 +1091,19 @@ does contain two unrelated facts.
 
 Output ONLY a JSON array with no surrounding text or markdown fences:
 [
-  {"key": "kebab-case-slug", "value": "concise 1-3 sentence statement", "type": "feedback|project|user|reference", "supersedes": null},
+  {"key": "kebab-case-slug", "value": "concise 1-3 sentence statement", "type": "feedback|project|user|reference", "supersedes": null, "scope": "repo|global", "project": null},
   ...
 ]
+
+Scope:
+  "repo"   - only matters when working in the repository this text came from:
+             its code, layout, commands, conventions, decisions about it.
+  "global" - holds anywhere: preferences about how to work, lessons that apply
+             across projects, facts about people or tools.
+  When unsure, use "global".
+
+Project: the id of one of the projects listed below that the entry belongs to,
+or null. Never an id that is not listed.
 
 Type guide:
   feedback    - preferences, constraints, lessons learned
@@ -1117,6 +1223,38 @@ pub fn format_existing_block(entries: &[(String, String)]) -> String {
         out.push_str(&format!("  {key}: {trimmed}{ellipsis}\n"));
     }
     out
+}
+
+/// Projects shown to the distiller, most recently updated first.
+const CONTEXT_PROJECTS: usize = 20;
+
+/// The prompt block naming the repo the text came from and the projects an
+/// entry can be linked to. Empty when there is neither.
+pub fn format_origin_block(repo: Option<&str>, projects: &[(i64, String)]) -> String {
+    let mut out = String::new();
+    if let Some(repo) = repo {
+        out.push_str(&format!(
+            "\nThis text comes from work in the repository `{repo}`.\n"
+        ));
+    }
+    if !projects.is_empty() {
+        out.push_str("\nProjects (id: name):\n");
+        for (id, name) in projects.iter().take(CONTEXT_PROJECTS) {
+            out.push_str(&format!("  {id}: {name}\n"));
+        }
+    }
+    out
+}
+
+/// The projects to show the distiller, most recently updated first.
+pub fn context_projects(db: &Database) -> Vec<(i64, String)> {
+    let mut projects = db.project_list().unwrap_or_default();
+    projects.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    projects
+        .into_iter()
+        .take(CONTEXT_PROJECTS)
+        .map(|p| (p.id, p.name))
+        .collect()
 }
 
 /// Run the resolved AI command (argv) with the distillation prompt appended as
@@ -1255,12 +1393,26 @@ fn parse_distilled_json(response: &str) -> anyhow::Result<Vec<DistilledMemory>> 
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
+        let repo_scoped = item["scope"]
+            .as_str()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("repo"));
+        let project = item["project"].as_i64().or_else(|| {
+            item["project"]
+                .as_str()?
+                .trim()
+                .trim_start_matches('#')
+                .parse()
+                .ok()
+        });
+
         if !key.is_empty() && !value.is_empty() {
             memories.push(DistilledMemory {
                 key,
                 value,
                 memory_type,
                 supersedes,
+                repo_scoped,
+                project,
             });
         }
     }
@@ -1278,6 +1430,26 @@ mod tests {
         assert!(text.contains("UNDER 1500 characters"), "{text}");
         assert!(text.contains("fit in 1500 characters"), "{text}");
         assert!(!text.contains("{max_value_chars}"));
+    }
+
+    #[test]
+    fn parse_distilled_reads_scope_and_project() {
+        let json = r##"[
+            {"key":"a","value":"v","type":"project","scope":"repo","project":3},
+            {"key":"b","value":"v","type":"project","scope":"global","project":"#4"},
+            {"key":"c","value":"v","type":"project"}
+        ]"##;
+        let got = parse_distilled_json(json).unwrap();
+        let fields: Vec<_> = got.iter().map(|m| (m.repo_scoped, m.project)).collect();
+        assert_eq!(fields, [(true, Some(3)), (false, Some(4)), (false, None)]);
+    }
+
+    #[test]
+    fn the_origin_block_names_the_repo_and_projects() {
+        assert_eq!(format_origin_block(None, &[]), "");
+        let block = format_origin_block(Some("sclerox"), &[(3, "Retrieval".into())]);
+        assert!(block.contains("repository `sclerox`"), "{block}");
+        assert!(block.contains("  3: Retrieval"), "{block}");
     }
 
     #[test]

@@ -110,10 +110,16 @@ pub fn run(db: &Database, cmd: ProjectCommand, format: OutputFormat) -> Result<(
         ProjectCommand::Get { id } => match db.project_get(id)? {
             Some(p) => {
                 let people = db.project_people(id)?;
+                let memories = db.project_memory_keys(id)?;
                 print_output(
                     format,
-                    &serde_json::json!({"project": p, "people": people}),
-                    || print_project(&p, &people),
+                    &serde_json::json!({"project": p, "people": people, "memories": memories}),
+                    || {
+                        print_project(&p, &people);
+                        if !memories.is_empty() {
+                            println!("Memories:    {}", memories.join(", "));
+                        }
+                    },
                 );
                 crate::cli::usage::read(db, "project get", "project", id);
             }
