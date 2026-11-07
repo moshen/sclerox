@@ -635,8 +635,10 @@ fn a_distilled_memory_traces_to_its_session_lines_and_repo() {
     .iter()
     .enumerate()
     {
+        // Claude Code records the session's directory on each entry, which
+        // is how the session's repo is known wherever the transcript is.
         lines.push(serde_json::json!({
-            "type": role, "uuid": format!("m{}", i + 1),
+            "type": role, "uuid": format!("m{}", i + 1), "cwd": repo,
             "timestamp": format!("2026-11-06T10:00:0{i}Z"),
             "message": {"content": text},
         }));
@@ -656,8 +658,9 @@ fn a_distilled_memory_traces_to_its_session_lines_and_repo() {
     )
     .unwrap();
     let resp_arg = resp.display().to_string().replace('\\', "/");
+    // Run from outside the repo: the repo comes from the transcript.
     e.cmd()
-        .current_dir(&repo)
+        .current_dir(tmp.path())
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))

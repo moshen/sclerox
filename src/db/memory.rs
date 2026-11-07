@@ -586,7 +586,17 @@ impl Database {
 
         // A savepoint rather than a transaction, so a caller's own
         // transaction can hold this one; anything but a completed supersede
-        // rolls back to it, including the snapshot.
+        // rolls back to it, including the snapshot. Without a caller's
+        // transaction, take the write lock before reading, as `memory_upsert`
+        // does: a read that later upgrades can fail on a busy database.
+        let own = if self.conn.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                &self.conn,
+                TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
         self.conn.execute_batch("SAVEPOINT memory_supersede")?;
         let tx = &self.conn;
         let result = (|| -> Result<bool> {
@@ -652,6 +662,9 @@ impl Database {
             self.conn.execute_batch("ROLLBACK TO memory_supersede")?;
         }
         self.conn.execute_batch("RELEASE memory_supersede")?;
+        if let (Some(tx), Ok(true)) = (own, &result) {
+            tx.commit()?;
+        }
         result
     }
 

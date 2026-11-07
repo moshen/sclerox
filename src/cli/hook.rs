@@ -645,7 +645,14 @@ fn run_distill_session(
         turns.len(),
         session_id
     );
-    let origin = SessionOrigin::new(db, session_id, "claude-code", &cwd, Some(&transcript_path));
+    let session_dir = claude_session_dir(&transcript_path, &cwd);
+    let origin = SessionOrigin::new(
+        db,
+        session_id,
+        "claude-code",
+        session_dir.as_deref(),
+        Some(&transcript_path),
+    );
     let total = distill_chunked(db, &argv, &turns, "session", &origin)?;
     // Always log the outcome - a run of zero-memory sessions is the signal
     // that distillation is broken, so it must be visible.
@@ -728,7 +735,13 @@ fn run_opencode(
     };
 
     let transcript = opencode_db_path();
-    let origin = SessionOrigin::new(db, session_id, "opencode", &dir, transcript.as_deref());
+    let origin = SessionOrigin::new(
+        db,
+        session_id,
+        "opencode",
+        Some(&dir),
+        transcript.as_deref(),
+    );
     let total = distill_chunked(db, &argv, &turns, "session", &origin)?;
     if total > 0 {
         eprintln!("[sclerox] distilled {total} memories from opencode session");
@@ -1638,6 +1651,34 @@ fn chunk_turns(turns: &[Turn], max_chars: usize) -> Vec<Chunk> {
     chunks
 }
 
+/// The directory a Claude Code session ran in: the `cwd` its transcript
+/// records, else `cwd` when the transcript is in `cwd`'s own project folder.
+/// `None` for a transcript found under another project that doesn't say,
+/// whose memories must not be scoped to the repo this command runs in.
+fn claude_session_dir(
+    transcript: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::io::BufRead;
+    let recorded = std::fs::File::open(transcript).ok().and_then(|f| {
+        std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .find_map(|line| {
+                let obj: serde_json::Value = serde_json::from_str(&line).ok()?;
+                obj["cwd"]
+                    .as_str()
+                    .filter(|c| !c.is_empty())
+                    .map(std::path::PathBuf::from)
+            })
+    });
+    if recorded.is_some() {
+        return recorded;
+    }
+    let folder = transcript.parent()?.file_name()?.to_string_lossy();
+    (folder == path_to_project_hash(cwd)).then(|| cwd.to_path_buf())
+}
+
 /// Where a session's distilled memories come from: the session, and the repo
 /// it ran in.
 struct SessionOrigin {
@@ -1650,10 +1691,10 @@ impl SessionOrigin {
         db: &Database,
         session_id: &str,
         agent: &str,
-        dir: &std::path::Path,
+        dir: Option<&std::path::Path>,
         transcript: Option<&std::path::Path>,
     ) -> Self {
-        let repo = crate::cli::provenance::RepoInfo::at(db, dir);
+        let repo = dir.and_then(|d| crate::cli::provenance::RepoInfo::at(db, d));
         let mut source = crate::db::provenance::Provenance {
             kind: "session".to_string(),
             session_id: Some(session_id.to_string()),
@@ -2388,6 +2429,36 @@ mod tests {
     }
 
     #[test]
+    fn a_session_runs_where_its_transcript_says_or_nowhere_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        let write = |folder: &str, lines: &[&str]| {
+            let dir = tmp.path().join(folder);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s.jsonl");
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let no_cwd = [r#"{"type":"user","message":{"content":"hi"}}"#];
+
+        // Recorded in the transcript: used wherever the transcript is.
+        let recorded = write(
+            "elsewhere-a",
+            &[r#"{"type":"mode"}"#, r#"{"type":"user","cwd":"/src/app"}"#],
+        );
+        assert_eq!(
+            claude_session_dir(&recorded, &cwd),
+            Some(std::path::PathBuf::from("/src/app"))
+        );
+        // Not recorded, but in this directory's project folder.
+        let own = write(&path_to_project_hash(&cwd), &no_cwd);
+        assert_eq!(claude_session_dir(&own, &cwd), Some(cwd.clone()));
+        // Not recorded, and from another project: unknown.
+        let other = write("elsewhere-b", &no_cwd);
+        assert_eq!(claude_session_dir(&other, &cwd), None);
+    }
+
+    #[test]
     fn turns_keep_their_transcript_line_message_id_and_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
@@ -2412,7 +2483,7 @@ mod tests {
         );
 
         let db = Database::open_in_memory().unwrap();
-        let origin = SessionOrigin::new(&db, "s1", "claude-code", dir.path(), Some(&path));
+        let origin = SessionOrigin::new(&db, "s1", "claude-code", Some(dir.path()), Some(&path));
         let chunk = &chunk_turns(&turns, 20_000)[0];
         let p = origin.for_chunk(&turns[chunk.turns.clone()], &chunk.text);
         assert_eq!((p.line_start, p.line_end), (Some(2), Some(4)));
