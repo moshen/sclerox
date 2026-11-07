@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use super::provenance::{copy_links, copy_provenance};
 use super::{cosine_of_bytes, embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +16,7 @@ pub struct MemoryEntry {
     pub updated_at: String,
     /// active | stale | superseded
     pub status: String,
-    /// manual | claude-auto | session
+    /// manual | session | distilled | imported (older rows: claude-auto)
     pub source: String,
     /// row id of the memory that replaced this one. Only non-active rows carry
     /// a pointer: keys repeat across history, so ids are the only stable link.
@@ -34,6 +35,19 @@ pub struct MemoryConflict {
     pub created_at: String,
     pub memory: MemoryEntry,
     pub matched: MemoryEntry,
+}
+
+impl MemoryEntry {
+    /// How the memory was written, from its `source`: `hand-written`,
+    /// `distilled` or `imported`.
+    pub fn origin(&self) -> &str {
+        match self.source.as_str() {
+            "manual" => "hand-written",
+            "session" | "distilled" => "distilled",
+            "imported" => "imported",
+            other => other,
+        }
+    }
 }
 
 const MEMORY_COLS: &str =
@@ -150,6 +164,9 @@ impl Database {
                                  THEN memory.embedding END,
                memory_type = excluded.memory_type,
                tags       = excluded.tags,
+               -- Rewritten by hand, it is hand-written now, and guarded as such.
+               source     = CASE WHEN excluded.source = 'manual'
+                                 THEN 'manual' ELSE memory.source END,
                updated_at = datetime('now')
              {}",
             if guard.is_empty() {
@@ -567,59 +584,88 @@ impl Database {
             );
         }
 
-        let tx = self.conn.unchecked_transaction()?;
-        let old_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
-                params![old_key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(old_id) = old_id else {
-            return Ok(false);
+        // A savepoint rather than a transaction, so a caller's own
+        // transaction can hold this one; anything but a completed supersede
+        // rolls back to it, including the snapshot. Without a caller's
+        // transaction, take the write lock before reading, as `memory_upsert`
+        // does: a read that later upgrades can fail on a busy database.
+        let own = if self.conn.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                &self.conn,
+                TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
         };
+        self.conn.execute_batch("SAVEPOINT memory_supersede")?;
+        let tx = &self.conn;
+        let result = (|| -> Result<bool> {
+            let old_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+                    params![old_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(old_id) = old_id else {
+                return Ok(false);
+            };
 
-        // Superseding into an existing active key replaces its value; keep it.
-        // A refused write returns before commit, which rolls the copy back too.
-        snapshot_active(&tx, new_key, new_value, memory_type, None, "", None)?;
-        let written = tx.execute(
-            &format!(
-                "INSERT INTO memory (key, value, memory_type, source)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
-                   value = excluded.value,
-                   embedding = CASE WHEN memory.value IS excluded.value
-                                    THEN memory.embedding END,
-                   memory_type = excluded.memory_type,
-                   updated_at = datetime('now')
-                 {}",
-                if protect_manual {
-                    "WHERE memory.source != 'manual'"
-                } else {
-                    ""
-                }
-            ),
-            params![new_key, new_value, memory_type, source],
-        )?;
-        if written == 0 {
-            // Dropping the transaction rolls back; the old row stays active.
-            return Ok(false);
+            // Superseding into an existing active key replaces its value; keep it.
+            // A refused write rolls back to the savepoint, taking the copy too.
+            snapshot_active(tx, new_key, new_value, memory_type, None, "", None)?;
+            let written = tx.execute(
+                &format!(
+                    "INSERT INTO memory (key, value, memory_type, source)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
+                       value = excluded.value,
+                       embedding = CASE WHEN memory.value IS excluded.value
+                                        THEN memory.embedding END,
+                       memory_type = excluded.memory_type,
+                       source = CASE WHEN excluded.source = 'manual'
+                                     THEN 'manual' ELSE memory.source END,
+                       updated_at = datetime('now')
+                     {}",
+                    if protect_manual {
+                        "WHERE memory.source != 'manual'"
+                    } else {
+                        ""
+                    }
+                ),
+                params![new_key, new_value, memory_type, source],
+            )?;
+            if written == 0 {
+                // Rolled back below; the old row stays active.
+                return Ok(false);
+            }
+            let new_id: i64 = tx.query_row(
+                "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
+                params![new_key],
+                |r| r.get(0),
+            )?;
+            // The merged memory keeps every source, scope and project of the
+            // one it replaces.
+            copy_provenance(tx, old_id, new_id)?;
+            copy_links(tx, old_id, new_id)?;
+            tx.execute(
+                "UPDATE memory
+                 SET status = 'superseded',
+                     superseded_by = ?1,
+                     updated_at = datetime('now')
+                 WHERE id = ?2",
+                params![new_id, old_id],
+            )?;
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            self.conn.execute_batch("ROLLBACK TO memory_supersede")?;
         }
-        let new_id: i64 = tx.query_row(
-            "SELECT id FROM memory WHERE key = ?1 AND status = 'active'",
-            params![new_key],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            "UPDATE memory
-             SET status = 'superseded',
-                 superseded_by = ?1,
-                 updated_at = datetime('now')
-             WHERE id = ?2",
-            params![new_id, old_id],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        self.conn.execute_batch("RELEASE memory_supersede")?;
+        if let (Some(tx), Ok(true)) = (own, &result) {
+            tx.commit()?;
+        }
+        result
     }
 
     /// Record that `memory_id` was distilled as a near-duplicate of
@@ -997,13 +1043,23 @@ fn snapshot_active(
         }
     );
     let (is_set, tags) = (tags.is_some(), tags.flatten());
-    match distinct_from {
+    let copied = match distinct_from {
         Some(original) => conn.execute(
             &sql,
             params![key, value, memory_type, is_set, tags, original],
         )?,
         None => conn.execute(&sql, params![key, value, memory_type, is_set, tags])?,
     };
+    // The old version keeps the sources it had then.
+    if copied > 0 {
+        let snapshot = conn.last_insert_rowid();
+        let active: i64 = conn.query_row(
+            "SELECT superseded_by FROM memory WHERE id = ?1",
+            [snapshot],
+            |r| r.get(0),
+        )?;
+        copy_provenance(conn, active, snapshot)?;
+    }
     Ok(())
 }
 
@@ -1020,6 +1076,71 @@ mod tests {
         assert_eq!(entry.key, "test_key");
         assert_eq!(entry.value, "test value");
         assert_eq!(entry.memory_type, "general");
+    }
+
+    #[test]
+    fn a_hand_rewritten_distilled_memory_becomes_hand_written() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set_full("k", "distilled", "project", None, "session")
+            .unwrap();
+        db.memory_set("k", "corrected by hand", "project", None)
+            .unwrap();
+        let entry = db.memory_get("k").unwrap().unwrap();
+        assert_eq!(entry.source, "manual");
+        // ...so distillation can no longer overwrite it.
+        let refused = db
+            .memory_set_unless_manual("k", "distilled again", "project", None, "session")
+            .unwrap();
+        assert_eq!(refused, None);
+        assert_eq!(
+            db.memory_get("k").unwrap().unwrap().value,
+            "corrected by hand"
+        );
+        // The version it replaced keeps its own source.
+        let history = db.memory_history("k").unwrap();
+        let old = history.iter().find(|e| e.value == "distilled").unwrap();
+        assert_eq!(old.source, "session");
+
+        // Superseding into a distilled key by hand does the same.
+        db.memory_set_full("d", "auto", "project", None, "session")
+            .unwrap();
+        db.memory_set("old", "x", "project", None).unwrap();
+        assert!(db
+            .memory_supersede("old", "d", "by hand", "project", "manual")
+            .unwrap());
+        assert_eq!(db.memory_get("d").unwrap().unwrap().source, "manual");
+    }
+
+    #[test]
+    fn a_supersede_can_run_inside_a_callers_transaction() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("old", "v", "project", None).unwrap();
+        db.memory_set("hand", "h", "project", None).unwrap();
+
+        let tx = db.conn.unchecked_transaction().unwrap();
+        db.memory_set("other", "o", "project", None).unwrap();
+        // Refused (the target is hand-written): only its own writes undo.
+        assert!(!db
+            .memory_supersede_unless_manual("old", "hand", "auto", "project", "session")
+            .unwrap());
+        assert!(db
+            .memory_supersede("old", "new", "v2", "project", "manual")
+            .unwrap());
+        tx.commit().unwrap();
+
+        assert_eq!(db.memory_get("hand").unwrap().unwrap().value, "h");
+        assert_eq!(db.memory_get("old").unwrap().unwrap().status, "superseded");
+        assert_eq!(db.memory_get("new").unwrap().unwrap().value, "v2");
+        assert!(db.memory_get("other").unwrap().is_some());
+
+        // A caller rolling back undoes the supersede with it.
+        let tx = db.conn.unchecked_transaction().unwrap();
+        assert!(db
+            .memory_supersede("new", "newer", "v3", "project", "manual")
+            .unwrap());
+        drop(tx);
+        assert_eq!(db.memory_get("new").unwrap().unwrap().status, "active");
+        assert!(db.memory_get("newer").unwrap().is_none());
     }
 
     #[test]

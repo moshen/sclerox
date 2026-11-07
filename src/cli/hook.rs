@@ -3,6 +3,7 @@ use clap::Subcommand;
 use std::cmp::Ordering;
 use std::io::Read;
 
+use crate::db::provenance::RepoScope;
 use crate::db::usage::UsageItem;
 use crate::db::Database;
 use crate::index::find_git_root;
@@ -142,7 +143,13 @@ fn run_start(db: &Database) -> Result<()> {
     // Emit compact session context for Claude Code to inject (layer-1 index only).
     // Hard-capped at ~750 tokens so the agent knows what's available without
     // loading full content. It then fetches detail via `sclerox memory get`, etc.
-    if let Ok((ctx, items)) = session_context(db, repo_name.as_deref()) {
+    let scope = git_root
+        .join(".git")
+        .exists()
+        .then(|| crate::cli::provenance::RepoInfo::at(db, &git_root))
+        .flatten()
+        .map(|r| r.scope());
+    if let Ok((ctx, items)) = session_context(db, scope.as_ref()) {
         if !ctx.is_empty() {
             let payload = serde_json::json!({
                 "hookSpecificOutput": {
@@ -170,13 +177,13 @@ fn run_start(db: &Database) -> Result<()> {
 /// on demand with `sclerox memory get`, `sclerox todo get`, etc. Section sizes and the
 /// overall budget come from `[session_context]` in config.
 #[cfg(test)]
-fn build_session_context(db: &Database, repo_name: Option<&str>) -> Result<String> {
-    Ok(session_context(db, repo_name)?.0)
+fn build_session_context(db: &Database, repo: Option<&RepoScope>) -> Result<String> {
+    Ok(session_context(db, repo)?.0)
 }
 
 /// [`build_session_context`], with the records it names in the order they
 /// appear, for the usage log.
-fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Vec<UsageItem>)> {
+fn session_context(db: &Database, repo: Option<&RepoScope>) -> Result<(String, Vec<UsageItem>)> {
     let cfg = &crate::config::settings().session_context;
     let mut out = String::new();
     let mut items = Vec::new();
@@ -243,14 +250,20 @@ fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Ve
     // 3. Relevant knowledge - FULL values of the top memories, not just keys.
     // Priority: feedback (user corrections) > project, repo-matched first, then
     // most-recent as fallback. This is the section that actually gets read.
-    let relevant = relevant_memories(db, repo_name, cfg.relevant_memories);
+    let relevant = relevant_memories(db, repo, cfg.relevant_memories);
     let shown_keys: std::collections::HashSet<String> =
         relevant.iter().map(|m| m.key.clone()).collect();
     if !relevant.is_empty() {
         let mut section = String::from("### Relevant knowledge\n");
         for m in &relevant {
             let val = truncate_for_index(&m.value, 200);
-            section.push_str(&format!("- [{}] {}: {}\n", m.memory_type, m.key, val));
+            section.push_str(&format!(
+                "- [{}, {}] {}: {}\n",
+                m.memory_type,
+                m.origin(),
+                m.key,
+                val
+            ));
         }
         section.push('\n');
         if push_if_fits(&mut out, &section, budget) {
@@ -258,8 +271,22 @@ fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Ve
         }
     }
 
+    // Memories scoped only to other repos stay out of the sections below too;
+    // if the scopes can't be read, so do all memories.
+    let elsewhere = match db.memory_scope_ids(repo) {
+        Ok((_, elsewhere)) => Some(elsewhere),
+        Err(e) => {
+            log::warn!("couldn't read memory scopes, so no memory keys are listed: {e:#}");
+            None
+        }
+    };
+    let shown_here = |m: &crate::db::memory::MemoryEntry| {
+        elsewhere.as_ref().is_some_and(|ids| !ids.contains(&m.id))
+    };
+
     // 4. Recent session memories (last 3) - chronological brief.
-    if let Ok(sessions) = db.memory_list(Some("session"), Some("active")) {
+    if let Ok(mut sessions) = db.memory_list(Some("session"), Some("active")) {
+        sessions.retain(|m| shown_here(m));
         if !sessions.is_empty() {
             let mut section = String::from("### Recent sessions\n");
             for m in sessions.iter().take(cfg.sessions_shown) {
@@ -280,6 +307,7 @@ fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Ve
         let others: Vec<&str> = all
             .iter()
             .filter(|m| m.memory_type != "session" && !shown_keys.contains(&m.key))
+            .filter(|m| shown_here(m))
             .map(|m| m.key.as_str())
             .take(cfg.memory_keys_shown)
             .collect();
@@ -327,82 +355,90 @@ fn session_context(db: &Database, repo_name: Option<&str>) -> Result<(String, Ve
 
 /// Collect up to `limit` distinct active memories to surface with full values.
 /// A configurable number of feedback slots (user corrections) are guaranteed
-/// when feedback exists. Remaining slots go to repo-name matches, then
-/// most-recent feedback, then most-recent project - deduplicated by key.
+/// when feedback exists. Remaining slots go to memories scoped to `repo`, then
+/// global memories that name it, then most-recent feedback, then most-recent
+/// project - deduplicated by key. Memories scoped only to other repos never
+/// show.
+///
+/// Naming the repo still counts after scopes, because a hand-written memory is
+/// global unless its writer passed `--repo`, however repo-specific it is.
 fn relevant_memories(
     db: &Database,
-    repo_name: Option<&str>,
+    repo: Option<&RepoScope>,
     limit: usize,
 ) -> Vec<crate::db::memory::MemoryEntry> {
+    use crate::db::memory::MemoryEntry;
     // Slots reserved for feedback so corrections surface even when repo-matched
     // project facts would otherwise fill every slot.
     let feedback_reserved = crate::config::settings().session_context.feedback_reserved;
-    let mut picked: Vec<crate::db::memory::MemoryEntry> = Vec::new();
+    let mut picked: Vec<MemoryEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let add = |m: crate::db::memory::MemoryEntry,
+    // Without scopes, a memory meant for another repo could show here.
+    let (scoped_here, scoped_elsewhere) = match db.memory_scope_ids(repo) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::warn!("couldn't read memory scopes, so no memories are shown: {e:#}");
+            return Vec::new();
+        }
+    };
+    let active = db.memory_list(None, Some("active")).unwrap_or_default();
+
+    let add = |m: MemoryEntry,
                picked: &mut Vec<_>,
                seen: &mut std::collections::HashSet<String>| {
-        if picked.len() < limit && seen.insert(m.key.clone()) {
+        if picked.len() < limit && !scoped_elsewhere.contains(&m.id) && seen.insert(m.key.clone()) {
             picked.push(m);
         }
     };
 
-    // Repo-matched feedback, ranked by recency, for both the repo name and its
-    // whitespace-split form. Collected up front so the reserved slot prefers a
-    // repo-relevant correction over a generic one.
-    let repo_feedback: Vec<crate::db::memory::MemoryEntry> = repo_name
+    // Memories scoped to this repo, feedback first, then most recent.
+    let mut scoped: Vec<MemoryEntry> = active
+        .iter()
+        .filter(|m| scoped_here.contains(&m.id) && m.memory_type != "session")
+        .cloned()
+        .collect();
+    scoped.sort_by_key(|m| m.memory_type != "feedback");
+
+    // Global memories naming the repo, for both the repo name and its
+    // whitespace-split form, so "sclerox-cli" also matches memories phrased
+    // with the individual words. Feedback first.
+    let mut named: Vec<MemoryEntry> = repo
         .into_iter()
-        .flat_map(|name| [name.to_string(), name.replace(['-', '_'], " ")])
+        .flat_map(|r| [r.repo_name.clone(), r.repo_name.replace(['-', '_'], " ")])
         .filter_map(|token| db.memory_search(&token).ok())
         .flatten()
-        .filter(|m| m.memory_type == "feedback")
+        .filter(|m| m.memory_type == "feedback" || m.memory_type == "project")
         .collect();
+    named.sort_by_key(|m| m.memory_type != "feedback");
 
-    // Reserved feedback slot(s): repo-matched feedback first, else most-recent.
-    for m in repo_feedback.iter().cloned() {
-        if picked.len() >= feedback_reserved {
+    // Reserved feedback slot(s): repo feedback first, else most-recent.
+    let recent_feedback = active.iter().filter(|m| m.memory_type == "feedback");
+    let feedback = scoped
+        .iter()
+        .chain(&named)
+        .filter(|m| m.memory_type == "feedback")
+        .chain(recent_feedback.clone());
+    for m in feedback {
+        if picked.len() >= feedback_reserved.min(limit) {
             break;
         }
-        add(m, &mut picked, &mut seen);
-    }
-    if picked.len() < feedback_reserved {
-        if let Ok(list) = db.memory_list(Some("feedback"), Some("active")) {
-            for m in list {
-                if picked.len() >= feedback_reserved {
-                    break;
-                }
-                add(m, &mut picked, &mut seen);
-            }
-        }
+        add(m.clone(), &mut picked, &mut seen);
     }
 
-    // Tier 1: repo-name matches. Split on non-alphanumerics so "sclerox-cli"
-    // also matches memories phrased with the individual words.
-    if let Some(name) = repo_name {
-        for token in [name.to_string(), name.replace(['-', '_'], " ")] {
-            if let Ok(hits) = db.memory_search(&token) {
-                let mut ordered = hits;
-                ordered.sort_by_key(|m| m.memory_type != "feedback"); // feedback first
-                for m in ordered {
-                    if m.memory_type == "feedback" || m.memory_type == "project" {
-                        add(m, &mut picked, &mut seen);
-                    }
-                }
-            }
-        }
-    }
-
-    // Tier 2/3: most-recent feedback, then most-recent project.
-    for ty in ["feedback", "project"] {
+    // Tier 1: this repo's memories. Tier 2/3: most-recent feedback, then
+    // most-recent project.
+    let recent_project = active.iter().filter(|m| m.memory_type == "project");
+    for m in scoped
+        .iter()
+        .chain(&named)
+        .chain(recent_feedback)
+        .chain(recent_project)
+    {
         if picked.len() >= limit {
             break;
         }
-        if let Ok(list) = db.memory_list(Some(ty), Some("active")) {
-            for m in list {
-                add(m, &mut picked, &mut seen);
-            }
-        }
+        add(m.clone(), &mut picked, &mut seen);
     }
 
     picked
@@ -609,7 +645,15 @@ fn run_distill_session(
         turns.len(),
         session_id
     );
-    let total = distill_chunked(db, &argv, &turns, "session")?;
+    let session_dir = claude_session_dir(&transcript_path, &cwd);
+    let origin = SessionOrigin::new(
+        db,
+        session_id,
+        "claude-code",
+        session_dir.as_deref(),
+        Some(&transcript_path),
+    );
+    let total = distill_chunked(db, &argv, &turns, "session", &origin)?;
     // Always log the outcome - a run of zero-memory sessions is the signal
     // that distillation is broken, so it must be visible.
     log::info!("background: distilled {total} memories from session {session_id}");
@@ -690,7 +734,15 @@ fn run_opencode(
         LockOutcome::Acquired(guard) => guard,
     };
 
-    let total = distill_chunked(db, &argv, &turns, "session")?;
+    let transcript = opencode_db_path();
+    let origin = SessionOrigin::new(
+        db,
+        session_id,
+        "opencode",
+        Some(&dir),
+        transcript.as_deref(),
+    );
+    let total = distill_chunked(db, &argv, &turns, "session", &origin)?;
     if total > 0 {
         eprintln!("[sclerox] distilled {total} memories from opencode session");
     }
@@ -699,41 +751,60 @@ fn run_opencode(
     Ok(())
 }
 
-/// Extract conversation turns from OpenCode's SQLite database for a given session.
-fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
-    let db_path = crate::xdg::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("no home dir"))?
-        .join(".local/share/opencode/opencode.db");
+/// OpenCode's database, which holds its sessions.
+fn opencode_db_path() -> Option<std::path::PathBuf> {
+    Some(crate::xdg::home_dir()?.join(".local/share/opencode/opencode.db"))
+}
+
+/// Extract conversation turns from OpenCode's SQLite database for a given
+/// session. A turn's `line` is its message's position in the session.
+fn extract_opencode_turns(session_id: &str) -> Result<Vec<Turn>> {
+    let db_path = opencode_db_path().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
 
     if !db_path.exists() {
         return Err(anyhow::anyhow!("opencode db not found"));
     }
+    read_opencode_turns(&db_path, session_id)
+}
 
+/// [`extract_opencode_turns`] from the database at `db_path`.
+fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Vec<Turn>> {
     let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT json_extract(m.data, '$.role') as role,
-                json_extract(p.data, '$.text') as text
-         FROM message m
+        "WITH m AS (
+             -- Every message's position, those without text included.
+             SELECT *, ROW_NUMBER() OVER (ORDER BY time_created, id) AS position
+             FROM message WHERE session_id = ?1
+         )
+         SELECT json_extract(m.data, '$.role') as role,
+                json_extract(p.data, '$.text') as text,
+                m.id, m.time_created, m.position
+         FROM m
          JOIN part p ON p.message_id = m.id
          WHERE m.session_id = ?1
            AND json_extract(p.data, '$.type') = 'text'
            AND json_extract(m.data, '$.role') IN ('user', 'assistant')
-         ORDER BY m.time_created, p.time_created",
+         ORDER BY m.time_created, m.id, p.time_created, p.id",
     )?;
 
     let rows = stmt.query_map([session_id], |row| {
         let role: String = row.get(0)?;
         let content: String = row.get(1).unwrap_or_default();
-        Ok((role, content))
+        let id: Option<String> = row.get(2).ok();
+        let created: Option<i64> = row.get(3).ok();
+        let position: i64 = row.get(4)?;
+        Ok((role, content, id, created, position))
     })?;
 
     let mut turns = Vec::new();
     for row in rows.flatten() {
-        let (role, content) = row;
+        let (role, content, id, created, position) = row;
+        // As for Claude transcripts: secrets never reach the distiller.
+        let content = strip_private_sections(&content);
         if content.trim().is_empty() {
             continue;
         }
@@ -742,7 +813,14 @@ fn extract_opencode_turns(session_id: &str) -> Result<Vec<String>> {
             "assistant" => ("Assistant", 1000usize),
             _ => continue,
         };
-        turns.push(format!("{label}: {}\n", truncate(&content, limit)));
+        turns.push(Turn {
+            text: format!("{label}: {}\n", truncate(&content, limit)),
+            line: position,
+            id,
+            at: created
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+        });
     }
 
     Ok(turns)
@@ -1053,8 +1131,9 @@ fn count_turns(path: &std::path::Path) -> Result<usize> {
 fn distill_chunked(
     db: &Database,
     argv: &[String],
-    turns: &[String],
+    turns: &[Turn],
     source: &str,
+    origin: &SessionOrigin,
 ) -> Result<usize> {
     let settings = crate::config::settings();
     let dedup = &settings.dedup;
@@ -1071,8 +1150,33 @@ fn distill_chunked(
     // so its embeddings go after other commands' queries.
     let mut embedder =
         crate::embed::optional(db.semantic_ready()).map(crate::embed::Embedder::bulk);
+    let projects = crate::cli::memory::context_projects(db);
+    let origin_block = crate::cli::memory::format_origin_block(
+        origin.repo.as_ref().map(|r| r.name.as_str()),
+        &projects,
+    );
 
-    for chunk in chunk_turns(turns, chunk_chars) {
+    for Chunk {
+        text: chunk,
+        turns: range,
+    } in chunk_turns(turns, chunk_chars)
+    {
+        let chunk_source = origin.for_chunk(&turns[range], &chunk);
+        // Record where a stored memory came from, and the scope and project
+        // the distiller gave it.
+        let note = |key: &str, m: &crate::cli::memory::DistilledMemory| {
+            crate::cli::provenance::record(db, key, &chunk_source);
+            let scoped = crate::cli::memory::apply_scope_and_project(
+                db,
+                key,
+                m,
+                origin.repo.as_ref(),
+                &projects,
+            );
+            if let Err(e) = scoped {
+                log::warn!("couldn't scope memory '{key}' or link its project: {e:#}");
+            }
+        };
         // Show the distiller the memories this chunk is topically near, so it
         // can reuse an existing key instead of inventing a near-identical slug.
         // Without this it is asked to guess what a previous run named a fact it
@@ -1094,7 +1198,8 @@ fn distill_chunked(
         );
         let existing_keys: std::collections::HashSet<String> =
             context_entries.iter().map(|(k, _)| k.clone()).collect();
-        let existing_block = crate::cli::memory::format_existing_block(&context_entries);
+        let existing_block =
+            crate::cli::memory::format_existing_block(&context_entries) + &origin_block;
 
         // A failed chunk must be LOUD in the logs: swallowing it silently hid a
         // broken claude flag for 8 days of zero distillations.
@@ -1161,6 +1266,7 @@ fn distill_chunked(
                         if let Some(v) = &emb {
                             let _ = db.memory_set_embedding(&alt, v);
                         }
+                        note(&alt, m);
                         log::info!(
                             "memory '{}' is hand-written; distilled rewrite stored as '{alt}' \
                              and flagged in memory_conflicts for review",
@@ -1217,6 +1323,7 @@ fn distill_chunked(
                         if let Some(v) = &emb {
                             let _ = db.memory_set_embedding(&m.key, v);
                         }
+                        note(&m.key, m);
                         stored += 1;
                     }
                     Ok(None) => log::info!("memory '{}' not stored: key is hand-written", m.key),
@@ -1333,6 +1440,7 @@ fn distill_chunked(
             if let Some(v) = &emb {
                 let _ = db.memory_set_embedding(&m.key, v);
             }
+            note(&m.key, m);
             stored += 1;
         }
     }
@@ -1499,52 +1607,151 @@ fn probe_windows(text: &str, window: usize, probes: usize) -> Vec<String> {
         .collect()
 }
 
+/// One user or assistant message of a session, as the distiller reads it.
+#[derive(Debug, Clone, Default)]
+struct Turn {
+    text: String,
+    /// 1-based line of the transcript it came from (for OpenCode, its
+    /// message's position in the session).
+    line: i64,
+    /// The message's id, when the transcript gives one.
+    id: Option<String>,
+    /// When it was sent, when the transcript says.
+    at: Option<String>,
+}
+
+/// Turns joined for one distiller call, and which turns they are.
+struct Chunk {
+    text: String,
+    turns: std::ops::Range<usize>,
+}
+
 /// Split turns into chunks of up to `max_chars` each.
-fn chunk_turns(turns: &[String], max_chars: usize) -> Vec<String> {
+fn chunk_turns(turns: &[Turn], max_chars: usize) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut start = 0;
 
-    for turn in turns {
-        if !current.is_empty() && current.len() + turn.len() > max_chars {
-            chunks.push(std::mem::take(&mut current));
+    for (i, turn) in turns.iter().enumerate() {
+        if !current.is_empty() && current.len() + turn.text.len() > max_chars {
+            chunks.push(Chunk {
+                text: std::mem::take(&mut current),
+                turns: start..i,
+            });
+            start = i;
         }
-        current.push_str(turn);
+        current.push_str(&turn.text);
     }
     if !current.is_empty() {
-        chunks.push(current);
+        chunks.push(Chunk {
+            text: current,
+            turns: start..turns.len(),
+        });
     }
     chunks
 }
 
+/// The directory a Claude Code session ran in: the `cwd` its transcript
+/// records, else `cwd` when the transcript is in `cwd`'s own project folder.
+/// `None` for a transcript found under another project that doesn't say,
+/// whose memories must not be scoped to the repo this command runs in.
+fn claude_session_dir(
+    transcript: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::io::BufRead;
+    let recorded = std::fs::File::open(transcript).ok().and_then(|f| {
+        std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .find_map(|line| {
+                let obj: serde_json::Value = serde_json::from_str(&line).ok()?;
+                obj["cwd"]
+                    .as_str()
+                    .filter(|c| !c.is_empty())
+                    .map(std::path::PathBuf::from)
+            })
+    });
+    if recorded.is_some() {
+        return recorded;
+    }
+    let folder = transcript.parent()?.file_name()?.to_string_lossy();
+    (folder == path_to_project_hash(cwd)).then(|| cwd.to_path_buf())
+}
+
+/// Where a session's distilled memories come from: the session, and the repo
+/// it ran in.
+struct SessionOrigin {
+    source: crate::db::provenance::Provenance,
+    repo: Option<crate::cli::provenance::RepoInfo>,
+}
+
+impl SessionOrigin {
+    fn new(
+        db: &Database,
+        session_id: &str,
+        agent: &str,
+        dir: Option<&std::path::Path>,
+        transcript: Option<&std::path::Path>,
+    ) -> Self {
+        let repo = dir.and_then(|d| crate::cli::provenance::RepoInfo::at(db, d));
+        let mut source = crate::db::provenance::Provenance {
+            kind: "session".to_string(),
+            session_id: Some(session_id.to_string()),
+            agent: Some(agent.to_string()),
+            transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        if let Some(repo) = &repo {
+            repo.describe(&mut source);
+        }
+        SessionOrigin { source, repo }
+    }
+
+    /// The source of memories distilled from `text`, made of `turns`. The
+    /// text is hashed after `<private>` stripping, as the distiller read it.
+    fn for_chunk(&self, turns: &[Turn], text: &str) -> crate::db::provenance::Provenance {
+        use sha2::{Digest, Sha256};
+        let mut p = self.source.clone();
+        if let (Some(first), Some(last)) = (turns.first(), turns.last()) {
+            p.line_start = Some(first.line);
+            p.line_end = Some(last.line);
+            p.message_start = first.id.clone();
+            p.message_end = last.id.clone();
+            p.observed_at = last.at.clone();
+        }
+        p.excerpt_sha256 = Some(format!("{:x}", Sha256::digest(text.as_bytes())));
+        p
+    }
+}
+
 /// Extract conversation turns from a Claude Code session JSONL.
-fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<String>> {
+fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<Turn>> {
     use std::io::BufRead;
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     let mut turns = Vec::new();
 
-    for line in reader.lines() {
+    for (n, line) in reader.lines().enumerate() {
         let line = line?;
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
 
-        match obj["type"].as_str() {
-            Some("user") => {
-                if let Some(content) = extract_text_content(&obj["message"]["content"]) {
-                    if !content.trim().is_empty() {
-                        turns.push(format!("User: {}\n", truncate(&content, 500)));
-                    }
-                }
+        let (label, limit) = match obj["type"].as_str() {
+            Some("user") => ("User", 500),
+            Some("assistant") => ("Assistant", 1000),
+            _ => continue,
+        };
+        if let Some(content) = extract_text_content(&obj["message"]["content"]) {
+            if !content.trim().is_empty() {
+                turns.push(Turn {
+                    text: format!("{label}: {}\n", truncate(&content, limit)),
+                    line: n as i64 + 1,
+                    id: obj["uuid"].as_str().map(str::to_string),
+                    at: obj["timestamp"].as_str().map(str::to_string),
+                });
             }
-            Some("assistant") => {
-                if let Some(content) = extract_text_content(&obj["message"]["content"]) {
-                    if !content.trim().is_empty() {
-                        turns.push(format!("Assistant: {}\n", truncate(&content, 1000)));
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1925,19 +2132,33 @@ mod tests {
 
     #[test]
     fn test_chunk_turns_splits_at_limit() {
-        let turns: Vec<String> = (0..10)
-            .map(|i| "x".repeat(6_000) + &format!(" turn{i}\n"))
-            .collect();
+        let turns = texts((0..10).map(|i| "x".repeat(6_000) + &format!(" turn{i}\n")));
         let chunks = chunk_turns(&turns, 20_000);
         // Each chunk should be at most the configured chunk size
         for chunk in &chunks {
-            assert!(chunk.len() <= 25_000, "chunk too large: {}", chunk.len());
+            assert!(
+                chunk.text.len() <= 25_000,
+                "chunk too large: {}",
+                chunk.text.len()
+            );
         }
         // All turns should be covered
-        let all: String = chunks.join("");
+        let all: String = chunks.iter().map(|c| c.text.as_str()).collect();
         for i in 0..10 {
             assert!(all.contains(&format!("turn{i}")));
         }
+        // ...and each chunk names exactly the turns it holds, in order.
+        let mut next = 0;
+        for chunk in &chunks {
+            assert_eq!(chunk.turns.start, next);
+            let joined: String = turns[chunk.turns.clone()]
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect();
+            assert_eq!(joined, chunk.text);
+            next = chunk.turns.end;
+        }
+        assert_eq!(next, turns.len());
     }
 
     #[test]
@@ -1963,6 +2184,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(distilled_sibling_key(&db, "k", hand), "k-distilled-2");
+    }
+
+    #[test]
+    fn opencode_turns_drop_private_text_and_count_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+               CREATE TABLE part (id TEXT, message_id TEXT, data TEXT, time_created INTEGER);
+               INSERT INTO message VALUES
+                 ('m1', 's', '{"role":"user"}', 1000),
+                 ('m0', 's', '{"role":"assistant"}', 1500),
+                 ('m2', 's', '{"role":"assistant"}', 2000),
+                 ('m2b', 's', '{"role":"user"}', 2000),
+                 ('m3', 's', '{"role":"user"}', 3000);
+               INSERT INTO part VALUES
+                 ('p1', 'm1', '{"type":"text","text":"key is <private>hunter2</private> ok"}', 1),
+                 ('p2', 'm0', '{"type":"tool"}', 2),
+                 ('p4', 'm2', '{"type":"text","text":"more"}', 3),
+                 ('p3', 'm2', '{"type":"text","text":"noted"}', 3),
+                 ('p5', 'm2b', '{"type":"text","text":"a"}', 3),
+                 ('p6', 'm3', '{"type":"text","text":"<private>only secret</private>"}', 5);"#,
+        )
+        .unwrap();
+        drop(conn);
+        let turns = read_opencode_turns(&path, "s").unwrap();
+        let got: Vec<_> = turns
+            .iter()
+            .map(|t| (t.line, t.id.as_deref(), t.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, Some("m1"), "User: key is  ok\n"),
+                // m0, tool calls only, still holds position 2.
+                // Parts written in the same millisecond: ordered by id.
+                (3, Some("m2"), "Assistant: noted\n"),
+                (3, Some("m2"), "Assistant: more\n"),
+                // Sent in the same millisecond as m2: ordered by id, once.
+                (4, Some("m2b"), "User: a\n"),
+            ]
+        );
+        assert_eq!(turns[0].at.as_deref(), Some("1970-01-01 00:00:01"));
     }
 
     #[test]
@@ -2109,7 +2374,7 @@ mod tests {
         )
         .unwrap();
 
-        let picked = relevant_memories(&db, Some("myrepo"), 5);
+        let picked = relevant_memories(&db, Some(&repo_named("myrepo")), 5);
         assert!(
             picked.iter().any(|m| m.memory_type == "feedback"),
             "feedback slot not guaranteed: {:?}",
@@ -2140,11 +2405,213 @@ mod tests {
 
     #[test]
     fn test_chunk_turns_single_chunk_if_small() {
-        let turns = vec![
-            "User: hello\n".to_string(),
-            "Assistant: world\n".to_string(),
-        ];
+        let turns = texts(["User: hello\n", "Assistant: world\n"].map(String::from));
         let chunks = chunk_turns(&turns, 20_000);
         assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].turns, 0..2);
+    }
+
+    fn texts(texts: impl IntoIterator<Item = String>) -> Vec<Turn> {
+        texts
+            .into_iter()
+            .map(|text| Turn {
+                text,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn repo_named(name: &str) -> RepoScope {
+        RepoScope {
+            repo_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_session_runs_where_its_transcript_says_or_nowhere_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        let write = |folder: &str, lines: &[&str]| {
+            let dir = tmp.path().join(folder);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s.jsonl");
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let no_cwd = [r#"{"type":"user","message":{"content":"hi"}}"#];
+
+        // Recorded in the transcript: used wherever the transcript is.
+        let recorded = write(
+            "elsewhere-a",
+            &[r#"{"type":"mode"}"#, r#"{"type":"user","cwd":"/src/app"}"#],
+        );
+        assert_eq!(
+            claude_session_dir(&recorded, &cwd),
+            Some(std::path::PathBuf::from("/src/app"))
+        );
+        // Not recorded, but in this directory's project folder.
+        let own = write(&path_to_project_hash(&cwd), &no_cwd);
+        assert_eq!(claude_session_dir(&own, &cwd), Some(cwd.clone()));
+        // Not recorded, and from another project: unknown.
+        let other = write("elsewhere-b", &no_cwd);
+        assert_eq!(claude_session_dir(&other, &cwd), None);
+    }
+
+    #[test]
+    fn turns_keep_their_transcript_line_message_id_and_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let lines = [
+            r#"{"type":"mode"}"#,
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-11-06T10:00:00Z","message":{"content":"hello"}}"#,
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","timestamp":"2026-11-06T10:00:05Z","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let turns = extract_conversation_turns(&path).unwrap();
+        let got: Vec<_> = turns
+            .iter()
+            .map(|t| (t.line, t.id.as_deref(), t.at.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (2, Some("u1"), Some("2026-11-06T10:00:00Z")),
+                (4, Some("a2"), Some("2026-11-06T10:00:05Z")),
+            ]
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        let origin = SessionOrigin::new(&db, "s1", "claude-code", Some(dir.path()), Some(&path));
+        let chunk = &chunk_turns(&turns, 20_000)[0];
+        let p = origin.for_chunk(&turns[chunk.turns.clone()], &chunk.text);
+        assert_eq!((p.line_start, p.line_end), (Some(2), Some(4)));
+        assert_eq!(
+            (p.message_start.as_deref(), p.message_end.as_deref()),
+            (Some("u1"), Some("a2"))
+        );
+        assert_eq!(p.observed_at.as_deref(), Some("2026-11-06T10:00:05Z"));
+        assert_eq!(p.excerpt_sha256.as_ref().map(String::len), Some(64));
+        assert_eq!(p.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn a_repo_scoped_memory_surfaces_without_naming_the_repo() {
+        isolate_config();
+        let db = Database::open_in_memory().unwrap();
+        let here = RepoScope {
+            repo_name: "app".into(),
+            root_commit: Some("r1".into()),
+            remote: None,
+        };
+        let elsewhere = RepoScope {
+            repo_name: "other".into(),
+            root_commit: Some("r2".into()),
+            remote: None,
+        };
+        // Newer global project facts that would otherwise fill the slots.
+        for i in 0..6 {
+            db.memory_set(&format!("global-{i}"), "fact", "project", None)
+                .unwrap();
+        }
+        let scoped = db
+            .memory_set("build-cmd", "build with make dist", "project", None)
+            .unwrap();
+        db.memory_scope_add(scoped, &here).unwrap();
+        let foreign = db
+            .memory_set("other-rule", "a rule", "feedback", None)
+            .unwrap();
+        db.memory_scope_add(foreign, &elsewhere).unwrap();
+        // Make the scoped one the oldest, so recency alone wouldn't pick it.
+        db.conn
+            .execute(
+                "UPDATE memory SET updated_at = '2000-01-01' WHERE id = ?1",
+                [scoped],
+            )
+            .unwrap();
+
+        let keys = |repo: Option<&RepoScope>| -> Vec<String> {
+            relevant_memories(&db, repo, 3)
+                .into_iter()
+                .map(|m| m.key)
+                .collect()
+        };
+        let in_app = keys(Some(&here));
+        assert_eq!(in_app[0], "build-cmd", "{in_app:?}");
+        assert!(!in_app.contains(&"other-rule".to_string()), "{in_app:?}");
+        // Outside any repo, scoped memories show nowhere.
+        let nowhere = keys(None);
+        assert!(!nowhere.contains(&"build-cmd".to_string()), "{nowhere:?}");
+        assert!(!nowhere.contains(&"other-rule".to_string()), "{nowhere:?}");
+    }
+
+    #[test]
+    fn global_memories_naming_the_repo_match_but_not_ones_scoped_elsewhere() {
+        isolate_config();
+        let db = Database::open_in_memory().unwrap();
+        // Hand-written without --repo, and with a recorded source: still
+        // matched by name.
+        let named = db
+            .memory_set("deploy-vpn", "the myrepo deploy needs VPN", "project", None)
+            .unwrap();
+        db.memory_provenance_add(
+            named,
+            &crate::db::provenance::Provenance {
+                kind: "manual".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Names the repo, but is scoped to another one.
+        let foreign = db
+            .memory_set(
+                "fork-docs",
+                "the myrepo fork's docs are stale",
+                "project",
+                None,
+            )
+            .unwrap();
+        db.memory_scope_add(
+            foreign,
+            &RepoScope {
+                repo_name: "fork".into(),
+                root_commit: Some("r9".into()),
+                remote: None,
+            },
+        )
+        .unwrap();
+        for i in 0..6 {
+            db.memory_set(&format!("filler-{i}"), "fact", "project", None)
+                .unwrap();
+        }
+        db.conn
+            .execute_batch(
+                "UPDATE memory SET updated_at = '2000-01-01'
+                 WHERE key IN ('deploy-vpn', 'fork-docs')",
+            )
+            .unwrap();
+        let picked: Vec<String> = relevant_memories(&db, Some(&repo_named("myrepo")), 2)
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(picked[0], "deploy-vpn", "{picked:?}");
+        assert!(!picked.contains(&"fork-docs".to_string()), "{picked:?}");
+    }
+
+    #[test]
+    fn session_context_says_how_each_memory_was_written() {
+        isolate_config();
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("hand", "a hand-written rule", "feedback", None)
+            .unwrap();
+        db.memory_set_full("auto", "a distilled fact", "project", None, "session")
+            .unwrap();
+        db.memory_set_full("ext", "an imported fact", "project", None, "imported")
+            .unwrap();
+        let ctx = build_session_context(&db, None).unwrap();
+        assert!(ctx.contains("[feedback, hand-written] hand:"), "{ctx}");
+        assert!(ctx.contains("[project, distilled] auto:"), "{ctx}");
+        assert!(ctx.contains("[project, imported] ext:"), "{ctx}");
     }
 }

@@ -131,6 +131,9 @@ pub struct DistillSettings {
     /// Existing related memories shown to the distiller so it can reuse a key
     /// and set `supersedes` instead of inventing a near-identical slug.
     pub context_memories: usize,
+    /// Projects (most recently updated first) shown to the distiller, so it
+    /// can link a memory to one. 0 shows none.
+    pub context_projects: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +321,7 @@ impl Default for DistillSettings {
             min_turns: 5,
             min_new_turns: 50,
             context_memories: 12,
+            context_projects: 50,
         }
     }
 }

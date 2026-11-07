@@ -835,6 +835,17 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
         fm.kv("type", &m.memory_type);
         fm.kv("status", &m.status);
         fm.kv("source", &m.source);
+        fm.kv("origin", m.origin());
+        let repos = db.memory_scopes(m.id).unwrap_or_default();
+        if !repos.is_empty() {
+            let names: Vec<String> = repos.iter().map(|r| r.repo_name.clone()).collect();
+            fm.list("repos", &names);
+        }
+        let projects = db.memory_projects(m.id).unwrap_or_default();
+        if !projects.is_empty() {
+            let names: Vec<String> = projects.iter().map(|(_, name)| slugify(name)).collect();
+            fm.list("projects", &names);
+        }
         if let Some(sb) = m.superseded_by {
             fm.kv("superseded_by", &sb.to_string());
         }
@@ -861,6 +872,15 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
             for p in &linked {
                 let s = slugify(&p.name);
                 body.push_str(&format!("- [[people/{s}|{}]]\n", p.name));
+            }
+        }
+
+        let sources = db.memory_provenance(m.id).unwrap_or_default();
+        if !sources.is_empty() {
+            body.push_str("\n## Sources\n\n");
+            for row in &sources {
+                let what = crate::cli::provenance::describe(&row.provenance);
+                body.push_str(&format!("- {}: {what}\n", row.created_at));
             }
         }
 
@@ -1163,9 +1183,24 @@ impl Frontmatter {
     }
 }
 
+/// `s` as a YAML double-quoted scalar. Control characters are escaped, so a
+/// newline or tab in a value can't break the frontmatter.
 fn yaml_quote(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn write_md(path: &Path, frontmatter: &str, body: &str) -> Result<()> {
@@ -1232,6 +1267,8 @@ mod tests {
         assert_eq!(yaml_quote("hi"), "\"hi\"");
         assert_eq!(yaml_quote("a\"b"), "\"a\\\"b\"");
         assert_eq!(yaml_quote("path\\to"), "\"path\\\\to\"");
+        assert_eq!(yaml_quote("a\nb\tc"), r#""a\nb\tc""#);
+        assert_eq!(yaml_quote("bell\u{7}"), r#""bell\u0007""#);
     }
 
     #[test]

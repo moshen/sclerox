@@ -6,6 +6,7 @@ pub mod memory;
 pub mod migrations;
 pub mod people;
 pub mod projects;
+pub mod provenance;
 pub mod reembed;
 pub mod repos;
 pub mod schema;
