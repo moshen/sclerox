@@ -706,6 +706,55 @@ fn a_distilled_memory_traces_to_its_session_lines_and_repo() {
     assert_eq!(m["projects"], serde_json::json!([]));
 }
 
+#[test]
+fn compressing_a_memory_leaves_unrelated_rows_alone() {
+    let e = Env::new();
+    let tmp = TempDir::new().unwrap();
+    e.run(&["memory", "set", "verbose", "a long note about two things"]);
+    e.run(&["memory", "set", "other", "an unrelated memory"]);
+    // The distiller splits the note in two; the second key already exists.
+    let resp = tmp.path().join("resp.json");
+    std::fs::write(
+        &resp,
+        serde_json::json!([
+            {"key": "thing-one", "value": "Thing one.", "type": "project"},
+            {"key": "other", "value": "Thing two.", "type": "project"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let resp_arg = resp.display().to_string().replace('\\', "/");
+    let out = e
+        .cmd()
+        .current_dir(tmp.path())
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "memory",
+            "distill",
+            "verbose",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Saved 1 memories."), "{stdout}");
+
+    // "verbose" was superseded into thing-one; "other" kept its value and
+    // gained no distill source.
+    let out = e.run(&["--output", "json", "memory", "get", "other"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["value"], "an unrelated memory");
+    let kinds: Vec<_> = m["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(kinds, ["manual"]);
+}
+
 // ─── People ──────────────────────────────────────────────────────────────────
 
 #[test]

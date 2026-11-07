@@ -211,7 +211,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             }
             warn_if_long(&key, &value);
             // The memory, its source, scope and projects land together.
-            let tx = db.conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &db.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let id = db.memory_set(&key, &value, &r#type, tag_list.as_deref())?;
             db.memory_provenance_add(id, &provenance::from_command("manual", here.as_ref()))?;
             if let (true, Some(here)) = (repo, &here) {
@@ -636,23 +639,26 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 });
             } else {
                 let mut embedder = crate::embed::optional(db.semantic_ready());
+                let mut saved = 0usize;
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
                     // Each memory lands with its source, scope and project,
-                    // or not at all.
-                    let tx = db.conn.unchecked_transaction()?;
-                    match &existing_key {
+                    // or not at all. The write lock comes first, so the
+                    // reads below can't fail to upgrade on a busy database.
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        &db.conn,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
+                    let written = match &existing_key {
                         // Compressing a single existing entry: supersede it,
                         // or update in place when the AI kept the same key.
-                        Some(old_key) if old_key != &m.key => {
-                            db.memory_supersede(
-                                old_key,
-                                &m.key,
-                                &m.value,
-                                &m.memory_type,
-                                "distilled",
-                            )?;
-                        }
+                        Some(old_key) if old_key != &m.key => db.memory_supersede(
+                            old_key,
+                            &m.key,
+                            &m.value,
+                            &m.memory_type,
+                            "distilled",
+                        )?,
                         _ => {
                             db.memory_set_full(
                                 &m.key,
@@ -661,8 +667,22 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                                 None,
                                 "distilled",
                             )?;
+                            true
                         }
+                    };
+                    // Nothing written (the key being compressed is no longer
+                    // active): leave whatever row holds this key alone.
+                    if !written {
+                        if format == OutputFormat::Text {
+                            eprintln!(
+                                "skipped '{}': '{}' is no longer active",
+                                m.key,
+                                existing_key.as_deref().unwrap_or_default()
+                            );
+                        }
+                        continue;
                     }
+                    saved += 1;
                     if let Some(entry) = db.memory_get(&m.key)? {
                         db.memory_provenance_add(entry.id, &source)?;
                     }
@@ -672,9 +692,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         embed_and_store(db, e, &m.key, &m.value);
                     }
                 }
-                print_output(format, &result, || {
-                    println!("\nSaved {} memories.", memories.len())
-                });
+                print_output(format, &result, || println!("\nSaved {saved} memories."));
             }
         }
 
