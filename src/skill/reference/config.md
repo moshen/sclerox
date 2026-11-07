@@ -22,6 +22,8 @@ match instead of being flagged) and
 `distill.context_memories` (how many related existing memories the distiller is
 shown so it can reuse a key rather than invent a near-identical one). Set
 `distill.context_memories = 0` to distill without that context.
+`distill.context_projects` (default 50) is how many projects, most recently
+updated first, the distiller is shown so it can link a memory to one.
 
 ## Embedding sizes
 

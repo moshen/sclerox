@@ -190,15 +190,6 @@ impl Database {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Ids of every memory with at least one recorded source.
-    pub fn memory_ids_with_provenance(&self) -> Result<HashSet<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT memory_id FROM memory_provenance")?;
-        let ids = stmt.query_map([], |r| r.get(0))?;
-        Ok(ids.collect::<Result<_, _>>()?)
-    }
-
     /// Scope memory `memory_id` to `repo`, in addition to any repos it is
     /// already scoped to.
     pub fn memory_scope_add(&self, memory_id: i64, repo: &RepoScope) -> Result<()> {

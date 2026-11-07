@@ -1241,9 +1241,6 @@ pub fn format_existing_block(entries: &[(String, String)]) -> String {
     out
 }
 
-/// Projects shown to the distiller, most recently updated first.
-const CONTEXT_PROJECTS: usize = 20;
-
 /// The prompt block naming the repo the text came from and the projects an
 /// entry can be linked to. Empty when there is neither.
 pub fn format_origin_block(repo: Option<&str>, projects: &[(i64, String)]) -> String {
@@ -1255,20 +1252,25 @@ pub fn format_origin_block(repo: Option<&str>, projects: &[(i64, String)]) -> St
     }
     if !projects.is_empty() {
         out.push_str("\nProjects (id: name):\n");
-        for (id, name) in projects.iter().take(CONTEXT_PROJECTS) {
+        for (id, name) in projects {
             out.push_str(&format!("  {id}: {name}\n"));
         }
     }
     out
 }
 
-/// The projects to show the distiller, most recently updated first.
+/// The projects to show the distiller: `distill.context_projects` of them,
+/// most recently updated first.
 pub fn context_projects(db: &Database) -> Vec<(i64, String)> {
+    let limit = settings().distill.context_projects;
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut projects = db.project_list().unwrap_or_default();
     projects.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     projects
         .into_iter()
-        .take(CONTEXT_PROJECTS)
+        .take(limit)
         .map(|p| (p.id, p.name))
         .collect()
 }

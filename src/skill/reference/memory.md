@@ -43,8 +43,10 @@ A memory is global unless scoped. A scoped memory shows in session start only
 in its repo, recognised by the repo's first commit or its remote, so another
 clone of the same repo counts. A repo with neither (no commits and no remote
 when the memory was scoped) is recognised by its directory name alone, which
-an unrelated repo of the same name also matches. Distillation scopes a memory to the session's
-repo when it only matters there, and may link it to a project.
+an unrelated repo of the same name also matches. After scoped memories,
+session start favours global memories that name the repo. Distillation
+scopes a memory to the session's repo when it only matters there, and may
+link it to a project.
 
 Supersede requires an ACTIVE old key and a DIFFERENT new key (a same-key
 update is `sclerox memory set`, which keeps the value it replaces in

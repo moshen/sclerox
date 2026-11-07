@@ -356,13 +356,12 @@ fn session_context(db: &Database, repo: Option<&RepoScope>) -> Result<(String, V
 /// Collect up to `limit` distinct active memories to surface with full values.
 /// A configurable number of feedback slots (user corrections) are guaranteed
 /// when feedback exists. Remaining slots go to memories scoped to `repo`, then
-/// older memories that name it, then most-recent feedback, then most-recent
+/// global memories that name it, then most-recent feedback, then most-recent
 /// project - deduplicated by key. Memories scoped only to other repos never
 /// show.
 ///
-/// Naming the repo counts only for memories with no recorded source, written
-/// before scopes existed: a newer memory that isn't scoped here was judged
-/// global, or belongs elsewhere.
+/// Naming the repo still counts after scopes, because a hand-written memory is
+/// global unless its writer passed `--repo`, however repo-specific it is.
 fn relevant_memories(
     db: &Database,
     repo: Option<&RepoScope>,
@@ -383,7 +382,6 @@ fn relevant_memories(
             return Vec::new();
         }
     };
-    let with_source = db.memory_ids_with_provenance().unwrap_or_default();
     let active = db.memory_list(None, Some("active")).unwrap_or_default();
 
     let add = |m: MemoryEntry,
@@ -402,7 +400,7 @@ fn relevant_memories(
         .collect();
     scoped.sort_by_key(|m| m.memory_type != "feedback");
 
-    // Older memories naming the repo, for both the repo name and its
+    // Global memories naming the repo, for both the repo name and its
     // whitespace-split form, so "sclerox-cli" also matches memories phrased
     // with the individual words. Feedback first.
     let mut named: Vec<MemoryEntry> = repo
@@ -410,7 +408,6 @@ fn relevant_memories(
         .flat_map(|r| [r.repo_name.clone(), r.repo_name.replace(['-', '_'], " ")])
         .filter_map(|token| db.memory_search(&token).ok())
         .flatten()
-        .filter(|m| !with_source.contains(&m.id))
         .filter(|m| m.memory_type == "feedback" || m.memory_type == "project")
         .collect();
     named.sort_by_key(|m| m.memory_type != "feedback");
@@ -2478,19 +2475,37 @@ mod tests {
     }
 
     #[test]
-    fn only_memories_without_a_source_match_by_repo_name() {
+    fn global_memories_naming_the_repo_match_but_not_ones_scoped_elsewhere() {
         isolate_config();
         let db = Database::open_in_memory().unwrap();
-        db.memory_set("old", "the myrepo deploy needs VPN", "project", None)
-            .unwrap();
-        let new = db
-            .memory_set("new", "the myrepo docs are stale", "project", None)
+        // Hand-written without --repo, and with a recorded source: still
+        // matched by name.
+        let named = db
+            .memory_set("deploy-vpn", "the myrepo deploy needs VPN", "project", None)
             .unwrap();
         db.memory_provenance_add(
-            new,
+            named,
             &crate::db::provenance::Provenance {
-                kind: "session".into(),
+                kind: "manual".into(),
                 ..Default::default()
+            },
+        )
+        .unwrap();
+        // Names the repo, but is scoped to another one.
+        let foreign = db
+            .memory_set(
+                "fork-docs",
+                "the myrepo fork's docs are stale",
+                "project",
+                None,
+            )
+            .unwrap();
+        db.memory_scope_add(
+            foreign,
+            &RepoScope {
+                repo_name: "fork".into(),
+                root_commit: Some("r9".into()),
+                remote: None,
             },
         )
         .unwrap();
@@ -2500,15 +2515,16 @@ mod tests {
         }
         db.conn
             .execute_batch(
-                "UPDATE memory SET updated_at = '2000-01-01' WHERE key IN ('old', 'new')",
+                "UPDATE memory SET updated_at = '2000-01-01'
+                 WHERE key IN ('deploy-vpn', 'fork-docs')",
             )
             .unwrap();
         let picked: Vec<String> = relevant_memories(&db, Some(&repo_named("myrepo")), 2)
             .into_iter()
             .map(|m| m.key)
             .collect();
-        assert_eq!(picked[0], "old", "{picked:?}");
-        assert!(!picked.contains(&"new".to_string()), "{picked:?}");
+        assert_eq!(picked[0], "deploy-vpn", "{picked:?}");
+        assert!(!picked.contains(&"fork-docs".to_string()), "{picked:?}");
     }
 
     #[test]
