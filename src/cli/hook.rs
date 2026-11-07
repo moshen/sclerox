@@ -775,7 +775,7 @@ fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Ve
          WHERE m.session_id = ?1
            AND json_extract(p.data, '$.type') = 'text'
            AND json_extract(m.data, '$.role') IN ('user', 'assistant')
-         ORDER BY m.time_created, m.id, p.time_created",
+         ORDER BY m.time_created, m.id, p.time_created, p.id",
     )?;
 
     let rows = stmt.query_map([session_id], |row| {
@@ -2152,7 +2152,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             r#"CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
-               CREATE TABLE part (message_id TEXT, data TEXT, time_created INTEGER);
+               CREATE TABLE part (id TEXT, message_id TEXT, data TEXT, time_created INTEGER);
                INSERT INTO message VALUES
                  ('m1', 's', '{"role":"user"}', 1000),
                  ('m0', 's', '{"role":"assistant"}', 1500),
@@ -2160,12 +2160,12 @@ mod tests {
                  ('m2b', 's', '{"role":"user"}', 2000),
                  ('m3', 's', '{"role":"user"}', 3000);
                INSERT INTO part VALUES
-                 ('m1', '{"type":"text","text":"key is <private>hunter2</private> ok"}', 1),
-                 ('m0', '{"type":"tool"}', 2),
-                 ('m2', '{"type":"text","text":"noted"}', 3),
-                 ('m2b', '{"type":"text","text":"a"}', 3),
-                 ('m2', '{"type":"text","text":"more"}', 4),
-                 ('m3', '{"type":"text","text":"<private>only secret</private>"}', 5);"#,
+                 ('p1', 'm1', '{"type":"text","text":"key is <private>hunter2</private> ok"}', 1),
+                 ('p2', 'm0', '{"type":"tool"}', 2),
+                 ('p4', 'm2', '{"type":"text","text":"more"}', 3),
+                 ('p3', 'm2', '{"type":"text","text":"noted"}', 3),
+                 ('p5', 'm2b', '{"type":"text","text":"a"}', 3),
+                 ('p6', 'm3', '{"type":"text","text":"<private>only secret</private>"}', 5);"#,
         )
         .unwrap();
         drop(conn);
@@ -2179,6 +2179,7 @@ mod tests {
             [
                 (1, Some("m1"), "User: key is  ok\n"),
                 // m0, tool calls only, still holds position 2.
+                // Parts written in the same millisecond: ordered by id.
                 (3, Some("m2"), "Assistant: noted\n"),
                 (3, Some("m2"), "Assistant: more\n"),
                 // Sent in the same millisecond as m2: ordered by id, once.

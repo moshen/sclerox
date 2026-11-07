@@ -220,7 +220,7 @@ pub fn describe(p: &Provenance) -> String {
     if let Some(repo) = &p.repo_name {
         let mut at = format!("in {repo}");
         if let Some(sha) = &p.commit_sha {
-            at.push_str(&format!(" @ {}", &sha[..sha.len().min(10)]));
+            at.push_str(&format!(" @ {}", sha.get(..10).unwrap_or(sha)));
         }
         if let Some(branch) = &p.branch {
             at.push_str(&format!(" on {branch}"));
