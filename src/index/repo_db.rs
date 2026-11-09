@@ -230,6 +230,8 @@ impl RepoDb {
              VALUES (?1, ?2, ?3)
              ON CONFLICT(path) DO UPDATE SET
                language = excluded.language,
+               last_modified = CASE WHEN content_hash <> excluded.content_hash
+                                    THEN NULL ELSE last_modified END,
                content_hash = excluded.content_hash",
             params![path, language, content_hash],
         )?;

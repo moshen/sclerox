@@ -33,7 +33,10 @@ where
         }
         OutputFormat::Text if full() => match serde_json::to_value(value) {
             Ok(value) => print!("{}", full_text(&value)),
-            Err(_) => text_fn(),
+            Err(e) => {
+                log::warn!("--full could not serialize its output: {e}");
+                text_fn();
+            }
         },
         OutputFormat::Text => text_fn(),
     }

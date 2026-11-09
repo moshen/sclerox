@@ -355,12 +355,14 @@ mod tests {
     }
 
     #[test]
-    fn re_upserting_a_file_keeps_its_date() {
+    fn a_new_hash_clears_a_date_so_an_aborted_run_is_repaired() {
         let db = RepoDb::open_in_memory().unwrap();
         track(&db, &["a.rs"]);
         db.set_file_dates(&HashMap::from([("a.rs".to_string(), FIRST.to_string())]))
             .unwrap();
-        db.upsert_file("a.rs", None, "h2").unwrap();
+        db.upsert_file("a.rs", None, "h").unwrap();
         assert_eq!(date(&db, "a.rs").as_deref(), Some(FIRST));
+        db.upsert_file("a.rs", None, "h2").unwrap();
+        assert_eq!(date(&db, "a.rs"), None);
     }
 }
