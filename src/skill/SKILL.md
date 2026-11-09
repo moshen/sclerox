@@ -144,7 +144,8 @@ forms match, so `retries` finds "Retry". Semantic hits list a record once, and
 code hits list each separate region of a file once.
 
 Add the global `--full` flag to see every field and untruncated content as
-text, including search hits and a meeting's whole transcript.
+text. On `sclerox search` it returns each hit's whole record, as that type's
+`get` command shows it, including a meeting's transcript.
 
 Every command takes `--output json` (a global flag, not `--format`) for
 scripting: stdout is then exactly one JSON document - the records for reads,

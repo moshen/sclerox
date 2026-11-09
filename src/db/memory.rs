@@ -316,6 +316,30 @@ impl Database {
     }
 
     pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
+        let mut results = self.memory_search_exact(query, status)?;
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "memory_fts",
+                table: "memory",
+                columns: MEMORY_COLS,
+                status: (status != "all").then_some(status),
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_memory,
+        )?;
+        Ok(results)
+    }
+
+    /// Active memories holding every term of `query`, or all of it as a
+    /// substring, for when a partial match would be a false one.
+    pub fn memory_search_all_terms(&self, query: &str) -> Result<Vec<MemoryEntry>> {
+        self.memory_search_exact(query, "active")
+    }
+
+    fn memory_search_exact(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
         let fts_query = fts::sanitize(query);
         let like_pat = fts::like_contains(query);
         let filter_status = status != "all";
@@ -374,19 +398,6 @@ impl Database {
 
         let mut results = fts_hits;
         results.extend(like_extras);
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "memory_fts",
-                table: "memory",
-                columns: MEMORY_COLS,
-                status: filter_status.then_some(status),
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_memory,
-        )?;
         Ok(results)
     }
 
