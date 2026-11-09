@@ -29,6 +29,9 @@ const GIT_REPO_ENV: &[&str] = &[
 pub fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
+    // A repo's own config can name this as a program to run, and a copied
+    // folder brings its `.git/config` along.
+    command.args(["-c", "core.fsmonitor=false"]);
     for var in GIT_REPO_ENV {
         command.env_remove(var);
     }

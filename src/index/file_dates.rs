@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -94,7 +94,11 @@ fn current_head(root: &Path) -> Option<String> {
 
 /// The NUL-separated paths a git command prints, or `None` if it fails.
 fn paths(root: &Path, args: &[&str], revs: &[&str]) -> Option<Vec<String>> {
-    let out = git_command(root).args(args).args(revs).output().ok()?;
+    paths_from(git_command(root).args(args).args(revs))
+}
+
+fn paths_from(command: &mut Command) -> Option<Vec<String>> {
+    let out = command.output().ok()?;
     out.status.success().then(|| {
         out.stdout
             .split(|b| *b == 0)
@@ -107,12 +111,7 @@ fn paths(root: &Path, args: &[&str], revs: &[&str]) -> Option<Vec<String>> {
 /// Files whose content isn't their last commit's: changed since HEAD, or
 /// untracked. Their date is their time on disk.
 fn uncommitted(root: &Path) -> Vec<String> {
-    let mut found = paths(
-        root,
-        &["diff", "--name-only", "--no-renames", "-z", "--relative"],
-        &["HEAD"],
-    )
-    .unwrap_or_default();
+    let mut found = changed_since_head(root).unwrap_or_default();
     found.extend(
         paths(
             root,
@@ -122,6 +121,53 @@ fn uncommitted(root: &Path) -> Vec<String> {
         .unwrap_or_default(),
     );
     found
+}
+
+/// Comparing the working tree with HEAD runs each file's clean filter, so
+/// filters set by the repo's own config, which a copied folder brings along,
+/// are switched off. Those set by the user's config, such as LFS, still run.
+fn changed_since_head(root: &Path) -> Option<Vec<String>> {
+    let overrides = repo_filter_overrides(root)?;
+    let mut command = git_command(root);
+    // The environment form, because `-c` can't express every filter name.
+    command.env("GIT_CONFIG_COUNT", overrides.len().to_string());
+    for (i, (key, value)) in overrides.iter().enumerate() {
+        command.env(format!("GIT_CONFIG_KEY_{i}"), key);
+        command.env(format!("GIT_CONFIG_VALUE_{i}"), value);
+    }
+    paths_from(command.args([
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        "--relative",
+        "HEAD",
+    ]))
+}
+
+/// Config that empties each filter command in the repo's own config, and
+/// keeps a filter marked required from failing for having none. `None` if the
+/// config can't be read.
+fn repo_filter_overrides(root: &Path) -> Option<Vec<(String, String)>> {
+    let out = git_command(root)
+        .args(["config", "--show-scope", "--name-only", "-z"])
+        .args(["--get-regexp", r"^filter\..*\.(clean|process)$"])
+        .output()
+        .ok()?;
+    // Exit code 1 means no key matched.
+    if !out.status.success() && out.status.code() != Some(1) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split('\0');
+    let mut overrides = Vec::new();
+    while let (Some(scope), Some(key)) = (fields.next(), fields.next()) {
+        if let ("local" | "worktree", Some((filter, _))) = (scope, key.rsplit_once('.')) {
+            overrides.push((key.to_string(), String::new()));
+            overrides.push((format!("{filter}.required"), "false".to_string()));
+        }
+    }
+    Some(overrides)
 }
 
 /// Walk history from `head`, newest first, recording the first commit to
@@ -285,6 +331,45 @@ mod tests {
             let at = date(&db, name).unwrap();
             assert!(at.starts_with(&today()), "{name}: {at}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dating_files_runs_no_command_from_the_repos_own_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, root, db) = repo();
+        write(&root, "a.rs", "1");
+        write(&root, "b.rs", "1");
+        commit(&root, FIRST);
+
+        let marker = dir.path().join("ran");
+        let script = dir.path().join("script");
+        let body = format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display());
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = script.to_str().unwrap();
+        for (key, value) in [
+            ("core.fsmonitor", script),
+            ("filter.a=b.clean", script),
+            ("filter.a=b.required", "true"),
+            ("filter.other.process", script),
+        ] {
+            git(&root, FIRST, &["config", key, value]);
+        }
+        write(
+            &root,
+            ".git/info/attributes",
+            "a.rs filter=a=b\nb.rs filter=other\n",
+        );
+
+        write(&root, "a.rs", "2");
+        write(&root, "b.rs", "2");
+        track(&db, &["a.rs", "b.rs"]);
+        refresh(&db, &root, all(&["a.rs", "b.rs"])).unwrap();
+        assert!(!marker.exists(), "a command from the repo's config ran");
+        assert!(date(&db, "a.rs").unwrap().starts_with(&today()));
+        assert!(date(&db, "b.rs").unwrap().starts_with(&today()));
     }
 
     #[test]
