@@ -861,6 +861,77 @@ CREATE INDEX IF NOT EXISTS read_events_created ON read_events(created_at);
 CREATE INDEX IF NOT EXISTS read_events_item ON read_events(item_type, item_ref);
 ";
 
+/// Migration v17: where each memory came from, and which repos and projects
+/// it belongs to.
+///
+/// `memory_provenance` holds one row per source: a `memory set`, an import,
+/// a distilled session chunk. Rows point at their source (transcript path,
+/// line range and message ids, a hash of the excerpt) rather than copying
+/// it. A memory merged from others keeps all their rows. Rows written before
+/// v17 have none and show as unknown.
+///
+/// `memory_repos` scopes a memory to a repo, named by its first commit and its
+/// normalized remote (`host/owner/repo`) so the scope survives moves,
+/// re-clones and the repo index being pruned; either one matching counts.
+/// `repo_name` is the fallback for repos with neither. `repo_roots` caches
+/// each clone's first commit, which can take seconds to find in a long
+/// history; `clone_stamp` (when its git directory was created) tells a new
+/// clone at the same path from the old one.
+pub const MIGRATION_V17: &str = "
+CREATE TABLE IF NOT EXISTS memory_provenance (
+    id              INTEGER PRIMARY KEY,
+    memory_id       INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    session_id      TEXT,
+    agent           TEXT,
+    repo_name       TEXT,
+    repo_path       TEXT,
+    repo_root       TEXT,
+    repo_remote     TEXT,
+    commit_sha      TEXT,
+    branch          TEXT,
+    source_path     TEXT,
+    transcript_path TEXT,
+    line_start      INTEGER,
+    line_end        INTEGER,
+    message_start   TEXT,
+    message_end     TEXT,
+    excerpt_sha256  TEXT,
+    observed_at     TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS memory_provenance_memory ON memory_provenance(memory_id);
+CREATE INDEX IF NOT EXISTS memory_provenance_session ON memory_provenance(session_id);
+
+CREATE TABLE IF NOT EXISTS memory_repos (
+    id          INTEGER PRIMARY KEY,
+    memory_id   INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    repo_name   TEXT NOT NULL,
+    root_commit TEXT,
+    remote      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_repos_unique
+    ON memory_repos(memory_id, repo_name, ifnull(root_commit, ''), ifnull(remote, ''));
+CREATE INDEX IF NOT EXISTS memory_repos_root ON memory_repos(root_commit);
+CREATE INDEX IF NOT EXISTS memory_repos_remote ON memory_repos(remote);
+
+CREATE TABLE IF NOT EXISTS memory_projects (
+    memory_id  INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (memory_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS memory_projects_project ON memory_projects(project_id);
+
+CREATE TABLE IF NOT EXISTS repo_roots (
+    path        TEXT PRIMARY KEY,
+    clone_stamp TEXT,
+    root_commit TEXT NOT NULL,
+    checked_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
 /// Migration v7: queue embedding work for the model server.
 pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
 

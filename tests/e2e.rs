@@ -466,6 +466,357 @@ fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
     assert!(out.contains("API host"), "{out}");
 }
 
+/// Run git in `dir` with a fixed identity; trimmed stdout.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    // Nothing from a surrounding git process (a hook, say) picks the repo.
+    for var in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(var);
+    }
+    let out = command
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        // Not the user's or the system's config: no signing, hooks
+        // or default-branch settings leak in.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".no-gitconfig"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A git repo named `app` with two commits and a remote: (dir, first commit,
+/// head).
+fn git_repo(parent: &std::path::Path) -> (PathBuf, String, String) {
+    let repo = parent.join("app");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@example.com:o/app.git"],
+    );
+    (repo, first, head)
+}
+
+/// `hook start`'s context, run in `dir`.
+fn session_start_context(e: &Env, dir: &std::path::Path) -> String {
+    let out = e
+        .cmd()
+        .args(["hook", "start"])
+        .current_dir(dir)
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    payload["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The "Relevant knowledge" section of `hook start`'s context, run in `dir`.
+fn relevant_knowledge(e: &Env, dir: &std::path::Path) -> String {
+    session_start_context(e, dir)
+        .split("### ")
+        .find(|s| s.starts_with("Relevant knowledge"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn a_hand_written_memory_records_its_repo_and_can_be_scoped_to_it() {
+    let e = Env::new();
+    let tmp = TempDir::new().unwrap();
+    let (repo, first, head) = git_repo(tmp.path());
+    let project = e.run_get_id(&["project", "add", "--name", "Build"]);
+
+    let out = e
+        .cmd()
+        .current_dir(&repo)
+        .env("SCLEROX_SESSION_ID", "sess-1")
+        .env("SCLEROX_AGENT", "test-agent")
+        .args([
+            "memory",
+            "set",
+            "build-cmd",
+            "Build with make dist, because the plain build skips assets.",
+            "--type",
+            "project",
+            "--repo",
+            "--project",
+            &project.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let out = e.run(&["--output", "json", "memory", "get", "build-cmd"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["origin"], "hand-written");
+    let source = &m["provenance"][0];
+    assert_eq!(source["kind"], "manual");
+    assert_eq!(source["session_id"], "sess-1");
+    assert_eq!(source["agent"], "test-agent");
+    assert_eq!(source["repo_name"], "app");
+    assert_eq!(source["commit_sha"], head.as_str());
+    assert_eq!(source["branch"], "main");
+    assert_eq!(m["repos"][0]["root_commit"], first.as_str());
+    assert_eq!(m["repos"][0]["remote"], "example.com/o/app");
+    assert_eq!(m["projects"][0]["id"], project);
+
+    let out = e.run(&["memory", "get", "build-cmd"]);
+    assert!(out.contains("Origin:  hand-written"), "{out}");
+    assert!(out.contains("Scope:   repo app"), "{out}");
+    assert!(out.contains("Projects: #"), "{out}");
+    assert!(
+        out.contains("manual, session sess-1 (test-agent), in app @"),
+        "{out}"
+    );
+    let out = e.run(&["project", "get", &project.to_string()]);
+    assert!(out.contains("build-cmd"), "{out}");
+
+    // Session start in the repo shows it, saying it was hand-written; in a
+    // clone elsewhere too; outside the repo it doesn't.
+    let line = "[project, hand-written] build-cmd:";
+    assert!(relevant_knowledge(&e, &repo).contains(line));
+    let clone = tmp.path().join("clone");
+    git(
+        tmp.path(),
+        &["clone", "-q", repo.to_str().unwrap(), "clone"],
+    );
+    assert!(relevant_knowledge(&e, &clone).contains(line));
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    // Not in any section, the key list included.
+    let ctx = session_start_context(&e, &elsewhere);
+    assert!(!ctx.contains("build-cmd"), "{ctx}");
+
+    // --global drops the scope.
+    e.run(&[
+        "memory",
+        "set",
+        "build-cmd",
+        "Build with make dist.",
+        "--global",
+    ]);
+    let out = e.run(&["memory", "get", "build-cmd"]);
+    assert!(out.contains("Scope:   global"), "{out}");
+}
+
+#[test]
+fn a_memory_describes_its_own_repo_when_run_from_a_git_hook() {
+    let e = Env::new();
+    let (first_parent, second_parent) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (repo, _, _) = git_repo(first_parent.path());
+    let (other, _, _) = git_repo(second_parent.path());
+    git(
+        &other,
+        &["remote", "set-url", "origin", "git@example.com:o/other.git"],
+    );
+
+    // Git points its hooks at a repository through the environment.
+    let out = e
+        .cmd()
+        .current_dir(&repo)
+        .env("GIT_DIR", other.join(".git"))
+        .args(["memory", "set", "k", "v", "--repo"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let out = e.run(&["--output", "json", "memory", "get", "k"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["repos"][0]["remote"], "example.com/o/app");
+}
+
+#[test]
+fn a_distilled_memory_traces_to_its_session_lines_and_repo() {
+    let e = Env::new();
+    let tmp = TempDir::new().unwrap();
+    let (repo, first, head) = git_repo(tmp.path());
+    let project = e.run_get_id(&["project", "add", "--name", "Build"]);
+
+    let home = tmp.path().join("home");
+    let proj = home.join(".claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut lines = vec![serde_json::json!({"type": "mode"})];
+    for (i, (role, text)) in [
+        ("user", "how do we build"),
+        ("assistant", "make dist"),
+        ("user", "ok"),
+        ("assistant", "noted"),
+        ("user", "b"),
+        ("assistant", "c"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Claude Code records the session's directory on each entry, which
+        // is how the session's repo is known wherever the transcript is.
+        lines.push(serde_json::json!({
+            "type": role, "uuid": format!("m{}", i + 1), "cwd": repo,
+            "timestamp": format!("2026-11-06T10:00:0{i}Z"),
+            "message": {"content": text},
+        }));
+    }
+    let transcript: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(proj.join("S2.jsonl"), transcript).unwrap();
+    let resp = tmp.path().join("resp.json");
+    std::fs::write(
+        &resp,
+        serde_json::json!([
+            {"key": "build-with-make-dist", "value": "Build with make dist.",
+             "type": "project", "supersedes": null, "scope": "repo", "project": project},
+            {"key": "prefers-short-answers", "value": "The user prefers short answers.",
+             "type": "feedback", "supersedes": null, "scope": "global", "project": 999}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let resp_arg = resp.display().to_string().replace('\\', "/");
+    // Run from outside the repo: the repo comes from the transcript.
+    e.cmd()
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".state"))
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "hook",
+            "distill-session",
+            "--session-id",
+            "S2",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .assert()
+        .success();
+
+    let out = e.run(&["--output", "json", "memory", "get", "build-with-make-dist"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["origin"], "distilled");
+    let source = &m["provenance"][0];
+    assert_eq!(source["kind"], "session");
+    assert_eq!(source["session_id"], "S2");
+    assert_eq!(source["agent"], "claude-code");
+    assert_eq!(source["commit_sha"], head.as_str());
+    assert_eq!(
+        (&source["line_start"], &source["line_end"]),
+        (&2.into(), &7.into())
+    );
+    assert_eq!(source["message_start"], "m1");
+    assert_eq!(source["message_end"], "m6");
+    assert_eq!(source["observed_at"], "2026-11-06T10:00:05Z");
+    assert!(source["transcript_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("S2.jsonl"));
+    assert_eq!(m["repos"][0]["root_commit"], first.as_str());
+    assert_eq!(m["projects"][0]["id"], project);
+
+    // Global, and a project it wasn't shown is ignored.
+    let out = e.run(&["--output", "json", "memory", "get", "prefers-short-answers"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["repos"], serde_json::json!([]));
+    assert_eq!(m["projects"], serde_json::json!([]));
+}
+
+#[test]
+fn compressing_a_memory_leaves_unrelated_rows_alone() {
+    let e = Env::new();
+    let tmp = TempDir::new().unwrap();
+    e.run(&["memory", "set", "verbose", "a long note about two things"]);
+    e.run(&["memory", "set", "other", "an unrelated memory"]);
+    // The distiller splits the note in two; the second key already exists.
+    let resp = tmp.path().join("resp.json");
+    std::fs::write(
+        &resp,
+        serde_json::json!([
+            {"key": "thing-one", "value": "Thing one.", "type": "project"},
+            {"key": "other", "value": "Thing two.", "type": "project"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let resp_arg = resp.display().to_string().replace('\\', "/");
+    let out = e
+        .cmd()
+        .current_dir(tmp.path())
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "memory",
+            "distill",
+            "verbose",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Saved 1 memories."), "{stdout}");
+
+    // The JSON result lists only what was written.
+    e.run(&["memory", "set", "verbose-2", "another long note"]);
+    let out = e
+        .cmd()
+        .current_dir(tmp.path())
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "--output",
+            "json",
+            "memory",
+            "distill",
+            "verbose-2",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let keys: Vec<_> = result["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys, ["thing-one"]);
+
+    // "verbose" was superseded into thing-one; "other" kept its value and
+    // gained no distill source.
+    let out = e.run(&["--output", "json", "memory", "get", "other"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["value"], "an unrelated memory");
+    let kinds: Vec<_> = m["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(kinds, ["manual"]);
+}
+
 // ─── People ──────────────────────────────────────────────────────────────────
 
 #[test]

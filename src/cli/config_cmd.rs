@@ -167,6 +167,7 @@ pub fn config_template() -> String {
          # min_turns = {min_turns}                     # sessions shorter than this are skipped\n\
          # min_new_turns = {min_new}                 # re-distill only after this much growth\n\
          # context_memories = {ctx_mem}               # related memories shown to the distiller for key reuse\n\
+         # context_projects = {ctx_proj}              # projects shown to the distiller, to link memories to\n\
          \n\
          [embed]\n\
          # enabled = true                # false: never load the model; keyword search only. env: SCLEROX_EMBED_ENABLED\n\
@@ -235,6 +236,7 @@ pub fn config_template() -> String {
         min_turns = d.distill.min_turns,
         min_new = d.distill.min_new_turns,
         ctx_mem = d.distill.context_memories,
+        ctx_proj = d.distill.context_projects,
         embed_model = d.embed.model,
         model_names = crate::embed::models::names().join("|"),
         embed_size = d.embed.chunk_size,
