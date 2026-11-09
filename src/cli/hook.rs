@@ -2423,6 +2423,7 @@ mod tests {
 
     #[test]
     fn a_memory_naming_part_of_a_repo_name_doesnt_outrank_newer_ones() {
+        isolate_config();
         let db = Database::open_in_memory().unwrap();
         for (key, value) in [
             ("both", "the claude code release"),
@@ -2430,9 +2431,13 @@ mod tests {
         ] {
             db.memory_set(key, value, "feedback", None).unwrap();
         }
-        // Timestamps have one-second resolution.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         db.memory_set("newer", "an unrelated preference", "feedback", None)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "UPDATE memory SET updated_at = '2000-01-01'
+                 WHERE key IN ('both', 'partial')",
+            )
             .unwrap();
 
         let picked: Vec<String> = relevant_memories(&db, Some(&repo_named("claude-code")), 2)

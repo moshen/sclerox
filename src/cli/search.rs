@@ -36,7 +36,7 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
         println!("\n{} results", results.len());
     };
     if full() {
-        print_output(format, &whole_records(db, &results), show);
+        print_output(format, &whole_records(db, &results)?, show);
     } else {
         print_output(format, &results, show);
     }
@@ -46,11 +46,11 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
 
 /// Each hit with the whole record it found, as that type's `get` command
 /// shows it, for `--full`. A code hit has no record beyond the hit itself.
-fn whole_records(db: &Database, results: &[SearchResult]) -> Vec<serde_json::Value> {
+fn whole_records(db: &Database, results: &[SearchResult]) -> Result<Vec<serde_json::Value>> {
     results
         .iter()
         .map(|result| {
-            let mut hit = serde_json::to_value(result).unwrap_or_default();
+            let mut hit = serde_json::to_value(result)?;
             match record_fields(db, result) {
                 Ok(serde_json::Value::Object(fields)) => {
                     if let Some(hit) = hit.as_object_mut() {
@@ -60,7 +60,7 @@ fn whole_records(db: &Database, results: &[SearchResult]) -> Vec<serde_json::Val
                 Ok(_) => {}
                 Err(e) => log::warn!("could not load the record of a search hit: {e:#}"),
             }
-            hit
+            Ok(hit)
         })
         .collect()
 }
