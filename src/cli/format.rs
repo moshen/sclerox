@@ -46,7 +46,7 @@ pub fn stamp(label: &str, at: &str) -> String {
 /// When a code hit's file last changed, to append to its location: empty for
 /// a file not dated yet.
 fn changed(at: Option<&str>) -> String {
-    at.map(|at| format!("  {}", stamp("changed", at)))
+    at.map(|at| format!("  {}", stamp("changed", &terminal_safe(at))))
         .unwrap_or_default()
 }
 
@@ -166,6 +166,10 @@ mod tests {
         assert_eq!(terminal_safe(&loc), loc, "idempotent");
         let sym = symbol_line("fn", "fn a() { \"\u{1b}[2J\" }", &loc, None);
         assert!(!sym.chars().any(char::is_control), "{sym}");
+
+        // A date comes from repo.db, which may be tampered with or shipped.
+        let dated = dated_location("/r", "a.rs", Some(1), Some("\u{1b}[2J"));
+        assert!(!dated.chars().any(char::is_control), "{dated}");
     }
 
     #[test]

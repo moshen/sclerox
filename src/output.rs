@@ -172,7 +172,17 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 /// given. The cut backs off to a char boundary, so a multibyte character
 /// straddling `max` can't panic.
 pub fn truncate(s: &str, max: usize) -> String {
-    if full() || s.len() <= max {
+    if full() {
+        s.to_string()
+    } else {
+        truncate_bounded(s, max)
+    }
+}
+
+/// [`truncate`] regardless of `--full`, for text with a real size limit
+/// rather than text being displayed.
+pub fn truncate_bounded(s: &str, max: usize) -> String {
+    if s.len() <= max {
         s.to_string()
     } else {
         format!("{}...", &s[..floor_char_boundary(s, max)])

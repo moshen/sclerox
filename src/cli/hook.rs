@@ -7,7 +7,7 @@ use crate::db::provenance::RepoScope;
 use crate::db::usage::UsageItem;
 use crate::db::Database;
 use crate::index::find_git_root;
-use crate::output::{floor_char_boundary, truncate};
+use crate::output::{floor_char_boundary, truncate_bounded};
 
 #[derive(Subcommand)]
 pub enum HookCommand {
@@ -814,7 +814,7 @@ fn read_opencode_turns(db_path: &std::path::Path, session_id: &str) -> Result<Ve
             _ => continue,
         };
         turns.push(Turn {
-            text: format!("{label}: {}\n", truncate(&content, limit)),
+            text: format!("{label}: {}\n", truncate_bounded(&content, limit)),
             line: position,
             id,
             at: created
@@ -1746,7 +1746,7 @@ fn extract_conversation_turns(path: &std::path::Path) -> Result<Vec<Turn>> {
         if let Some(content) = extract_text_content(&obj["message"]["content"]) {
             if !content.trim().is_empty() {
                 turns.push(Turn {
-                    text: format!("{label}: {}\n", truncate(&content, limit)),
+                    text: format!("{label}: {}\n", truncate_bounded(&content, limit)),
                     line: n as i64 + 1,
                     id: obj["uuid"].as_str().map(str::to_string),
                     at: obj["timestamp"].as_str().map(str::to_string),
