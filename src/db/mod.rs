@@ -20,10 +20,28 @@ use std::sync::Once;
 
 use migrations::{Migration, PRIMARY_MIGRATIONS, PRIMARY_VERSION};
 
-/// How many nearest chunks to ask for so that `limit` remain after collapsing
-/// several chunks of one record. sqlite-vec refuses a `k` above 4096.
-pub(crate) fn knn_overfetch(limit: usize) -> i64 {
-    limit.saturating_mul(5).min(4096) as i64
+/// sqlite-vec refuses a larger `k`.
+const KNN_MAX: usize = 4096;
+
+/// Nearest-neighbour rows collapsed to `limit` results. `fetch` returns the
+/// `k` nearest chunks, and `collapse` reduces them to results. Several chunks
+/// can collapse into one result, so this starts at five per result and asks
+/// for more while the results fall short and `fetch` filled its window.
+pub(crate) fn knn_collapsed<T>(
+    limit: usize,
+    mut fetch: impl FnMut(i64) -> Result<Vec<T>>,
+    collapse: impl Fn(Vec<T>) -> Vec<T>,
+) -> Result<Vec<T>> {
+    let mut k = limit.saturating_mul(5).min(KNN_MAX);
+    loop {
+        let rows = fetch(k as i64)?;
+        let full = rows.len() == k;
+        let results = collapse(rows);
+        if results.len() >= limit || !full || k == KNN_MAX {
+            return Ok(results);
+        }
+        k = k.saturating_mul(4).min(KNN_MAX);
+    }
 }
 
 /// The best row for each record from rows sorted best first, up to `limit`.
@@ -541,6 +559,55 @@ pub fn cosine_of_bytes(a: &[u8], b: &[u8]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knn_widens_only_while_a_full_window_falls_short() {
+        let run = |available: usize, keep: usize| {
+            let mut asked = Vec::new();
+            let results = knn_collapsed(
+                2,
+                |k| {
+                    asked.push(k);
+                    Ok(vec![0; available.min(k as usize)])
+                },
+                |rows: Vec<i32>| rows.into_iter().take(keep).collect(),
+            )
+            .unwrap();
+            (results.len(), asked)
+        };
+        assert_eq!(run(100, 2), (2, vec![10]), "enough results");
+        assert_eq!(run(7, 1), (1, vec![10]), "window not filled: no more rows");
+        assert_eq!(run(30, 1), (1, vec![10, 40]), "second window not filled");
+        assert_eq!(
+            run(9999, 1),
+            (1, vec![10, 40, 160, 640, 2560, 4096]),
+            "stops at sqlite-vec's cap"
+        );
+    }
+
+    #[test]
+    fn a_long_record_cant_crowd_others_out_of_semantic_search() {
+        let db = Database::open_in_memory().unwrap();
+        let unit = |i: usize, weight: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[0] = weight;
+            v[i] = (1.0 - weight * weight).sqrt();
+            v
+        };
+        let long = db.meeting_add("long", None, None, None).unwrap();
+        let other = db.meeting_add("other", None, None, None).unwrap();
+        let chunks: Vec<(String, Option<Vec<f32>>)> = (0..30)
+            .map(|i| (format!("c{i}"), Some(unit(i + 1, 0.99 - i as f32 * 0.01))))
+            .collect();
+        db.meeting_store_chunks(long, &chunks).unwrap();
+        db.meeting_store_chunks(other, &[("o".to_string(), Some(unit(40, 0.5)))])
+            .unwrap();
+        let hits = db.meeting_similar(&unit(1, 1.0), 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.meeting.id).collect::<Vec<_>>(),
+            [long, other]
+        );
+    }
 
     #[test]
     fn prose_search_finds_records_that_share_only_some_terms() {

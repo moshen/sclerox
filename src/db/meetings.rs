@@ -280,25 +280,31 @@ impl Database {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(params![query, crate::db::knn_overfetch(limit)], |row| {
-                let meeting = Meeting {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    meeting_date: row.get(2)?,
-                    transcript: row.get(3)?,
-                    notes: row.get(4)?,
-                    created_at: row.get(5)?,
-                };
-                let matched_chunk: String = row.get(6)?;
-                let distance: f64 = row.get(7)?;
-                Ok(SimilarMeeting {
-                    meeting,
-                    score: 1.0 - distance as f32,
-                    matched_chunk,
-                })
-            })?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()?;
-            Ok(crate::db::best_per_record(rows, |r| r.meeting.id, limit))
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(params![query, k], |row| {
+                        let meeting = Meeting {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            meeting_date: row.get(2)?,
+                            transcript: row.get(3)?,
+                            notes: row.get(4)?,
+                            created_at: row.get(5)?,
+                        };
+                        let matched_chunk: String = row.get(6)?;
+                        let distance: f64 = row.get(7)?;
+                        Ok(SimilarMeeting {
+                            meeting,
+                            score: 1.0 - distance as f32,
+                            matched_chunk,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| crate::db::best_per_record(rows, |r| r.meeting.id, limit),
+            )
         })
     }
 }

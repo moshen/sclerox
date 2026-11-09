@@ -424,33 +424,36 @@ impl Database {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(
-                rusqlite::params![query, crate::db::knn_overfetch(limit)],
-                |r| {
-                    let todo = Todo {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        notes: r.get(2)?,
-                        status: r.get(3)?,
-                        source_url: r.get(4)?,
-                        category: r.get(5)?,
-                        originated_date: r.get(6)?,
-                        deadline_date: r.get(7)?,
-                        completed_at: r.get(8)?,
-                        created_at: r.get(9)?,
-                        updated_at: r.get(10)?,
-                    };
-                    let matched_chunk: String = r.get(11)?;
-                    let distance: f64 = r.get(12)?;
-                    Ok(SimilarTodo {
-                        todo,
-                        score: 1.0 - distance as f32,
-                        matched_chunk,
-                    })
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(rusqlite::params![query, k], |r| {
+                        let todo = Todo {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            notes: r.get(2)?,
+                            status: r.get(3)?,
+                            source_url: r.get(4)?,
+                            category: r.get(5)?,
+                            originated_date: r.get(6)?,
+                            deadline_date: r.get(7)?,
+                            completed_at: r.get(8)?,
+                            created_at: r.get(9)?,
+                            updated_at: r.get(10)?,
+                        };
+                        let matched_chunk: String = r.get(11)?;
+                        let distance: f64 = r.get(12)?;
+                        Ok(SimilarTodo {
+                            todo,
+                            score: 1.0 - distance as f32,
+                            matched_chunk,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
                 },
-            )?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()?;
-            Ok(crate::db::best_per_record(rows, |r| r.todo.id, limit))
+                |rows| crate::db::best_per_record(rows, |r| r.todo.id, limit),
+            )
         })
     }
 }

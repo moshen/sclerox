@@ -665,23 +665,29 @@ impl RepoDb {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(params![query, crate::db::knn_overfetch(limit)], |row| {
-                let chunk_text: String = row.get(0)?;
-                let start_line: Option<i64> = row.get(1)?;
-                let end_line: Option<i64> = row.get(2)?;
-                let file_path: String = row.get(3)?;
-                let distance: f64 = row.get(4)?;
-                Ok(SimilarChunk {
-                    file_path,
-                    chunk_text,
-                    start_line,
-                    end_line,
-                    score: 1.0 - distance as f32, // cosine distance -> similarity
-                    last_modified: row.get(5)?,
-                })
-            })?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()?;
-            Ok(distinct_regions(rows, limit))
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(params![query, k], |row| {
+                        let chunk_text: String = row.get(0)?;
+                        let start_line: Option<i64> = row.get(1)?;
+                        let end_line: Option<i64> = row.get(2)?;
+                        let file_path: String = row.get(3)?;
+                        let distance: f64 = row.get(4)?;
+                        Ok(SimilarChunk {
+                            file_path,
+                            chunk_text,
+                            start_line,
+                            end_line,
+                            score: 1.0 - distance as f32, // cosine distance -> similarity
+                            last_modified: row.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| distinct_regions(rows, limit),
+            )
         })
     }
 
@@ -748,6 +754,28 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 1);
+    }
+
+    #[test]
+    fn similar_chunks_look_further_when_overlaps_fill_the_window() {
+        let db = RepoDb::open_in_memory().unwrap();
+        let near = |weight: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[0] = weight;
+            v[1] = (1.0 - weight * weight).sqrt();
+            v
+        };
+        let a = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
+        for i in 0..20 {
+            let weight = 0.99 - i as f32 * 0.01;
+            db.insert_chunk(a, i, "same", Some(1), Some(50), Some(&near(weight)))
+                .unwrap();
+        }
+        db.insert_chunk(a, 20, "separate", Some(100), Some(150), Some(&near(0.5)))
+            .unwrap();
+        let hits = db.similar_chunks(&near(1.0), 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].chunk_text, "separate");
     }
 
     #[test]
