@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::cli::format::{code_chunk_lines, code_location, code_text_lines, stamp, symbol_line};
+use crate::cli::format::{
+    changed, code_chunk_lines, code_location, code_text_lines, stamp, symbol_line,
+};
 use crate::db::Database;
 use crate::output::{print_output, OutputFormat};
 use crate::search::{rank, search_hits, SearchResult};
@@ -136,20 +138,24 @@ pub(crate) fn render(r: &SearchResult) -> String {
             signature,
             file_path,
             start_line,
+            last_modified,
             ..
         } => {
             let sig = signature.as_deref().unwrap_or(name);
             let loc = code_location(repo_path, file_path, Some(*start_line));
-            format!("[symbol] {}", symbol_line(kind, sig, &loc))
+            let at = changed(last_modified.as_deref());
+            format!("[symbol] {}{at}", symbol_line(kind, sig, &loc))
         }
         SearchResult::CodeText {
             repo_path,
             file_path,
             line,
             text,
+            last_modified,
             ..
         } => {
-            let loc = code_location(repo_path, file_path, Some(*line));
+            let loc = code_location(repo_path, file_path, Some(*line))
+                + &changed(last_modified.as_deref());
             format!("[code] {}", code_text_lines(&loc, text))
         }
         SearchResult::CodeChunk {
@@ -158,9 +164,11 @@ pub(crate) fn render(r: &SearchResult) -> String {
             start_line,
             score,
             snippet,
+            last_modified,
             ..
         } => {
-            let loc = code_location(repo_path, file_path, *start_line);
+            let loc = code_location(repo_path, file_path, *start_line)
+                + &changed(last_modified.as_deref());
             format!("[code] {}", code_chunk_lines(*score, &loc, snippet))
         }
     }

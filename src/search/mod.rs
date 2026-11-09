@@ -66,6 +66,9 @@ pub enum SearchResult {
         signature: Option<String>,
         file_path: String,
         start_line: i64,
+        /// When the file last changed: its last commit, or its time on disk
+        /// if it has uncommitted changes. `None` until it is next indexed.
+        last_modified: Option<String>,
     },
     /// A line of an indexed file holding every term of the query (substring,
     /// any case): the full-text tier of code search.
@@ -75,6 +78,7 @@ pub enum SearchResult {
         file_path: String,
         line: i64,
         text: String,
+        last_modified: Option<String>,
     },
     /// A semantically-matched code chunk (not a named symbol) from a repo's
     /// indexed content - catches comments, strings, and logic FTS symbol search
@@ -86,6 +90,7 @@ pub enum SearchResult {
         start_line: Option<i64>,
         score: f32,
         snippet: String,
+        last_modified: Option<String>,
     },
 }
 
@@ -485,6 +490,7 @@ pub fn search_hits_embedded(
                     signature: sym.signature,
                     file_path: sym.file_path,
                     start_line: sym.start_line,
+                    last_modified: sym.last_modified,
                 },
             });
         }
@@ -526,6 +532,7 @@ pub fn search_hits_embedded(
                 start_line: c.start_line,
                 score,
                 snippet: truncate(c.chunk_text.trim(), 120),
+                last_modified: c.last_modified,
             },
         });
     }
@@ -560,6 +567,7 @@ pub fn code_text_hits(
                 file_path: m.file_path,
                 line: m.line,
                 text: truncate(&m.text, 120),
+                last_modified: m.last_modified,
             },
         })),
         Err(e) => log::error!("full-text search failed for repo '{}': {e:#}", repo.name),
@@ -613,6 +621,7 @@ mod tests {
                 file_path: String::new(),
                 line: 1,
                 text: String::new(),
+                last_modified: None,
             },
         };
         let repos: Vec<String> =

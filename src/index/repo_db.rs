@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::db::{
@@ -41,6 +42,8 @@ pub struct Symbol {
     pub signature: Option<String>,
     pub start_line: i64,
     pub end_line: i64,
+    /// When the file last changed; see [`super::file_dates`].
+    pub last_modified: Option<String>,
 }
 
 /// One line of an indexed file that matches a full-text query.
@@ -51,6 +54,7 @@ pub struct TextMatch {
     pub text: String,
     /// The line holds the query's words as one phrase, not just each word.
     pub phrase: bool,
+    pub last_modified: Option<String>,
 }
 
 /// Matching lines reported per file, so one file can't fill every slot.
@@ -63,6 +67,7 @@ pub struct SimilarChunk {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub score: f32,
+    pub last_modified: Option<String>,
 }
 
 impl RepoDb {
@@ -219,16 +224,14 @@ impl RepoDb {
         path: &str,
         language: Option<&str>,
         content_hash: &str,
-        last_modified: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO files (path, language, content_hash, last_modified)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO files (path, language, content_hash)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT(path) DO UPDATE SET
                language = excluded.language,
-               content_hash = excluded.content_hash,
-               last_modified = excluded.last_modified",
-            params![path, language, content_hash, last_modified],
+               content_hash = excluded.content_hash",
+            params![path, language, content_hash],
         )?;
         let id: i64 =
             self.conn
@@ -340,7 +343,7 @@ impl RepoDb {
         let phrase = terms.join(" ");
         let phrase_query = format!("\"{}\"", phrase.replace('"', "\"\""));
         let mut stmt = self.conn.prepare(
-            "SELECT f.path FROM files_fts JOIN files f ON f.id = files_fts.rowid
+            "SELECT f.path, f.last_modified FROM files_fts JOIN files f ON f.id = files_fts.rowid
              WHERE files_fts MATCH ?1
              ORDER BY files_fts.rowid NOT IN
                       (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
@@ -355,6 +358,7 @@ impl RepoDb {
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
             let file_path: String = row.get(0)?;
+            let last_modified: Option<String> = row.get(1)?;
             // A path that resolves outside the repo is never read: a `../`
             // or absolute one from a tampered or shipped repo.db, or an
             // indexed file since replaced by a symlink pointing out.
@@ -392,6 +396,7 @@ impl RepoDb {
                         line: i as i64 + 1,
                         text: l.trim().to_string(),
                         phrase: !not_phrase,
+                        last_modified: last_modified.clone(),
                     }),
             );
         }
@@ -456,7 +461,7 @@ impl RepoDb {
     pub fn callers(&self, symbol_name: &str) -> Result<Vec<(Symbol, String, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line,
-                    e.kind, COALESCE(e.line, 0), e.confidence
+                    e.kind, COALESCE(e.line, 0), e.confidence, f.last_modified
              FROM symbol_edges e
              JOIN symbols s ON s.id = e.from_symbol_id
              JOIN files f ON f.id = s.file_id
@@ -474,6 +479,7 @@ impl RepoDb {
                     signature: r.get(5)?,
                     start_line: r.get(6)?,
                     end_line: r.get(7)?,
+                    last_modified: r.get(11)?,
                 },
                 r.get::<_, String>(8)?,
                 r.get::<_, i64>(9)?,
@@ -486,7 +492,7 @@ impl RepoDb {
     /// Find symbols by exact name match.
     pub fn symbol_by_name(&self, name: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line
+            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line, f.last_modified
              FROM symbols s
              JOIN files f ON s.file_id = f.id
              WHERE s.name = ?1
@@ -502,6 +508,7 @@ impl RepoDb {
                 signature: r.get(5)?,
                 start_line: r.get(6)?,
                 end_line: r.get(7)?,
+                last_modified: r.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -593,7 +600,7 @@ impl RepoDb {
         // (hundreds to low thousands), so a full scan is fast enough.
         let pattern = fts::like_contains(query);
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line
+            "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line, f.last_modified
              FROM symbols s
              JOIN files f ON s.file_id = f.id
              WHERE s.name LIKE ?1 ESCAPE '\\' OR s.signature LIKE ?1 ESCAPE '\\'
@@ -609,6 +616,7 @@ impl RepoDb {
                 signature: row.get(5)?,
                 start_line: row.get(6)?,
                 end_line: row.get(7)?,
+                last_modified: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -626,7 +634,7 @@ impl RepoDb {
         self.semantic_read(|| {
             let query = embedding_to_bytes(query_embedding);
             let mut stmt = self.conn.prepare(
-                "SELECT c.chunk_text, c.start_line, c.end_line, f.path, v.distance
+                "SELECT c.chunk_text, c.start_line, c.end_line, f.path, v.distance, f.last_modified
              FROM chunks_vec v
              JOIN chunks c ON c.id = v.rowid
              JOIN files f ON c.file_id = f.id
@@ -645,10 +653,24 @@ impl RepoDb {
                     start_line,
                     end_line,
                     score: 1.0 - distance as f32, // cosine distance -> similarity
+                    last_modified: row.get(5)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
+    }
+
+    /// Set when each file in `dates` (path to UTC time) last changed.
+    pub fn set_file_dates(&self, dates: &HashMap<String, String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE files SET last_modified = ?2 WHERE path = ?1")?;
+            for (path, at) in dates {
+                stmt.execute(params![path, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn list_files(&self) -> Result<Vec<IndexedFile>> {
@@ -702,7 +724,7 @@ mod tests {
     fn test_upsert_file_and_symbols() {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db
-            .upsert_file("src/main.rs", Some("rust"), "abc123", None)
+            .upsert_file("src/main.rs", Some("rust"), "abc123")
             .unwrap();
         db.insert_symbol(file_id, "function", "main", Some("fn main()"), 1, 10)
             .unwrap();
@@ -746,7 +768,7 @@ mod tests {
     #[test]
     fn test_chunks_similarity() {
         let db = RepoDb::open_in_memory().unwrap();
-        let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h1").unwrap();
         db.insert_chunk(
             file_id,
             0,
@@ -777,7 +799,7 @@ mod tests {
     #[test]
     fn test_reembed_backfill() {
         let db = RepoDb::open_in_memory().unwrap();
-        let file_id = db.upsert_file("a.rs", Some("rust"), "h1", None).unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h1").unwrap();
         // One embedded chunk, one without.
         db.insert_chunk(file_id, 0, "embedded", None, None, Some(&v384(0)))
             .unwrap();
@@ -797,7 +819,7 @@ mod tests {
     fn test_file_hash_cache() {
         let db = RepoDb::open_in_memory().unwrap();
         assert!(db.file_hash("src/main.rs").unwrap().is_none());
-        db.upsert_file("src/main.rs", Some("rust"), "deadbeef", None)
+        db.upsert_file("src/main.rs", Some("rust"), "deadbeef")
             .unwrap();
         assert_eq!(
             db.file_hash("src/main.rs").unwrap().as_deref(),
@@ -813,7 +835,7 @@ mod tests {
         std::fs::write(root.path().join("b.rs"), "fn other() {}\n").unwrap();
         let db = RepoDb::open_in_memory().unwrap();
         for (path, text) in [("a.rs", src), ("b.rs", "fn other() {}\n")] {
-            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.upsert_file(path, Some("rust"), "h").unwrap();
             db.set_file_text(path, text).unwrap();
         }
         let lines = |q: &str| -> Vec<(String, i64)> {
@@ -852,7 +874,7 @@ mod tests {
             ("c.rs", "// gamma delta\n"),
             ("d.rs", "// delta gamma\n// delta gamma\n// delta gamma\n"),
         ] {
-            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.upsert_file(path, Some("rust"), "h").unwrap();
             db.set_file_text(path, text).unwrap();
         }
         let top = db.search_text(root.path(), "gamma delta", 1).unwrap();
@@ -869,7 +891,7 @@ mod tests {
             escape.as_str(),
             outside.path().join("secret.txt").to_str().unwrap(),
         ] {
-            db.upsert_file(path, None, "h", None).unwrap();
+            db.upsert_file(path, None, "h").unwrap();
             db.set_file_text(path, "frobnicate secret\n").unwrap();
         }
         assert!(root.path().join(&escape).exists(), "the escape resolves");
@@ -879,7 +901,7 @@ mod tests {
             .is_empty());
 
         // Re-indexing a file drops its old text.
-        let id = db.upsert_file("a.rs", Some("rust"), "h2", None).unwrap();
+        let id = db.upsert_file("a.rs", Some("rust"), "h2").unwrap();
         db.delete_file_data(id).unwrap();
         assert!(lines("frobnicate").is_empty());
     }
@@ -894,7 +916,7 @@ mod tests {
         std::fs::write(root.path().join("inner.txt"), "frobnicate inside\n").unwrap();
         let db = RepoDb::open_in_memory().unwrap();
         for path in ["a.rs", "in.rs"] {
-            db.upsert_file(path, Some("rust"), "h", None).unwrap();
+            db.upsert_file(path, Some("rust"), "h").unwrap();
             db.set_file_text(path, "frobnicate secret inside\n")
                 .unwrap();
         }
@@ -922,7 +944,7 @@ mod tests {
         let db = RepoDb { conn };
         db.init().unwrap();
         assert_eq!(db.user_version().unwrap(), REPO_VERSION);
-        db.upsert_file("a.rs", None, "h", None).unwrap();
+        db.upsert_file("a.rs", None, "h").unwrap();
         db.set_file_text("a.rs", "hello there").unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "hello there").unwrap();
@@ -939,7 +961,7 @@ mod tests {
         conn.execute_batch(REPO_SCHEMA).unwrap();
         conn.execute_batch("PRAGMA user_version = 4").unwrap();
         let db = RepoDb { conn };
-        let file_id = db.upsert_file("a.rs", Some("rust"), "h", None).unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         let emb = embedded.then(|| v384(0));
         db.conn
             .execute(
@@ -1020,7 +1042,7 @@ mod tests {
     #[test]
     fn test_first_vector_records_the_configured_model() {
         let db = RepoDb::open_in_memory().unwrap();
-        let file_id = db.upsert_file("a.rs", Some("rust"), "h", None).unwrap();
+        let file_id = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         // A chunk without a vector records nothing.
         db.insert_chunk(file_id, 0, "text only", None, None, None)
             .unwrap();
@@ -1041,7 +1063,7 @@ mod tests {
         assert!(db.similar_chunks(&v384(0), 5).unwrap().is_empty());
 
         // New vectors are refused; the chunk text itself is still stored.
-        let file_id = db.upsert_file("b.rs", Some("rust"), "h2", None).unwrap();
+        let file_id = db.upsert_file("b.rs", Some("rust"), "h2").unwrap();
         db.insert_chunk(file_id, 0, "fn b() {}", None, None, Some(&v384(1)))
             .unwrap();
         assert_eq!(db.chunks_without_embedding().unwrap().len(), 1);
@@ -1060,7 +1082,7 @@ mod tests {
         // vectors and doesn't take on embedding the rest.
         let db = repo_db_at_v4(true);
         db.init().unwrap();
-        let file_id = db.upsert_file("b.rs", Some("rust"), "h2", None).unwrap();
+        let file_id = db.upsert_file("b.rs", Some("rust"), "h2").unwrap();
         db.insert_chunk(file_id, 0, "fn b() {}", None, None, None)
             .unwrap();
         let n = db

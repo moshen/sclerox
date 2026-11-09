@@ -1286,6 +1286,122 @@ fn symbol_hits_print_the_same_full_path_everywhere() {
 }
 
 #[test]
+fn code_hits_show_when_their_file_last_changed() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("app");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("lib.rs"), "fn alpha_widget() {}\n").unwrap();
+    git(&repo, &["add", "lib.rs"]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+    e.run(&["repo", "index", "--no-embed", repo.to_str().unwrap()]);
+
+    let committed: i64 = git(&repo, &["log", "-1", "--format=%ct"]).parse().unwrap();
+    let at = chrono::DateTime::from_timestamp(committed, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let want = format!("(changed {at})");
+    for args in [
+        &["search", "alpha_widget"][..],
+        &["code", "search", "alpha_widget"][..],
+        &["repo", "search-symbols", "alpha_widget"][..],
+    ] {
+        let out = e.run(args);
+        assert!(
+            out.contains(&want),
+            "{args:?} printed:\n{out}\nwanted: {want}"
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&e.run(&["search", "alpha_widget", "--output", "json"])).unwrap();
+    let hit = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["type"] == "Symbol");
+    assert_eq!(hit.unwrap()["last_modified"], at.as_str());
+}
+
+#[test]
+fn the_core_types_expose_when_they_were_created() {
+    let e = Env::new();
+    e.run(&["memory", "set", "k1", "a value"]);
+    let person = e
+        .run_get_id(&["people", "add", "--name", "Carol"])
+        .to_string();
+    let meeting = e
+        .run_get_id(&["meeting", "add", "--title", "Sync", "--date", "2026-06-09"])
+        .to_string();
+    let todo = e
+        .run_get_id(&["todo", "add", "--title", "Ship it"])
+        .to_string();
+    e.run(&[
+        "research",
+        "start",
+        "--name",
+        "A question",
+        "--slug",
+        "a-question",
+    ]);
+    for args in [
+        &["memory", "get", "k1"][..],
+        &["people", "get", &person][..],
+        &["meeting", "get", &meeting][..],
+        &["todo", "get", &todo][..],
+        &["research", "get", "a-question"][..],
+    ] {
+        let json = e.run(&[args, &["--output", "json"]].concat());
+        assert!(json.contains("\"created_at\": \""), "{args:?}: {json}");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        assert!(e.run(args).contains(&today), "{args:?} text has no date");
+    }
+}
+
+#[test]
+fn full_shows_every_field_and_untruncated_content_as_text() {
+    let e = Env::new();
+    let long = format!("searchable {}", "word ".repeat(200));
+    let long = long.trim();
+    e.run(&["memory", "set", "long-one", long]);
+    let dir = TempDir::new().unwrap();
+    let transcript = dir.path().join("t.txt");
+    std::fs::write(&transcript, long).unwrap();
+    let meeting = e
+        .run_get_id(&[
+            "meeting",
+            "add",
+            "--title",
+            "Sync",
+            "--transcript-file",
+            transcript.to_str().unwrap(),
+        ])
+        .to_string();
+
+    // Cut without the flag; whole with it, on either side of the subcommand.
+    assert!(!e.run(&["memory", "list"]).contains(long));
+    assert!(!e.run(&["meeting", "get", &meeting]).contains(long));
+    let list = e.run(&["memory", "list", "--full"]);
+    assert!(list.contains(long), "{list}");
+    assert!(list.contains("created_at: "), "{list}");
+    assert!(list.contains("status: active"), "{list}");
+    let got = e.run(&["--full", "meeting", "get", &meeting]);
+    assert!(got.contains(long), "{got}");
+    assert!(got.contains("created_at: "), "{got}");
+
+    let hits = e.run(&["search", "searchable", "--full"]);
+    assert!(hits.contains(long), "{hits}");
+    assert!(hits.contains("updated_at: "), "{hits}");
+
+    // A miss is still its plain message.
+    assert_eq!(
+        e.run(&["memory", "get", "missing", "--full"]),
+        "Not found: missing"
+    );
+}
+
+#[test]
 fn code_text_is_found_word_for_word_without_embeddings() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();

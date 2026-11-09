@@ -1,8 +1,10 @@
+pub mod file_dates;
 pub mod parser;
 pub mod repo_db;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::db::Database;
@@ -268,6 +270,7 @@ impl<'a> RepoIndexer<'a> {
         let mut result = IndexResult::default();
         let mut rechunk_complete = true;
         let mut text_backfill_complete = true;
+        let mut rewritten = HashSet::new();
 
         for path in &files {
             let path = path.as_path();
@@ -385,7 +388,8 @@ impl<'a> RepoIndexer<'a> {
                 }
             }
 
-            let file_id = repo_db.upsert_file(&rel_path, lang, &hash, None)?;
+            let file_id = repo_db.upsert_file(&rel_path, lang, &hash)?;
+            rewritten.insert(rel_path.clone());
             // Keep the vectors of chunks whose text survives the re-chunk, so
             // an edit costs only the chunks it actually changed.
             let kept_vectors = repo_db.file_chunk_vectors(file_id)?;
@@ -450,6 +454,11 @@ impl<'a> RepoIndexer<'a> {
                 chunks.len(),
                 edges.len(),
             );
+        }
+
+        // Dates only label hits, so failing to read them doesn't fail the index.
+        if let Err(e) = file_dates::refresh(&repo_db, repo_root, rewritten) {
+            log::warn!("could not record file dates for '{name}': {e:#}");
         }
 
         if rechunk && rechunk_complete {

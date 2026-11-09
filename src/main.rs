@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod db;
 mod embed;
+mod git;
 mod index;
 mod logging;
 mod migrate;

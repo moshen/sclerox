@@ -43,6 +43,13 @@ pub fn stamp(label: &str, at: &str) -> String {
     format!("({label} {at})")
 }
 
+/// When a code hit's file last changed, to append to its location: empty for
+/// a file not dated yet.
+pub fn changed(at: Option<&str>) -> String {
+    at.map(|at| format!("  {}", stamp("changed", at)))
+        .unwrap_or_default()
+}
+
 /// Map a status string to its checkbox.
 pub fn status_checkbox(status: &str) -> &'static str {
     match status {

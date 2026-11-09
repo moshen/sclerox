@@ -3,7 +3,7 @@ use clap::Subcommand;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
-use crate::cli::format::{code_chunk_lines, code_location, code_text_lines, symbol_line};
+use crate::cli::format::{changed, code_chunk_lines, code_location, code_text_lines, symbol_line};
 use crate::db::repos::RepoEntry;
 use crate::db::Database;
 use crate::index::repo_db::{RepoDb, SimilarChunk, Symbol};
@@ -94,6 +94,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                         signature: s.signature,
                         file_path: s.file_path,
                         start_line: s.start_line,
+                        last_modified: s.last_modified,
                     });
                 }
 
@@ -148,6 +149,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                         start_line: c.start_line,
                         score: c.score,
                         snippet: c.chunk_text,
+                        last_modified: c.last_modified,
                     }),
             );
 
@@ -163,24 +165,28 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                             signature,
                             file_path,
                             start_line,
+                            last_modified,
                             ..
                         } => {
                             let sig = signature.as_deref().unwrap_or(name);
                             let loc = code_location(repo_path, file_path, Some(*start_line));
-                            println!("{}", symbol_line(kind, sig, &loc));
+                            let at = changed(last_modified.as_deref());
+                            println!("{}{at}", symbol_line(kind, sig, &loc));
                         }
                         SearchResult::CodeText {
                             repo_path,
                             file_path,
                             line,
                             text,
+                            last_modified,
                             ..
                         } => {
                             if !text_header {
                                 println!("\nText matches:");
                                 text_header = true;
                             }
-                            let loc = code_location(repo_path, file_path, Some(*line));
+                            let loc = code_location(repo_path, file_path, Some(*line))
+                                + &changed(last_modified.as_deref());
                             println!("  {}", code_text_lines(&loc, text));
                         }
                         SearchResult::CodeChunk {
@@ -189,13 +195,15 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                             start_line,
                             score,
                             snippet,
+                            last_modified,
                             ..
                         } => {
                             if !semantic_header {
                                 println!("\nSemantic matches:");
                                 semantic_header = true;
                             }
-                            let loc = code_location(repo_path, file_path, *start_line);
+                            let loc = code_location(repo_path, file_path, *start_line)
+                                + &changed(last_modified.as_deref());
                             println!("  {}", code_chunk_lines(*score, &loc, snippet));
                         }
                         _ => {}

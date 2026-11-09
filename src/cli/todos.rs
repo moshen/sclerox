@@ -474,6 +474,7 @@ fn print_todo_detail(t: &crate::db::todos::Todo) {
     println!("{checkbox} #{} {}", t.id, t.title);
     println!("  Category:   {}", t.category);
     println!("  Originated: {}", t.originated_date);
+    println!("  Created:    {}", t.created_at);
     if let Some(d) = &t.deadline_date {
         println!("  Deadline:   {d}");
     }

@@ -359,6 +359,7 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                         signature: s.signature,
                         file_path: s.file_path,
                         start_line: s.start_line,
+                        last_modified: s.last_modified,
                     });
                 }
             }
@@ -371,6 +372,7 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                         signature,
                         file_path,
                         start_line,
+                        last_modified,
                         ..
                     } = h
                     {
@@ -380,7 +382,11 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                             file_path,
                             Some(*start_line),
                         );
-                        println!("{}", crate::cli::format::symbol_line(kind, sig, &loc));
+                        let changed = crate::cli::format::changed(last_modified.as_deref());
+                        println!(
+                            "{}{changed}",
+                            crate::cli::format::symbol_line(kind, sig, &loc)
+                        );
                     }
                 }
                 if hits.is_empty() {

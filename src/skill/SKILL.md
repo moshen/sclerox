@@ -133,8 +133,13 @@ list` at session start - they're already visible. Use `sclerox memory get <key>`
 Global search across everything: `sclerox search "<query>"`. Hits come best first
 across all types (people, projects and symbols last). They carry a UTC
 time: `(updated ...)` is when a memory, todo, person, project or research item
-last changed; meetings and repos show only `(created ...)`; code hits have none.
+last changed; meetings and repos show only `(created ...)`; code hits show
+`(changed ...)`, the file's last commit, or its time on disk if it has
+uncommitted changes.
 When two updated hits disagree, the newer one is usually current.
+
+Add the global `--full` flag to see every field and untruncated content as
+text, including search hits and a meeting's whole transcript.
 
 Every command takes `--output json` (a global flag, not `--format`) for
 scripting: stdout is then exactly one JSON document - the records for reads,
