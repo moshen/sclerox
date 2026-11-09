@@ -42,6 +42,10 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = parse_level_filter)]
     pub log_level: Option<crate::logging::LevelFilter>,
 
+    /// Show every field and untruncated content in text output
+    #[arg(long, global = true)]
+    pub full: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -125,6 +129,7 @@ pub enum Commands {
 pub fn run(cli: Cli) -> Result<()> {
     let format = cli.output;
     crate::output::set_format(format);
+    crate::output::set_full(cli.full);
 
     match cli.command {
         Commands::Install(args) => install::run_install(args, format),

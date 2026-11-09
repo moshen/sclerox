@@ -305,6 +305,7 @@ fn print_meeting(m: &Meeting, people: &[MeetingPerson]) {
     println!("ID:    #{}", m.id);
     println!("Title: {}", m.title);
     println!("Date:  {}", m.meeting_date.as_deref().unwrap_or("-"));
+    println!("Created: {}", m.created_at);
     if let Some(notes) = &m.notes {
         println!("Notes:\n{notes}");
     }

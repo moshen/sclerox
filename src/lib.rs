@@ -2,6 +2,7 @@
 // tests and benchmarks. The CLI (cli/, config.rs) is binary-only.
 pub mod db;
 pub mod embed;
+pub mod git;
 pub mod index;
 pub mod migrate;
 pub mod output;

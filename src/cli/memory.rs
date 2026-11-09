@@ -5,7 +5,7 @@ use crate::cli::provenance::{self, RepoInfo};
 use crate::config::settings;
 use crate::db::Database;
 use crate::embed::Embedder;
-use crate::output::{print_miss, print_output, OutputFormat};
+use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum MemoryCommand {
@@ -297,6 +297,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                             if let Some(s) = &successor {
                                 println!("Superseded by: {s}");
                             }
+                            println!("Created: {}", entry.created_at);
                             println!("Updated: {}", entry.updated_at);
                             for line in detail.lines() {
                                 println!("{line}");
@@ -803,15 +804,6 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
         },
     }
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let boundary = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-        format!("{}...", &s[..boundary])
-    }
 }
 
 /// Warn (to stderr) when a memory value exceeds the recommended length.
