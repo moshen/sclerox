@@ -173,19 +173,22 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
     i
 }
 
-/// Cut `s` to at most `max` bytes plus a `...` marker, unless `--full` was
-/// given. The cut backs off to a char boundary, so a multibyte character
-/// straddling `max` can't panic.
+/// Cut displayed text to at most `max` characters plus a `...` marker, unless
+/// `--full` was given.
 pub fn truncate(s: &str, max: usize) -> String {
     if full() {
-        s.to_string()
-    } else {
-        truncate_bounded(s, max)
+        return s.to_string();
+    }
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}...", &s[..cut]),
+        None => s.to_string(),
     }
 }
 
-/// [`truncate`] regardless of `--full`, for text with a real size limit
-/// rather than text being displayed.
+/// Cut `s` to at most `max` bytes plus a `...` marker regardless of `--full`,
+/// for text with a real size limit rather than text being displayed. The cut
+/// backs off to a char boundary, so a multibyte character straddling `max`
+/// can't panic.
 pub fn truncate_bounded(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -199,10 +202,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_backs_off_multibyte_char_at_limit() {
+    fn test_truncate_bounded_backs_off_multibyte_char_at_limit() {
         // 'é' occupies bytes 119..121, so a raw &s[..120] would panic.
         let s = format!("{}é caching", "a".repeat(119));
-        assert_eq!(truncate(&s, 120), format!("{}...", "a".repeat(119)));
+        assert_eq!(truncate_bounded(&s, 120), format!("{}...", "a".repeat(119)));
     }
 
     #[test]
@@ -227,8 +230,15 @@ mod tests {
 
     #[test]
     fn test_truncate_short_and_exact_passthrough() {
-        assert_eq!(truncate("héllo", 6), "héllo");
+        assert_eq!(truncate("héllo", 5), "héllo");
         assert_eq!(truncate("héllo", 100), "héllo");
-        assert_eq!(truncate("héllo", 2), "h...");
+        assert_eq!(truncate("héllo", 2), "hé...");
+    }
+
+    #[test]
+    fn test_truncate_counts_characters_not_bytes() {
+        let s = "語".repeat(81);
+        assert_eq!(truncate(&s, 80), format!("{}...", "語".repeat(80)));
+        assert_eq!(truncate(&"語".repeat(80), 80), "語".repeat(80));
     }
 }
