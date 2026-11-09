@@ -1394,7 +1394,11 @@ fn full_shows_every_field_and_untruncated_content_as_text() {
     assert!(hits.contains(long), "{hits}");
     assert!(hits.contains("updated_at: "), "{hits}");
 
-    // A miss is still its plain message.
+    // An empty list and a miss are still their plain messages.
+    assert_eq!(
+        Env::new().run(&["memory", "list", "--full"]),
+        Env::new().run(&["memory", "list"])
+    );
     assert_eq!(
         e.run(&["memory", "get", "missing", "--full"]),
         "Not found: missing"

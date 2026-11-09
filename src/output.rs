@@ -32,6 +32,8 @@ where
             );
         }
         OutputFormat::Text if full() => match serde_json::to_value(value) {
+            // Nothing to label: the command's own "none found" message.
+            Ok(serde_json::Value::Array(items)) if items.is_empty() => text_fn(),
             Ok(value) => print!("{}", full_text(&value)),
             Err(e) => {
                 log::warn!("--full could not serialize its output: {e}");
