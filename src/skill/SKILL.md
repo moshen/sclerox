@@ -138,6 +138,11 @@ last changed; meetings and repos show only `(created ...)`; code hits show
 uncommitted changes.
 When two updated hits disagree, the newer one is usually current.
 
+Plain questions work: records holding every word come first, then a limited
+number holding only some of them, ignoring words like "why" and "did". Word
+forms match, so `retries` finds "Retry". Semantic hits list a record once, and
+code hits list each separate region of a file once.
+
 Add the global `--full` flag to see every field and untruncated content as
 text, including search hits and a meeting's whole transcript.
 

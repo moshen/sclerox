@@ -1,3 +1,22 @@
+use anyhow::Result;
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, Row};
+
+/// Words too common to say what a query or text is about.
+pub const STOPWORDS: &[&str] = &[
+    "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at", "be", "been",
+    "being", "but", "by", "can", "could", "did", "do", "does", "each", "for", "from", "get", "had",
+    "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "just", "me", "must", "my",
+    "not", "now", "of", "off", "on", "one", "or", "our", "out", "per", "set", "should", "so",
+    "some", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "us", "use", "used", "uses", "very", "via", "was", "we", "were", "what", "when",
+    "where", "which", "who", "why", "will", "with", "would", "you", "your",
+];
+
+/// Most hits the [`loose_query`] tier adds per table: it matches any one term,
+/// so a common term could otherwise bring in most of the table.
+const LOOSE_LIMIT: usize = 10;
+
 /// Sanitize a user-provided query for SQLite FTS5 MATCH.
 ///
 /// FTS5 treats `-`, `AND`, `OR`, `NOT`, `*`, `(`, `)` as operators.
@@ -15,6 +34,95 @@ pub fn sanitize(query: &str) -> String {
         .map(|term| format!("\"{}\"*", term.replace('"', "")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A MATCH query for records holding any significant term of `query`, for
+/// when no record holds them all. Stopwords are left out unless that would
+/// leave nothing. `None` when it would be the same search as [`sanitize`].
+/// bm25 ranks the matches, so a record with rarer terms comes first.
+pub fn loose_query(query: &str) -> Option<String> {
+    let terms: Vec<(String, String)> = query
+        .split_whitespace()
+        .map(|term| {
+            let word = term.trim_matches(|c: char| !c.is_alphanumeric());
+            (term.replace('"', ""), word.to_lowercase())
+        })
+        .filter(|(_, word)| !word.is_empty())
+        .collect();
+    let significant: Vec<&String> = terms
+        .iter()
+        .filter(|(_, word)| !STOPWORDS.contains(&word.as_str()))
+        .map(|(term, _)| term)
+        .collect();
+    let kept = if significant.is_empty() {
+        terms.iter().map(|(term, _)| term).collect()
+    } else {
+        significant
+    };
+    (kept.len() > 1 || (kept.len() == 1 && terms.len() > 1)).then(|| {
+        kept.iter()
+            .map(|term| format!("\"{term}\"*"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+/// Where [`append_loose`] looks: `table`'s full-text index `fts`.
+pub struct LooseSource<'a> {
+    pub fts: &'a str,
+    pub table: &'a str,
+    pub columns: &'a str,
+    /// Keep only rows with this status.
+    pub status: Option<&'a str>,
+}
+
+/// Add the best [`loose_query`] matches that aren't in `hits` yet, after them:
+/// records matching only some terms rank below those matching all of them.
+pub fn append_loose<T>(
+    conn: &Connection,
+    query: &str,
+    source: LooseSource<'_>,
+    hits: &mut Vec<T>,
+    id: impl Fn(&T) -> i64,
+    row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<()> {
+    let Some(loose) = loose_query(query) else {
+        return Ok(());
+    };
+    let LooseSource {
+        fts,
+        table,
+        columns,
+        status,
+    } = source;
+    let seen: std::collections::HashSet<i64> = hits.iter().map(&id).collect();
+    let filter = if status.is_some() {
+        "WHERE status = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {columns} FROM {table}
+         JOIN (SELECT rowid AS hit_id, rank AS hit_rank FROM {fts} WHERE {fts} MATCH ?1) hits
+           ON hits.hit_id = {table}.id
+         {filter}
+         ORDER BY hits.hit_rank LIMIT ?2"
+    );
+    let mut values = vec![
+        Value::Text(loose),
+        Value::Integer((seen.len() + LOOSE_LIMIT) as i64),
+    ];
+    values.extend(status.map(|s| Value::Text(s.to_string())));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(values), row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    hits.extend(
+        rows.into_iter()
+            .filter(|hit| !seen.contains(&id(hit)))
+            .take(LOOSE_LIMIT),
+    );
+    Ok(())
 }
 
 /// A MATCH query for a `tokenize='trigram'` FTS5 table: every term of
@@ -123,6 +231,31 @@ mod tests {
         );
         assert_eq!(trigram_query("fn if"), None);
         assert_eq!(trigram_query(""), None);
+    }
+
+    #[test]
+    fn loose_query_drops_stopwords_and_matches_any_term() {
+        assert_eq!(
+            loose_query("why did we drop CoreML?").as_deref(),
+            Some(r#""drop"* OR "CoreML?"*"#)
+        );
+        assert_eq!(loose_query("what is retry").as_deref(), Some(r#""retry"*"#));
+    }
+
+    #[test]
+    fn loose_query_keeps_the_terms_when_only_stopwords_remain() {
+        assert_eq!(
+            loose_query("what is").as_deref(),
+            Some(r#""what"* OR "is"*"#)
+        );
+    }
+
+    #[test]
+    fn loose_query_is_none_when_it_would_repeat_the_strict_search() {
+        assert_eq!(loose_query("retry"), None);
+        assert_eq!(loose_query("the"), None);
+        assert_eq!(loose_query("- ?"), None);
+        assert_eq!(loose_query(""), None);
     }
 
     #[test]

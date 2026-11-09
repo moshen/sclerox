@@ -70,6 +70,28 @@ pub struct SimilarChunk {
     pub last_modified: Option<String>,
 }
 
+/// The best `limit` of `chunks` (sorted best first), leaving out any that
+/// overlaps a better chunk of the same file. Separate regions of a file stay.
+fn distinct_regions(chunks: Vec<SimilarChunk>, limit: usize) -> Vec<SimilarChunk> {
+    let mut kept: Vec<SimilarChunk> = Vec::new();
+    for chunk in chunks {
+        if kept.len() == limit {
+            break;
+        }
+        let overlaps = |other: &SimilarChunk| {
+            other.file_path == chunk.file_path
+                && matches!(
+                    (chunk.start_line, chunk.end_line, other.start_line, other.end_line),
+                    (Some(a), Some(b), Some(c), Some(d)) if a <= d && c <= b
+                )
+        };
+        if !kept.iter().any(overlaps) {
+            kept.push(chunk);
+        }
+    }
+    kept
+}
+
 impl RepoDb {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -624,7 +646,7 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Top-`limit` code chunks nearest to `query_embedding`, via the sqlite-vec
+    /// The `limit` best regions of code nearest to `query_embedding`, via the sqlite-vec
     /// KNN index (`chunks_vec`, cosine). The index does the distance work in C,
     /// so this is O(log n)-ish instead of a full Rust scan. `score` is cosine
     /// similarity (1 - cosine distance), matching the previous semantics.
@@ -643,7 +665,7 @@ impl RepoDb {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let rows = stmt.query_map(params![query, crate::db::knn_overfetch(limit)], |row| {
                 let chunk_text: String = row.get(0)?;
                 let start_line: Option<i64> = row.get(1)?;
                 let end_line: Option<i64> = row.get(2)?;
@@ -658,7 +680,8 @@ impl RepoDb {
                     last_modified: row.get(5)?,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(distinct_regions(rows, limit))
         })
     }
 
@@ -711,6 +734,51 @@ impl RepoDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_search_finds_a_joined_identifier_from_separate_words() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "struct FinancialDocument;\n";
+        std::fs::write(root.path().join("a.rs"), text).unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        db.upsert_file("a.rs", Some("rust"), "h").unwrap();
+        db.set_file_text("a.rs", text).unwrap();
+        let hits = db
+            .search_text(root.path(), "financial document", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 1);
+    }
+
+    #[test]
+    fn similar_chunks_collapse_overlaps_and_keep_separate_regions() {
+        let db = RepoDb::open_in_memory().unwrap();
+        let near = |weight: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[0] = weight;
+            v[1] = (1.0 - weight * weight).sqrt();
+            v
+        };
+        let a = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
+        let b = db.upsert_file("b.rs", Some("rust"), "h").unwrap();
+        for (file, i, text, start, end, weight) in [
+            (a, 0, "best", 10, 30, 0.99),
+            (a, 1, "overlaps best", 25, 45, 0.98),
+            (a, 2, "separate", 100, 120, 0.97),
+            (b, 0, "same lines, other file", 10, 30, 0.96),
+            (a, 3, "past the limit", 200, 220, 0.5),
+        ] {
+            db.insert_chunk(file, i, text, Some(start), Some(end), Some(&near(weight)))
+                .unwrap();
+        }
+        let texts: Vec<String> = db
+            .similar_chunks(&near(1.0), 3)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.chunk_text)
+            .collect();
+        assert_eq!(texts, ["best", "separate", "same lines, other file"]);
+    }
 
     #[test]
     fn test_repo_db_open_in_memory() {

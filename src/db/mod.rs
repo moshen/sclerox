@@ -20,6 +20,21 @@ use std::sync::Once;
 
 use migrations::{Migration, PRIMARY_MIGRATIONS, PRIMARY_VERSION};
 
+/// How many nearest chunks to ask for so that `limit` remain after collapsing
+/// several chunks of one record. sqlite-vec refuses a `k` above 4096.
+pub(crate) fn knn_overfetch(limit: usize) -> i64 {
+    limit.saturating_mul(5).min(4096) as i64
+}
+
+/// The best row for each record from rows sorted best first, up to `limit`.
+pub(crate) fn best_per_record<T>(rows: Vec<T>, id: impl Fn(&T) -> i64, limit: usize) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|row| seen.insert(id(row)))
+        .take(limit)
+        .collect()
+}
+
 static VEC_INIT: Once = Once::new();
 
 /// Register the sqlite-vec extension so `vec0` virtual tables are available on
@@ -526,6 +541,176 @@ pub fn cosine_of_bytes(a: &[u8], b: &[u8]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_search_finds_records_that_share_only_some_terms() {
+        use crate::db::todos::TodoStatus;
+
+        let db = Database::open_in_memory().unwrap();
+        let text = "Dropped CoreML after the benchmark";
+        db.memory_set("m", text, "general", None).unwrap();
+        db.meeting_add("Review", None, Some(text), None).unwrap();
+        db.people_add("Sam", Some(text)).unwrap();
+        db.project_add("Speedup", Some(text), &[]).unwrap();
+        db.todo_add(text, None, TodoStatus::Open, None, "general", None, None)
+            .unwrap();
+        db.investigation_start("Backends", "backends", Some(text))
+            .unwrap();
+        db.repo_register("/tmp/r", "r", Some(text), "/tmp/r.db", None)
+            .unwrap();
+
+        let query = "why did we drop CoreML";
+        assert_eq!(db.memory_search(query).unwrap().len(), 1);
+        assert_eq!(db.meeting_search(query).unwrap().len(), 1);
+        assert_eq!(db.people_search(query).unwrap().len(), 1);
+        assert_eq!(db.project_search(query).unwrap().len(), 1);
+        assert_eq!(db.todo_search(query).unwrap().len(), 1);
+        assert_eq!(db.investigation_search(query).unwrap().len(), 1);
+        assert_eq!(db.repo_search(query).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prose_search_handles_inflections_and_joined_words() {
+        let db = Database::open_in_memory().unwrap();
+        let keys = |q: &str| -> Vec<String> {
+            db.memory_search(q)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.key)
+                .collect()
+        };
+        db.memory_set("coreml", "Dropped CoreML for ONNX", "general", None)
+            .unwrap();
+        db.memory_set("retry", "Retry a failed request", "general", None)
+            .unwrap();
+        db.memory_set("doc", "Parse a FinancialDocument", "general", None)
+            .unwrap();
+
+        assert_eq!(keys("drop CoreML"), ["coreml"]);
+        assert_eq!(keys("why did we drop CoreML"), ["coreml"]);
+        assert_eq!(keys("retries"), ["retry"]);
+        assert_eq!(keys("financial document"), ["doc"]);
+    }
+
+    #[test]
+    fn records_with_every_term_rank_above_those_with_some() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("some", "alpha only", "general", None)
+            .unwrap();
+        db.memory_set("every", "alpha and beta", "general", None)
+            .unwrap();
+        let hits = db.memory_search("alpha beta").unwrap();
+        assert_eq!(hits[0].key, "every");
+        assert_eq!(hits[1].key, "some");
+        assert_eq!(hits.len(), 2, "no record appears twice");
+    }
+
+    #[test]
+    fn a_common_term_cant_flood_the_results() {
+        let db = Database::open_in_memory().unwrap();
+        for i in 0..30 {
+            db.memory_set(&format!("k{i}"), "alpha", "general", None)
+                .unwrap();
+        }
+        assert_eq!(db.memory_search("alpha beta").unwrap().len(), 10);
+        assert_eq!(db.memory_search("alpha").unwrap().len(), 30);
+    }
+
+    #[test]
+    fn inactive_memories_stay_out_of_the_loose_tier() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set("gone", "alpha", "general", None).unwrap();
+        db.conn
+            .execute("UPDATE memory SET status = 'superseded'", [])
+            .unwrap();
+        assert!(db.memory_search("alpha beta").unwrap().is_empty());
+        assert_eq!(
+            db.memory_search_filtered("alpha beta", "all")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stemming_migration_reindexes_existing_rows_and_keeps_triggers() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE memory_fts;
+                 CREATE VIRTUAL TABLE memory_fts USING fts5(
+                     key, value, memory_type, tags, content=memory, content_rowid=id);",
+            )
+            .unwrap();
+        db.memory_set("old", "Retry a request", "general", None)
+            .unwrap();
+        assert!(db.memory_search("retries").unwrap().is_empty());
+
+        db.conn
+            .execute_batch(crate::db::schema::MIGRATION_V18)
+            .unwrap();
+        assert_eq!(db.memory_search("retries").unwrap().len(), 1);
+
+        db.memory_set("new", "Batches are small", "general", None)
+            .unwrap();
+        assert_eq!(db.memory_search("batch").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn semantic_search_returns_each_record_once_at_its_best_chunk() {
+        use crate::db::todos::TodoStatus;
+
+        let db = Database::open_in_memory().unwrap();
+        let unit = |i: usize, weight: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[0] = weight;
+            v[i] = (1.0 - weight * weight).sqrt();
+            v
+        };
+        // Record 1 has the three nearest chunks; record 2 is next.
+        let chunks = |near: &str, n: usize| -> Vec<(String, Option<Vec<f32>>)> {
+            (0..n)
+                .map(|i| {
+                    let weight = 0.99 - i as f32 * 0.01;
+                    (format!("{near} {i}"), Some(unit(i + 1, weight)))
+                })
+                .collect()
+        };
+        let other = || vec![("other".to_string(), Some(unit(9, 0.5)))];
+        let query = unit(1, 1.0);
+
+        let a = db.meeting_add("a", None, None, None).unwrap();
+        let b = db.meeting_add("b", None, None, None).unwrap();
+        db.meeting_store_chunks(a, &chunks("near", 3)).unwrap();
+        db.meeting_store_chunks(b, &other()).unwrap();
+        let hits = db.meeting_similar(&query, 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.meeting.id).collect::<Vec<_>>(),
+            [a, b]
+        );
+        assert_eq!(hits[0].matched_chunk, "near 0");
+
+        let add = |t| {
+            db.todo_add(t, None, TodoStatus::Open, None, "general", None, None)
+                .unwrap()
+        };
+        let (a, b) = (add("a"), add("b"));
+        db.todo_store_chunks(a, &chunks("near", 3)).unwrap();
+        db.todo_store_chunks(b, &other()).unwrap();
+        let hits = db.todo_similar(&query, 2).unwrap();
+        assert_eq!(hits.iter().map(|h| h.todo.id).collect::<Vec<_>>(), [a, b]);
+
+        let a = db.investigation_start("a", "a", None).unwrap();
+        let b = db.investigation_start("b", "b", None).unwrap();
+        db.investigation_store_chunks(a, &chunks("near", 3))
+            .unwrap();
+        db.investigation_store_chunks(b, &other()).unwrap();
+        let hits = db.investigation_similar(&query, 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.investigation.id).collect::<Vec<_>>(),
+            [a, b]
+        );
+    }
 
     #[test]
     fn cosine_scores_from_stored_vectors() {

@@ -374,6 +374,19 @@ impl Database {
 
         let mut results = fts_hits;
         results.extend(like_extras);
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "memory_fts",
+                table: "memory",
+                columns: MEMORY_COLS,
+                status: filter_status.then_some(status),
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_memory,
+        )?;
         Ok(results)
     }
 
@@ -961,15 +974,9 @@ impl Database {
 /// Significant lowercase tokens of a string: alphanumeric words of 3+ chars,
 /// minus common stopwords. Used for near-duplicate scoring.
 fn significant_tokens(s: &str) -> std::collections::HashSet<String> {
-    const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "have", "has",
-        "had", "not", "but", "its", "into", "when", "then", "than", "them", "they", "use", "used",
-        "uses", "via", "per", "can", "will", "should", "must", "which", "each", "any", "all",
-        "one", "now", "how", "why", "what", "who", "our", "out", "off", "get", "set",
-    ];
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
+        .filter(|w| w.len() >= 3 && !fts::STOPWORDS.contains(w))
         .map(|w| w.to_string())
         .collect()
 }

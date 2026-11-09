@@ -36,9 +36,9 @@ r5 = 0.75
 
 ["current.all"]
 false_rate = 1.0
-mrr = 0.877
-ndcg10 = 0.793
-r10 = 0.848
+mrr = 0.88
+ndcg10 = 0.798
+r10 = 0.859
 r5 = 0.783
 
 ["current.identifier"]
@@ -48,15 +48,15 @@ r10 = 0.7
 r5 = 0.6
 
 ["current.known_item"]
-mrr = 0.625
+mrr = 0.644
 ndcg10 = 0.658
 r10 = 0.75
 r5 = 0.75
 
 ["current.natural_language"]
 mrr = 1.0
-ndcg10 = 0.901
-r10 = 0.9
+ndcg10 = 0.913
+r10 = 0.925
 r5 = 0.9
 
 ["current.no_answer"]
@@ -69,11 +69,11 @@ r10 = 1.0
 r5 = 0.75
 
 ["keyword.all"]
-false_rate = 0.0
-mrr = 0.5
-ndcg10 = 0.441
-r10 = 0.438
-r5 = 0.438
+false_rate = 0.5
+mrr = 0.779
+ndcg10 = 0.772
+r10 = 0.888
+r5 = 0.888
 
 ["keyword.identifier"]
 mrr = 0.9
@@ -82,22 +82,22 @@ r10 = 1.0
 r5 = 1.0
 
 ["keyword.known_item"]
-mrr = 0.75
-ndcg10 = 0.653
-r10 = 0.625
-r5 = 0.625
+mrr = 0.583
+ndcg10 = 0.706
+r10 = 1.0
+r5 = 1.0
 
 ["keyword.natural_language"]
-mrr = 0.4
-ndcg10 = 0.286
-r10 = 0.258
-r5 = 0.258
+mrr = 0.875
+ndcg10 = 0.776
+r10 = 0.842
+r5 = 0.842
 
 ["keyword.no_answer"]
-false_rate = 0.0
+false_rate = 0.5
 
 ["keyword.temporal"]
-mrr = 0.0
-ndcg10 = 0.0
-r10 = 0.0
-r5 = 0.0
+mrr = 0.583
+ndcg10 = 0.625
+r10 = 0.75
+r5 = 0.75

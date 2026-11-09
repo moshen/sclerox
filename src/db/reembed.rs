@@ -1036,7 +1036,8 @@ mod tests {
             .unwrap();
         assert!(!db.memory_set_embedding("new", &unit(1)).unwrap());
         // The memory itself is stored and keyword search still finds it.
-        assert_eq!(db.memory_search("new fact").unwrap().len(), 1);
+        let hits = db.memory_search("new fact").unwrap();
+        assert_eq!(hits[0].key, "new");
         assert_eq!(db.memory_needing_embedding().unwrap().len(), 1);
     }
 }

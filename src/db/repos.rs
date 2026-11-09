@@ -83,8 +83,23 @@ impl Database {
                 OR path LIKE ?2 ESCAPE '\\'
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![fts_query, like_pat], row_to_repo)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut results = stmt
+            .query_map(params![fts_query, like_pat], row_to_repo)?
+            .collect::<Result<Vec<_>, _>>()?;
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "repos_fts",
+                table: "repos",
+                columns: "id, path, name, description, db_path, last_indexed, created_at",
+                status: None,
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_repo,
+        )?;
+        Ok(results)
     }
 
     /// Repos whose description is nearest to `query_embedding`, via the
