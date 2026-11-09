@@ -52,6 +52,13 @@ pub fn refresh(repo_db: &RepoDb, root: &Path, rewritten: HashSet<String>) -> Res
         }
     }
 
+    if needed.is_empty() {
+        if let Some(head) = &head {
+            repo_db.set_meta(DATES_HEAD_KEY, head)?;
+        }
+        return Ok(());
+    }
+
     let mut dates = HashMap::new();
     if let Some(head) = &head {
         let mut wanted = needed.clone();

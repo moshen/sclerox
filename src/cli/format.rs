@@ -45,7 +45,7 @@ pub fn stamp(label: &str, at: &str) -> String {
 
 /// When a code hit's file last changed, to append to its location: empty for
 /// a file not dated yet.
-pub fn changed(at: Option<&str>) -> String {
+fn changed(at: Option<&str>) -> String {
     at.map(|at| format!("  {}", stamp("changed", at)))
         .unwrap_or_default()
 }
@@ -67,10 +67,26 @@ pub fn code_location(repo_root: &str, file_path: &str, line: Option<i64>) -> Str
     terminal_safe(&format!("{repo_root}/{file_path}{line}"))
 }
 
-/// A symbol hit: `[kind] signature (location)`, made [`terminal_safe`] (a
-/// signature is source text).
-pub fn symbol_line(kind: &str, signature: &str, location: &str) -> String {
-    terminal_safe(&format!("[{kind}] {signature} ({location})"))
+/// [`code_location`] followed by when the file last [`changed`].
+pub fn dated_location(
+    repo_root: &str,
+    file_path: &str,
+    line: Option<i64>,
+    last_modified: Option<&str>,
+) -> String {
+    code_location(repo_root, file_path, line) + &changed(last_modified)
+}
+
+/// A symbol hit: `[kind] signature (location)` and when its file last
+/// [`changed`], made [`terminal_safe`] (a signature is source text).
+pub fn symbol_line(
+    kind: &str,
+    signature: &str,
+    location: &str,
+    last_modified: Option<&str>,
+) -> String {
+    let changed = changed(last_modified);
+    terminal_safe(&format!("[{kind}] {signature} ({location}){changed}"))
 }
 
 /// `text` safe to print: repo content (file names, source) is untrusted, so
@@ -148,7 +164,7 @@ mod tests {
         let loc = code_location("/r", "x\u{1b}]0;pwned\u{7}.rs", Some(3));
         assert_eq!(loc, "/r/x\\u{1b}]0;pwned\\u{7}.rs:3");
         assert_eq!(terminal_safe(&loc), loc, "idempotent");
-        let sym = symbol_line("fn", "fn a() { \"\u{1b}[2J\" }", &loc);
+        let sym = symbol_line("fn", "fn a() { \"\u{1b}[2J\" }", &loc, None);
         assert!(!sym.chars().any(char::is_control), "{sym}");
     }
 

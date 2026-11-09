@@ -32,6 +32,9 @@ pub fn git_command(dir: &Path) -> Command {
     for var in GIT_REPO_ENV {
         command.env_remove(var);
     }
+    // Sclerox only reads repos, and may do so from a hook while the user runs
+    // git: an optional index refresh could make their command fail on the lock.
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     command.stdin(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
     command

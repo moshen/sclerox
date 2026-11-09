@@ -382,10 +382,14 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                             file_path,
                             Some(*start_line),
                         );
-                        let changed = crate::cli::format::changed(last_modified.as_deref());
                         println!(
-                            "{}{changed}",
-                            crate::cli::format::symbol_line(kind, sig, &loc)
+                            "{}",
+                            crate::cli::format::symbol_line(
+                                kind,
+                                sig,
+                                &loc,
+                                last_modified.as_deref()
+                            )
                         );
                     }
                 }
