@@ -468,7 +468,19 @@ fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
 
 /// Run git in `dir` with a fixed identity; trimmed stdout.
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    // Nothing from a surrounding git process (a hook, say) picks the repo.
+    for var in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(var);
+    }
+    let out = command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -479,10 +491,7 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         // Not the user's or the system's config: no signing, hooks
         // or default-branch settings leak in.
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            std::env::temp_dir().join("sclerox-no-gitconfig"),
-        )
+        .env("GIT_CONFIG_GLOBAL", dir.join(".no-gitconfig"))
         .output()
         .unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -614,6 +623,32 @@ fn a_hand_written_memory_records_its_repo_and_can_be_scoped_to_it() {
 }
 
 #[test]
+fn a_memory_describes_its_own_repo_when_run_from_a_git_hook() {
+    let e = Env::new();
+    let (first_parent, second_parent) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (repo, _, _) = git_repo(first_parent.path());
+    let (other, _, _) = git_repo(second_parent.path());
+    git(
+        &other,
+        &["remote", "set-url", "origin", "git@example.com:o/other.git"],
+    );
+
+    // Git points its hooks at a repository through the environment.
+    let out = e
+        .cmd()
+        .current_dir(&repo)
+        .env("GIT_DIR", other.join(".git"))
+        .args(["memory", "set", "k", "v", "--repo"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let out = e.run(&["--output", "json", "memory", "get", "k"]);
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(m["repos"][0]["remote"], "example.com/o/app");
+}
+
+#[test]
 fn a_distilled_memory_traces_to_its_session_lines_and_repo() {
     let e = Env::new();
     let tmp = TempDir::new().unwrap();
@@ -740,6 +775,33 @@ fn compressing_a_memory_leaves_unrelated_rows_alone() {
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Saved 1 memories."), "{stdout}");
+
+    // The JSON result lists only what was written.
+    e.run(&["memory", "set", "verbose-2", "another long note"]);
+    let out = e
+        .cmd()
+        .current_dir(tmp.path())
+        .env("SCLEROX_EMBED_ENABLED", "false")
+        .args([
+            "--output",
+            "json",
+            "memory",
+            "distill",
+            "verbose-2",
+            "--via",
+            &format!("sh -c 'cat \"{resp_arg}\"' sh"),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let keys: Vec<_> = result["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys, ["thing-one"]);
 
     // "verbose" was superseded into thing-one; "other" kept its value and
     // gained no distill source.

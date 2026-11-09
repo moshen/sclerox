@@ -241,16 +241,43 @@ pub fn describe(p: &Provenance) -> String {
     parts.join(", ")
 }
 
+/// What `git rev-parse --local-env-vars` lists: variables that tie a git
+/// command to one repository. Git sets them while it runs hooks, where they
+/// would otherwise name that repo instead of the one being asked about.
+const GIT_REPO_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
+/// A git command that runs on the repo at `dir`, whatever the environment
+/// says.
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
+    for var in GIT_REPO_ENV {
+        command.env_remove(var);
+    }
+    command.stdin(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    command
+}
+
 /// Run git in `dir`; its trimmed stdout when it succeeds.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = git_command(dir).args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -259,13 +286,9 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// Run git in `dir`; whether it succeeded.
 fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    git_command(dir)
         .args(args)
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -415,6 +438,23 @@ pub fn normalize_remote(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Run git in `dir` with a fixed identity, away from the caller's
+    /// repository and git config; trimmed stdout.
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let out = git_command(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", dir.join(".no-gitconfig"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     #[test]
     fn https_and_ssh_remotes_normalize_alike() {
         let want = Some("github.com/moshen/sclerox".to_string());
@@ -466,27 +506,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("proj");
         std::fs::create_dir(&repo).unwrap();
-        let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                // Not the user's or the system's config: no signing, hooks
-                // or default-branch settings leak in.
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env(
-                    "GIT_CONFIG_GLOBAL",
-                    std::env::temp_dir().join("sclerox-no-gitconfig"),
-                )
-                .output()
-                .unwrap();
-            assert!(ok.status.success(), "{args:?}: {ok:?}");
-            String::from_utf8_lossy(&ok.stdout).trim().to_string()
-        };
+        let run = |args: &[&str]| test_git(&repo, args);
         run(&["init", "-q", "-b", "main"]);
         run(&["commit", "-q", "--allow-empty", "-m", "first"]);
         let first = run(&["rev-parse", "HEAD"]);
@@ -544,24 +564,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         let git_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                // Not the user's or the system's config: no signing, hooks
-                // or default-branch settings leak in.
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env(
-                    "GIT_CONFIG_GLOBAL",
-                    std::env::temp_dir().join("sclerox-no-gitconfig"),
-                )
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{args:?}: {out:?}");
+            test_git(dir, args);
         };
         std::fs::create_dir(&src).unwrap();
         git_in(&src, &["init", "-q", "-b", "main"]);

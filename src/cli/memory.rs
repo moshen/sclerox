@@ -639,7 +639,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                 });
             } else {
                 let mut embedder = crate::embed::optional(db.semantic_ready());
-                let mut saved = 0usize;
+                let mut written = Vec::new();
                 for m in &memories {
                     warn_if_long(&m.key, &m.value);
                     // Each memory lands with its source, scope and project,
@@ -649,7 +649,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         &db.conn,
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
-                    let written = match &existing_key {
+                    let stored = match &existing_key {
                         // Compressing a single existing entry: supersede it,
                         // or update in place when the AI kept the same key.
                         Some(old_key) if old_key != &m.key => db.memory_supersede(
@@ -672,7 +672,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     };
                     // Nothing written (the key being compressed is no longer
                     // active): leave whatever row holds this key alone.
-                    if !written {
+                    if !stored {
                         if format == OutputFormat::Text {
                             eprintln!(
                                 "skipped '{}': '{}' is no longer active",
@@ -682,7 +682,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         }
                         continue;
                     }
-                    saved += 1;
+                    written.push(m);
                     if let Some(entry) = db.memory_get(&m.key)? {
                         db.memory_provenance_add(entry.id, &source)?;
                     }
@@ -692,7 +692,10 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                         embed_and_store(db, e, &m.key, &m.value);
                     }
                 }
-                print_output(format, &result, || println!("\nSaved {saved} memories."));
+                let result = serde_json::json!({"memories": written, "saved": true});
+                print_output(format, &result, || {
+                    println!("\nSaved {} memories.", written.len())
+                });
             }
         }
 
