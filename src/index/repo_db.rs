@@ -92,6 +92,24 @@ fn distinct_regions(chunks: Vec<SimilarChunk>, limit: usize) -> Vec<SimilarChunk
     kept
 }
 
+/// How well a symbol's name matches `query`, lower first: the exact name,
+/// then the same name in another case, a prefix, a substring, and last a
+/// match only in the signature.
+pub fn symbol_match(name: &str, query: &str) -> u8 {
+    let (name_lc, query_lc) = (name.to_lowercase(), query.to_lowercase());
+    if name == query {
+        0
+    } else if name_lc == query_lc {
+        1
+    } else if name_lc.starts_with(&query_lc) {
+        2
+    } else if name_lc.contains(&query_lc) {
+        3
+    } else {
+        4
+    }
+}
+
 impl RepoDb {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -618,6 +636,8 @@ impl RepoDb {
         )
     }
 
+    /// Symbols whose name or signature holds `query`, best first: see
+    /// [`symbol_match`].
     pub fn search_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
         // Use LIKE for substring matching so "Sumo" finds "SumoClient" and
         // "SearchJob" finds "CreateSearchJobRequest". Symbol tables are small
@@ -643,7 +663,9 @@ impl RepoDb {
                 last_modified: row.get(8)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut symbols = rows.collect::<Result<Vec<_>, _>>()?;
+        symbols.sort_by_key(|s| symbol_match(&s.name, query));
+        Ok(symbols)
     }
 
     /// The `limit` best regions of code nearest to `query_embedding`, via the sqlite-vec
@@ -740,6 +762,28 @@ impl RepoDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_match_puts_the_exact_name_then_prefixes_then_substrings() {
+        let mut names = [
+            "reparse_invoice",
+            "parse_invoice_line",
+            "Parse_Invoice",
+            "invoice_tools",
+            "parse_invoice",
+        ];
+        names.sort_by_key(|n| symbol_match(n, "parse_invoice"));
+        assert_eq!(
+            names,
+            [
+                "parse_invoice",
+                "Parse_Invoice",
+                "parse_invoice_line",
+                "reparse_invoice",
+                "invoice_tools",
+            ]
+        );
+    }
 
     #[test]
     fn code_search_finds_a_joined_identifier_from_separate_words() {

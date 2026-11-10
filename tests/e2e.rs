@@ -1360,6 +1360,40 @@ fn the_core_types_expose_when_they_were_created() {
 }
 
 #[test]
+fn search_shows_a_limited_number_of_results_and_says_so() {
+    let e = Env::new();
+    for i in 0..5 {
+        e.run(&[
+            "memory",
+            "set",
+            &format!("fish-{i}"),
+            "zebrafish need warm water",
+        ]);
+    }
+    let lines = |out: &str| out.lines().filter(|l| l.starts_with("[memory]")).count();
+
+    let cut = e.run(&["search", "zebrafish", "--limit", "2"]);
+    assert_eq!(lines(&cut), 2, "{cut}");
+    assert!(cut.contains("Showing 2 of 5 results"), "{cut}");
+    let all = e.run(&["search", "zebrafish", "--all"]);
+    assert_eq!(lines(&all), 5, "{all}");
+    assert!(all.ends_with("5 results"), "{all}");
+    let full = e.run(&["--full", "search", "zebrafish", "--limit", "2"]);
+    assert!(full.contains("Showing 2 of 5 results"), "{full}");
+
+    // JSON stays a list of hits, with the note on stderr.
+    let out = e
+        .cmd()
+        .args(["--output", "json", "search", "zebrafish", "--limit", "2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(hits.as_array().unwrap().len(), 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Showing 2 of 5 results"));
+}
+
+#[test]
 fn search_full_returns_each_hits_whole_record() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();

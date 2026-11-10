@@ -96,6 +96,11 @@ Unset similarity thresholds follow the model, since each scores on its own
 scale (`sclerox config show` prints the effective values).
 `search.code_text_limit` caps the code lines `code search` and `sclerox search`
 show for matching the query word for word (default 20).
+`search.result_limit` (default 20) and `search.token_budget` (default 2000,
+counted at about 4 bytes per token) cap what `sclerox search` shows; its
+`--limit N` and `--all` override them. `search.ranking = "cosine"` orders hits
+by semantic score alone instead of the default `"fusion"`, which combines each
+type's keyword order with semantic score.
 `search.semantic_margin` drops semantic hits scoring more than that below the
 best hit for the query (Granite default 0.05; `1.0` turns it off).
 Distillation merges a near-duplicate into the memory it matched only at or

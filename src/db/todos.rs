@@ -132,54 +132,18 @@ impl Database {
     }
 
     pub fn todo_search(&self, query: &str) -> Result<Vec<Todo>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-
-        // Tier 1: FTS prefix matches (fast, word-boundary aware)
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, notes, status, source_url, category, originated_date,
-                    deadline_date, completed_at, created_at, updated_at
-             FROM todos
-             WHERE id IN (SELECT rowid FROM todos_fts WHERE todos_fts MATCH ?1)
-             ORDER BY updated_at DESC",
-        )?;
-        let fts_hits: Vec<Todo> = stmt
-            .query_map(params![fts_query], row_to_todo)?
-            .collect::<Result<Vec<_>, _>>()?;
-        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|t| t.id).collect();
-
-        // Tier 2: LIKE substring fallback - catches mid-word occurrences not found by FTS
-        let mut stmt2 = self.conn.prepare(
-            "SELECT id, title, notes, status, source_url, category, originated_date,
-                    deadline_date, completed_at, created_at, updated_at
-             FROM todos
-             WHERE (title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\')
-             ORDER BY updated_at DESC",
-        )?;
-        let like_extras: Vec<Todo> = stmt2
-            .query_map(params![like_pat], row_to_todo)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|t| !fts_ids.contains(&t.id))
-            .collect();
-
-        let mut results = fts_hits;
-        results.extend(like_extras);
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "todos_fts",
-                table: "todos",
-                columns: "id, title, notes, status, source_url, category, originated_date,
-                    deadline_date, completed_at, created_at, updated_at",
-                status: None,
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_todo,
-        )?;
-        Ok(results)
+        let source = fts::Source {
+            fts: "todos_fts",
+            table: "todos",
+            columns: "id, title, notes, status, source_url, category, originated_date,
+                  deadline_date, completed_at, created_at, updated_at",
+            // title, notes, category, status
+            weights: &[4.0, 1.0, 1.0, 1.0],
+            like: "title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\'",
+            then_by: "updated_at DESC",
+            status: None,
+        };
+        fts::search(&self.conn, query, &source, |hit| hit.id, row_to_todo)
     }
 
     /// Mark a todo done and record a resolution note in notes.
@@ -487,6 +451,30 @@ mod tests {
 
     fn db() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn todo_search_ranks_a_title_match_above_newer_mentions_in_notes() {
+        let db = db();
+        let add = |title, notes| {
+            db.todo_add(title, notes, TodoStatus::Open, None, "general", None, None)
+                .unwrap()
+        };
+        let titled = add("Backlog grooming", None);
+        let noted = add("Clean up", Some("after the backlog review, tidy the board"));
+        db.conn
+            .execute(
+                "UPDATE todos SET updated_at = datetime('now', '+1 day') WHERE id = ?1",
+                [noted],
+            )
+            .unwrap();
+        let ids: Vec<i64> = db
+            .todo_search("backlog")
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, [titled, noted]);
     }
 
     #[test]

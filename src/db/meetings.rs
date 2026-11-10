@@ -95,50 +95,17 @@ impl Database {
     }
 
     pub fn meeting_search(&self, query: &str) -> Result<Vec<Meeting>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, meeting_date, transcript, notes, created_at
-             FROM meetings
-             WHERE id IN (SELECT rowid FROM meetings_fts WHERE meetings_fts MATCH ?1)
-             ORDER BY meeting_date DESC",
-        )?;
-        let fts_hits: Vec<Meeting> = stmt
-            .query_map(params![fts_query], row_to_meeting)?
-            .collect::<Result<Vec<_>, _>>()?;
-        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
-
-        let mut stmt2 = self.conn.prepare(
-            "SELECT id, title, meeting_date, transcript, notes, created_at
-             FROM meetings
-             WHERE (title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\'
-                 OR transcript LIKE ?1 ESCAPE '\\')
-             ORDER BY meeting_date DESC",
-        )?;
-        let like_extras: Vec<Meeting> = stmt2
-            .query_map(params![like_pat], row_to_meeting)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|m| !fts_ids.contains(&m.id))
-            .collect();
-
-        let mut results = fts_hits;
-        results.extend(like_extras);
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "meetings_fts",
-                table: "meetings",
-                columns: "id, title, meeting_date, transcript, notes, created_at",
-                status: None,
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_meeting,
-        )?;
-        Ok(results)
+        let source = fts::Source {
+            fts: "meetings_fts",
+            table: "meetings",
+            columns: "id, title, meeting_date, transcript, notes, created_at",
+            // title, transcript, notes
+            weights: &[4.0, 1.0, 1.0],
+            like: "title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\' OR transcript LIKE ?1 ESCAPE '\\'",
+            then_by: "meeting_date DESC",
+            status: None,
+        };
+        fts::search(&self.conn, query, &source, |hit| hit.id, row_to_meeting)
     }
 
     pub fn meeting_update(

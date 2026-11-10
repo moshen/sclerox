@@ -73,33 +73,18 @@ impl Database {
     /// Repos whose name or description matches `query` in full text (word
     /// prefixes), or whose name, description or path holds it as a substring.
     pub fn repo_search(&self, query: &str) -> Result<Vec<RepoEntry>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, description, db_path, last_indexed, created_at
-             FROM repos
-             WHERE id IN (SELECT rowid FROM repos_fts WHERE repos_fts MATCH ?1)
-                OR name LIKE ?2 ESCAPE '\\' OR description LIKE ?2 ESCAPE '\\'
-                OR path LIKE ?2 ESCAPE '\\'
-             ORDER BY name",
-        )?;
-        let mut results = stmt
-            .query_map(params![fts_query, like_pat], row_to_repo)?
-            .collect::<Result<Vec<_>, _>>()?;
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "repos_fts",
-                table: "repos",
-                columns: "id, path, name, description, db_path, last_indexed, created_at",
-                status: None,
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_repo,
-        )?;
-        Ok(results)
+        let source = fts::Source {
+            fts: "repos_fts",
+            table: "repos",
+            columns: "id, path, name, description, db_path, last_indexed, created_at",
+            // name, description
+            weights: &[4.0, 1.0],
+            like: "name LIKE ?1 ESCAPE '\\' OR description LIKE ?1 ESCAPE '\\'
+                OR path LIKE ?1 ESCAPE '\\'",
+            then_by: "name",
+            status: None,
+        };
+        fts::search(&self.conn, query, &source, |hit| hit.id, row_to_repo)
     }
 
     /// Repos whose description is nearest to `query_embedding`, via the

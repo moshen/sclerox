@@ -131,7 +131,13 @@ list` at session start - they're already visible. Use `sclerox memory get <key>`
 ## Reference
 
 Global search across everything: `sclerox search "<query>"`. Hits come best first
-across all types (people, projects and symbols last). They carry a UTC
+across all types: a hit found by both keyword and meaning ranks above one found
+only one way, and a record whose key, title or name is exactly the query comes
+first. Within a type, a match in a key, title or name beats one in body text,
+and a symbol named exactly the query beats one that only starts with it or
+holds it. Keyword hits show the passage that matched. It shows the best 20 or
+about 2000 tokens of hits, whichever is fewer, and says when it cut any:
+`--limit N` shows N, `--all` shows every one. Hits carry a UTC
 time: `(updated ...)` is when a memory, todo, person, project or research item
 last changed; meetings and repos show only `(created ...)`; code hits show
 `(changed ...)`, the file's last commit, or its time on disk if it has
