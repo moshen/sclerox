@@ -439,7 +439,7 @@ fn store_todo_chunks(
 ) {
     let source = text_chunks::todo_source(title, notes);
     if let Err(e) = text_chunks::store(db, TextChunkKind::Todo, id, &source, Some(embedder)) {
-        log::debug!("could not embed todo #{id}: {e:#}");
+        log::warn!("could not embed todo #{id}: {e:#}");
     }
 }
 
