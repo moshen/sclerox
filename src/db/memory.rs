@@ -983,11 +983,18 @@ impl Database {
 }
 
 /// Significant lowercase tokens of a string: alphanumeric words of 3+ chars,
-/// minus common stopwords. Used for near-duplicate scoring.
+/// minus common stopwords. Used for near-duplicate scoring, so unlike
+/// [`fts::STOPWORDS`] it keeps words like "after" that can change a fact.
 fn significant_tokens(s: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "have", "has",
+        "had", "not", "but", "its", "into", "when", "then", "than", "them", "they", "use", "used",
+        "uses", "via", "per", "can", "will", "should", "must", "which", "each", "any", "all",
+        "one", "now", "how", "why", "what", "who", "our", "out", "off", "get", "set",
+    ];
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3 && !fts::STOPWORDS.contains(w))
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
         .map(|w| w.to_string())
         .collect()
 }
@@ -1511,6 +1518,8 @@ mod tests {
 
         // Empty proposed -> zero.
         assert_eq!(token_overlap("the and for", "anything here"), 0.0);
+        // A word that reverses the fact still counts against a duplicate.
+        assert!(token_overlap("deploy after approval", "deploy before approval") < 1.0);
     }
 
     /// Two active memories plus a flagged conflict between them.
