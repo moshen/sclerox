@@ -67,62 +67,123 @@ pub fn loose_query(query: &str) -> Option<String> {
     })
 }
 
-/// Where [`append_loose`] looks: `table`'s full-text index `fts`.
-pub struct LooseSource<'a> {
+/// A table and its full-text index `fts`, and how [`search`] ranks matches.
+pub struct Source<'a> {
     pub fts: &'a str,
     pub table: &'a str,
     pub columns: &'a str,
+    /// bm25 weight of each indexed column, in the index's order, so a match in
+    /// a key, title or name counts for more than one in body text.
+    pub weights: &'a [f64],
+    /// Substring match on `table`, with `?1` as the [`like_contains`] pattern.
+    pub like: &'a str,
+    /// Orders substring matches, which have no bm25 score, and breaks ties.
+    pub then_by: &'a str,
     /// Keep only rows with this status.
     pub status: Option<&'a str>,
 }
 
-/// Add the best [`loose_query`] matches that aren't in `hits` yet, after them:
-/// records matching only some terms rank below those matching all of them.
-pub fn append_loose<T>(
+impl Source<'_> {
+    fn bm25(&self) -> String {
+        let weights: Vec<String> = self.weights.iter().map(|w| w.to_string()).collect();
+        format!("bm25({}, {})", self.fts, weights.join(", "))
+    }
+
+    /// `table` joined to its rows matching `?1`, best first. `?2` is a row
+    /// limit; the status, when kept, is `?3`.
+    fn matching(&self) -> String {
+        let (columns, table, fts) = (self.columns, self.table, self.fts);
+        format!(
+            "SELECT {columns} FROM {table}
+             JOIN (SELECT rowid AS hit_id, {bm25} AS hit_rank FROM {fts} WHERE {fts} MATCH ?1) hits
+               ON hits.hit_id = {table}.id
+             {filter}
+             ORDER BY hits.hit_rank, {then_by} LIMIT ?2",
+            bm25 = self.bm25(),
+            filter = self.status_filter("WHERE"),
+            then_by = self.then_by,
+        )
+    }
+
+    fn status_filter(&self, join: &str) -> String {
+        match self.status {
+            Some(_) => format!("{join} {}.status = ?3", self.table),
+            None => String::new(),
+        }
+    }
+
+    fn query<T>(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        pattern: String,
+        limit: Option<usize>,
+        row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut values = vec![
+            Value::Text(pattern),
+            Value::Integer(limit.map_or(-1, |n| n as i64)),
+        ];
+        values.extend(self.status.map(|s| Value::Text(s.to_string())));
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(values), row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// Records holding every term of `query`, by weighted bm25, then those
+/// holding it as a substring, which full-text matching misses mid-word.
+pub fn search_all_terms<T>(
     conn: &Connection,
     query: &str,
-    source: LooseSource<'_>,
-    hits: &mut Vec<T>,
+    source: &Source<'_>,
     id: impl Fn(&T) -> i64,
-    row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
-) -> Result<()> {
-    let Some(loose) = loose_query(query) else {
-        return Ok(());
-    };
-    let LooseSource {
-        fts,
-        table,
-        columns,
-        status,
-    } = source;
+    mut row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let mut hits = source.query(conn, &source.matching(), sanitize(query), None, &mut row)?;
     let seen: std::collections::HashSet<i64> = hits.iter().map(&id).collect();
-    let filter = if status.is_some() {
-        "WHERE status = ?3"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT {columns} FROM {table}
-         JOIN (SELECT rowid AS hit_id, rank AS hit_rank FROM {fts} WHERE {fts} MATCH ?1) hits
-           ON hits.hit_id = {table}.id
-         {filter}
-         ORDER BY hits.hit_rank LIMIT ?2"
+    let like = format!(
+        "SELECT {columns} FROM {table} WHERE ({like}) {filter} ORDER BY {then_by} LIMIT ?2",
+        columns = source.columns,
+        table = source.table,
+        like = source.like,
+        filter = source.status_filter("AND"),
+        then_by = source.then_by,
     );
-    let mut values = vec![
-        Value::Text(loose),
-        Value::Integer((seen.len() + LOOSE_LIMIT) as i64),
-    ];
-    values.extend(status.map(|s| Value::Text(s.to_string())));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_from_iter(values), row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let substring = source.query(conn, &like, like_contains(query), None, &mut row)?;
+    hits.extend(substring.into_iter().filter(|hit| !seen.contains(&id(hit))));
+    Ok(hits)
+}
+
+/// [`search_all_terms`], then the best few records holding only some of the
+/// terms (see [`loose_query`]).
+pub fn search<T>(
+    conn: &Connection,
+    query: &str,
+    source: &Source<'_>,
+    id: impl Fn(&T) -> i64,
+    mut row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let mut hits = search_all_terms(conn, query, source, &id, &mut row)?;
+    let Some(loose) = loose_query(query) else {
+        return Ok(hits);
+    };
+    let seen: std::collections::HashSet<i64> = hits.iter().map(&id).collect();
+    let rows = source.query(
+        conn,
+        &source.matching(),
+        loose,
+        Some(seen.len() + LOOSE_LIMIT),
+        row,
+    )?;
     hits.extend(
         rows.into_iter()
             .filter(|hit| !seen.contains(&id(hit)))
             .take(LOOSE_LIMIT),
     );
-    Ok(())
+    Ok(hits)
 }
 
 /// A MATCH query for a `tokenize='trigram'` FTS5 table: every term of

@@ -6,23 +6,49 @@ use crate::cli::format::{
 };
 use crate::db::Database;
 use crate::output::{full, print_output, OutputFormat};
-use crate::search::{rank, search_hits, SearchResult};
+use crate::search::{order, search_hits, Hit, SearchResult};
 
 #[derive(Args)]
 pub struct SearchArgs {
     pub query: String,
+    /// Show at most this many results (default: search.result_limit)
+    #[arg(long, conflicts_with = "all")]
+    pub limit: Option<usize>,
+    /// Show every result, past the result limit and token budget
+    #[arg(long)]
+    pub all: bool,
 }
 
 pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> {
     let s = crate::config::settings();
-    let hits = rank(search_hits(
-        db,
+    let hits = order(
+        search_hits(
+            db,
+            &args.query,
+            s.semantic_threshold() as f32,
+            s.semantic_margin().map(|m| m as f32),
+            s.search.semantic_limit,
+            s.search.code_text_limit,
+        )?,
         &args.query,
-        s.semantic_threshold() as f32,
-        s.semantic_margin().map(|m| m as f32),
-        s.search.semantic_limit,
-        s.search.code_text_limit,
-    )?);
+        s.search.ranking,
+    );
+    let found = hits.len();
+    let hits = if args.all {
+        hits
+    } else {
+        within(
+            hits,
+            args.limit.unwrap_or(s.search.result_limit),
+            s.search.token_budget,
+        )
+    };
+    let cut = (hits.len() < found).then(|| {
+        format!(
+            "Showing {} of {found} results; --limit N or --all shows more.",
+            hits.len()
+        )
+    });
     let logged: Vec<_> = hits.iter().map(crate::cli::usage::hit_item).collect();
     let results: Vec<SearchResult> = hits.into_iter().map(|h| h.result).collect();
     let show = || {
@@ -33,8 +59,15 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
         for r in &results {
             println!("{}", render(r));
         }
-        println!("\n{} results", results.len());
+        match &cut {
+            Some(cut) => println!("\n{cut}"),
+            None => println!("\n{} results", results.len()),
+        }
     };
+    // JSON stays a list of hits, so the note goes to stderr.
+    if let (Some(cut), false) = (&cut, matches!(format, OutputFormat::Text)) {
+        eprintln!("{cut}");
+    }
     if full() {
         print_output(format, &whole_records(db, &results)?, show);
     } else {
@@ -42,6 +75,21 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
     }
     crate::cli::usage::search(db, "search", &args.query, &logged);
     Ok(())
+}
+
+/// The best of `hits`, in order: at most `limit`, and only as many as fit in
+/// about `budget` tokens of text output, though always the first.
+fn within(hits: Vec<Hit>, limit: usize, budget: usize) -> Vec<Hit> {
+    let mut spent = 0;
+    hits.into_iter()
+        .take(limit)
+        .enumerate()
+        .take_while(|(i, h)| {
+            spent += crate::embed::tokens::estimate_tokens(&render(&h.result));
+            *i == 0 || spent <= budget
+        })
+        .map(|(_, h)| h)
+        .collect()
 }
 
 /// Each hit with the whole record it found, as that type's `get` command
@@ -253,3 +301,34 @@ pub(crate) fn render(r: &SearchResult) -> String {
 #[cfg(test)]
 #[path = "search_eval/mod.rs"]
 mod eval;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::HitSource;
+
+    fn hit(key: &str) -> Hit {
+        Hit {
+            score: None,
+            source: HitSource::Keyword,
+            result: SearchResult::Memory {
+                id: 0,
+                key: key.into(),
+                snippet: "x".repeat(200),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn within_keeps_the_limit_and_the_token_budget_but_always_the_first() {
+        let hits = || vec![hit("a"), hit("b"), hit("c")];
+        let keys =
+            |hits: Vec<Hit>| -> Vec<String> { hits.iter().map(|h| h.result.item().1).collect() };
+        assert_eq!(keys(within(hits(), 2, 10_000)), ["a", "b"]);
+        // Each hit renders to about 60 tokens.
+        assert_eq!(keys(within(hits(), 10, 130)), ["a", "b"]);
+        assert_eq!(keys(within(hits(), 10, 1)), ["a"]);
+    }
+}

@@ -526,6 +526,75 @@ pub enum ScoredTable {
     Repo,
 }
 
+/// A table whose keyword hits show [`Database::keyword_snippets`].
+#[derive(Debug, Clone, Copy)]
+pub enum SnippetTable {
+    Memory,
+    Meeting,
+    Investigation,
+}
+
+/// Words [`Database::keyword_snippets`] keeps around a match: about the 120
+/// characters a hit shows otherwise. Shorter text comes back whole.
+const SNIPPET_TOKENS: u8 = 20;
+
+impl Database {
+    /// For each of `ids` that matches `query` in its body text, the passage
+    /// around the match, on one line. Tried with every term, then with any
+    /// significant one, as keyword search does. A record matching only in its
+    /// key or title, or only as a substring, has none.
+    pub fn keyword_snippets(
+        &self,
+        table: SnippetTable,
+        query: &str,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut found = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(found);
+        }
+        // The body columns, by index in the full-text table, most useful first.
+        let (fts, columns): (&str, &[u8]) = match table {
+            SnippetTable::Memory => ("memory_fts", &[1]),
+            SnippetTable::Meeting => ("meetings_fts", &[2, 1]),
+            SnippetTable::Investigation => ("investigations_fts", &[3, 2]),
+        };
+        let snippets: Vec<String> = columns
+            .iter()
+            .map(|c| format!("snippet({fts}, {c}, char(2), char(3), '...', {SNIPPET_TOKENS})"))
+            .collect();
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT rowid, {} FROM {fts} WHERE {fts} MATCH ?1 AND rowid IN ({list})",
+            snippets.join(", ")
+        );
+        for pattern in std::iter::once(fts::sanitize(query)).chain(fts::loose_query(query)) {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([pattern], |row| {
+                let id: i64 = row.get(0)?;
+                let mut best = None;
+                for i in 0..columns.len() {
+                    let text: Option<String> = row.get(i + 1)?;
+                    if let Some(text) = text.filter(|t| t.contains('\u{2}')) {
+                        best = Some(text);
+                        break;
+                    }
+                }
+                Ok((id, best))
+            })?;
+            for row in rows {
+                if let (id, Some(text)) = row? {
+                    let text = text.replace(['\u{2}', '\u{3}'], "");
+                    found
+                        .entry(id)
+                        .or_insert_with(|| text.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }

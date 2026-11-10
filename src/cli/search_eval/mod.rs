@@ -39,7 +39,7 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 
 use crate::db::Database;
-use crate::search::{rank, search_hits_embedded, HitSource, SearchResult};
+use crate::search::{order, rank, search_hits_embedded, HitSource, SearchResult};
 
 /// A result's [`SearchResult::item`] as one `<type>:<ref>` label, such as
 /// `todo:12`.
@@ -122,6 +122,7 @@ pub struct Params {
     pub margin: Option<f32>,
     pub semantic_limit: usize,
     pub code_text_limit: usize,
+    pub ranking: crate::search::Ranking,
 }
 
 impl Params {
@@ -131,6 +132,7 @@ impl Params {
             margin: s.semantic_margin().map(|m| m as f32),
             semantic_limit: s.search.semantic_limit,
             code_text_limit: s.search.code_text_limit,
+            ranking: s.search.ranking,
         }
     }
 
@@ -157,6 +159,10 @@ pub struct Ranker {
 }
 
 impl Ranker {
+    fn named(self, name: &'static str) -> Self {
+        Self { name, ..self }
+    }
+
     pub fn new(
         name: &'static str,
         run: impl Fn(&Database, &str, Option<&[f32]>) -> Result<Vec<SearchResult>> + 'static,
@@ -168,10 +174,10 @@ impl Ranker {
     }
 }
 
-/// `sclerox search` as it is: [`rank`] over every tier.
+/// `sclerox search` as it is: [`order`] over every tier.
 pub fn current(p: Params) -> Ranker {
     Ranker::new("current", move |db, q, emb| {
-        Ok(rank(p.hits(db, q, emb)?)
+        Ok(order(p.hits(db, q, emb)?, q, p.ranking)
             .into_iter()
             .map(|h| h.result)
             .collect())
@@ -203,7 +209,16 @@ pub fn cosine(p: Params) -> Ranker {
 
 /// The rankers every eval compares, baseline first.
 pub fn rankers(p: Params) -> Vec<Ranker> {
-    vec![current(p), keyword(p), cosine(p)]
+    vec![
+        current(p),
+        keyword(p),
+        cosine(p),
+        current(Params {
+            ranking: crate::search::Ranking::Cosine,
+            ..p
+        })
+        .named("cosine-order"),
+    ]
 }
 
 /// One ranker's result on one query.
@@ -499,14 +514,14 @@ pub fn report(queries: &[EvalQuery], ev: &Evaluation) -> String {
         let _ = writeln!(out, "\n[{}]", group.name());
         let _ = writeln!(
             out,
-            "{:<10} {:>4} {:>6} {:>6} {:>6} {:>8} {:>4} {:>6} {:>8} {:>7}",
+            "{:<12} {:>4} {:>6} {:>6} {:>6} {:>8} {:>4} {:>6} {:>8} {:>7}",
             "ranker", "n", "R@5", "R@10", "MRR", "nDCG@10", "none", "false", "tok→1st", "tokens"
         );
         for (name, scores) in ev.rankers.iter().zip(&ev.scores) {
             let s = summarize(queries, scores, group);
             let _ = writeln!(
                 out,
-                "{name:<10} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>4} {:>6.3} {:>8.0} {:>7.0}",
+                "{name:<12} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>8.3} {:>4} {:>6.3} {:>8.0} {:>7.0}",
                 s.labelled,
                 s.r5,
                 s.r10,
@@ -552,7 +567,7 @@ pub fn report(queries: &[EvalQuery], ev: &Evaluation) -> String {
                     }
                 }
                 if !cells.is_empty() {
-                    let _ = writeln!(out, "{name:<10} {:<17} {}", group.name(), cells.join("  "));
+                    let _ = writeln!(out, "{name:<12} {:<17} {}", group.name(), cells.join("  "));
                 }
             }
         }

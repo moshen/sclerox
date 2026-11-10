@@ -1,5 +1,39 @@
 # Written by synthetic_search_eval with SCLEROX_EVAL_BLESS=1; see synthetic.rs.
 
+["cosine-order.all"]
+false_rate = 1.0
+mrr = 0.88
+ndcg10 = 0.798
+r10 = 0.859
+r5 = 0.783
+
+["cosine-order.identifier"]
+mrr = 1.0
+ndcg10 = 0.72
+r10 = 0.7
+r5 = 0.6
+
+["cosine-order.known_item"]
+mrr = 0.644
+ndcg10 = 0.658
+r10 = 0.75
+r5 = 0.75
+
+["cosine-order.natural_language"]
+mrr = 1.0
+ndcg10 = 0.913
+r10 = 0.925
+r5 = 0.9
+
+["cosine-order.no_answer"]
+false_rate = 1.0
+
+["cosine-order.temporal"]
+mrr = 0.667
+ndcg10 = 0.747
+r10 = 1.0
+r5 = 0.75
+
 ["cosine.all"]
 false_rate = 1.0
 mrr = 0.855
@@ -36,37 +70,37 @@ r5 = 0.75
 
 ["current.all"]
 false_rate = 1.0
-mrr = 0.88
-ndcg10 = 0.798
-r10 = 0.859
-r5 = 0.783
+mrr = 0.971
+ndcg10 = 0.936
+r10 = 0.967
+r5 = 0.946
 
 ["current.identifier"]
 mrr = 1.0
-ndcg10 = 0.72
-r10 = 0.7
-r5 = 0.6
+ndcg10 = 0.984
+r10 = 1.0
+r5 = 1.0
 
 ["current.known_item"]
-mrr = 0.644
-ndcg10 = 0.658
-r10 = 0.75
-r5 = 0.75
+mrr = 0.833
+ndcg10 = 0.875
+r10 = 1.0
+r5 = 1.0
 
 ["current.natural_language"]
 mrr = 1.0
-ndcg10 = 0.913
+ndcg10 = 0.911
 r10 = 0.925
-r5 = 0.9
+r5 = 0.875
 
 ["current.no_answer"]
 false_rate = 1.0
 
 ["current.temporal"]
-mrr = 0.667
-ndcg10 = 0.747
+mrr = 1.0
+ndcg10 = 1.0
 r10 = 1.0
-r5 = 0.75
+r5 = 1.0
 
 ["keyword.all"]
 false_rate = 0.5

@@ -61,6 +61,13 @@ pub struct SearchSettings {
     /// Max lines of code that hold the query word for word, across all
     /// indexed repos.
     pub code_text_limit: usize,
+    /// How hits of every type are put in one order.
+    pub ranking: crate::search::Ranking,
+    /// Most results `sclerox search` shows; `--limit` and `--all` override it.
+    pub result_limit: usize,
+    /// Most tokens of results `sclerox search` shows, about 4 bytes each;
+    /// `--all` overrides it.
+    pub token_budget: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +284,9 @@ impl Default for SearchSettings {
             semantic_limit: 25,
             semantic_margin: None,
             code_text_limit: 20,
+            ranking: crate::search::Ranking::Fusion,
+            result_limit: 20,
+            token_budget: 2000,
         }
     }
 }
@@ -540,6 +550,8 @@ impl Settings {
             &mut self.search.code_text_limit,
             20,
         );
+        require_positive("search.result_limit", &mut self.search.result_limit, 20);
+        require_positive("search.token_budget", &mut self.search.token_budget, 2000);
         require_positive(
             "memory.max_value_chars",
             &mut self.memory.max_value_chars,

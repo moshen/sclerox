@@ -2,7 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
-use crate::output::truncate;
+use crate::db::SnippetTable;
+use crate::output::{excerpt, full, truncate};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -134,6 +135,82 @@ pub struct Hit {
     pub source: HitSource,
 }
 
+/// How [`order`] puts hits of every type into one list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ranking {
+    /// [`fuse`]: keyword and cosine ranks together.
+    #[default]
+    Fusion,
+    /// [`rank`]: cosine score alone.
+    Cosine,
+}
+
+/// `hits` best first, by `ranking`.
+pub fn order(hits: Vec<Hit>, query: &str, ranking: Ranking) -> Vec<Hit> {
+    match ranking {
+        Ranking::Fusion => fuse(hits, query),
+        Ranking::Cosine => rank(hits),
+    }
+}
+
+/// The `k` of reciprocal rank fusion: how far a rank's weight falls from the
+/// top of a list. 60 is the value from the original paper and usual default.
+const RRF_K: f64 = 60.0;
+
+/// Order `hits` by reciprocal rank fusion: each hit scores
+/// `Σ 1 / (RRF_K + rank)` over the lists it is in. Each type's keyword hits
+/// are one list, in the order [`search_hits`] gives them, as bm25 scores from
+/// different tables can't be compared; every hit with a cosine score is in
+/// one more list across types. A hit whose key, title or name is the query
+/// itself comes first.
+pub fn fuse(hits: Vec<Hit>, query: &str) -> Vec<Hit> {
+    let mut fused = vec![0.0; hits.len()];
+    let mut keyword_ranks: std::collections::HashMap<std::mem::Discriminant<SearchResult>, f64> =
+        Default::default();
+    for (i, hit) in hits.iter().enumerate() {
+        if hit.source == HitSource::Keyword {
+            let rank = keyword_ranks
+                .entry(std::mem::discriminant(&hit.result))
+                .or_default();
+            *rank += 1.0;
+            fused[i] += 1.0 / (RRF_K + *rank);
+        }
+    }
+    let mut scored: Vec<(usize, f32)> = hits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, h)| h.score.map(|s| (i, s)))
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (rank, (i, _)) in scored.into_iter().enumerate() {
+        fused[i] += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    let mut ordered: Vec<(bool, f64, Hit)> = hits
+        .into_iter()
+        .zip(fused)
+        .map(|(hit, score)| (!names_query(&hit.result, query), score, hit))
+        .collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+    ordered.into_iter().map(|(_, _, hit)| hit).collect()
+}
+
+/// Whether `query` is the hit's key, title, name or slug, ignoring case.
+fn names_query(result: &SearchResult, query: &str) -> bool {
+    let names: Vec<&String> = match result {
+        SearchResult::Memory { key, .. } => vec![key],
+        SearchResult::Person { name, .. }
+        | SearchResult::Project { name, .. }
+        | SearchResult::Repo { name, .. }
+        | SearchResult::Symbol { name, .. } => vec![name],
+        SearchResult::Meeting { title, .. } | SearchResult::Todo { title, .. } => vec![title],
+        SearchResult::Investigation { name, slug, .. } => vec![name, slug],
+        SearchResult::CodeText { .. } | SearchResult::CodeChunk { .. } => vec![],
+    };
+    let query = query.trim().to_lowercase();
+    names.iter().any(|name| name.trim().to_lowercase() == query)
+}
+
 /// Order `hits` best first across types: scored hits by score, then
 /// unscored hits in the order given. With no embedder nothing is scored, so
 /// that order is [`search_hits`]' grouping by type.
@@ -197,6 +274,17 @@ pub fn search_hits_embedded(
         crate::embed::models::semantic_cutoff(scores, semantic_threshold, semantic_margin)
     };
     let mut results = Vec::new();
+    // Where each keyword hit matched, unless --full shows the whole text.
+    let snippets_of = |table: SnippetTable, ids: &std::collections::HashSet<i64>| {
+        if full() {
+            return Default::default();
+        }
+        let ids: Vec<i64> = ids.iter().copied().collect();
+        db.keyword_snippets(table, query, &ids).unwrap_or_else(|e| {
+            log::warn!("could not cut snippets for {table:?} hits: {e:#}");
+            Default::default()
+        })
+    };
     // Cosine of each keyword hit, from its stored vector, so it ranks with
     // the semantic hits.
     let fts_scores = |table: ScoredTable, ids: &[i64]| match query_emb {
@@ -210,6 +298,7 @@ pub fn search_hits_embedded(
         ScoredTable::Memory,
         &memory_fts.iter().map(|m| m.id).collect::<Vec<_>>(),
     );
+    let snippets = snippets_of(SnippetTable::Memory, &memory_fts_ids);
     for m in memory_fts {
         results.push(Hit {
             score: scores.get(&m.id).copied(),
@@ -217,7 +306,7 @@ pub fn search_hits_embedded(
             result: SearchResult::Memory {
                 id: m.id,
                 key: m.key,
-                snippet: truncate(&m.value, 120),
+                snippet: keyword_snippet(snippets.get(&m.id), &[Some(&m.value)], query),
                 created_at: m.created_at,
                 updated_at: m.updated_at,
             },
@@ -263,13 +352,13 @@ pub fn search_hits_embedded(
         ScoredTable::Meeting,
         &meeting_fts.iter().map(|m| m.id).collect::<Vec<_>>(),
     );
+    let snippets = snippets_of(SnippetTable::Meeting, &meeting_fts_ids);
     for m in meeting_fts {
-        let snippet = m
-            .notes
-            .as_deref()
-            .or(m.transcript.as_deref())
-            .map(|s| truncate(s, 120))
-            .unwrap_or_default();
+        let snippet = keyword_snippet(
+            snippets.get(&m.id),
+            &[m.notes.as_deref(), m.transcript.as_deref()],
+            query,
+        );
         results.push(Hit {
             score: scores.get(&m.id).copied(),
             source: HitSource::Keyword,
@@ -363,13 +452,13 @@ pub fn search_hits_embedded(
         ScoredTable::Investigation,
         &inv_fts.iter().map(|i| i.id).collect::<Vec<_>>(),
     );
+    let snippets = snippets_of(SnippetTable::Investigation, &inv_fts_ids);
     for i in inv_fts {
-        let snippet = i
-            .findings
-            .as_deref()
-            .or(i.plan.as_deref())
-            .map(|s| truncate(s, 120))
-            .unwrap_or_default();
+        let snippet = keyword_snippet(
+            snippets.get(&i.id),
+            &[i.findings.as_deref(), i.plan.as_deref()],
+            query,
+        );
         results.push(Hit {
             score: scores.get(&i.id).copied(),
             source: HitSource::Keyword,
@@ -452,6 +541,7 @@ pub fn search_hits_embedded(
     // Fan out to all registered repo DBs: symbol and full-text search always,
     // plus a semantic code-chunk pass (ranked globally across repos) when
     // embeddings are available.
+    let mut symbols = Vec::new();
     let mut code_text = Vec::new();
     let mut code_chunks: Vec<(
         f32,
@@ -468,32 +558,26 @@ pub fn search_hits_embedded(
             log::error!("could not open repo db for '{}'", repo.name);
             continue;
         };
-        let Ok(symbols) = repo_db.search_symbols(query) else {
+        let Ok(repo_symbols) = repo_db.search_symbols(query) else {
             log::error!("symbol search failed for repo '{}'", repo.name);
             continue;
         };
         log::debug!(
             "repo '{}': {} symbol hits for '{}'",
             repo.name,
-            symbols.len(),
+            repo_symbols.len(),
             query
         );
-        for sym in symbols {
-            results.push(Hit {
-                score: None,
-                source: HitSource::Keyword,
-                result: SearchResult::Symbol {
-                    repo_name: repo.name.clone(),
-                    repo_path: repo.path.clone(),
-                    kind: sym.kind,
-                    name: sym.name,
-                    signature: sym.signature,
-                    file_path: sym.file_path,
-                    start_line: sym.start_line,
-                    last_modified: sym.last_modified,
-                },
-            });
-        }
+        symbols.extend(repo_symbols.into_iter().map(|sym| SearchResult::Symbol {
+            repo_name: repo.name.clone(),
+            repo_path: repo.path.clone(),
+            kind: sym.kind,
+            name: sym.name,
+            signature: sym.signature,
+            file_path: sym.file_path,
+            start_line: sym.start_line,
+            last_modified: sym.last_modified,
+        }));
         code_text_hits(&mut code_text, &repo, &repo_db, query, code_text_limit);
         if let Some(qe) = query_emb {
             for c in repo_db
@@ -506,6 +590,16 @@ pub fn search_hits_embedded(
             }
         }
     }
+    // Each repo's symbols come best first; keep that order across repos.
+    symbols.sort_by_key(|s| match s {
+        SearchResult::Symbol { name, .. } => crate::index::repo_db::symbol_match(name, query),
+        _ => unreachable!(),
+    });
+    results.extend(symbols.into_iter().map(|result| Hit {
+        score: None,
+        source: HitSource::Keyword,
+        result,
+    }));
     results.extend(
         rank_code_text(code_text, code_text_limit)
             .into_iter()
@@ -540,6 +634,21 @@ pub fn search_hits_embedded(
     Ok(results)
 }
 
+/// What a keyword hit shows of its text: `found`, the passage where the query
+/// matched (see [`Database::keyword_snippets`]), else an [`excerpt`] of the
+/// first of `texts` holding the query, else the start of the first.
+fn keyword_snippet(found: Option<&String>, texts: &[Option<&str>], query: &str) -> String {
+    if let Some(found) = found {
+        return found.clone();
+    }
+    let mut texts = texts.iter().flatten();
+    texts
+        .clone()
+        .find_map(|t| excerpt(t, query, 120))
+        .or_else(|| texts.next().map(|t| truncate(t, 120)))
+        .unwrap_or_default()
+}
+
 /// A line holding the query word for word, from one repo, before the lines
 /// of all repos are ranked together by [`rank_code_text`].
 pub struct CodeTextHit {
@@ -566,7 +675,7 @@ pub fn code_text_hits(
                 repo_path: repo.path.clone(),
                 file_path: m.file_path,
                 line: m.line,
-                text: truncate(&m.text, 120),
+                text: excerpt(&m.text, query, 120).unwrap_or_else(|| truncate(&m.text, 120)),
                 last_modified: m.last_modified,
             },
         })),
@@ -609,6 +718,123 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, [4, 2, 1, 3]);
+    }
+
+    fn keyword(result: SearchResult) -> Hit {
+        Hit {
+            score: None,
+            source: HitSource::Keyword,
+            result,
+        }
+    }
+
+    fn memory(key: &str) -> SearchResult {
+        SearchResult::Memory {
+            id: 0,
+            key: key.into(),
+            snippet: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn label(h: &Hit) -> String {
+        h.result.item().1
+    }
+
+    #[test]
+    fn fuse_puts_an_exact_name_first_past_many_similar_hits() {
+        let person = SearchResult::Person {
+            id: 7,
+            name: "Ada Lovelace".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let project = SearchResult::Project {
+            id: 8,
+            name: "Invoice extraction".into(),
+            description: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let symbol = SearchResult::Symbol {
+            repo_name: String::new(),
+            repo_path: String::new(),
+            kind: "function".into(),
+            name: "parse_invoice".into(),
+            signature: None,
+            file_path: String::new(),
+            start_line: 1,
+            last_modified: None,
+        };
+        for (named, query) in [
+            (person, "ada lovelace"),
+            (project, "Invoice Extraction"),
+            (symbol, "parse_invoice"),
+        ] {
+            // Memories found both ways, every one scoring high on cosine.
+            let mut hits: Vec<Hit> = (0..20)
+                .map(|i| Hit {
+                    score: Some(0.9 - i as f32 / 100.0),
+                    ..keyword(memory(&format!("note-{i}")))
+                })
+                .collect();
+            let want = named.item().1;
+            hits.push(keyword(named));
+            assert_eq!(label(&fuse(hits, query)[0]), want, "{query}");
+        }
+    }
+
+    #[test]
+    fn fuse_ranks_a_hit_found_both_ways_above_one_found_once() {
+        let semantic = |key, score| Hit {
+            score: Some(score),
+            source: HitSource::Semantic,
+            result: memory(key),
+        };
+        let both = Hit {
+            score: Some(0.7),
+            ..keyword(memory("both"))
+        };
+        let hits = vec![
+            keyword(memory("keyword-only")),
+            both,
+            semantic("semantic-only", 0.9),
+        ];
+        // Each of the others is first in one list, so scores less.
+        assert_eq!(label(&fuse(hits, "query")[0]), "both");
+    }
+
+    #[test]
+    fn keyword_hits_show_the_passage_that_matched() {
+        let db = Database::open_in_memory().unwrap();
+        let filler = "word ".repeat(60);
+        let text = |what| format!("{filler}the zebrafish {what} {filler}");
+        db.memory_set("long-note", &text("tank"), "feedback", None)
+            .unwrap();
+        db.meeting_add("Planning", None, Some(&text("rollout")), None)
+            .unwrap();
+        db.investigation_start("Fish", "fish", Some(&text("plan")))
+            .unwrap();
+        // A whole word through full-text search, and part of one through the
+        // substring tier.
+        for query in ["zebrafish", "ebrafis"] {
+            let snippets: Vec<String> = search_hits_embedded(&db, query, None, 0.45, None, 5, 20)
+                .unwrap()
+                .into_iter()
+                .filter_map(|h| match h.result {
+                    SearchResult::Memory { snippet, .. }
+                    | SearchResult::Meeting { snippet, .. }
+                    | SearchResult::Investigation { snippet, .. } => Some(snippet),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(snippets.len(), 3, "{query}: {snippets:?}");
+            for snippet in snippets {
+                assert!(snippet.contains(query), "{query}: {snippet}");
+                assert!(snippet.chars().count() < 150, "{query}: {snippet}");
+            }
+        }
     }
 
     #[test]

@@ -143,6 +143,9 @@ pub fn config_template() -> String {
          # semantic_limit = {sem_lim}                # max semantic hits per entity type\n\
          # semantic_margin = {sem_margin}            # drop hits this far below the best one; 1.0 = off\n\
          # code_text_limit = {code_text_lim}               # max code lines matching the query word for word\n\
+         # ranking = \"fusion\"            # \"fusion\": keyword and semantic ranks together; \"cosine\": semantic score alone\n\
+         # result_limit = {result_lim}                 # most results sclerox search shows; --limit / --all override\n\
+         # token_budget = {token_budget}               # most tokens of results it shows, about 4 bytes each; --all overrides\n\
          \n\
          [dedup]\n\
          # cosine_threshold = {cos_thr}            # semantic near-dup => supersede\n\
@@ -210,6 +213,8 @@ pub fn config_template() -> String {
         sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
         code_text_lim = d.search.code_text_limit,
+        result_lim = d.search.result_limit,
+        token_budget = d.search.token_budget,
         // MiniLM has no margin; show Granite's as the example value.
         sem_margin = dm
             .top_margin

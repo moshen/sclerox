@@ -67,32 +67,17 @@ impl Database {
     /// Projects whose name or description matches `query` in full text (word
     /// prefixes) or holds it as a substring.
     pub fn project_search(&self, query: &str) -> Result<Vec<Project>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, links, created_at, updated_at
-             FROM projects
-             WHERE id IN (SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1)
-                OR name LIKE ?2 ESCAPE '\\' OR description LIKE ?2 ESCAPE '\\'
-             ORDER BY name",
-        )?;
-        let mut results = stmt
-            .query_map(params![fts_query, like_pat], row_to_project)?
-            .collect::<Result<Vec<_>, _>>()?;
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "projects_fts",
-                table: "projects",
-                columns: "id, name, description, links, created_at, updated_at",
-                status: None,
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_project,
-        )?;
-        Ok(results)
+        let source = fts::Source {
+            fts: "projects_fts",
+            table: "projects",
+            columns: "id, name, description, links, created_at, updated_at",
+            // name, description
+            weights: &[4.0, 1.0],
+            like: "name LIKE ?1 ESCAPE '\\' OR description LIKE ?1 ESCAPE '\\'",
+            then_by: "name",
+            status: None,
+        };
+        fts::search(&self.conn, query, &source, |hit| hit.id, row_to_project)
     }
 
     pub fn project_update(

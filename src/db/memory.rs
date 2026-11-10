@@ -53,6 +53,21 @@ impl MemoryEntry {
 const MEMORY_COLS: &str =
     "id, key, value, memory_type, tags, created_at, updated_at, status, source, superseded_by, reviewed_at";
 
+/// Where keyword search looks for memories with `status`, or any status for
+/// `"all"`.
+fn memory_source(status: &str) -> fts::Source<'_> {
+    fts::Source {
+        fts: "memory_fts",
+        table: "memory",
+        columns: MEMORY_COLS,
+        // key, value, memory_type, tags
+        weights: &[4.0, 1.0, 1.0, 2.0],
+        like: "key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\'",
+        then_by: "updated_at DESC",
+        status: (status != "all").then_some(status),
+    }
+}
+
 /// An active memory ranked by cosine similarity to a query embedding.
 #[derive(Debug, Clone)]
 pub struct SimilarMemory {
@@ -316,89 +331,25 @@ impl Database {
     }
 
     pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
-        let mut results = self.memory_search_exact(query, status)?;
-        fts::append_loose(
+        fts::search(
             &self.conn,
             query,
-            fts::LooseSource {
-                fts: "memory_fts",
-                table: "memory",
-                columns: MEMORY_COLS,
-                status: (status != "all").then_some(status),
-            },
-            &mut results,
-            |hit| hit.id,
+            &memory_source(status),
+            |m| m.id,
             row_to_memory,
-        )?;
-        Ok(results)
+        )
     }
 
     /// Active memories holding every term of `query`, or all of it as a
     /// substring, for when a partial match would be a false one.
     pub fn memory_search_all_terms(&self, query: &str) -> Result<Vec<MemoryEntry>> {
-        self.memory_search_exact(query, "active")
-    }
-
-    fn memory_search_exact(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-        let filter_status = status != "all";
-
-        // Tier 1: FTS prefix matches, most relevant (bm25) first. Recency only
-        // breaks ties: ordering by it alone put any later passing mention ahead
-        // of the memory that is actually about the term.
-        let fts_sql = if filter_status {
-            format!(
-                "WITH hits AS (SELECT rowid AS hit_id, rank FROM memory_fts WHERE memory_fts MATCH ?1)
-                 SELECT {MEMORY_COLS} FROM memory JOIN hits ON hits.hit_id = memory.id
-                     WHERE status = ?2
-                     ORDER BY hits.rank, updated_at DESC"
-            )
-        } else {
-            format!(
-                "WITH hits AS (SELECT rowid AS hit_id, rank FROM memory_fts WHERE memory_fts MATCH ?1)
-                 SELECT {MEMORY_COLS} FROM memory JOIN hits ON hits.hit_id = memory.id
-                     ORDER BY hits.rank, updated_at DESC"
-            )
-        };
-        let mut stmt = self.conn.prepare(&fts_sql)?;
-        let fts_hits: Vec<MemoryEntry> = if filter_status {
-            stmt.query_map(params![fts_query, status], row_to_memory)?
-        } else {
-            stmt.query_map(params![fts_query], row_to_memory)?
-        }
-        .collect::<Result<Vec<_>, _>>()?;
-        let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
-
-        // Tier 2: LIKE substring fallback
-        let like_sql = if filter_status {
-            format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                     WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
-                       AND status = ?2
-                     ORDER BY updated_at DESC"
-            )
-        } else {
-            format!(
-                "SELECT {MEMORY_COLS} FROM memory
-                     WHERE (key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\')
-                     ORDER BY updated_at DESC"
-            )
-        };
-        let mut stmt2 = self.conn.prepare(&like_sql)?;
-        let like_extras: Vec<MemoryEntry> = if filter_status {
-            stmt2.query_map(params![like_pat, status], row_to_memory)?
-        } else {
-            stmt2.query_map(params![like_pat], row_to_memory)?
-        }
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|m| !fts_ids.contains(&m.id))
-        .collect();
-
-        let mut results = fts_hits;
-        results.extend(like_extras);
-        Ok(results)
+        fts::search_all_terms(
+            &self.conn,
+            query,
+            &memory_source("active"),
+            |m| m.id,
+            row_to_memory,
+        )
     }
 
     /// Active memories whose values are near-duplicates of `value`, best first.

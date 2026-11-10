@@ -65,32 +65,18 @@ impl Database {
     /// Search people by name/notes (FTS, or a substring of either) or by
     /// identifier value (LIKE).
     pub fn people_search(&self, query: &str) -> Result<Vec<Person>> {
-        let fts_query = fts::sanitize(query);
-        let like_pat = fts::like_contains(query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, notes, created_at, updated_at FROM people
-             WHERE id IN (SELECT rowid FROM people_fts WHERE people_fts MATCH ?1)
-                OR name LIKE ?2 ESCAPE '\\' OR notes LIKE ?2 ESCAPE '\\'
-                OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?2 ESCAPE '\\')
-             ORDER BY name",
-        )?;
-        let mut results = stmt
-            .query_map(params![fts_query, like_pat], row_to_person)?
-            .collect::<Result<Vec<_>, _>>()?;
-        fts::append_loose(
-            &self.conn,
-            query,
-            fts::LooseSource {
-                fts: "people_fts",
-                table: "people",
-                columns: "id, name, notes, created_at, updated_at",
-                status: None,
-            },
-            &mut results,
-            |hit| hit.id,
-            row_to_person,
-        )?;
-        Ok(results)
+        let source = fts::Source {
+            fts: "people_fts",
+            table: "people",
+            columns: "id, name, notes, created_at, updated_at",
+            // name, notes
+            weights: &[4.0, 1.0],
+            like: "name LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\'
+                OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?1 ESCAPE '\\')",
+            then_by: "name",
+            status: None,
+        };
+        fts::search(&self.conn, query, &source, |hit| hit.id, row_to_person)
     }
 
     pub fn people_update(&self, id: i64, update: PersonUpdate) -> Result<bool> {

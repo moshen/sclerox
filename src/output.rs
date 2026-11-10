@@ -185,6 +185,32 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// About `max` characters of `s` around the first place it holds `query`, or
+/// failing that one of its words of three or more characters, ignoring
+/// case: [`truncate`], but starting up to a third of the window before the
+/// match when `s` is longer than the window. `None` when `s` holds neither.
+/// With `--full`, all of `s`.
+pub fn excerpt(s: &str, query: &str, max: usize) -> Option<String> {
+    // ASCII lowercasing keeps every byte offset, so a match in `hay` is one
+    // in `s`.
+    let hay = s.to_ascii_lowercase();
+    let query = query.trim().to_ascii_lowercase();
+    let at = std::iter::once(query.as_str())
+        .chain(query.split_whitespace().filter(|t| t.chars().count() >= 3))
+        .filter(|t| !t.is_empty())
+        .find_map(|t| hay.find(t))?;
+    let len = s.chars().count();
+    let start = s[..at]
+        .chars()
+        .count()
+        .saturating_sub(max / 3)
+        .min(len.saturating_sub(max));
+    match s.char_indices().nth(start) {
+        Some((cut, _)) if start > 0 && !full() => Some(format!("...{}", truncate(&s[cut..], max))),
+        _ => Some(truncate(s, max)),
+    }
+}
+
 /// Cut `s` to at most `max` bytes plus a `...` marker regardless of `--full`,
 /// for text with a real size limit rather than text being displayed. The cut
 /// backs off to a char boundary, so a multibyte character straddling `max`
@@ -200,6 +226,34 @@ pub fn truncate_bounded(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excerpt_cuts_long_text_around_the_match() {
+        let s = format!("{}needle {}", "a ".repeat(100), "b ".repeat(100));
+        let cut = excerpt(&s, "Needle", 60).unwrap();
+        assert!(
+            cut.starts_with("...a ") && cut.contains("needle b"),
+            "{cut}"
+        );
+        // Failing the whole query, one of its words.
+        let word = excerpt(&s, "the needle please", 60).unwrap();
+        assert!(word.contains("needle"), "{word}");
+        assert_eq!(excerpt(&s, "absent", 60), None);
+    }
+
+    #[test]
+    fn excerpt_keeps_text_that_fits_and_fills_the_window_near_the_end() {
+        assert_eq!(
+            excerpt("a short needle line", "needle", 60).unwrap(),
+            "a short needle line"
+        );
+        let s = format!("{}needle", "a ".repeat(100));
+        let cut = excerpt(&s, "needle", 60).unwrap();
+        assert!(
+            cut.ends_with("needle") && cut.chars().count() == 63,
+            "{cut}"
+        );
+    }
 
     #[test]
     fn test_truncate_bounded_backs_off_multibyte_char_at_limit() {
