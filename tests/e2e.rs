@@ -1378,6 +1378,8 @@ fn search_shows_a_limited_number_of_results_and_says_so() {
     let all = e.run(&["search", "zebrafish", "--all"]);
     assert_eq!(lines(&all), 5, "{all}");
     assert!(all.ends_with("5 results"), "{all}");
+    let full = e.run(&["--full", "search", "zebrafish", "--limit", "2"]);
+    assert!(full.contains("Showing 2 of 5 results"), "{full}");
 
     // JSON stays a list of hits, with the note on stderr.
     let out = e

@@ -64,12 +64,17 @@ pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> 
             None => println!("\n{} results", results.len()),
         }
     };
+    let text = matches!(format, OutputFormat::Text);
     // JSON stays a list of hits, so the note goes to stderr.
-    if let (Some(cut), false) = (&cut, matches!(format, OutputFormat::Text)) {
+    if let (Some(cut), false) = (&cut, text) {
         eprintln!("{cut}");
     }
     if full() {
         print_output(format, &whole_records(db, &results)?, show);
+        // --full text prints the records in place of `show` and its note.
+        if let (Some(cut), true, false) = (&cut, text, results.is_empty()) {
+            println!("\n{cut}");
+        }
     } else {
         print_output(format, &results, show);
     }
