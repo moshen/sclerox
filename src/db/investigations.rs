@@ -114,6 +114,20 @@ impl Database {
 
         let mut results = fts_hits;
         results.extend(like_extras);
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "investigations_fts",
+                table: "investigations",
+                columns:
+                    "id, name, slug, status, plan, findings, created_at, concluded_at, updated_at",
+                status: None,
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_investigation,
+        )?;
         Ok(results)
     }
 
@@ -368,27 +382,34 @@ impl Database {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
-                let inv = Investigation {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    slug: row.get(2)?,
-                    status: row.get(3)?,
-                    plan: row.get(4)?,
-                    findings: row.get(5)?,
-                    created_at: row.get(6)?,
-                    concluded_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                };
-                let matched_chunk: String = row.get(9)?;
-                let distance: f64 = row.get(10)?;
-                Ok(SimilarInvestigation {
-                    investigation: inv,
-                    score: 1.0 - distance as f32,
-                    matched_chunk,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(rusqlite::params![query, k], |row| {
+                        let inv = Investigation {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            slug: row.get(2)?,
+                            status: row.get(3)?,
+                            plan: row.get(4)?,
+                            findings: row.get(5)?,
+                            created_at: row.get(6)?,
+                            concluded_at: row.get(7)?,
+                            updated_at: row.get(8)?,
+                        };
+                        let matched_chunk: String = row.get(9)?;
+                        let distance: f64 = row.get(10)?;
+                        Ok(SimilarInvestigation {
+                            investigation: inv,
+                            score: 1.0 - distance as f32,
+                            matched_chunk,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| crate::db::best_per_record(rows, |r| r.investigation.id, limit),
+            )
         })
     }
 }

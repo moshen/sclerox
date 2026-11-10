@@ -1360,6 +1360,52 @@ fn the_core_types_expose_when_they_were_created() {
 }
 
 #[test]
+fn search_full_returns_each_hits_whole_record() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    let transcript = dir.path().join("t.txt");
+    let body = format!(
+        "zebrafish rollout {}the final sentence",
+        "word ".repeat(400)
+    );
+    std::fs::write(&transcript, &body).unwrap();
+    e.run(&[
+        "meeting",
+        "add",
+        "--title",
+        "Planning",
+        "--transcript-file",
+        transcript.to_str().unwrap(),
+    ]);
+    e.run(&[
+        "memory",
+        "set",
+        "fish-note",
+        "zebrafish need warm water",
+        "--type",
+        "feedback",
+    ]);
+
+    let text = e.run(&["--full", "search", "zebrafish"]);
+    assert!(text.contains("the final sentence"), "{text}");
+    assert!(text.contains("memory_type: feedback"), "{text}");
+
+    let json = e.run(&["--full", "--output", "json", "search", "zebrafish"]);
+    let hits: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let hits = hits.as_array().unwrap();
+    let meeting = hits.iter().find(|h| h["type"] == "Meeting").unwrap();
+    assert_eq!(meeting["transcript"].as_str().unwrap(), body);
+    assert!(meeting["people"].is_array());
+    let memory = hits.iter().find(|h| h["type"] == "Memory").unwrap();
+    assert_eq!(memory["memory_type"], "feedback");
+    assert!(memory["provenance"].is_array());
+
+    // Without the flag a hit stays a summary.
+    let plain = e.run(&["--output", "json", "search", "zebrafish"]);
+    assert!(!plain.contains("the final sentence"));
+}
+
+#[test]
 fn full_shows_every_field_and_untruncated_content_as_text() {
     let e = Env::new();
     let long = format!("searchable {}", "word ".repeat(200));

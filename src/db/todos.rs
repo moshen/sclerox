@@ -165,6 +165,20 @@ impl Database {
 
         let mut results = fts_hits;
         results.extend(like_extras);
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "todos_fts",
+                table: "todos",
+                columns: "id, title, notes, status, source_url, category, originated_date,
+                    deadline_date, completed_at, created_at, updated_at",
+                status: None,
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_todo,
+        )?;
         Ok(results)
     }
 
@@ -410,29 +424,36 @@ impl Database {
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
             )?;
-            let rows = stmt.query_map(rusqlite::params![query, limit as i64], |r| {
-                let todo = Todo {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    notes: r.get(2)?,
-                    status: r.get(3)?,
-                    source_url: r.get(4)?,
-                    category: r.get(5)?,
-                    originated_date: r.get(6)?,
-                    deadline_date: r.get(7)?,
-                    completed_at: r.get(8)?,
-                    created_at: r.get(9)?,
-                    updated_at: r.get(10)?,
-                };
-                let matched_chunk: String = r.get(11)?;
-                let distance: f64 = r.get(12)?;
-                Ok(SimilarTodo {
-                    todo,
-                    score: 1.0 - distance as f32,
-                    matched_chunk,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(rusqlite::params![query, k], |r| {
+                        let todo = Todo {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            notes: r.get(2)?,
+                            status: r.get(3)?,
+                            source_url: r.get(4)?,
+                            category: r.get(5)?,
+                            originated_date: r.get(6)?,
+                            deadline_date: r.get(7)?,
+                            completed_at: r.get(8)?,
+                            created_at: r.get(9)?,
+                            updated_at: r.get(10)?,
+                        };
+                        let matched_chunk: String = r.get(11)?;
+                        let distance: f64 = r.get(12)?;
+                        Ok(SimilarTodo {
+                            todo,
+                            score: 1.0 - distance as f32,
+                            matched_chunk,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| crate::db::best_per_record(rows, |r| r.todo.id, limit),
+            )
         })
     }
 }

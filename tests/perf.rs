@@ -174,18 +174,23 @@ fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
     let dims = 384usize;
     let dir = TempDir::new().unwrap();
     let db = Database::open(&dir.path().join("sclerox.db")).unwrap();
-    let meeting_id = db.meeting_add("Perf", None, None, None).unwrap();
 
     // Deterministic mock embeddings; each chunk points along a rotating basis.
-    let chunks: Vec<(String, Option<Vec<f32>>)> = (0..n_chunks)
-        .map(|i| {
-            let emb: Vec<f32> = (0..dims)
-                .map(|j| ((i * dims + j) as f32 * 0.001).sin())
-                .collect();
-            (format!("chunk {i}"), Some(emb))
-        })
-        .collect();
-    db.meeting_store_chunks(meeting_id, &chunks).unwrap();
+    // Spread over meetings, since a search returns each meeting once.
+    let meetings = 20;
+    for m in 0..meetings {
+        let meeting_id = db.meeting_add("Perf", None, None, None).unwrap();
+        let chunks: Vec<(String, Option<Vec<f32>>)> = (m..n_chunks)
+            .step_by(meetings)
+            .map(|i| {
+                let emb: Vec<f32> = (0..dims)
+                    .map(|j| ((i * dims + j) as f32 * 0.001).sin())
+                    .collect();
+                (format!("chunk {i}"), Some(emb))
+            })
+            .collect();
+        db.meeting_store_chunks(meeting_id, &chunks).unwrap();
+    }
 
     let query: Vec<f32> = (0..dims).map(|j| ((j as f32) * 0.002).cos()).collect();
 

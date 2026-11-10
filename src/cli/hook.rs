@@ -406,7 +406,7 @@ fn relevant_memories(
     let mut named: Vec<MemoryEntry> = repo
         .into_iter()
         .flat_map(|r| [r.repo_name.clone(), r.repo_name.replace(['-', '_'], " ")])
-        .filter_map(|token| db.memory_search(&token).ok())
+        .filter_map(|token| db.memory_search_all_terms(&token).ok())
         .flatten()
         .filter(|m| m.memory_type == "feedback" || m.memory_type == "project")
         .collect();
@@ -2419,6 +2419,32 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_memory_naming_part_of_a_repo_name_doesnt_outrank_newer_ones() {
+        isolate_config();
+        let db = Database::open_in_memory().unwrap();
+        for (key, value) in [
+            ("both", "the claude code release"),
+            ("partial", "writing code by hand"),
+        ] {
+            db.memory_set(key, value, "feedback", None).unwrap();
+        }
+        db.memory_set("newer", "an unrelated preference", "feedback", None)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "UPDATE memory SET updated_at = '2000-01-01'
+                 WHERE key IN ('both', 'partial')",
+            )
+            .unwrap();
+
+        let picked: Vec<String> = relevant_memories(&db, Some(&repo_named("claude-code")), 2)
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(picked, ["both", "newer"]);
     }
 
     fn repo_named(name: &str) -> RepoScope {

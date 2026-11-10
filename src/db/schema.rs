@@ -877,6 +877,59 @@ CREATE INDEX IF NOT EXISTS read_events_item ON read_events(item_type, item_ref);
 /// each clone's first commit, which can take seconds to find in a long
 /// history; `clone_stamp` (when its git directory was created) tells a new
 /// clone at the same path from the old one.
+/// Prose indexes stem words, so "retries" finds "Retry". The triggers refer to
+/// these tables by name, so they carry over.
+pub const MIGRATION_V18: &str = "
+DROP TABLE memory_fts;
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    key, value, memory_type, tags,
+    content=memory, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
+
+DROP TABLE people_fts;
+CREATE VIRTUAL TABLE people_fts USING fts5(
+    name, notes,
+    content=people, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO people_fts(people_fts) VALUES('rebuild');
+
+DROP TABLE meetings_fts;
+CREATE VIRTUAL TABLE meetings_fts USING fts5(
+    title, transcript, notes,
+    content=meetings, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO meetings_fts(meetings_fts) VALUES('rebuild');
+
+DROP TABLE projects_fts;
+CREATE VIRTUAL TABLE projects_fts USING fts5(
+    name, description,
+    content=projects, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO projects_fts(projects_fts) VALUES('rebuild');
+
+DROP TABLE repos_fts;
+CREATE VIRTUAL TABLE repos_fts USING fts5(
+    name, description,
+    content=repos, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO repos_fts(repos_fts) VALUES('rebuild');
+
+DROP TABLE todos_fts;
+CREATE VIRTUAL TABLE todos_fts USING fts5(
+    title, notes, category, status,
+    content=todos, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO todos_fts(todos_fts) VALUES('rebuild');
+
+DROP TABLE investigations_fts;
+CREATE VIRTUAL TABLE investigations_fts USING fts5(
+    name, slug, plan, findings,
+    content=investigations, content_rowid=id, tokenize='porter unicode61'
+);
+INSERT INTO investigations_fts(investigations_fts) VALUES('rebuild');
+";
+
 pub const MIGRATION_V17: &str = "
 CREATE TABLE IF NOT EXISTS memory_provenance (
     id              INTEGER PRIMARY KEY,
@@ -945,6 +998,15 @@ pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
 /// index run (see `index::TEXT_INDEX_META_KEY`).
 pub const REPO_MIGRATION_V8: &str = files_fts_table!();
 
+/// `symbols_fts` was maintained on every write but never queried: symbol
+/// search matches substrings with `LIKE`.
+pub const REPO_MIGRATION_V9: &str = "
+DROP TRIGGER IF EXISTS symbols_ai;
+DROP TRIGGER IF EXISTS symbols_au;
+DROP TRIGGER IF EXISTS symbols_ad;
+DROP TABLE IF EXISTS symbols_fts;
+";
+
 pub const REPO_SCHEMA: &str = concat!(
     "
 PRAGMA journal_mode=WAL;
@@ -972,25 +1034,6 @@ CREATE TABLE IF NOT EXISTS symbols (
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-    name, kind, signature,
-    content=symbols, content_rowid=id
-);
-CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, kind, signature)
-    VALUES (new.id, new.name, new.kind, new.signature);
-END;
-CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature)
-    VALUES ('delete', old.id, old.name, old.kind, old.signature);
-    INSERT INTO symbols_fts(rowid, name, kind, signature)
-    VALUES (new.id, new.name, new.kind, new.signature);
-END;
-CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature)
-    VALUES ('delete', old.id, old.name, old.kind, old.signature);
-END;
-
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,

@@ -74,8 +74,23 @@ impl Database {
                 OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?2 ESCAPE '\\')
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![fts_query, like_pat], row_to_person)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut results = stmt
+            .query_map(params![fts_query, like_pat], row_to_person)?
+            .collect::<Result<Vec<_>, _>>()?;
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "people_fts",
+                table: "people",
+                columns: "id, name, notes, created_at, updated_at",
+                status: None,
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_person,
+        )?;
+        Ok(results)
     }
 
     pub fn people_update(&self, id: i64, update: PersonUpdate) -> Result<bool> {

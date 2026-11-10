@@ -76,8 +76,23 @@ impl Database {
                 OR name LIKE ?2 ESCAPE '\\' OR description LIKE ?2 ESCAPE '\\'
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![fts_query, like_pat], row_to_project)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut results = stmt
+            .query_map(params![fts_query, like_pat], row_to_project)?
+            .collect::<Result<Vec<_>, _>>()?;
+        fts::append_loose(
+            &self.conn,
+            query,
+            fts::LooseSource {
+                fts: "projects_fts",
+                table: "projects",
+                columns: "id, name, description, links, created_at, updated_at",
+                status: None,
+            },
+            &mut results,
+            |hit| hit.id,
+            row_to_project,
+        )?;
+        Ok(results)
     }
 
     pub fn project_update(
