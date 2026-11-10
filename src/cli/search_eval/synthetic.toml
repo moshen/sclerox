@@ -69,6 +69,17 @@ title = "Design sync"
 date = "2026-09-03"
 notes = "Ana showed the new onboarding screens. Dark mode colours need more contrast before launch."
 
+[[meeting]]
+title = "Observability sync"
+date = "2026-10-02"
+notes = "Chose Honeycomb over Datadog; the contract starts in November."
+transcript = "Lena: the holiday rota still has gaps. Omar: swap the Christmas and New Year shifts so nobody covers both. Lena: and put the rota in the shared calendar so people can trade days."
+
+[[meeting]]
+title = "Office move retrospective"
+date = "2026-10-20"
+notes = "Movers arrived two hours late. Badge readers on floor three still reject the old cards. Book the freight elevator a week ahead next time."
+
 [[project]]
 name = "Invoice extraction"
 description = "Parse supplier invoices into FinancialDocument records."
@@ -177,6 +188,23 @@ def rotate_password(env: str) -> str:
 
 def store_secret(path: str, value: str) -> None:
     raise NotImplementedError("wire up the vault client")
+'''
+
+[[file]]
+path = "src/billing/sales_tax.rs"
+content = '''
+pub fn rate_for(region: &str) -> f64 {
+    match region {
+        "CA" => 0.0725,
+        "NY" => 0.04,
+        "TX" => 0.0625,
+        _ => 0.0,
+    }
+}
+
+pub fn apply(amount_cents: i64, region: &str) -> i64 {
+    amount_cents + (amount_cents as f64 * rate_for(region)).round() as i64
+}
 '''
 
 # --- Queries -----------------------------------------------------------------
@@ -311,3 +339,18 @@ kind = "no_answer"
 [[query]]
 q = "how do we hire interns"
 kind = "no_answer"
+
+[[query]]
+q = "which monitoring vendor did we pick"
+kind = "natural_language"
+relevant = ["meeting:4"]
+
+[[query]]
+q = "lessons from relocating offices"
+kind = "natural_language"
+relevant = ["meeting:5"]
+
+[[query]]
+q = "billing sales tax"
+kind = "identifier"
+relevant = ["code:src/billing/sales_tax.rs", "symbol:rate_for"]

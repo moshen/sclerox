@@ -324,9 +324,43 @@ fn load(spec: &ModelSpec, files: &[(&'static str, PathBuf)]) -> Result<fastembed
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Bump when [`chunk_text`] changes how it cuts text, so databases re-chunk
-/// their stored text on the next `sclerox db reembed`.
-const TEXT_CHUNKER_VERSION: u32 = 1;
+/// Default `embed.chunk_size`: most characters in a chunk of meeting, todo
+/// or research text.
+pub const DEFAULT_TEXT_CHUNK_CHARS: usize = 800;
+
+/// Most characters of a chunk's header: room for a title and section or a
+/// path and symbol, without taking much of the model's window from the text.
+pub const CONTEXT_CHARS: usize = 200;
+
+/// A chunk's header from `header`, cut to [`CONTEXT_CHARS`] and kept on one
+/// line; `None` when that leaves nothing.
+pub fn context(header: &str) -> Option<String> {
+    let line = header.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line: String = line.chars().take(CONTEXT_CHARS).collect();
+    (!line.is_empty()).then_some(line)
+}
+
+/// The text embedded for a chunk: its header (meeting title and section,
+/// research name and section, or code path and symbol), a blank line, then
+/// the chunk. The header is stored apart from the chunk, which stays as
+/// written for display. [`PASSAGE_SQL`] builds the same text in SQL.
+pub fn passage(context: Option<&str>, text: &str) -> String {
+    match context.filter(|c| !c.is_empty()) {
+        Some(context) => format!("{context}\n\n{text}"),
+        None => text.to_string(),
+    }
+}
+
+/// [`passage`] over a chunk table's `context` and `chunk_text` columns, for
+/// the re-embed paths that read the text in SQL.
+pub const PASSAGE_SQL: &str = "CASE WHEN context IS NULL OR context = '' THEN chunk_text \
+     ELSE context || char(10) || char(10) || chunk_text END";
+
+/// Bump when [`chunk_text`] or what text chunks hold changes, so databases
+/// re-chunk their stored text on the next `sclerox db reembed`. v2: meeting
+/// notes and transcripts, and research plans and findings, are cut apart,
+/// each chunk with a header.
+const TEXT_CHUNKER_VERSION: u32 = 2;
 
 /// Meta key recording which chunker cut a database's meeting, todo and
 /// research chunks. Absent with chunks stored: cut before it was recorded.
@@ -429,6 +463,31 @@ fn overlap_tail(para: &str, overlap_chars: usize, room: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passage_sql_builds_the_same_text_as_passage() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let long = "word ".repeat(100);
+        for (header, text) in [
+            (Some("Sync (notes)"), "We moved the launch."),
+            (None, "fn alpha() {}"),
+            (Some(""), "plain"),
+            (Some(long.as_str()), "after a long title"),
+        ] {
+            let context = header.and_then(context).or(header.map(str::to_string));
+            let in_sql: String = conn
+                .query_row(
+                    &format!("SELECT {PASSAGE_SQL} FROM (SELECT ?1 AS context, ?2 AS chunk_text)"),
+                    rusqlite::params![context, text],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(in_sql, passage(context.as_deref(), text), "{header:?}");
+        }
+        assert_eq!(context("  Sync\n  (notes) "), Some("Sync (notes)".into()));
+        assert_eq!(context(" \n"), None);
+        assert_eq!(context(&long).unwrap().chars().count(), CONTEXT_CHARS);
+    }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();

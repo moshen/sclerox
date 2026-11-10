@@ -8,10 +8,10 @@ pub struct Migration {
 
 /// Current target schema version for the primary database.
 /// Must equal the highest version in PRIMARY_MIGRATIONS (or 1 if no migrations yet).
-pub const PRIMARY_VERSION: u32 = 18;
+pub const PRIMARY_VERSION: u32 = 19;
 
 /// Current target schema version for per-repo databases.
-pub const REPO_VERSION: u32 = 9;
+pub const REPO_VERSION: u32 = 10;
 
 /// Migrations for the primary database (~/.local/share/sclerox/sclerox.db).
 ///
@@ -111,6 +111,11 @@ pub const PRIMARY_MIGRATIONS: &[Migration] = &[
         description: "stem words in the prose full-text indexes",
         sql: crate::db::schema::MIGRATION_V18,
     },
+    Migration {
+        version: 19,
+        description: "section and embedding header on text chunks",
+        sql: crate::db::schema::MIGRATION_V19,
+    },
 ];
 
 /// Migrations for per-repo databases (<repo>/.sclerox/repo.db).
@@ -154,6 +159,11 @@ pub const REPO_MIGRATIONS: &[Migration] = &[
         version: 9,
         description: "drop the unused symbols_fts index",
         sql: crate::db::schema::REPO_MIGRATION_V9,
+    },
+    Migration {
+        version: 10,
+        description: "embedding header on code chunks",
+        sql: crate::db::schema::REPO_MIGRATION_V10,
     },
 ];
 

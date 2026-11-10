@@ -169,7 +169,7 @@ fn per_table_search_500_research() {
 /// vec0 triggers populate `meeting_chunks_vec`, then time `meeting_similar`.
 /// This exercises the sqlite-vec index end-to-end without the fastembed model.
 fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
-    use sclerox::db::Database;
+    use sclerox::db::{Database, TextChunk, TextChunkKind};
 
     let dims = 384usize;
     let dir = TempDir::new().unwrap();
@@ -180,16 +180,22 @@ fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
     let meetings = 20;
     for m in 0..meetings {
         let meeting_id = db.meeting_add("Perf", None, None, None).unwrap();
-        let chunks: Vec<(String, Option<Vec<f32>>)> = (m..n_chunks)
+        let chunks: Vec<TextChunk> = (m..n_chunks)
             .step_by(meetings)
             .map(|i| {
                 let emb: Vec<f32> = (0..dims)
                     .map(|j| ((i * dims + j) as f32 * 0.001).sin())
                     .collect();
-                (format!("chunk {i}"), Some(emb))
+                TextChunk {
+                    section: None,
+                    context: None,
+                    text: format!("chunk {i}"),
+                    embedding: Some(emb),
+                }
             })
             .collect();
-        db.meeting_store_chunks(meeting_id, &chunks).unwrap();
+        db.store_text_chunks(TextChunkKind::Meeting, meeting_id, &chunks)
+            .unwrap();
     }
 
     let query: Vec<f32> = (0..dims).map(|j| ((j as f32) * 0.002).cos()).collect();

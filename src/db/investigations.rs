@@ -309,33 +309,28 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Store pre-chunked text with optional embeddings for an investigation.
+    /// Store chunks with no section or header, each with its vector when it
+    /// has one, replacing the item's chunks; see [`Database::store_text_chunks`].
+    #[cfg(test)]
     pub fn investigation_store_chunks(
         &self,
         investigation_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        // Replacing the chunks and deciding whether their vectors may be kept
-        // happen in one transaction; see `write_with_vectors`.
-        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
-        self.write_with_vectors(wants_vectors, |keep_vectors| {
-            self.conn.execute(
-                "DELETE FROM investigation_chunks WHERE investigation_id = ?1",
-                params![investigation_id],
-            )?;
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO investigation_chunks (investigation_id, chunk_index, chunk_text, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (i, (text, emb)) in chunks.iter().enumerate() {
-                let emb_bytes = emb
-                    .as_ref()
-                    .filter(|_| keep_vectors)
-                    .map(|e| crate::db::embedding_to_bytes(e));
-                stmt.execute(params![investigation_id, i as i64, text, emb_bytes])?;
-            }
-            Ok(())
-        })
+        let chunks: Vec<_> = chunks
+            .iter()
+            .map(|(text, emb)| crate::db::TextChunk {
+                section: None,
+                context: None,
+                text: text.clone(),
+                embedding: emb.clone(),
+            })
+            .collect();
+        self.store_text_chunks(
+            crate::db::TextChunkKind::Research,
+            investigation_id,
+            &chunks,
+        )
     }
 
     /// Find investigations semantically similar to a query embedding.
@@ -353,7 +348,7 @@ impl Database {
             let mut stmt = self.conn.prepare(
                 "SELECT i.id, i.name, i.slug, i.status, i.plan, i.findings,
                     i.created_at, i.concluded_at, i.updated_at,
-                    ic.chunk_text, v.distance
+                    ic.chunk_text, v.distance, ic.section
              FROM investigation_chunks_vec v
              JOIN investigation_chunks ic ON ic.id = v.rowid
              JOIN investigations i ON ic.investigation_id = i.id
@@ -381,6 +376,7 @@ impl Database {
                             investigation: inv,
                             score: 1.0 - distance as f32,
                             matched_chunk,
+                            matched_section: row.get(11)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -402,6 +398,9 @@ pub struct SimilarInvestigation {
     pub investigation: Investigation,
     pub score: f32,
     pub matched_chunk: String,
+    /// Where the chunk came from: "plan" or "findings".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_section: Option<String>,
 }
 
 fn row_to_investigation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Investigation> {

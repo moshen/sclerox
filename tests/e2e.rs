@@ -239,6 +239,58 @@ fn memory_reembed_backfills_missing() {
 }
 
 #[test]
+fn meeting_notes_and_transcript_are_chunked_under_the_title() {
+    let e = Env::new();
+    let dir = TempDir::new().unwrap();
+    let transcript = dir.path().join("t.txt");
+    std::fs::write(&transcript, "Lena: the holiday rota still has gaps.").unwrap();
+    e.run(&[
+        "meeting",
+        "add",
+        "--title",
+        "Vendors",
+        "--notes",
+        "Chose Honeycomb over Datadog.",
+        "--transcript-file",
+        transcript.to_str().unwrap(),
+        "--no-embed",
+    ]);
+    let chunks = || -> Vec<(String, String, String)> {
+        let conn = rusqlite::Connection::open(&e.db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT section, context, chunk_text FROM meeting_chunks ORDER BY chunk_index")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let row = |s: &str, c: &str, t: &str| (s.to_string(), c.to_string(), t.to_string());
+    assert_eq!(
+        chunks(),
+        [
+            row("notes", "Vendors (notes)", "Chose Honeycomb over Datadog."),
+            row(
+                "transcript",
+                "Vendors (transcript)",
+                "Lena: the holiday rota still has gaps."
+            ),
+        ]
+    );
+
+    // A new title re-cuts the chunks under it.
+    e.run(&[
+        "meeting",
+        "update",
+        "1",
+        "--title",
+        "Vendor review",
+        "--no-embed",
+    ]);
+    assert_eq!(chunks()[0].1, "Vendor review (notes)");
+}
+
+#[test]
 fn db_reembed_rechunks_text_cut_at_other_sizes() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();
@@ -279,7 +331,7 @@ fn db_reembed_rechunks_text_cut_at_other_sizes() {
             )
             .unwrap()
     };
-    assert_eq!(chunker().as_deref(), Some("v1:size=800:overlap=200"));
+    assert_eq!(chunker().as_deref(), Some("v2:size=800:overlap=200"));
     let (before, _, _) = meeting_chunks();
 
     // Same sizes: nothing to re-cut.
@@ -296,7 +348,7 @@ fn db_reembed_rechunks_text_cut_at_other_sizes() {
     assert!(after > before, "{after} chunks vs {before}");
     assert!(longest <= 300, "longest chunk {longest}");
     assert_eq!(missing, 0, "every new chunk embedded");
-    assert_eq!(chunker().as_deref(), Some("v1:size=300:overlap=50"));
+    assert_eq!(chunker().as_deref(), Some("v2:size=300:overlap=50"));
 
     let out = e.run(&["db", "reembed"]);
     assert!(!out.contains("re-chunked"), "got: {out}");

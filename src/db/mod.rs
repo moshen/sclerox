@@ -15,7 +15,7 @@ pub mod todos;
 pub mod usage;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Once;
 
@@ -94,49 +94,131 @@ impl TextChunkKind {
         }
     }
 
-    /// (item table, first source column, second source column)
-    fn source_columns(self) -> (&'static str, &'static str, &'static str) {
+    /// (item table, title column, first source column, second source column)
+    fn source_columns(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
-            Self::Meeting => ("meetings", "transcript", "notes"),
-            Self::Todo => ("todos", "title", "notes"),
-            Self::Research => ("investigations", "plan", "findings"),
+            Self::Meeting => ("meetings", "title", "notes", "transcript"),
+            Self::Todo => ("todos", "NULL", "title", "notes"),
+            Self::Research => ("investigations", "name", "plan", "findings"),
         }
     }
 
-    /// The text an item's chunks are cut from, given its two source columns:
-    /// a meeting's transcript, or its notes without one; a todo's title, then
-    /// its notes; an investigation's plan, then its findings.
-    pub fn source_text(self, first: Option<&str>, second: Option<&str>) -> String {
+    /// What an item's chunks are cut from, given its title column and two
+    /// source columns. A meeting's notes and transcript, and an
+    /// investigation's plan and findings, are sections of their own, each
+    /// chunk headed by the title and section. A todo's title and notes are
+    /// one text, with no header: the title is in it.
+    pub fn source(
+        self,
+        title: Option<&str>,
+        first: Option<&str>,
+        second: Option<&str>,
+    ) -> ChunkSource {
         let present = |t: &Option<&str>| t.is_some_and(|t| !t.trim().is_empty());
-        match self {
-            Self::Meeting => {
-                let text = if first.is_some_and(|t| !t.is_empty()) {
-                    first
-                } else {
-                    second
+        let sections = match self {
+            Self::Meeting | Self::Research => {
+                let names = match self {
+                    Self::Meeting => ["notes", "transcript"],
+                    _ => ["plan", "findings"],
                 };
-                text.unwrap_or("").to_string()
+                names
+                    .into_iter()
+                    .zip([first, second])
+                    .filter(|(_, t)| present(t))
+                    .map(|(name, t)| (Some(name), t.unwrap_or_default().to_string()))
+                    .collect()
             }
-            Self::Todo | Self::Research => [first, second]
-                .into_iter()
-                .filter(present)
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            Self::Todo => {
+                let text = [first, second]
+                    .into_iter()
+                    .filter(present)
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(None, text)]
+                }
+            }
+        };
+        ChunkSource {
+            title: title.map(str::to_string),
+            sections,
         }
     }
+}
+
+/// What an item's text chunks are cut from: the title or name heading each
+/// chunk's embedding, and the sections of text, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkSource {
+    pub title: Option<String>,
+    pub sections: Vec<(Option<&'static str>, String)>,
+}
+
+impl ChunkSource {
+    /// Cut each section with `cut`, heading every chunk with the title and
+    /// its section. The chunks carry no vectors yet.
+    pub fn cut(&self, cut: &dyn Fn(&str) -> Vec<String>) -> Vec<TextChunk> {
+        let mut chunks = Vec::new();
+        for (section, text) in &self.sections {
+            let context = match (&self.title, section) {
+                (Some(title), Some(section)) => {
+                    crate::embed::context(&format!("{title} ({section})"))
+                }
+                _ => None,
+            };
+            chunks.extend(cut(text).into_iter().map(|text| TextChunk {
+                section: *section,
+                context: context.clone(),
+                text,
+                embedding: None,
+            }));
+        }
+        chunks
+    }
+}
+
+/// One chunk of an item's text: the part it was cut from, its header, its
+/// text and its vector, when it has one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextChunk {
+    pub section: Option<&'static str>,
+    pub context: Option<String>,
+    pub text: String,
+    pub embedding: Option<Vec<f32>>,
+}
+
+impl TextChunk {
+    /// The text its vector is embedded from; see [`crate::embed::passage`].
+    pub fn passage(&self) -> String {
+        crate::embed::passage(self.context.as_deref(), &self.text)
+    }
+}
+
+/// An item's [`ChunkSource`] from a row holding its title and two source
+/// columns from column `at` on.
+fn source_row(
+    kind: TextChunkKind,
+    r: &rusqlite::Row<'_>,
+    at: usize,
+) -> rusqlite::Result<ChunkSource> {
+    let get = |i: usize| r.get::<_, Option<String>>(at + i);
+    let (title, first, second) = (get(0)?, get(1)?, get(2)?);
+    Ok(kind.source(title.as_deref(), first.as_deref(), second.as_deref()))
 }
 
 /// The tables holding meeting, todo and research chunks.
 pub const TEXT_CHUNK_TABLES: [&str; 3] = ["meeting_chunks", "todo_chunks", "investigation_chunks"];
 
-/// One item's new text chunks, each with its vector when it has one, and the
-/// source text they were cut from.
+/// One item's new text chunks, each with its vector when it has one, and
+/// what they were cut from.
 pub struct ItemChunks {
     pub kind: TextChunkKind,
     pub id: i64,
-    pub source: String,
-    pub chunks: Vec<(String, Option<Vec<f32>>)>,
+    pub source: ChunkSource,
+    pub chunks: Vec<TextChunk>,
 }
 
 /// What [`Database::replace_text_chunks`] did besides the planned swap.
@@ -258,37 +340,71 @@ impl Database {
         )?)
     }
 
-    /// Every item of `kind` with the text its chunks are cut from.
-    pub fn text_chunk_sources(&self, kind: TextChunkKind) -> Result<Vec<(i64, String)>> {
-        let (table, first, second) = kind.source_columns();
+    /// Every item of `kind` with what its chunks are cut from.
+    pub fn text_chunk_sources(&self, kind: TextChunkKind) -> Result<Vec<(i64, ChunkSource)>> {
+        let (table, title, first, second) = kind.source_columns();
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, {first}, {second} FROM {table} ORDER BY id"
+            "SELECT id, {title}, {first}, {second} FROM {table} ORDER BY id"
         ))?;
-        let rows = stmt.query_map([], |r| {
-            let (a, b): (Option<String>, Option<String>) = (r.get(1)?, r.get(2)?);
-            Ok((r.get(0)?, kind.source_text(a.as_deref(), b.as_deref())))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, source_row(kind, r, 1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// The text item `id`'s chunks are cut from now; `None` once it is deleted.
-    fn text_chunk_source(&self, kind: TextChunkKind, id: i64) -> Result<Option<String>> {
-        let (table, first, second) = kind.source_columns();
-        let row = self.conn.query_row(
-            &format!("SELECT {first}, {second} FROM {table} WHERE id = ?1"),
+    /// What item `id`'s chunks are cut from now; `None` once it is deleted.
+    pub fn text_chunk_source(&self, kind: TextChunkKind, id: i64) -> Result<Option<ChunkSource>> {
+        let (table, title, first, second) = kind.source_columns();
+        self.conn
+            .query_row(
+                &format!("SELECT {title}, {first}, {second} FROM {table} WHERE id = ?1"),
+                params![id],
+                |r| source_row(kind, r, 0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Replace item `id`'s text chunks with `chunks`. Vectors are kept only
+    /// when the database may take them; see `write_with_vectors`.
+    pub fn store_text_chunks(
+        &self,
+        kind: TextChunkKind,
+        id: i64,
+        chunks: &[TextChunk],
+    ) -> Result<()> {
+        let wants_vectors = chunks.iter().any(|c| c.embedding.is_some());
+        self.write_with_vectors(wants_vectors, |keep_vectors| {
+            self.write_text_chunks(kind, id, chunks, keep_vectors)
+        })
+    }
+
+    /// [`Self::store_text_chunks`] inside a transaction the caller holds.
+    fn write_text_chunks(
+        &self,
+        kind: TextChunkKind,
+        id: i64,
+        chunks: &[TextChunk],
+        keep_vectors: bool,
+    ) -> Result<()> {
+        let (table, column) = kind.table();
+        self.conn.execute(
+            &format!("DELETE FROM {table} WHERE {column} = ?1"),
             params![id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            },
-        );
-        match row {
-            Ok((a, b)) => Ok(Some(kind.source_text(a.as_deref(), b.as_deref()))),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        )?;
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "INSERT INTO {table} ({column}, chunk_index, chunk_text, section, context, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        ))?;
+        for (i, c) in chunks.iter().enumerate() {
+            let emb_bytes = c
+                .embedding
+                .as_deref()
+                .filter(|_| keep_vectors)
+                .map(embedding_to_bytes);
+            stmt.execute(params![
+                id, i as i64, c.text, c.section, c.context, emb_bytes
+            ])?;
         }
+        Ok(())
     }
 
     /// Replace the text chunks of every item in `items` and record `signature`
@@ -305,11 +421,11 @@ impl Database {
         &self,
         items: &[ItemChunks],
         signature: &str,
-        cut: &dyn Fn(&str) -> Vec<String>,
+        cut: &dyn Fn(&ChunkSource) -> Vec<TextChunk>,
     ) -> Result<ReplacedTextChunks> {
         let wants_vectors = items
             .iter()
-            .any(|item| item.chunks.iter().any(|(_, e)| e.is_some()));
+            .any(|item| item.chunks.iter().any(|c| c.embedding.is_some()));
         // `write_with_vectors` opens a transaction only to store vectors, and
         // joins one already open, so open it here for the vector-less case too.
         let tx = rusqlite::Transaction::new_unchecked(
@@ -327,31 +443,12 @@ impl Database {
                     }
                     Some(now) if now != item.source => {
                         replaced.recut += 1;
-                        recut = if now.trim().is_empty() {
-                            Vec::new()
-                        } else {
-                            cut(&now).into_iter().map(|c| (c, None)).collect()
-                        };
+                        recut = cut(&now);
                         &recut
                     }
                     Some(_) => &item.chunks,
                 };
-                let (table, column) = item.kind.table();
-                self.conn.execute(
-                    &format!("DELETE FROM {table} WHERE {column} = ?1"),
-                    params![item.id],
-                )?;
-                let mut stmt = self.conn.prepare_cached(&format!(
-                    "INSERT INTO {table} ({column}, chunk_index, chunk_text, embedding)
-                     VALUES (?1, ?2, ?3, ?4)"
-                ))?;
-                for (i, (text, emb)) in chunks.iter().enumerate() {
-                    let emb_bytes = emb
-                        .as_deref()
-                        .filter(|_| keep_vectors)
-                        .map(embedding_to_bytes);
-                    stmt.execute(params![item.id, i as i64, text, emb_bytes])?;
-                }
+                self.write_text_chunks(item.kind, item.id, chunks, keep_vectors)?;
             }
             self.set_meta(crate::embed::TEXT_CHUNKER_KEY, signature)
         })?;

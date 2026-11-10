@@ -341,7 +341,7 @@ impl Default for EmbedSettings {
         Self {
             enabled: true,
             model: crate::embed::models::DEFAULT_MODEL.to_string(),
-            chunk_size: 800,
+            chunk_size: crate::embed::DEFAULT_TEXT_CHUNK_CHARS,
             chunk_overlap: 200,
             memory_chars: None,
             server: "auto".to_string(),
@@ -596,7 +596,11 @@ impl Settings {
         require_positive("distill.chunk_chars", &mut self.distill.chunk_chars, 20_000);
         require_positive("distill.min_turns", &mut self.distill.min_turns, 5);
         require_positive("distill.min_new_turns", &mut self.distill.min_new_turns, 50);
-        require_positive("embed.chunk_size", &mut self.embed.chunk_size, 800);
+        require_positive(
+            "embed.chunk_size",
+            &mut self.embed.chunk_size,
+            crate::embed::DEFAULT_TEXT_CHUNK_CHARS,
+        );
         if self.embed.memory_chars == Some(0) {
             eprintln!("warning: embed.memory_chars must be > 0; using the model's default");
             self.embed.memory_chars = None;

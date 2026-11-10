@@ -43,6 +43,16 @@ pub fn stamp(label: &str, at: &str) -> String {
     format!("({label} {at})")
 }
 
+/// A semantic hit's best chunk, cut to one line and led by the part of the
+/// record it came from: `(notes) We moved the launch...`.
+pub fn matched(section: Option<&str>, chunk: &str) -> String {
+    let chunk = crate::output::truncate(chunk, 100);
+    match section {
+        Some(section) => format!("({section}) {chunk}"),
+        None => chunk,
+    }
+}
+
 /// When a code hit's file last changed, to append to its location: empty for
 /// a file not dated yet.
 fn changed(at: Option<&str>) -> String {
