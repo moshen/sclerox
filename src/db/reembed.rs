@@ -684,7 +684,10 @@ mod tests {
             }
         );
         // Semantic search is off while the models disagree...
-        assert!(db.memory_similar(&unit(0), 5).unwrap().is_empty());
+        assert!(db
+            .memory_similar(&unit(0), 5, &Default::default())
+            .unwrap()
+            .is_empty());
 
         let mut seen = Vec::new();
         let n = db
@@ -699,11 +702,16 @@ mod tests {
 
         // ...and back on afterwards, against the new vectors only.
         assert_eq!(db.embedding_model_check().unwrap(), ModelCheck::Match);
-        let hits = db.memory_similar(&unit(1), 5).unwrap();
+        let hits = db.memory_similar(&unit(1), 5, &Default::default()).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.key, "kept");
         assert!(hits[0].score > 0.99, "index holds the new vector");
-        assert!(db.meeting_similar(&unit(1), 5).unwrap()[0].score > 0.99);
+        assert!(
+            db.meeting_similar(&unit(1), 5, &Default::default())
+                .unwrap()[0]
+                .score
+                > 0.99
+        );
 
         // The inactive memory's old-model vector is gone, not left to resurface.
         let stale_vectors: i64 = db
@@ -829,7 +837,7 @@ mod tests {
         assert!(texts_seen.iter().any(|t| t == "an edited fact"));
         assert!(texts_seen.iter().any(|t| t == "a fact saved mid-rebuild"));
         assert_eq!(db.missing_vectors().unwrap(), 0);
-        let hits = db.memory_similar(&unit(1), 5).unwrap();
+        let hits = db.memory_similar(&unit(1), 5, &Default::default()).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -1036,7 +1044,7 @@ mod tests {
             .unwrap();
         assert!(!db.memory_set_embedding("new", &unit(1)).unwrap());
         // The memory itself is stored and keyword search still finds it.
-        let hits = db.memory_search("new fact").unwrap();
+        let hits = db.memory_search("new fact", &Default::default()).unwrap();
         assert_eq!(hits[0].key, "new");
         assert_eq!(db.memory_needing_embedding().unwrap().len(), 1);
     }

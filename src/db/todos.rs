@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,7 +132,14 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn todo_search(&self, query: &str) -> Result<Vec<Todo>> {
+    /// Todos matching `query` with `status` (any when `None`), dated within
+    /// `dates`.
+    pub fn todo_search(
+        &self,
+        query: &str,
+        status: Option<&str>,
+        dates: &Dates,
+    ) -> Result<Vec<Todo>> {
         let source = fts::Source {
             fts: "todos_fts",
             table: "todos",
@@ -141,7 +149,10 @@ impl Database {
             weights: &[4.0, 1.0, 1.0, 1.0],
             like: "title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\'",
             then_by: "updated_at DESC",
-            status: None,
+            status,
+            dates,
+            changed: "updated_at",
+            created: "created_at",
         };
         fts::search(&self.conn, query, &source, |hit| hit.id, row_to_todo)
     }
@@ -294,42 +305,6 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// History: search completed items, optionally filtered by date range.
-    pub fn todo_history(
-        &self,
-        query: Option<&str>,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<Vec<Todo>> {
-        // Use NULL-safe parameter binding so dates are always parameterized.
-        let base = "SELECT id, title, notes, status, source_url, category, originated_date,
-                    deadline_date, completed_at, created_at, updated_at
-                    FROM todos
-                    WHERE status = 'done'
-                      AND (?2 IS NULL OR completed_at >= ?2)
-                      AND (?3 IS NULL OR completed_at <= ?3)";
-
-        if let Some(q) = query {
-            let q = fts::sanitize(q);
-            let sql = "SELECT id, title, notes, status, source_url, category, originated_date,
-                        deadline_date, completed_at, created_at, updated_at
-                 FROM todos
-                 WHERE id IN (SELECT rowid FROM todos_fts WHERE todos_fts MATCH ?1)
-                   AND status = 'done'
-                   AND (?2 IS NULL OR completed_at >= ?2)
-                   AND (?3 IS NULL OR completed_at <= ?3)
-                 ORDER BY completed_at DESC";
-            let mut stmt = self.conn.prepare(sql)?;
-            let rows = stmt.query_map(params![q, from, to], row_to_todo)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        } else {
-            let sql = format!("{base} ORDER BY completed_at DESC"); // base is a literal const str
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![rusqlite::types::Null, from, to], row_to_todo)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        }
-    }
-
     // ---------- embeddings ----------
 
     pub fn todo_store_chunks(
@@ -375,7 +350,13 @@ impl Database {
 
     /// Todos whose chunks are nearest to `query_embedding`, via the sqlite-vec
     /// KNN index (`todo_chunks_vec`, cosine). `score` = 1 - cosine distance.
-    pub fn todo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarTodo>> {
+    pub fn todo_similar(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        status: Option<&str>,
+        dates: &Dates,
+    ) -> Result<Vec<SimilarTodo>> {
         self.semantic_read(|| {
             let query = crate::db::embedding_to_bytes(query_embedding);
             let mut stmt = self.conn.prepare(
@@ -416,7 +397,13 @@ impl Database {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(Into::into)
                 },
-                |rows| crate::db::best_per_record(rows, |r| r.todo.id, limit),
+                |rows| {
+                    let rows = rows.into_iter().filter(|r| {
+                        status.is_none_or(|s| r.todo.status == s)
+                            && dates.keeps(&r.todo.updated_at, &r.todo.created_at)
+                    });
+                    crate::db::best_per_record(rows.collect(), |r| r.todo.id, limit)
+                },
             )
         })
     }
@@ -469,7 +456,7 @@ mod tests {
             )
             .unwrap();
         let ids: Vec<i64> = db
-            .todo_search("backlog")
+            .todo_search("backlog", None, &Default::default())
             .unwrap()
             .iter()
             .map(|t| t.id)
@@ -588,7 +575,9 @@ mod tests {
         )
         .unwrap();
 
-        let results = db.todo_search("authentication").unwrap();
+        let results = db
+            .todo_search("authentication", None, &Default::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].title.contains("authentication"));
     }
@@ -632,7 +621,7 @@ mod tests {
         db.todo_done(id1, Some("resolved via PR")).unwrap();
         db.todo_done(id2, None).unwrap();
 
-        let history = db.todo_history(None, None, None).unwrap();
+        let history = db.todo_list(Some("done")).unwrap();
         assert_eq!(history.len(), 2);
         assert!(history.iter().all(|t| t.status == "done"));
     }
@@ -653,7 +642,7 @@ mod tests {
             .unwrap();
         db.todo_done(id, Some("applied migration v2")).unwrap();
         db.todo_add(
-            "Review PR",
+            "Plan the next migration",
             None,
             TodoStatus::Open,
             None,
@@ -663,9 +652,49 @@ mod tests {
         )
         .unwrap();
 
-        let results = db.todo_history(Some("migration"), None, None).unwrap();
+        let results = db
+            .todo_search("migration", Some("done"), &Dates::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].title.contains("Migrate"));
+        // Some of the terms, as `todo search` matches them.
+        let results = db
+            .todo_search("schema rollback", Some("done"), &Dates::default())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn todo_search_keeps_the_status_and_dates_asked_for() {
+        let db = db();
+        let add = |title: &str| {
+            db.todo_add(title, None, TodoStatus::Open, None, "general", None, None)
+                .unwrap()
+        };
+        let (june, july) = (add("June release"), add("July release"));
+        add("Next release");
+        for (id, at) in [(june, "2026-06-08 17:30:00"), (july, "2026-07-02 09:00:00")] {
+            db.todo_done(id, None).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE todos SET updated_at = ?2, created_at = '2026-01-05 00:00:00'
+                     WHERE id = ?1",
+                    params![id, at],
+                )
+                .unwrap();
+        }
+        let range = |from, to, created| Dates::parse(Some(from), Some(to), created).unwrap();
+        let titles = |todos: Vec<Todo>| todos.into_iter().map(|t| t.title).collect::<Vec<_>>();
+        let search =
+            |status, dates: &Dates| titles(db.todo_search("release", status, dates).unwrap());
+
+        assert_eq!(search(Some("done"), &Dates::default()).len(), 2);
+        assert_eq!(search(Some("open"), &Dates::default()), ["Next release"]);
+        // The whole last day is in range.
+        let june_only = range("2026-06-01", "2026-06-08", false);
+        assert_eq!(search(None, &june_only), ["June release"]);
+        let created = range("2026-01-05", "2026-01-05", true);
+        assert_eq!(search(None, &created).len(), 2);
     }
 
     #[test]

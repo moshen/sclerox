@@ -195,9 +195,9 @@ fn bench_meeting_knn(n_chunks: usize, budget: Duration) {
     let query: Vec<f32> = (0..dims).map(|j| ((j as f32) * 0.002).cos()).collect();
 
     // Warm up, then measure a single KNN query (the actual hot path).
-    let _ = db.meeting_similar(&query, 10).unwrap();
+    let _ = db.meeting_similar(&query, 10, &Default::default()).unwrap();
     let start = Instant::now();
-    let results = db.meeting_similar(&query, 10).unwrap();
+    let results = db.meeting_similar(&query, 10, &Default::default()).unwrap();
     let elapsed = start.elapsed();
 
     println!("\n[perf] vec0 KNN over {n_chunks} chunks ({dims}d): {elapsed:?}");

@@ -463,7 +463,12 @@ mod tests {
         };
         run(&db.conn, DbKind::Main, &mut embed, &mut nothing).unwrap();
         assert_eq!(seen, ["fact"]);
-        assert!(db.meeting_similar(&unit(1), 1).unwrap()[0].score > 0.99);
+        assert!(
+            db.meeting_similar(&unit(1), 1, &Default::default())
+                .unwrap()[0]
+                .score
+                > 0.99
+        );
     }
 
     #[test]

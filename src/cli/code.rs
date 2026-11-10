@@ -21,6 +21,8 @@ pub enum CodeCommand {
         /// Restrict to repos whose name contains this string
         #[arg(long)]
         repo: Option<String>,
+        #[command(flatten)]
+        range: crate::cli::dates::Range,
     },
     /// Show what a symbol calls / inherits / implements
     Calls {
@@ -47,7 +49,12 @@ pub enum CodeCommand {
 
 pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> {
     match cmd {
-        CodeCommand::Search { needle, repo } => {
+        CodeCommand::Search {
+            needle,
+            repo,
+            range,
+        } => {
+            let dates = range.dates()?;
             db.repo_prune_gone()?;
             let repos = db.repo_list()?;
             if repos.is_empty() {
@@ -87,7 +94,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     Err(_) => continue,
                 };
 
-                for s in repo_db.search_symbols(&needle)? {
+                for s in repo_db.search_symbols(&needle, &dates)? {
                     results.push(SearchResult::Symbol {
                         repo_name: entry.name.clone(),
                         repo_path: entry.path.clone(),
@@ -106,11 +113,12 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     &repo_db,
                     &needle,
                     sem.code_text_limit,
+                    &dates,
                 );
 
                 if let Some(ref qe) = query_emb {
                     for c in repo_db
-                        .similar_chunks(qe, sem.semantic_limit)
+                        .similar_chunks(qe, sem.semantic_limit, &dates)
                         .unwrap_or_default()
                     {
                         if c.score >= floor {

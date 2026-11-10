@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::db::{
+    dates::Dates,
     embedding_to_bytes, fts,
     migrations::{REPO_MIGRATIONS, REPO_VERSION},
     run_migrations,
@@ -377,25 +378,33 @@ impl RepoDb {
     /// what it says now. Terms under three characters can't be looked up in
     /// the trigram index: they only narrow the lines, and a query of nothing
     /// but such terms matches nothing.
-    pub fn search_text(&self, root: &Path, query: &str, limit: usize) -> Result<Vec<TextMatch>> {
+    pub fn search_text(
+        &self,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        dates: &Dates,
+    ) -> Result<Vec<TextMatch>> {
         let Some(fts_query) = fts::trigram_query(query) else {
             return Ok(Vec::new());
         };
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let phrase = terms.join(" ");
         let phrase_query = format!("\"{}\"", phrase.replace('"', "\"\""));
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT f.path, f.last_modified FROM files_fts JOIN files f ON f.id = files_fts.rowid
-             WHERE files_fts MATCH ?1
-             ORDER BY files_fts.rowid NOT IN
-                      (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
-                      files_fts.rank",
-        )?;
+                 WHERE files_fts MATCH ?1 AND {dates}
+                 ORDER BY files_fts.rowid NOT IN
+                          (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
+                          files_fts.rank",
+            dates = dates.sql("f.last_modified", 3),
+        ))?;
         // Every read must resolve inside the repo; see below.
         let Ok(root) = root.canonicalize() else {
             return Ok(Vec::new());
         };
-        let mut rows = stmt.query(params![fts_query, phrase_query])?;
+        let [from, to] = dates.values();
+        let mut rows = stmt.query(params![fts_query, phrase_query, from, to])?;
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
@@ -638,19 +647,21 @@ impl RepoDb {
 
     /// Symbols whose name or signature holds `query`, best first: see
     /// [`symbol_match`].
-    pub fn search_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
+    pub fn search_symbols(&self, query: &str, dates: &Dates) -> Result<Vec<Symbol>> {
         // Use LIKE for substring matching so "Sumo" finds "SumoClient" and
         // "SearchJob" finds "CreateSearchJobRequest". Symbol tables are small
         // (hundreds to low thousands), so a full scan is fast enough.
         let pattern = fts::like_contains(query);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line, s.end_line, f.last_modified
              FROM symbols s
              JOIN files f ON s.file_id = f.id
-             WHERE s.name LIKE ?1 ESCAPE '\\' OR s.signature LIKE ?1 ESCAPE '\\'
+             WHERE (s.name LIKE ?1 ESCAPE '\\' OR s.signature LIKE ?1 ESCAPE '\\') AND {dates}
              ORDER BY s.name",
-        )?;
-        let rows = stmt.query_map(params![pattern], |row| {
+            dates = dates.sql("f.last_modified", 2),
+        ))?;
+        let [from, to] = dates.values();
+        let rows = stmt.query_map(params![pattern, from, to], |row| {
             Ok(Symbol {
                 id: row.get(0)?,
                 file_id: row.get(1)?,
@@ -676,6 +687,7 @@ impl RepoDb {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        dates: &Dates,
     ) -> Result<Vec<SimilarChunk>> {
         self.semantic_read(|| {
             let query = embedding_to_bytes(query_embedding);
@@ -708,7 +720,12 @@ impl RepoDb {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(Into::into)
                 },
-                |rows| distinct_regions(rows, limit),
+                |rows| {
+                    let rows = rows
+                        .into_iter()
+                        .filter(|c| dates.contains(c.last_modified.as_deref()));
+                    distinct_regions(rows.collect(), limit)
+                },
             )
         })
     }
@@ -794,7 +811,7 @@ mod tests {
         db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         db.set_file_text("a.rs", text).unwrap();
         let hits = db
-            .search_text(root.path(), "financial document", 10)
+            .search_text(root.path(), "financial document", 10, &Default::default())
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 1);
@@ -817,7 +834,9 @@ mod tests {
         }
         db.insert_chunk(a, 20, "separate", Some(100), Some(150), Some(&near(0.5)))
             .unwrap();
-        let hits = db.similar_chunks(&near(1.0), 2).unwrap();
+        let hits = db
+            .similar_chunks(&near(1.0), 2, &Default::default())
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[1].chunk_text, "separate");
     }
@@ -844,7 +863,7 @@ mod tests {
                 .unwrap();
         }
         let texts: Vec<String> = db
-            .similar_chunks(&near(1.0), 3)
+            .similar_chunks(&near(1.0), 3, &Default::default())
             .unwrap()
             .into_iter()
             .map(|c| c.chunk_text)
@@ -874,7 +893,7 @@ mod tests {
             .unwrap();
 
         // Exact match
-        let syms = db.search_symbols("main").unwrap();
+        let syms = db.search_symbols("main", &Default::default()).unwrap();
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "main");
         assert_eq!(syms[0].file_path, "src/main.rs");
@@ -889,11 +908,11 @@ mod tests {
             40,
         )
         .unwrap();
-        let by_prefix = db.search_symbols("Config").unwrap();
+        let by_prefix = db.search_symbols("Config", &Default::default()).unwrap();
         assert_eq!(by_prefix.len(), 2, "should match Config and ConfigBuilder");
 
         // CamelCase substring
-        let by_mid = db.search_symbols("Builder").unwrap();
+        let by_mid = db.search_symbols("Builder", &Default::default()).unwrap();
         assert_eq!(by_mid.len(), 1);
         assert_eq!(by_mid[0].name, "ConfigBuilder");
     }
@@ -933,7 +952,7 @@ mod tests {
         // Query closest to v384(0) → the "foo" chunk ranks first.
         let mut query = v384(0);
         query[1] = 0.1;
-        let results = db.similar_chunks(&query, 2).unwrap();
+        let results = db.similar_chunks(&query, 2, &Default::default()).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].chunk_text.contains("foo"));
     }
@@ -981,7 +1000,7 @@ mod tests {
             db.set_file_text(path, text).unwrap();
         }
         let lines = |q: &str| -> Vec<(String, i64)> {
-            db.search_text(root.path(), q, 10)
+            db.search_text(root.path(), q, 10, &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|m| (m.file_path, m.line))
@@ -1002,7 +1021,12 @@ mod tests {
         assert!(lines("nowhere").is_empty());
         // The per-file and overall caps.
         assert_eq!(lines("widget").len(), TEXT_MATCH_LINES_PER_FILE);
-        assert_eq!(db.search_text(root.path(), "widget", 1).unwrap().len(), 1);
+        assert_eq!(
+            db.search_text(root.path(), "widget", 1, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
 
         // A file holding the phrase leads a better-ranked one that holds
         // only the words, even when the limit leaves room for one file.
@@ -1019,7 +1043,9 @@ mod tests {
             db.upsert_file(path, Some("rust"), "h").unwrap();
             db.set_file_text(path, text).unwrap();
         }
-        let top = db.search_text(root.path(), "gamma delta", 1).unwrap();
+        let top = db
+            .search_text(root.path(), "gamma delta", 1, &Default::default())
+            .unwrap();
         assert_eq!((top[0].file_path.as_str(), top[0].phrase), ("c.rs", true));
 
         // A stored path that leaves the repo is never read.
@@ -1038,7 +1064,7 @@ mod tests {
         }
         assert!(root.path().join(&escape).exists(), "the escape resolves");
         assert!(db
-            .search_text(root.path(), "secret", 10)
+            .search_text(root.path(), "secret", 10, &Default::default())
             .unwrap()
             .is_empty());
 
@@ -1068,7 +1094,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path().join("inner.txt"), root.path().join("in.rs"))
             .unwrap();
         let found: Vec<String> = db
-            .search_text(root.path(), "frobnicate", 10)
+            .search_text(root.path(), "frobnicate", 10, &Default::default())
             .unwrap()
             .into_iter()
             .map(|m| m.text)
@@ -1090,7 +1116,12 @@ mod tests {
         db.set_file_text("a.rs", "hello there").unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "hello there").unwrap();
-        assert_eq!(db.search_text(root.path(), "hello", 5).unwrap().len(), 1);
+        assert_eq!(
+            db.search_text(root.path(), "hello", 5, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// A repo database at v4 (before the model was recorded), with one chunk
@@ -1202,7 +1233,10 @@ mod tests {
         let db = repo_db_at_v4(true);
         db.init().unwrap(); // recorded as MiniLM; the configured model is Granite
         assert!(!db.semantic_ready());
-        assert!(db.similar_chunks(&v384(0), 5).unwrap().is_empty());
+        assert!(db
+            .similar_chunks(&v384(0), 5, &Default::default())
+            .unwrap()
+            .is_empty());
 
         // New vectors are refused; the chunk text itself is still stored.
         let file_id = db.upsert_file("b.rs", Some("rust"), "h2").unwrap();
@@ -1215,7 +1249,10 @@ mod tests {
         // Symbol (keyword) search is unaffected.
         db.insert_symbol(file_id, "function", "b", None, 1, 1)
             .unwrap();
-        assert_eq!(db.search_symbols("b").unwrap().len(), 1);
+        assert_eq!(
+            db.search_symbols("b", &Default::default()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1252,7 +1289,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(db.embedding_model().unwrap().as_deref(), Some(granite));
-        let hits = db.similar_chunks(&v384(1), 5).unwrap();
+        let hits = db.similar_chunks(&v384(1), 5, &Default::default()).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].score > 0.99, "chunks_vec holds the new vector");
     }

@@ -29,9 +29,16 @@ pub enum PeopleCommand {
     #[command(alias = "show")]
     Get { id: i64 },
     /// List all people
-    List,
+    List {
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Search people by name, notes, or any identifier value
-    Search { query: String },
+    Search {
+        query: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Update a person's name or notes
     Update {
         id: i64,
@@ -134,8 +141,10 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
             None => print_miss(format, &format!("Person #{id} not found")),
         },
 
-        PeopleCommand::List => {
-            let people = db.people_list()?;
+        PeopleCommand::List { dates } => {
+            let dates = dates.dates()?;
+            let mut people = db.people_list()?;
+            people.retain(|p| dates.keeps(&p.updated_at, &p.created_at));
             print_output(format, &people, || {
                 if people.is_empty() {
                     println!("No people recorded.");
@@ -155,8 +164,8 @@ pub fn run(db: &Database, cmd: PeopleCommand, format: OutputFormat) -> Result<()
             });
         }
 
-        PeopleCommand::Search { query } => {
-            let results = db.people_search(&query)?;
+        PeopleCommand::Search { query, dates } => {
+            let results = db.people_search(&query, &dates.dates()?)?;
             print_output(format, &results, || {
                 if results.is_empty() {
                     println!("No matches for: {query}");

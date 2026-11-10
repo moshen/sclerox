@@ -1,6 +1,7 @@
 pub mod code;
 pub mod completions;
 pub mod config_cmd;
+pub mod dates;
 pub mod db;
 pub mod format;
 pub mod hook;

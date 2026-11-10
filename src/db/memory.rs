@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::provenance::{copy_links, copy_provenance};
 use super::{cosine_of_bytes, embedding_to_bytes, fts, Database};
 
@@ -55,7 +56,7 @@ const MEMORY_COLS: &str =
 
 /// Where keyword search looks for memories with `status`, or any status for
 /// `"all"`.
-fn memory_source(status: &str) -> fts::Source<'_> {
+fn memory_source<'a>(status: &'a str, dates: &'a Dates) -> fts::Source<'a> {
     fts::Source {
         fts: "memory_fts",
         table: "memory",
@@ -65,6 +66,9 @@ fn memory_source(status: &str) -> fts::Source<'_> {
         like: "key LIKE ?1 ESCAPE '\\' OR value LIKE ?1 ESCAPE '\\'",
         then_by: "updated_at DESC",
         status: (status != "all").then_some(status),
+        dates,
+        changed: "updated_at",
+        created: "created_at",
     }
 }
 
@@ -326,15 +330,20 @@ impl Database {
     }
 
     /// Search active memories by default. Pass status="all" to search everything.
-    pub fn memory_search(&self, query: &str) -> Result<Vec<MemoryEntry>> {
-        self.memory_search_filtered(query, "active")
+    pub fn memory_search(&self, query: &str, dates: &Dates) -> Result<Vec<MemoryEntry>> {
+        self.memory_search_filtered(query, "active", dates)
     }
 
-    pub fn memory_search_filtered(&self, query: &str, status: &str) -> Result<Vec<MemoryEntry>> {
+    pub fn memory_search_filtered(
+        &self,
+        query: &str,
+        status: &str,
+        dates: &Dates,
+    ) -> Result<Vec<MemoryEntry>> {
         fts::search(
             &self.conn,
             query,
-            &memory_source(status),
+            &memory_source(status, dates),
             |m| m.id,
             row_to_memory,
         )
@@ -346,7 +355,7 @@ impl Database {
         fts::search_all_terms(
             &self.conn,
             query,
-            &memory_source("active"),
+            &memory_source("active", &Dates::default()),
             |m| m.id,
             row_to_memory,
         )
@@ -448,6 +457,7 @@ impl Database {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        dates: &Dates,
     ) -> Result<Vec<SimilarMemory>> {
         self.semantic_read(|| {
             let query = embedding_to_bytes(query_embedding);
@@ -459,15 +469,29 @@ impl Database {
              ORDER BY v.distance"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![query, limit as i64], |row| {
-                let entry = row_to_memory(row)?;
-                let distance: f64 = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
-                Ok(SimilarMemory {
-                    entry,
-                    score: 1.0 - distance as f32,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            // One vector per memory, so only a date range leaves fewer than
+            // `k` results.
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(params![query, k], |row| {
+                        let entry = row_to_memory(row)?;
+                        let distance: f64 = row.get(11)?; // after the 11 MEMORY_COLS (0-10)
+                        Ok(SimilarMemory {
+                            entry,
+                            score: 1.0 - distance as f32,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| {
+                    rows.into_iter()
+                        .filter(|r| dates.keeps(&r.entry.updated_at, &r.entry.created_at))
+                        .take(limit)
+                        .collect()
+                },
+            )
         })
     }
 
@@ -481,7 +505,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<SimilarMemory>> {
         Ok(self
-            .memory_similar(query_embedding, limit)?
+            .memory_similar(query_embedding, limit, &Dates::default())?
             .into_iter()
             .filter(|sm| sm.score >= threshold)
             .collect())
@@ -1154,7 +1178,7 @@ mod tests {
             .unwrap();
 
         let keys = |q: &str| -> Vec<String> {
-            db.memory_search(q)
+            db.memory_search(q, &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|m| m.key)
@@ -1191,7 +1215,7 @@ mod tests {
                 .unwrap();
         }
 
-        let results = db.memory_search("rollback").unwrap();
+        let results = db.memory_search("rollback", &Default::default()).unwrap();
         assert_eq!(results.len(), 4);
         assert_eq!(results[0].key, "deploy-rollback");
     }
@@ -1303,9 +1327,14 @@ mod tests {
         assert_eq!(hist[1].superseded_by, Some(id));
 
         // Only the current value is searchable by default.
-        assert!(db.memory_search("Postgres").unwrap().is_empty());
+        assert!(db
+            .memory_search("Postgres", &Default::default())
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            db.memory_search_filtered("Postgres", "all").unwrap().len(),
+            db.memory_search_filtered("Postgres", "all", &Default::default())
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -1399,7 +1428,7 @@ mod tests {
         db.memory_set("py-pref", "use Python for scripts", "feedback", None)
             .unwrap();
 
-        let results = db.memory_search("Rust").unwrap();
+        let results = db.memory_search("Rust", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "rust-pref");
     }
@@ -1821,6 +1850,37 @@ mod tests {
     }
 
     #[test]
+    fn memory_similar_looks_past_nearer_memories_outside_the_dates() {
+        let db = Database::open_in_memory().unwrap();
+        let near = |w: f32| {
+            let mut v = vec![0.0f32; 384];
+            v[0] = w;
+            v[1] = 1.0 - w;
+            v
+        };
+        // More recent memories near the query than the first window holds.
+        for i in 0..8 {
+            db.memory_set(&format!("new-{i}"), "new", "project", None)
+                .unwrap();
+            db.memory_set_embedding(&format!("new-{i}"), &near(0.9))
+                .unwrap();
+        }
+        db.memory_set("old", "old", "project", None).unwrap();
+        db.memory_set_embedding("old", &near(0.5)).unwrap();
+        db.conn
+            .execute(
+                "UPDATE memory SET updated_at = '2025-01-01 00:00:00' WHERE key = 'old'",
+                [],
+            )
+            .unwrap();
+
+        let last_year = Dates::parse(None, Some("2025-12-31"), false).unwrap();
+        let hits = db.memory_similar(&near(1.0), 1, &last_year).unwrap();
+        let keys: Vec<_> = hits.iter().map(|h| h.entry.key.as_str()).collect();
+        assert_eq!(keys, ["old"]);
+    }
+
+    #[test]
     fn test_memory_similar_and_embedding_backfill() {
         let db = Database::open_in_memory().unwrap();
         db.memory_set("a", "alpha", "project", None).unwrap();
@@ -1846,7 +1906,7 @@ mod tests {
         assert!(db.memory_needing_embedding().unwrap().is_empty());
 
         // Ranking: exact match first, then the near neighbour.
-        let res = db.memory_similar(&unit(0), 2).unwrap();
+        let res = db.memory_similar(&unit(0), 2, &Default::default()).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].entry.key, "a");
         assert_eq!(res[1].entry.key, "c");

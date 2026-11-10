@@ -47,6 +47,8 @@ pub enum MemoryCommand {
         /// Include stale and superseded entries
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Full-text search memory (active only by default)
     Search {
@@ -54,6 +56,8 @@ pub enum MemoryCommand {
         /// Also search stale and superseded entries
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Delete a memory entry permanently
     Delete { key: String },
@@ -310,9 +314,11 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             }
         }
 
-        MemoryCommand::List { r#type, all } => {
+        MemoryCommand::List { r#type, all, dates } => {
+            let dates = dates.dates()?;
             let status = if all { Some("all") } else { None };
-            let entries = db.memory_list(r#type.as_deref(), status)?;
+            let mut entries = db.memory_list(r#type.as_deref(), status)?;
+            entries.retain(|e| dates.keeps(&e.updated_at, &e.created_at));
             print_output(format, &entries, || {
                 if entries.is_empty() {
                     println!("No entries.");
@@ -336,11 +342,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             });
         }
 
-        MemoryCommand::Search { query, all } => {
+        MemoryCommand::Search { query, all, dates } => {
+            let dates = dates.dates()?;
             let mut results = if all {
-                db.memory_search_filtered(&query, "all")?
+                db.memory_search_filtered(&query, "all", &dates)?
             } else {
-                db.memory_search(&query)?
+                db.memory_search(&query, &dates)?
             };
             // Add a semantic tier for active search: embeddings live only on
             // active rows, so this is skipped for --all (which includes stale).
@@ -358,7 +365,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                             .semantic_margin()
                             .map(|m| m as f32);
                         let hits = db
-                            .memory_similar(&qe, sem.semantic_limit)
+                            .memory_similar(&qe, sem.semantic_limit, &dates)
                             .unwrap_or_default();
                         let cut = crate::embed::models::semantic_cutoff(
                             hits.iter().map(|r| r.score),

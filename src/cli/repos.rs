@@ -27,9 +27,16 @@ pub enum RepoCommand {
         wait: bool,
     },
     /// List all indexed repositories
-    List,
+    List {
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Search repos by name/description/path (FTS + semantic combined)
-    Search { query: String },
+    Search {
+        query: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Show indexed files and symbols for a repo
     Show {
         #[arg(default_value = ".")]
@@ -48,7 +55,11 @@ pub enum RepoCommand {
     /// Automatically heals the registry before searching:
     /// removes repos whose directories are gone, reindexes repos whose
     /// DB is missing, and migrates DBs that are behind the current schema.
-    SearchSymbols { query: String },
+    SearchSymbols {
+        query: String,
+        #[command(flatten)]
+        range: crate::cli::dates::Range,
+    },
     /// Check and heal all registered repos
     ///
     /// Removes stale entries, reindexes missing DBs, migrates old schemas.
@@ -153,14 +164,16 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
             }
         }
 
-        RepoCommand::List => {
+        RepoCommand::List { dates } => {
+            let dates = dates.dates()?;
             for removed in db.repo_prune_gone()? {
                 progress(format_args!(
                     "Removing stale entry: {} (directory gone)",
                     removed.name
                 ));
             }
-            let repos = db.repo_list()?;
+            let mut repos = db.repo_list()?;
+            repos.retain(|r| dates.keeps(&r.created_at, &r.created_at));
             print_output(format, &repos, || {
                 if repos.is_empty() {
                     println!("No repos indexed. Run `sclerox repo index [path]` to add one.");
@@ -180,17 +193,18 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
             });
         }
 
-        RepoCommand::Search { query } => {
+        RepoCommand::Search { query, dates } => {
+            let dates = dates.dates()?;
             db.repo_prune_gone()?;
             // Keyword (FTS + substring) on name/description/path first
-            let fts_hits = db.repo_search(&query)?;
+            let fts_hits = db.repo_search(&query, &dates)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|r| r.id).collect();
 
             // Semantic results deduped against FTS
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
             let semantic: Vec<_> = query_emb
-                .map(|qe| db.repo_similar(&qe, 5).unwrap_or_default())
+                .map(|qe| db.repo_similar(&qe, 5, &dates).unwrap_or_default())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|r| !fts_ids.contains(&r.repo.id))
@@ -275,7 +289,7 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
             });
 
             if let Some(query) = symbols {
-                let results = repo_db.search_symbols(&query)?;
+                let results = repo_db.search_symbols(&query, &Default::default())?;
                 print_output(
                     format,
                     &serde_json::json!({"repo": stats, "symbols": results}),
@@ -328,7 +342,8 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
             }
         }
 
-        RepoCommand::SearchSymbols { query } => {
+        RepoCommand::SearchSymbols { query, range } => {
+            let dates = range.dates()?;
             heal_repos(db, false)?;
 
             let repos = db.repo_list()?;
@@ -350,7 +365,7 @@ pub fn run(db: &Database, cmd: RepoCommand, format: OutputFormat) -> Result<()> 
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                for s in repo_db.search_symbols(&query)? {
+                for s in repo_db.search_symbols(&query, &dates)? {
                     hits.push(SearchResult::Symbol {
                         repo_name: repo.name.clone(),
                         repo_path: repo.path.clone(),

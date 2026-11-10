@@ -10,8 +10,8 @@ sclerox todo update <id> [--title] [--notes] [--deadline] [--category]
 sclerox todo done <id> [--note "<resolution>"]
 sclerox todo watch <id>
 sclerox todo reopen <id>
-sclerox todo history [<query>]
-sclerox todo search "<query>"
+sclerox todo search "<query>" [--status done]
+sclerox todo list --status done --from 2w  # done in the last two weeks
 sclerox todo people add|remove|list <todo_id> <person_id>
 sclerox todo projects add|remove|list <todo_id> <project_id>
 ```

@@ -1,7 +1,8 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,10 @@ pub struct SimilarMeeting {
     pub score: f32,
     pub matched_chunk: String,
 }
+
+/// What dates a meeting for a date range: when it took place, or when it
+/// was added if that wasn't given.
+const MEETING_DATE: &str = "COALESCE(meeting_date, created_at)";
 
 impl Database {
     pub fn meeting_add(
@@ -57,44 +62,19 @@ impl Database {
         }
     }
 
-    pub fn meeting_list(
-        &self,
-        date_from: Option<&str>,
-        date_to: Option<&str>,
-    ) -> Result<Vec<Meeting>> {
-        let sql = match (date_from, date_to) {
-            (Some(_), Some(_)) => {
-                "SELECT id, title, meeting_date, transcript, notes, created_at
-                 FROM meetings WHERE meeting_date >= ?1 AND meeting_date <= ?2
-                 ORDER BY meeting_date DESC"
-            }
-            (Some(_), None) => {
-                "SELECT id, title, meeting_date, transcript, notes, created_at
-                 FROM meetings WHERE meeting_date >= ?1
-                 ORDER BY meeting_date DESC"
-            }
-            (None, Some(_)) => {
-                "SELECT id, title, meeting_date, transcript, notes, created_at
-                 FROM meetings WHERE meeting_date <= ?2
-                 ORDER BY meeting_date DESC"
-            }
-            (None, None) => {
-                "SELECT id, title, meeting_date, transcript, notes, created_at
-                 FROM meetings ORDER BY meeting_date DESC"
-            }
-        };
-
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = match (date_from, date_to) {
-            (Some(f), Some(t)) => stmt.query_map(params![f, t], row_to_meeting)?,
-            (Some(f), None) => stmt.query_map(params![f], row_to_meeting)?,
-            (None, Some(t)) => stmt.query_map(params![t], row_to_meeting)?,
-            (None, None) => stmt.query_map([], row_to_meeting)?,
-        };
+    pub fn meeting_list(&self, dates: &Dates) -> Result<Vec<Meeting>> {
+        let sql = format!(
+            "SELECT id, title, meeting_date, transcript, notes, created_at
+             FROM meetings WHERE {}
+             ORDER BY meeting_date DESC",
+            dates.sql(MEETING_DATE, 1),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(dates.values()), row_to_meeting)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn meeting_search(&self, query: &str) -> Result<Vec<Meeting>> {
+    pub fn meeting_search(&self, query: &str, dates: &Dates) -> Result<Vec<Meeting>> {
         let source = fts::Source {
             fts: "meetings_fts",
             table: "meetings",
@@ -104,6 +84,9 @@ impl Database {
             like: "title LIKE ?1 ESCAPE '\\' OR notes LIKE ?1 ESCAPE '\\' OR transcript LIKE ?1 ESCAPE '\\'",
             then_by: "meeting_date DESC",
             status: None,
+            dates,
+            changed: MEETING_DATE,
+            created: MEETING_DATE,
         };
         fts::search(&self.conn, query, &source, |hit| hit.id, row_to_meeting)
     }
@@ -235,6 +218,7 @@ impl Database {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        dates: &Dates,
     ) -> Result<Vec<SimilarMeeting>> {
         self.semantic_read(|| {
             let query = embedding_to_bytes(query_embedding);
@@ -270,7 +254,17 @@ impl Database {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(Into::into)
                 },
-                |rows| crate::db::best_per_record(rows, |r| r.meeting.id, limit),
+                |rows| {
+                    let rows = rows.into_iter().filter(|r| {
+                        dates.contains(Some(
+                            r.meeting
+                                .meeting_date
+                                .as_deref()
+                                .unwrap_or(&r.meeting.created_at),
+                        ))
+                    });
+                    crate::db::best_per_record(rows.collect(), |r| r.meeting.id, limit)
+                },
             )
         })
     }
@@ -316,7 +310,9 @@ mod tests {
         db.meeting_add("1:1 Sync", None, None, Some("career growth topics"))
             .unwrap();
 
-        let results = db.meeting_search("microservices").unwrap();
+        let results = db
+            .meeting_search("microservices", &Default::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Architecture Review");
     }
@@ -362,7 +358,7 @@ mod tests {
         let mut query = vec![0.0f32; 384];
         query[0] = 0.9;
         query[1] = 0.1;
-        let results = db.meeting_similar(&query, 2).unwrap();
+        let results = db.meeting_similar(&query, 2, &Default::default()).unwrap();
         assert_eq!(results.len(), 1, "one result per meeting");
         // The chunk kept should be the one matching [1,0,0]
         assert!(results[0].matched_chunk.contains("Rust"));
@@ -418,10 +414,15 @@ mod tests {
         db.meeting_add("M3", Some("2026-06-01"), None, None)
             .unwrap();
 
-        let results = db
-            .meeting_list(Some("2026-02-01"), Some("2026-05-01"))
-            .unwrap();
+        // The last day is in range, and a meeting without a date is dated by
+        // when it was added.
+        db.meeting_add("Undated", None, None, None).unwrap();
+        let range = |from, to| Dates::parse(Some(from), Some(to), false).unwrap();
+        let results = db.meeting_list(&range("2026-02-01", "2026-03-01")).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "M2");
+        let results = db.meeting_list(&range("2026-03-01", "0d")).unwrap();
+        let titles: Vec<_> = results.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, ["M3", "M2", "Undated"]);
     }
 }

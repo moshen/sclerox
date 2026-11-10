@@ -952,7 +952,11 @@ mod tests {
         indexer.index_repo(&db, repo.path(), None).unwrap();
 
         let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
-        let found = |q: &str| rdb.search_text(repo.path(), q, 10).unwrap().len();
+        let found = |q: &str| {
+            rdb.search_text(repo.path(), q, 10, &Default::default())
+                .unwrap()
+                .len()
+        };
         assert_eq!(found("frobnicates"), 1, "a line no chunk holds");
         assert_eq!(found("std::io"), 1);
         assert_eq!(
@@ -1093,7 +1097,7 @@ mod tests {
 
         let rdb = RepoDb::open(&p.join(".sclerox").join("repo.db")).unwrap();
         let mut files: Vec<String> = rdb
-            .search_text(p, "zebra", 20)
+            .search_text(p, "zebra", 20, &Default::default())
             .unwrap()
             .into_iter()
             .map(|m| m.file_path)
@@ -1130,7 +1134,12 @@ mod tests {
                 .collect()
         };
         assert_eq!(paths(), ["Cargo.toml"]);
-        assert_eq!(rdb.search_text(p, "zebra", 20).unwrap().len(), 1);
+        assert_eq!(
+            rdb.search_text(p, "zebra", 20, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
         std::fs::write(p.join("notes.txt"), "zebra notes\n").unwrap();
         RepoIndexer::new(None).index_repo(&db, p, None).unwrap();
         assert_eq!(paths(), ["Cargo.toml", "notes.txt"]);
@@ -1162,7 +1171,12 @@ mod tests {
         std::fs::write(&lib, "fn alpha() {}\n").unwrap();
         indexer.index_repo(&db, repo.path(), None).unwrap();
         assert_eq!(text_index().as_deref(), Some(TEXT_INDEX_VERSION));
-        assert_eq!(rdb.search_text(repo.path(), "alpha", 5).unwrap().len(), 1);
+        assert_eq!(
+            rdb.search_text(repo.path(), "alpha", 5, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
