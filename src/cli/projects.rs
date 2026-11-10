@@ -22,9 +22,16 @@ pub enum ProjectCommand {
     /// Get a project by ID
     Get { id: i64 },
     /// List all projects
-    List,
+    List {
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Full-text search projects
-    Search { query: String },
+    Search {
+        query: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Update a project
     Update {
         id: i64,
@@ -126,8 +133,10 @@ pub fn run(db: &Database, cmd: ProjectCommand, format: OutputFormat) -> Result<(
             None => print_miss(format, &format!("Project #{id} not found")),
         },
 
-        ProjectCommand::List => {
-            let projects = db.project_list()?;
+        ProjectCommand::List { dates } => {
+            let dates = dates.dates()?;
+            let mut projects = db.project_list()?;
+            projects.retain(|p| dates.keeps(&p.updated_at, &p.created_at));
             print_output(format, &projects, || {
                 if projects.is_empty() {
                     println!("No projects.");
@@ -145,8 +154,8 @@ pub fn run(db: &Database, cmd: ProjectCommand, format: OutputFormat) -> Result<(
             });
         }
 
-        ProjectCommand::Search { query } => {
-            let results = db.project_search(&query)?;
+        ProjectCommand::Search { query, dates } => {
+            let results = db.project_search(&query, &dates.dates()?)?;
             print_output(format, &results, || {
                 if results.is_empty() {
                     println!("No matches for: {query}");

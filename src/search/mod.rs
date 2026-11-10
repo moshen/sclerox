@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::db::dates::Dates;
 use crate::db::Database;
 use crate::db::SnippetTable;
 use crate::output::{excerpt, full, truncate};
@@ -224,36 +225,31 @@ pub fn rank(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits
 }
 
-/// Every hit for `query`, grouped by type in a fixed order. FTS/LIKE always
-/// runs, and its hits are kept whatever their score; semantic (cosine) tiers
-/// run when an embedder is available, keeping hits at/above
-/// `semantic_threshold` and capping each entity type at `semantic_limit`.
-/// With a `semantic_margin`, hits more than that far below the best hit of
-/// their entity type are dropped too (see `embed::models::semantic_cutoff`).
-/// Code is also searched word for word, up to `code_text_limit` lines across
-/// all repos (see [`code_text_hits`]).
-/// The tunables are passed in so this library function stays config-free.
-pub fn search_hits(
-    db: &Database,
-    query: &str,
-    semantic_threshold: f32,
-    semantic_margin: Option<f32>,
-    semantic_limit: usize,
-    code_text_limit: usize,
-) -> Result<Vec<Hit>> {
+/// The settings [`search_hits`] runs with, passed in so this library stays
+/// config-free.
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// Semantic hits below this cosine score are dropped.
+    pub semantic_threshold: f32,
+    /// Semantic hits more than this far below the best of their type are
+    /// dropped too (see `embed::models::semantic_cutoff`).
+    pub semantic_margin: Option<f32>,
+    /// Most semantic hits of each type.
+    pub semantic_limit: usize,
+    /// Most code lines across all repos (see [`code_text_hits`]).
+    pub code_text_limit: usize,
+}
+
+/// Every hit for `query` dated within `dates`, grouped by type in a fixed
+/// order. FTS/LIKE always runs, and its hits are kept whatever their score;
+/// semantic (cosine) tiers run when an embedder is available and keep the
+/// hits `tuning` allows. Code is also searched word for word.
+pub fn search_hits(db: &Database, query: &str, tuning: &Tuning, dates: &Dates) -> Result<Vec<Hit>> {
     // None if the embedder is unavailable. Each database checks its own
     // recorded model when searched.
     let query_emb: Option<Vec<f32>> =
         crate::embed::optional(true).and_then(|mut emb| emb.embed_query(query).ok());
-    search_hits_embedded(
-        db,
-        query,
-        query_emb.as_deref(),
-        semantic_threshold,
-        semantic_margin,
-        semantic_limit,
-        code_text_limit,
-    )
+    search_hits_embedded(db, query, query_emb.as_deref(), tuning, dates)
 }
 
 /// [`search_hits`] with the query already embedded, or `None` to search by
@@ -263,13 +259,17 @@ pub fn search_hits_embedded(
     db: &Database,
     query: &str,
     query_emb: Option<&[f32]>,
-    semantic_threshold: f32,
-    semantic_margin: Option<f32>,
-    semantic_limit: usize,
-    code_text_limit: usize,
+    tuning: &Tuning,
+    dates: &Dates,
 ) -> Result<Vec<Hit>> {
     use crate::db::ScoredTable;
 
+    let Tuning {
+        semantic_threshold,
+        semantic_margin,
+        semantic_limit,
+        code_text_limit,
+    } = *tuning;
     let cutoff = |scores: &mut dyn Iterator<Item = f32>| {
         crate::embed::models::semantic_cutoff(scores, semantic_threshold, semantic_margin)
     };
@@ -292,7 +292,7 @@ pub fn search_hits_embedded(
         None => Default::default(),
     };
 
-    let memory_fts = db.memory_search(query)?;
+    let memory_fts = db.memory_search(query, dates)?;
     let memory_fts_ids: std::collections::HashSet<i64> = memory_fts.iter().map(|m| m.id).collect();
     let scores = fts_scores(
         ScoredTable::Memory,
@@ -313,7 +313,9 @@ pub fn search_hits_embedded(
         });
     }
     if let Some(qe) = query_emb {
-        let hits = db.memory_similar(qe, semantic_limit).unwrap_or_default();
+        let hits = db
+            .memory_similar(qe, semantic_limit, dates)
+            .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !memory_fts_ids.contains(&r.entry.id) && r.score >= cut {
@@ -332,7 +334,7 @@ pub fn search_hits_embedded(
         }
     }
 
-    for p in db.people_search(query)? {
+    for p in db.people_search(query, dates)? {
         results.push(Hit {
             score: None,
             source: HitSource::Keyword,
@@ -345,7 +347,7 @@ pub fn search_hits_embedded(
         });
     }
 
-    let meeting_fts = db.meeting_search(query)?;
+    let meeting_fts = db.meeting_search(query, dates)?;
     let meeting_fts_ids: std::collections::HashSet<i64> =
         meeting_fts.iter().map(|m| m.id).collect();
     let scores = fts_scores(
@@ -372,7 +374,9 @@ pub fn search_hits_embedded(
         });
     }
     if let Some(qe) = query_emb {
-        let hits = db.meeting_similar(qe, semantic_limit).unwrap_or_default();
+        let hits = db
+            .meeting_similar(qe, semantic_limit, dates)
+            .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !meeting_fts_ids.contains(&r.meeting.id) && r.score >= cut {
@@ -391,7 +395,7 @@ pub fn search_hits_embedded(
         }
     }
 
-    for p in db.project_search(query)? {
+    for p in db.project_search(query, dates)? {
         results.push(Hit {
             score: None,
             source: HitSource::Keyword,
@@ -405,7 +409,7 @@ pub fn search_hits_embedded(
         });
     }
 
-    let todo_fts: Vec<_> = db.todo_search(query)?;
+    let todo_fts: Vec<_> = db.todo_search(query, None, dates)?;
     let todo_fts_ids: std::collections::HashSet<i64> = todo_fts.iter().map(|t| t.id).collect();
     let scores = fts_scores(
         ScoredTable::Todo,
@@ -426,7 +430,9 @@ pub fn search_hits_embedded(
         });
     }
     if let Some(qe) = query_emb {
-        let hits = db.todo_similar(qe, semantic_limit).unwrap_or_default();
+        let hits = db
+            .todo_similar(qe, semantic_limit, None, dates)
+            .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !todo_fts_ids.contains(&r.todo.id) && r.score >= cut {
@@ -446,7 +452,7 @@ pub fn search_hits_embedded(
         }
     }
 
-    let inv_fts = db.investigation_search(query)?;
+    let inv_fts = db.investigation_search(query, dates)?;
     let inv_fts_ids: std::collections::HashSet<i64> = inv_fts.iter().map(|i| i.id).collect();
     let scores = fts_scores(
         ScoredTable::Investigation,
@@ -475,7 +481,7 @@ pub fn search_hits_embedded(
     }
     if let Some(qe) = query_emb {
         let hits = db
-            .investigation_similar(qe, semantic_limit)
+            .investigation_similar(qe, semantic_limit, dates)
             .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
@@ -499,7 +505,7 @@ pub fn search_hits_embedded(
 
     // Drop deleted clones before any repo rows are read.
     db.repo_prune_gone()?;
-    let repo_fts = db.repo_search(query)?;
+    let repo_fts = db.repo_search(query, dates)?;
     let repo_fts_ids: std::collections::HashSet<i64> = repo_fts.iter().map(|r| r.id).collect();
     let scores = fts_scores(
         ScoredTable::Repo,
@@ -519,7 +525,9 @@ pub fn search_hits_embedded(
         });
     }
     if let Some(qe) = query_emb {
-        let hits = db.repo_similar(qe, semantic_limit).unwrap_or_default();
+        let hits = db
+            .repo_similar(qe, semantic_limit, dates)
+            .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
             if !repo_fts_ids.contains(&r.repo.id) && r.score >= cut {
@@ -558,7 +566,7 @@ pub fn search_hits_embedded(
             log::error!("could not open repo db for '{}'", repo.name);
             continue;
         };
-        let Ok(repo_symbols) = repo_db.search_symbols(query) else {
+        let Ok(repo_symbols) = repo_db.search_symbols(query, dates) else {
             log::error!("symbol search failed for repo '{}'", repo.name);
             continue;
         };
@@ -578,10 +586,17 @@ pub fn search_hits_embedded(
             start_line: sym.start_line,
             last_modified: sym.last_modified,
         }));
-        code_text_hits(&mut code_text, &repo, &repo_db, query, code_text_limit);
+        code_text_hits(
+            &mut code_text,
+            &repo,
+            &repo_db,
+            query,
+            code_text_limit,
+            dates,
+        );
         if let Some(qe) = query_emb {
             for c in repo_db
-                .similar_chunks(qe, semantic_limit)
+                .similar_chunks(qe, semantic_limit, dates)
                 .unwrap_or_default()
             {
                 if c.score >= semantic_threshold {
@@ -666,8 +681,9 @@ pub fn code_text_hits(
     repo_db: &crate::index::repo_db::RepoDb,
     query: &str,
     limit: usize,
+    dates: &Dates,
 ) {
-    match repo_db.search_text(std::path::Path::new(&repo.path), query, limit) {
+    match repo_db.search_text(std::path::Path::new(&repo.path), query, limit, dates) {
         Ok(lines) => out.extend(lines.into_iter().map(|m| CodeTextHit {
             phrase: m.phrase,
             result: SearchResult::CodeText {
@@ -693,6 +709,13 @@ pub fn rank_code_text(mut hits: Vec<CodeTextHit>, limit: usize) -> Vec<SearchRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TUNING: Tuning = Tuning {
+        semantic_threshold: 0.45,
+        semantic_margin: None,
+        semantic_limit: 5,
+        code_text_limit: 20,
+    };
 
     #[test]
     fn rank_puts_scored_hits_first_best_first() {
@@ -819,16 +842,17 @@ mod tests {
         // A whole word through full-text search, and part of one through the
         // substring tier.
         for query in ["zebrafish", "ebrafis"] {
-            let snippets: Vec<String> = search_hits_embedded(&db, query, None, 0.45, None, 5, 20)
-                .unwrap()
-                .into_iter()
-                .filter_map(|h| match h.result {
-                    SearchResult::Memory { snippet, .. }
-                    | SearchResult::Meeting { snippet, .. }
-                    | SearchResult::Investigation { snippet, .. } => Some(snippet),
-                    _ => None,
-                })
-                .collect();
+            let snippets: Vec<String> =
+                search_hits_embedded(&db, query, None, &TUNING, &Dates::default())
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|h| match h.result {
+                        SearchResult::Memory { snippet, .. }
+                        | SearchResult::Meeting { snippet, .. }
+                        | SearchResult::Investigation { snippet, .. } => Some(snippet),
+                        _ => None,
+                    })
+                    .collect();
             assert_eq!(snippets.len(), 3, "{query}: {snippets:?}");
             for snippet in snippets {
                 assert!(snippet.contains(query), "{query}: {snippet}");
@@ -888,10 +912,11 @@ mod tests {
         )
         .unwrap();
 
-        let results: Vec<SearchResult> = rank(search_hits(&db, "Rust", 0.45, None, 5, 20).unwrap())
-            .into_iter()
-            .map(|h| h.result)
-            .collect();
+        let results: Vec<SearchResult> =
+            rank(search_hits(&db, "Rust", &TUNING, &Dates::default()).unwrap())
+                .into_iter()
+                .map(|h| h.result)
+                .collect();
         assert!(
             results.len() >= 5,
             "expected at least 5, got {}",

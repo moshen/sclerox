@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +84,7 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn investigation_search(&self, query: &str) -> Result<Vec<Investigation>> {
+    pub fn investigation_search(&self, query: &str, dates: &Dates) -> Result<Vec<Investigation>> {
         let source = fts::Source {
             fts: "investigations_fts",
             table: "investigations",
@@ -94,6 +95,9 @@ impl Database {
                 OR plan LIKE ?1 ESCAPE '\\' OR findings LIKE ?1 ESCAPE '\\'",
             then_by: "updated_at DESC",
             status: None,
+            dates,
+            changed: "updated_at",
+            created: "created_at",
         };
         fts::search(
             &self.conn,
@@ -342,6 +346,7 @@ impl Database {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        dates: &Dates,
     ) -> Result<Vec<SimilarInvestigation>> {
         self.semantic_read(|| {
             let query = crate::db::embedding_to_bytes(query_embedding);
@@ -381,7 +386,12 @@ impl Database {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(Into::into)
                 },
-                |rows| crate::db::best_per_record(rows, |r| r.investigation.id, limit),
+                |rows| {
+                    let rows = rows.into_iter().filter(|r| {
+                        dates.keeps(&r.investigation.updated_at, &r.investigation.created_at)
+                    });
+                    crate::db::best_per_record(rows.collect(), |r| r.investigation.id, limit)
+                },
             )
         })
     }
@@ -491,10 +501,14 @@ mod tests {
         )
         .unwrap();
 
-        let results = db.investigation_search("Temporal").unwrap();
+        let results = db
+            .investigation_search("Temporal", &Default::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
 
-        let results = db.investigation_search("report-gen-worker").unwrap();
+        let results = db
+            .investigation_search("report-gen-worker", &Default::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 

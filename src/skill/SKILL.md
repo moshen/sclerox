@@ -144,6 +144,11 @@ last changed; meetings and repos show only `(created ...)`; code hits show
 uncommitted changes.
 When two updated hits disagree, the newer one is usually current.
 
+Every `search` and `list` command takes `--from` and `--to`: a date
+(`2026-06-08`) or an age (`7d`, `2w`, `3m`, `1y`), both ends included. They
+test when a record last changed, or with `--created` when it was created;
+meetings go by their meeting date and code by its last change.
+
 Plain questions work: records holding every word come first, then a limited
 number holding only some of them, ignoring words like "why" and "did". Word
 forms match, so `retries` finds "Retry". Semantic hits list a record once, and

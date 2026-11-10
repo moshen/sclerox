@@ -891,7 +891,7 @@ fn export_memory(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<(
 }
 
 fn export_meetings(db: &Database, dir: &Path, stats: &mut ExportStats) -> Result<()> {
-    let meetings = db.meeting_list(None, None)?;
+    let meetings = db.meeting_list(&Default::default())?;
     if meetings.is_empty() {
         return Ok(());
     }

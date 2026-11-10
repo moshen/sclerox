@@ -95,9 +95,16 @@ sclerox memory import --agent claude    # import from Claude Code auto-memory fi
 
 ### `sclerox search <query>`
 Global full-text search across memory, people, meetings, projects, todos, investigations, and code symbols.
-Results come in one list, best first: by cosine similarity to the query,
-keyword matches included, then people, projects, symbols and anything else
-without a stored vector. Up to `search.semantic_limit` (25) semantic hits per type.
+Results come in one list, best first, fusing each type's keyword order with
+cosine similarity to the query. Up to `search.semantic_limit` (25) semantic hits per type.
+
+### Dates: `--from`, `--to`, `--created`
+Every `search` and `list` command takes `--from` and `--to` to keep what is
+dated in that range, both ends included. Each is a date (`2026-06-08`, with an
+optional `HH:MM[:SS]` time, UTC) or an age back from today (`7d`, `2w`, `3m`,
+`1y`). Records are dated by when they last changed; `--created` dates them by
+when they were created instead. Meetings are always dated by when they took
+place, and code by the file's last change.
 
 ### `sclerox code search [--repo <name>] <query>`
 Search symbols across all indexed repos. `--repo` filters by repo name substring.
@@ -146,12 +153,11 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `sclerox todo list [--status open\|done\|watch\|all]` | List todos |
 | `sclerox todo add --title <title>` | Add a todo |
 | `sclerox todo get <id>` | Get a todo by ID |
-| `sclerox todo search <query>` | Full-text search todos (includes done items) |
+| `sclerox todo search <query> [--status open\|done\|watch\|all]` | Search todos (all statuses by default) |
 | `sclerox todo update <id> [--title\|--notes\|...]` | Edit a todo's fields |
 | `sclerox todo done <id> [--note]` | Mark done |
 | `sclerox todo watch <id>` | Convert to watch item |
 | `sclerox todo reopen <id>` | Reopen |
-| `sclerox todo history [<query>]` | Search completed todos |
 | `sclerox todo delete <id>` | Delete a todo permanently |
 | `sclerox todo people add\|remove\|list <id> <person_id>` | Link people |
 | `sclerox todo projects add\|remove\|list <id> <project_id>` | Link projects |

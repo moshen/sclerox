@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +65,7 @@ impl Database {
 
     /// Search people by name/notes (FTS, or a substring of either) or by
     /// identifier value (LIKE).
-    pub fn people_search(&self, query: &str) -> Result<Vec<Person>> {
+    pub fn people_search(&self, query: &str, dates: &Dates) -> Result<Vec<Person>> {
         let source = fts::Source {
             fts: "people_fts",
             table: "people",
@@ -75,6 +76,9 @@ impl Database {
                 OR id IN (SELECT person_id FROM people_identifiers WHERE identifier LIKE ?1 ESCAPE '\\')",
             then_by: "name",
             status: None,
+            dates,
+            changed: "updated_at",
+            created: "created_at",
         };
         fts::search(&self.conn, query, &source, |hit| hit.id, row_to_person)
     }
@@ -278,7 +282,9 @@ mod tests {
             .unwrap();
 
         // Search by email value finds the person
-        let results = db.people_search("abc@example.com").unwrap();
+        let results = db
+            .people_search("abc@example.com", &Default::default())
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Dave");
     }
@@ -325,12 +331,12 @@ mod tests {
         make_person(&db, "Alice");
         make_person(&db, "Bob");
 
-        let results = db.people_search("alice").unwrap();
+        let results = db.people_search("alice", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Alice");
 
         // A mid-word substring of the name matches too.
-        let results = db.people_search("lic").unwrap();
+        let results = db.people_search("lic", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Alice");
     }

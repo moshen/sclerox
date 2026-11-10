@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, Row};
 
+use super::dates::Dates;
+
 /// Words too common to say what a query or text is about.
 pub const STOPWORDS: &[&str] = &[
     "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at", "be", "been",
@@ -81,6 +83,11 @@ pub struct Source<'a> {
     pub then_by: &'a str,
     /// Keep only rows with this status.
     pub status: Option<&'a str>,
+    /// Keep only rows dated in this range: by the `changed` column, or under
+    /// `--created` the `created` one.
+    pub dates: &'a Dates,
+    pub changed: &'a str,
+    pub created: &'a str,
 }
 
 impl Source<'_> {
@@ -90,25 +97,30 @@ impl Source<'_> {
     }
 
     /// `table` joined to its rows matching `?1`, best first. `?2` is a row
-    /// limit; the status, when kept, is `?3`.
+    /// limit; see [`Source::filter`] for the rest.
     fn matching(&self) -> String {
         let (columns, table, fts) = (self.columns, self.table, self.fts);
         format!(
             "SELECT {columns} FROM {table}
              JOIN (SELECT rowid AS hit_id, {bm25} AS hit_rank FROM {fts} WHERE {fts} MATCH ?1) hits
                ON hits.hit_id = {table}.id
-             {filter}
+             WHERE {filter}
              ORDER BY hits.hit_rank, {then_by} LIMIT ?2",
             bm25 = self.bm25(),
-            filter = self.status_filter("WHERE"),
+            filter = self.filter(),
             then_by = self.then_by,
         )
     }
 
-    fn status_filter(&self, join: &str) -> String {
+    /// The status (`?3`, when kept) and date range (`?4`, `?5`, NULL for an
+    /// open end) rows must have.
+    fn filter(&self) -> String {
+        let dates = self
+            .dates
+            .sql(self.dates.pick(self.changed, self.created), 4);
         match self.status {
-            Some(_) => format!("{join} {}.status = ?3", self.table),
-            None => String::new(),
+            Some(_) => format!("{}.status = ?3 AND {dates}", self.table),
+            None => dates,
         }
     }
 
@@ -120,11 +132,15 @@ impl Source<'_> {
         limit: Option<usize>,
         row: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>> {
-        let mut values = vec![
+        let [from, to] = self.dates.values();
+        let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+        let values = [
             Value::Text(pattern),
             Value::Integer(limit.map_or(-1, |n| n as i64)),
+            text(self.status.map(str::to_string)),
+            text(from),
+            text(to),
         ];
-        values.extend(self.status.map(|s| Value::Text(s.to_string())));
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt
             .query_map(params_from_iter(values), row)?
@@ -145,11 +161,11 @@ pub fn search_all_terms<T>(
     let mut hits = source.query(conn, &source.matching(), sanitize(query), None, &mut row)?;
     let seen: std::collections::HashSet<i64> = hits.iter().map(&id).collect();
     let like = format!(
-        "SELECT {columns} FROM {table} WHERE ({like}) {filter} ORDER BY {then_by} LIMIT ?2",
+        "SELECT {columns} FROM {table} WHERE ({like}) AND {filter} ORDER BY {then_by} LIMIT ?2",
         columns = source.columns,
         table = source.table,
         like = source.like,
-        filter = source.status_filter("AND"),
+        filter = source.filter(),
         then_by = source.then_by,
     );
     let substring = source.query(conn, &like, like_contains(query), None, &mut row)?;

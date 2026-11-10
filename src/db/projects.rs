@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +67,7 @@ impl Database {
 
     /// Projects whose name or description matches `query` in full text (word
     /// prefixes) or holds it as a substring.
-    pub fn project_search(&self, query: &str) -> Result<Vec<Project>> {
+    pub fn project_search(&self, query: &str, dates: &Dates) -> Result<Vec<Project>> {
         let source = fts::Source {
             fts: "projects_fts",
             table: "projects",
@@ -76,6 +77,9 @@ impl Database {
             like: "name LIKE ?1 ESCAPE '\\' OR description LIKE ?1 ESCAPE '\\'",
             then_by: "name",
             status: None,
+            dates,
+            changed: "updated_at",
+            created: "created_at",
         };
         fts::search(&self.conn, query, &source, |hit| hit.id, row_to_project)
     }
@@ -294,12 +298,12 @@ mod tests {
         db.project_add("Dashboard v2", Some("Rebuild of main dashboard"), &[])
             .unwrap();
 
-        let results = db.project_search("auth").unwrap();
+        let results = db.project_search("auth", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Auth Overhaul");
 
         // A mid-word substring matches too.
-        let results = db.project_search("board").unwrap();
+        let results = db.project_search("board", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Dashboard v2");
     }

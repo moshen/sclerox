@@ -6,7 +6,7 @@ use crate::cli::format::{
 };
 use crate::db::Database;
 use crate::output::{full, print_output, OutputFormat};
-use crate::search::{order, search_hits, Hit, SearchResult};
+use crate::search::{order, search_hits, Hit, SearchResult, Tuning};
 
 #[derive(Args)]
 pub struct SearchArgs {
@@ -17,19 +17,20 @@ pub struct SearchArgs {
     /// Show every result, past the result limit and token budget
     #[arg(long)]
     pub all: bool,
+    #[command(flatten)]
+    pub dates: crate::cli::dates::DateArgs,
 }
 
 pub fn run(db: &Database, args: SearchArgs, format: OutputFormat) -> Result<()> {
     let s = crate::config::settings();
+    let tuning = Tuning {
+        semantic_threshold: s.semantic_threshold() as f32,
+        semantic_margin: s.semantic_margin().map(|m| m as f32),
+        semantic_limit: s.search.semantic_limit,
+        code_text_limit: s.search.code_text_limit,
+    };
     let hits = order(
-        search_hits(
-            db,
-            &args.query,
-            s.semantic_threshold() as f32,
-            s.semantic_margin().map(|m| m as f32),
-            s.search.semantic_limit,
-            s.search.code_text_limit,
-        )?,
+        search_hits(db, &args.query, &tuning, &args.dates.dates()?)?,
         &args.query,
         s.search.ranking,
     );

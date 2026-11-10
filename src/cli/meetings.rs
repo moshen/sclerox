@@ -27,13 +27,15 @@ pub enum MeetingCommand {
     Get { id: i64 },
     /// List meetings
     List {
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Search meetings (FTS + semantic similarity combined)
-    Search { query: String },
+    Search {
+        query: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Update a meeting's fields
     Update {
         id: i64,
@@ -116,8 +118,8 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
             None => print_miss(format, &format!("Meeting #{id} not found")),
         },
 
-        MeetingCommand::List { from, to } => {
-            let meetings = db.meeting_list(from.as_deref(), to.as_deref())?;
+        MeetingCommand::List { dates } => {
+            let meetings = db.meeting_list(&dates.dates()?)?;
             print_output(format, &meetings, || {
                 if meetings.is_empty() {
                     println!("No meetings found.");
@@ -131,16 +133,17 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
             });
         }
 
-        MeetingCommand::Search { query } => {
+        MeetingCommand::Search { query, dates } => {
+            let dates = dates.dates()?;
             // FTS results first (exact keyword matches)
-            let fts_hits = db.meeting_search(&query)?;
+            let fts_hits = db.meeting_search(&query, &dates)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|m| m.id).collect();
 
             // Semantic results - appended, deduped against FTS hits
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
             let semantic: Vec<_> = query_emb
-                .map(|qe| db.meeting_similar(&qe, 5).unwrap_or_default())
+                .map(|qe| db.meeting_similar(&qe, 5, &dates).unwrap_or_default())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|r| !fts_ids.contains(&r.meeting.id))

@@ -1,3 +1,4 @@
+pub mod dates;
 pub mod fts;
 pub mod investigations;
 pub mod jobs;
@@ -671,7 +672,9 @@ mod tests {
         db.meeting_store_chunks(long, &chunks).unwrap();
         db.meeting_store_chunks(other, &[("o".to_string(), Some(unit(40, 0.5)))])
             .unwrap();
-        let hits = db.meeting_similar(&unit(1, 1.0), 2).unwrap();
+        let hits = db
+            .meeting_similar(&unit(1, 1.0), 2, &Default::default())
+            .unwrap();
         assert_eq!(
             hits.iter().map(|h| h.meeting.id).collect::<Vec<_>>(),
             [long, other]
@@ -696,20 +699,42 @@ mod tests {
             .unwrap();
 
         let query = "why did we drop CoreML";
-        assert_eq!(db.memory_search(query).unwrap().len(), 1);
-        assert_eq!(db.meeting_search(query).unwrap().len(), 1);
-        assert_eq!(db.people_search(query).unwrap().len(), 1);
-        assert_eq!(db.project_search(query).unwrap().len(), 1);
-        assert_eq!(db.todo_search(query).unwrap().len(), 1);
-        assert_eq!(db.investigation_search(query).unwrap().len(), 1);
-        assert_eq!(db.repo_search(query).unwrap().len(), 1);
+        assert_eq!(
+            db.memory_search(query, &Default::default()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.meeting_search(query, &Default::default()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.people_search(query, &Default::default()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.project_search(query, &Default::default()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.todo_search(query, None, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.investigation_search(query, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.repo_search(query, &Default::default()).unwrap().len(), 1);
     }
 
     #[test]
     fn prose_search_handles_inflections_and_joined_words() {
         let db = Database::open_in_memory().unwrap();
         let keys = |q: &str| -> Vec<String> {
-            db.memory_search(q)
+            db.memory_search(q, &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|m| m.key)
@@ -735,7 +760,7 @@ mod tests {
             .unwrap();
         db.memory_set("every", "alpha and beta", "general", None)
             .unwrap();
-        let hits = db.memory_search("alpha beta").unwrap();
+        let hits = db.memory_search("alpha beta", &Default::default()).unwrap();
         assert_eq!(hits[0].key, "every");
         assert_eq!(hits[1].key, "some");
         assert_eq!(hits.len(), 2, "no record appears twice");
@@ -748,8 +773,18 @@ mod tests {
             db.memory_set(&format!("k{i}"), "alpha", "general", None)
                 .unwrap();
         }
-        assert_eq!(db.memory_search("alpha beta").unwrap().len(), 10);
-        assert_eq!(db.memory_search("alpha").unwrap().len(), 30);
+        assert_eq!(
+            db.memory_search("alpha beta", &Default::default())
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            db.memory_search("alpha", &Default::default())
+                .unwrap()
+                .len(),
+            30
+        );
     }
 
     #[test]
@@ -759,9 +794,12 @@ mod tests {
         db.conn
             .execute("UPDATE memory SET status = 'superseded'", [])
             .unwrap();
-        assert!(db.memory_search("alpha beta").unwrap().is_empty());
+        assert!(db
+            .memory_search("alpha beta", &Default::default())
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            db.memory_search_filtered("alpha beta", "all")
+            db.memory_search_filtered("alpha beta", "all", &Default::default())
                 .unwrap()
                 .len(),
             1
@@ -780,16 +818,29 @@ mod tests {
             .unwrap();
         db.memory_set("old", "Retry a request", "general", None)
             .unwrap();
-        assert!(db.memory_search("retries").unwrap().is_empty());
+        assert!(db
+            .memory_search("retries", &Default::default())
+            .unwrap()
+            .is_empty());
 
         db.conn
             .execute_batch(crate::db::schema::MIGRATION_V18)
             .unwrap();
-        assert_eq!(db.memory_search("retries").unwrap().len(), 1);
+        assert_eq!(
+            db.memory_search("retries", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
 
         db.memory_set("new", "Batches are small", "general", None)
             .unwrap();
-        assert_eq!(db.memory_search("batch").unwrap().len(), 1);
+        assert_eq!(
+            db.memory_search("batch", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -819,7 +870,7 @@ mod tests {
         let b = db.meeting_add("b", None, None, None).unwrap();
         db.meeting_store_chunks(a, &chunks("near", 3)).unwrap();
         db.meeting_store_chunks(b, &other()).unwrap();
-        let hits = db.meeting_similar(&query, 2).unwrap();
+        let hits = db.meeting_similar(&query, 2, &Default::default()).unwrap();
         assert_eq!(
             hits.iter().map(|h| h.meeting.id).collect::<Vec<_>>(),
             [a, b]
@@ -833,7 +884,9 @@ mod tests {
         let (a, b) = (add("a"), add("b"));
         db.todo_store_chunks(a, &chunks("near", 3)).unwrap();
         db.todo_store_chunks(b, &other()).unwrap();
-        let hits = db.todo_similar(&query, 2).unwrap();
+        let hits = db
+            .todo_similar(&query, 2, None, &Default::default())
+            .unwrap();
         assert_eq!(hits.iter().map(|h| h.todo.id).collect::<Vec<_>>(), [a, b]);
 
         let a = db.investigation_start("a", "a", None).unwrap();
@@ -841,7 +894,9 @@ mod tests {
         db.investigation_store_chunks(a, &chunks("near", 3))
             .unwrap();
         db.investigation_store_chunks(b, &other()).unwrap();
-        let hits = db.investigation_similar(&query, 2).unwrap();
+        let hits = db
+            .investigation_similar(&query, 2, &Default::default())
+            .unwrap();
         assert_eq!(
             hits.iter().map(|h| h.investigation.id).collect::<Vec<_>>(),
             [a, b]
@@ -1051,7 +1106,10 @@ mod tests {
             .execute("INSERT INTO memory (key, value) VALUES ('old', 'x')", [])
             .unwrap();
         // FTS stayed consistent through the rebuild.
-        assert_eq!(db.memory_search("v2").unwrap().len(), 1);
+        assert_eq!(
+            db.memory_search("v2", &Default::default()).unwrap().len(),
+            1
+        );
     }
 
     /// A primary database at v13 with the given SQL applied, ready for v14.

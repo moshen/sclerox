@@ -137,15 +137,13 @@ impl Params {
     }
 
     fn hits(&self, db: &Database, q: &str, emb: Option<&[f32]>) -> Result<Vec<crate::search::Hit>> {
-        search_hits_embedded(
-            db,
-            q,
-            emb,
-            self.threshold,
-            self.margin,
-            self.semantic_limit,
-            self.code_text_limit,
-        )
+        let tuning = crate::search::Tuning {
+            semantic_threshold: self.threshold,
+            semantic_margin: self.margin,
+            semantic_limit: self.semantic_limit,
+            code_text_limit: self.code_text_limit,
+        };
+        search_hits_embedded(db, q, emb, &tuning, &Default::default())
     }
 }
 

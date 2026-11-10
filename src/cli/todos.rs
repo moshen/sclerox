@@ -3,7 +3,9 @@ use clap::Subcommand;
 
 use crate::cli::text_chunks;
 use crate::config::settings;
-use crate::db::{todos::TodoStatus, Database};
+use crate::db::dates::Dates;
+use crate::db::todos::{SimilarTodo, Todo, TodoStatus};
+use crate::db::Database;
 use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
@@ -45,9 +47,18 @@ pub enum TodoCommand {
         /// Show only items with a deadline within N days
         #[arg(long)]
         deadline_within: Option<u32>,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Full-text search todos (includes done items)
-    Search { query: String },
+    Search {
+        query: String,
+        /// Only todos with this status
+        #[arg(long, default_value = "all", value_parser = ["open", "done", "watch", "all"])]
+        status: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Edit a todo's fields
     Update {
         id: i64,
@@ -73,14 +84,12 @@ pub enum TodoCommand {
     Watch { id: i64 },
     /// Reopen a done or watch item
     Reopen { id: i64 },
-    /// Search completed todos (history)
+    /// `todo list --status done`, or with a query `todo search --status done`
+    #[command(hide = true)]
     History {
-        /// Optional search query
         query: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long)]
-        to: Option<String>,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Delete a todo permanently
     Delete { id: i64 },
@@ -184,15 +193,18 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             status,
             category,
             deadline_within,
+            dates,
         } => {
+            let dates = dates.dates()?;
             let mut todos = if let Some(days) = deadline_within {
                 db.todo_list_due_within(days, Some(&status))?
             } else {
                 db.todo_list(Some(&status))?
             };
-            if let Some(cat) = &category {
-                todos.retain(|t| &t.category == cat);
-            }
+            todos.retain(|t| {
+                category.as_ref().is_none_or(|c| &t.category == c)
+                    && dates.keeps(&t.updated_at, &t.created_at)
+            });
             print_output(format, &todos, || {
                 if todos.is_empty() {
                     println!("No todos.");
@@ -205,40 +217,13 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             });
         }
 
-        TodoCommand::Search { query } => {
-            // Tier 1+2: FTS prefix + LIKE substring
-            let fts_results = db.todo_search(&query)?;
-
-            // Tier 3: semantic similarity - always runs alongside FTS+LIKE.
-            // Results are deduped against FTS hits and filtered by a minimum score.
-            // Model load costs ~1s; acceptable for a search that already has context.
-            let sem = &settings().search;
-            let floor = crate::config::settings().semantic_threshold() as f32;
-            let fts_ids: std::collections::HashSet<i64> =
-                fts_results.iter().map(|t| t.id).collect();
-            let semantic: Vec<_> =
-                if let Some(mut emb) = crate::embed::optional(db.semantic_ready()) {
-                    if let Ok(query_emb) = emb.embed_query(&query) {
-                        let hits = db
-                            .todo_similar(&query_emb, sem.semantic_limit)
-                            .unwrap_or_default();
-                        let margin = crate::config::settings()
-                            .semantic_margin()
-                            .map(|m| m as f32);
-                        let cut = crate::embed::models::semantic_cutoff(
-                            hits.iter().map(|r| r.score),
-                            floor,
-                            margin,
-                        );
-                        hits.into_iter()
-                            .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= cut)
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                };
+        TodoCommand::Search {
+            query,
+            status,
+            dates,
+        } => {
+            let status = (status != "all").then_some(status.as_str());
+            let (fts_results, semantic) = find(db, &query, status, &dates.dates()?)?;
 
             print_output(
                 format,
@@ -315,19 +300,22 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             }
         }
 
-        TodoCommand::History { query, from, to } => {
-            let results = db.todo_history(query.as_deref(), from.as_deref(), to.as_deref())?;
-            print_output(format, &results, || {
-                if results.is_empty() {
-                    println!("No history found.");
-                } else {
-                    for t in &results {
-                        let done_at = t.completed_at.as_deref().unwrap_or("?");
-                        println!("[done {}] #{} {}", done_at, t.id, t.title);
-                    }
-                    println!("\n{} items", results.len());
-                }
-            });
+        TodoCommand::History { query, dates } => {
+            let status = "done".to_string();
+            let cmd = match query {
+                Some(query) => TodoCommand::Search {
+                    query,
+                    status,
+                    dates,
+                },
+                None => TodoCommand::List {
+                    status,
+                    category: None,
+                    deadline_within: None,
+                    dates,
+                },
+            };
+            return run(db, cmd, format);
         }
 
         TodoCommand::Delete { id } => {
@@ -487,4 +475,36 @@ fn print_todo_detail(t: &crate::db::todos::Todo) {
     if let Some(at) = &t.completed_at {
         println!("  Done at:    {at}");
     }
+}
+
+/// Todos with `status` matching `query` within `dates`: keyword matches,
+/// then the semantic ones they missed, above the configured cutoff.
+fn find(
+    db: &Database,
+    query: &str,
+    status: Option<&str>,
+    dates: &Dates,
+) -> Result<(Vec<Todo>, Vec<SimilarTodo>)> {
+    let fts = db.todo_search(query, status, dates)?;
+    let fts_ids: std::collections::HashSet<i64> = fts.iter().map(|t| t.id).collect();
+    // Model load costs ~1s; acceptable for a search that already has context.
+    let Some(query_emb) =
+        crate::embed::optional(db.semantic_ready()).and_then(|mut emb| emb.embed_query(query).ok())
+    else {
+        return Ok((fts, Vec::new()));
+    };
+    let s = settings();
+    let hits = db
+        .todo_similar(&query_emb, s.search.semantic_limit, status, dates)
+        .unwrap_or_default();
+    let cut = crate::embed::models::semantic_cutoff(
+        hits.iter().map(|r| r.score),
+        s.semantic_threshold() as f32,
+        s.semantic_margin().map(|m| m as f32),
+    );
+    let semantic = hits
+        .into_iter()
+        .filter(|r| !fts_ids.contains(&r.todo.id) && r.score >= cut)
+        .collect();
+    Ok((fts, semantic))
 }

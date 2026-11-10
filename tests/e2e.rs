@@ -1394,6 +1394,67 @@ fn search_shows_a_limited_number_of_results_and_says_so() {
 }
 
 #[test]
+fn searches_and_lists_keep_to_the_dates_asked_for() {
+    let e = Env::new();
+    e.run(&["memory", "set", "tank-temp", "zebrafish need warm water"]);
+    let today = e.run(&["search", "zebrafish", "--from", "1d"]);
+    assert!(today.contains("[memory]"), "{today}");
+    for args in [
+        &["search", "zebrafish", "--to", "1d"][..],
+        &["search", "zebrafish", "--created", "--to", "1d"],
+        &["memory", "search", "zebrafish", "--to", "1d"],
+        &["memory", "list", "--to", "1d"],
+    ] {
+        let out = e.run(args);
+        assert!(!out.contains("tank-temp"), "{args:?}: {out}");
+    }
+    assert!(e
+        .run(&["memory", "list", "--from", "2w"])
+        .contains("tank-temp"));
+
+    let out = e
+        .cmd()
+        .args(["search", "zebrafish", "--from", "soon"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--from 'soon'"));
+
+    e.run(&[
+        "meeting",
+        "add",
+        "--title",
+        "Kickoff",
+        "--date",
+        "2026-01-15",
+    ]);
+    let listed = |from: &str, to: &str| e.run(&["meeting", "list", "--from", from, "--to", to]);
+    assert!(listed("2026-01-01", "2026-01-15").contains("Kickoff"));
+    assert!(!listed("2026-01-16", "2026-01-31").contains("Kickoff"));
+}
+
+#[test]
+fn todo_history_lists_or_searches_done_todos() {
+    let e = Env::new();
+    let done = e.run_get_id(&["todo", "add", "--title", "Ship the zebrafish tank"]);
+    e.run(&["todo", "add", "--title", "Clean the zebrafish tank"]);
+    e.run(&["todo", "done", &done.to_string()]);
+
+    for args in [
+        &["todo", "history"][..],
+        &["todo", "history", "zebrafish"],
+        &["todo", "list", "--status", "done", "--from", "1d"],
+        &["todo", "search", "zebrafish", "--status", "done"],
+    ] {
+        let out = e.run(args);
+        assert!(out.contains("Ship"), "{args:?}: {out}");
+        assert!(!out.contains("Clean"), "{args:?}: {out}");
+    }
+    assert!(!e.run(&["todo", "history", "--to", "1d"]).contains("Ship"));
+    assert!(!e.run(&["todo", "--help"]).contains("  history"));
+}
+
+#[test]
 fn search_full_returns_each_hits_whole_record() {
     let e = Env::new();
     let dir = TempDir::new().unwrap();

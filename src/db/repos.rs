@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::dates::Dates;
 use super::{embedding_to_bytes, fts, Database};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +73,7 @@ impl Database {
 
     /// Repos whose name or description matches `query` in full text (word
     /// prefixes), or whose name, description or path holds it as a substring.
-    pub fn repo_search(&self, query: &str) -> Result<Vec<RepoEntry>> {
+    pub fn repo_search(&self, query: &str, dates: &Dates) -> Result<Vec<RepoEntry>> {
         let source = fts::Source {
             fts: "repos_fts",
             table: "repos",
@@ -83,40 +84,62 @@ impl Database {
                 OR path LIKE ?1 ESCAPE '\\'",
             then_by: "name",
             status: None,
+            dates,
+            changed: "created_at",
+            created: "created_at",
         };
         fts::search(&self.conn, query, &source, |hit| hit.id, row_to_repo)
     }
 
     /// Repos whose description is nearest to `query_embedding`, via the
     /// sqlite-vec KNN index (`repos_vec`, cosine). `score` = 1 - cosine distance.
-    pub fn repo_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SimilarRepo>> {
+    pub fn repo_similar(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        dates: &Dates,
+    ) -> Result<Vec<SimilarRepo>> {
         self.semantic_read(|| {
             let query = crate::db::embedding_to_bytes(query_embedding);
             let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at,
+                "SELECT r.id, r.path, r.name, r.description, r.db_path, r.last_indexed, r.created_at,
                     v.distance
              FROM repos_vec v
              JOIN repos r ON r.id = v.rowid
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
-        )?;
-            let rows = stmt.query_map(params![query, limit as i64], |row| {
-                let repo = RepoEntry {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    name: row.get(2)?,
-                    description: row.get(3)?,
-                    db_path: row.get(4)?,
-                    last_indexed: row.get(5)?,
-                    created_at: row.get(6)?,
-                };
-                let distance: f64 = row.get(7)?;
-                Ok(SimilarRepo {
-                    repo,
-                    score: 1.0 - distance as f32,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            )?;
+            // One vector per repo, so only a date range leaves fewer than `k`
+            // results.
+            crate::db::knn_collapsed(
+                limit,
+                |k| {
+                    stmt.query_map(params![query, k], |row| {
+                        let repo = RepoEntry {
+                            id: row.get(0)?,
+                            path: row.get(1)?,
+                            name: row.get(2)?,
+                            description: row.get(3)?,
+                            db_path: row.get(4)?,
+                            last_indexed: row.get(5)?,
+                            created_at: row.get(6)?,
+                        };
+                        let distance: f64 = row.get(7)?;
+                        Ok(SimilarRepo {
+                            repo,
+                            score: 1.0 - distance as f32,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+                },
+                |rows| {
+                    rows.into_iter()
+                        .filter(|r| dates.contains(Some(&r.repo.created_at)))
+                        .take(limit)
+                        .collect()
+                },
+            )
         })
     }
 
@@ -341,14 +364,14 @@ mod tests {
         )
         .unwrap();
 
-        let results = db.repo_search("OAuth").unwrap();
+        let results = db.repo_search("OAuth", &Default::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "auth-service");
 
         // Mid-word substrings of the name, description and path match too.
         for q in ["service", "tripe", "/b"] {
             let names: Vec<_> = db
-                .repo_search(q)
+                .repo_search(q, &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|r| r.name)
@@ -391,7 +414,7 @@ mod tests {
         let mut query = vec![0.0f32; 384];
         query[0] = 0.95;
         query[1] = 0.05;
-        let results = db.repo_similar(&query, 2).unwrap();
+        let results = db.repo_similar(&query, 2, &Default::default()).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].repo.name, "repo-a");
         assert!(results[0].score > results[1].score);

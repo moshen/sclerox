@@ -30,9 +30,15 @@ pub enum ResearchCommand {
         #[arg(long, default_value = "open",
               value_parser = ["open","concluded","all"])]
         status: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
     },
     /// Search investigations (FTS + semantic similarity combined)
-    Search { query: String },
+    Search {
+        query: String,
+        #[command(flatten)]
+        dates: crate::cli::dates::DateArgs,
+    },
     /// Update plan, findings, or status
     Update {
         id: i64,
@@ -146,8 +152,10 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             }
         }
 
-        ResearchCommand::List { status } => {
-            let invs = db.investigation_list(Some(&status))?;
+        ResearchCommand::List { status, dates } => {
+            let dates = dates.dates()?;
+            let mut invs = db.investigation_list(Some(&status))?;
+            invs.retain(|i| dates.keeps(&i.updated_at, &i.created_at));
             print_output(format, &invs, || {
                 if invs.is_empty() {
                     println!("No investigations.");
@@ -160,16 +168,17 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             });
         }
 
-        ResearchCommand::Search { query } => {
+        ResearchCommand::Search { query, dates } => {
+            let dates = dates.dates()?;
             // FTS results first
-            let fts_hits = db.investigation_search(&query)?;
+            let fts_hits = db.investigation_search(&query, &dates)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
 
             // Semantic results - appended, deduped against FTS hits
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
             let semantic: Vec<_> = query_emb
-                .map(|qe| db.investigation_similar(&qe, 5).unwrap_or_default())
+                .map(|qe| db.investigation_similar(&qe, 5, &dates).unwrap_or_default())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|r| !fts_ids.contains(&r.investigation.id))
