@@ -1,7 +1,7 @@
 //! The `--from`/`--to` range searches keep their records to.
 
 use anyhow::{bail, Result};
-use chrono::{Days, Months, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Days, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
 /// How dates are stored, and how SQLite's `datetime()` writes them.
 const STAMP: &str = "%Y-%m-%d %H:%M:%S";
@@ -144,9 +144,11 @@ fn age(s: &str, today: NaiveDate) -> Option<NaiveDate> {
 
 /// A stored date or time, as SQLite's `datetime()` reads the forms sclerox
 /// stores: a date, or a date and time with an optional `T`, fraction and `Z`.
+/// Like `datetime()`, it drops the fraction.
 fn read_stamp(s: &str) -> Option<NaiveDateTime> {
     let s = s.trim().trim_end_matches('Z').replacen('T', " ", 1);
     NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|at| at.with_nanosecond(0).unwrap_or(at))
         .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M"))
         .ok()
         .or_else(|| {
@@ -215,6 +217,7 @@ mod tests {
             "2026-06-08 23:59:59",
             "2026-06-08T12:00:00Z",
             "2026-06-04 10:00:00.250",
+            "2026-06-08 23:59:59.500",
         ] {
             assert!(june.contains(Some(inside)), "{inside}");
         }
@@ -226,7 +229,13 @@ mod tests {
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let [from, to] = june.values();
-        for stamp in ["2026-06-01", "2026-06-08T12:00:00Z", "2026-06-09", "soon"] {
+        for stamp in [
+            "2026-06-01",
+            "2026-06-08T12:00:00Z",
+            "2026-06-08 23:59:59.500",
+            "2026-06-09",
+            "soon",
+        ] {
             let in_sql: bool = conn
                 .query_row(
                     &format!("SELECT coalesce({}, 0)", june.sql("?3", 1)),
