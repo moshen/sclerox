@@ -73,7 +73,8 @@ pub fn loose_query(query: &str) -> Option<String> {
 /// The terms code search matches one by one when a query of several words
 /// isn't found whole: each word lowercased and trimmed of punctuation (an
 /// identifier keeps its `_`), without stopwords or words under three
-/// characters, which the trigram index can't look up. `None` for a single
+/// characters, which the trigram index can't look up, and only the first
+/// [`CODE_TERMS`], so a pasted page stays a small query. `None` for a single
 /// word or nothing left, as the whole-query tiers already search for it.
 pub fn code_terms(query: &str) -> Option<Vec<String>> {
     let words: Vec<&str> = query.split_whitespace().collect();
@@ -90,10 +91,16 @@ pub fn code_terms(query: &str) -> Option<Vec<String>> {
             && !terms.contains(&term)
         {
             terms.push(term);
+            if terms.len() == CODE_TERMS {
+                break;
+            }
         }
     }
     (!terms.is_empty()).then_some(terms)
 }
+
+/// Most terms [`code_terms`] keeps.
+const CODE_TERMS: usize = 16;
 
 /// A table and its full-text index `fts`, and how [`search`] ranks matches.
 pub struct Source<'a> {
@@ -372,6 +379,8 @@ mod tests {
                 "rotate_password".into()
             ])
         );
+        let page: String = (0..2000).map(|i| format!("word{i} ")).collect();
+        assert_eq!(code_terms(&page).unwrap().len(), CODE_TERMS);
         assert_eq!(code_terms("parse_invoice"), None);
         assert_eq!(code_terms("what is it"), None);
         assert_eq!(code_terms(""), None);

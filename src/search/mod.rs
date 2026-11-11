@@ -723,7 +723,17 @@ pub fn symbol_hits(
     let Some(terms) = fts::code_terms(query) else {
         return Ok(());
     };
-    let some = repo_db.search_symbols_any(&terms, seen.len() + fts::LOOSE_LIMIT, dates)?;
+    // Only adds to the hits above, so a failure here leaves them standing.
+    let some = match repo_db.search_symbols_any(&terms, seen.len() + fts::LOOSE_LIMIT, dates) {
+        Ok(some) => some,
+        Err(e) => {
+            log::error!(
+                "term search of symbols failed for repo '{}': {e:#}",
+                repo.name
+            );
+            return Ok(());
+        }
+    };
     out.extend(
         some.into_iter()
             .filter(|(_, sym)| !seen.contains(&sym.id))
