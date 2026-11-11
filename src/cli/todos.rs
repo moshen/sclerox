@@ -222,6 +222,7 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
             status,
             dates,
         } => {
+            let command = crate::cli::usage::with_status("todo search", &status, "open");
             let status = (status != "all").then_some(status.as_str());
             let (fts_results, semantic) = find(db, &query, status, &dates.dates()?)?;
 
@@ -265,7 +266,7 @@ pub fn run(db: &Database, cmd: TodoCommand, format: OutputFormat) -> Result<()> 
                         .map(|r| crate::cli::usage::semantic("todo", r.todo.id, r.score)),
                 )
                 .collect();
-            crate::cli::usage::search(db, "todo search", &query, &logged);
+            crate::cli::usage::search(db, &command, &query, &logged);
         }
 
         TodoCommand::Done { id, note } => {

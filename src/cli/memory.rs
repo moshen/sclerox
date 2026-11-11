@@ -424,7 +424,12 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     println!("\n{} results", results.len());
                 }
             });
-            crate::cli::usage::search(db, "memory search", &query, &logged);
+            crate::cli::usage::search(
+                db,
+                &crate::cli::usage::with_status("memory search", status, "active"),
+                &query,
+                &logged,
+            );
         }
 
         MemoryCommand::Delete { key } => {

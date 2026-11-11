@@ -12,6 +12,7 @@ sclerox memory get <key>                  # includes its origin, scope, projects
 sclerox memory get <key> --history        # current value, every earlier value + supersession chain
 sclerox memory search "<query>"           # active only by default
 sclerox memory search "<query>" --status all  # also stale/superseded (or one: stale, superseded)
+# Only active memories match by meaning: stale/superseded ones need a keyword in the query
 sclerox memory list [--type <t>] [--status active|stale|superseded|all]
 sclerox memory stale <key> [--reason "why it's no longer valid"]
 sclerox memory supersede <old_key> <new_key> "<new_value>"

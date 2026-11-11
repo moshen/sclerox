@@ -179,6 +179,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             dates,
         } => {
             let dates = dates.dates()?;
+            let command = crate::cli::usage::with_status("research search", &status, "open");
             let status = (status != "all").then_some(status.as_str());
             // FTS results first
             let fts_hits = db.investigation_search(&query, status, &dates)?;
@@ -239,7 +240,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     crate::cli::usage::semantic("research", &r.investigation.slug, r.score)
                 }))
                 .collect();
-            crate::cli::usage::search(db, "research search", &query, &logged);
+            crate::cli::usage::search(db, &command, &query, &logged);
         }
 
         ResearchCommand::Update {

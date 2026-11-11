@@ -2141,6 +2141,39 @@ fn search_and_get_are_recorded_with_the_session() {
 }
 
 #[test]
+fn a_search_is_logged_with_its_status_when_not_the_default() {
+    let e = Env::new();
+    for args in [
+        &["memory", "search", "queue"][..],
+        &["memory", "search", "queue", "--all"],
+        &["todo", "search", "queue", "--status", "open"],
+        &["todo", "search", "queue", "--status", "done"],
+        &["research", "search", "queue", "--status", "all"],
+    ] {
+        e.run(args);
+    }
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT command FROM retrieval_events ORDER BY id")
+        .unwrap();
+    let commands: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "memory search",
+            "memory search --status all",
+            "todo search",
+            "todo search --status done",
+            "research search --status all",
+        ]
+    );
+}
+
+#[test]
 fn usage_logging_can_be_turned_off() {
     let e = Env::new();
     std::fs::write(&e.config, "[usage]\nenabled = false\n").unwrap();
