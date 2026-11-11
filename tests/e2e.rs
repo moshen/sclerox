@@ -1651,7 +1651,7 @@ fn code_text_is_found_word_for_word_without_embeddings() {
 }
 
 #[test]
-fn db_check_reads_the_search_indexes() {
+fn db_check_compares_the_search_indexes_with_their_tables() {
     let e = Env::new();
     e.run(&[
         "memory",
@@ -1676,6 +1676,23 @@ fn db_check_reads_the_search_indexes() {
     let json: serde_json::Value =
         serde_json::from_str(&e.run(&["db", "check", "--output", "json"])).unwrap();
     assert_eq!(json["ok"], true, "{json}");
+
+    // A row changed with the trigger that updates its index gone leaves the
+    // index out of step, which SQLite's own check doesn't notice.
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    conn.execute_batch("DROP TRIGGER memory_au; UPDATE memory SET value = 'Something else';")
+        .unwrap();
+    drop(conn);
+    let out = e.cmd().args(["db", "check"]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("memory_fts: "), "{stdout}");
+
+    // A database that isn't there isn't created and checked.
+    let missing = Env::new();
+    let out = missing.cmd().args(["db", "check"]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!missing.db.exists());
 }
 
 /// (chunks, chunks without a vector) in a repo's index.

@@ -143,6 +143,10 @@ pub fn run(cli: Cli) -> Result<()> {
             let db = Database::open(&settings().db_path)?;
             hook::run(&db, cmd)
         }
+        // Opening would create an empty database, which would check out fine.
+        Commands::Db(db::DbCommand::Check) if !settings().db_path.exists() => {
+            anyhow::bail!("no database at {}", settings().db_path.display())
+        }
         cmd => {
             let db = Database::open(&settings().db_path)?;
             // Run any pending embedding backfills once, right after the DB opens.

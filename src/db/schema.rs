@@ -1106,6 +1106,18 @@ CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
     files_fts_table!()
 );
 
+/// The full-text indexes of the prose tables, built with the `word_parts`
+/// tokenizer since v20.
+pub const PROSE_INDEXES: [&str; 7] = [
+    "memory_fts",
+    "people_fts",
+    "meetings_fts",
+    "projects_fts",
+    "repos_fts",
+    "todos_fts",
+    "investigations_fts",
+];
+
 /// Migration v20: prose indexes also hold the parts of camelCase words, so
 /// "document" finds "FinancialDocument" (see `db::word_parts`). Rebuilt as in
 /// v18, whose triggers carry over.
