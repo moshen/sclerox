@@ -43,10 +43,14 @@ fn own_checkout() -> Option<()> {
 }
 
 /// Rerun when HEAD moves: a checkout changes `HEAD`, a commit changes the
-/// branch's ref (loose, or in `packed-refs` after a gc). In a worktree,
-/// `HEAD` is its own but refs are shared with the main checkout. Cargo reruns
-/// on every build for a path that doesn't exist, so a missing file is watched
-/// through its nearest existing directory, which catches it being created.
+/// branch's ref. In a worktree, `HEAD` is its own but refs are shared with
+/// the main checkout. A loose ref file wins over `packed-refs`, so that is
+/// watched when it exists (a gc that packs it deletes it, which Cargo sees).
+/// Otherwise the branch is in `packed-refs` or not yet created, and its next
+/// commit writes the loose file, caught by watching its nearest existing
+/// directory under `refs/`. Cargo reruns on every build for a watched path
+/// that doesn't exist, and scans a watched directory whole, so nothing
+/// outside `refs/` is watched as a directory.
 fn rerun_on_new_commit() {
     let (Some(git_dir), Some(common)) = (
         git(&["rev-parse", "--git-dir"]),
@@ -55,21 +59,51 @@ fn rerun_on_new_commit() {
         return;
     };
     let (git_dir, common) = (Path::new(&git_dir), Path::new(&common));
-    let mut watch = vec![git_dir.join("HEAD"), common.join("packed-refs")];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        watch.push(common.join(branch));
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    // A detached HEAD holds the commit itself.
+    let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    let loose = common.join(branch);
+    let mut watch = Vec::new();
+    if loose.exists() {
+        watch.push(loose.as_path());
+    } else {
+        let packed = common.join("packed-refs");
+        if packed.exists() {
+            println!("cargo:rerun-if-changed={}", packed.display());
+        }
+        let refs = common.join("refs");
+        watch.extend(
+            loose
+                .ancestors()
+                .take_while(|p| p.starts_with(&refs))
+                .find(|p| p.exists()),
+        );
     }
     for path in watch {
-        if let Some(existing) = path.ancestors().find(|p| p.exists()) {
-            println!("cargo:rerun-if-changed={}", existing.display());
-        }
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 
+/// Runs git on this package's directory. Variables that tie git to one
+/// repository (`git rev-parse --local-env-vars`: `GIT_DIR` and the like,
+/// which git sets while running hooks) are cleared, so they can't point it
+/// at another repository.
 fn git(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).output().ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (out.status.success() && !s.is_empty()).then_some(s)
+    let run = |args: &[&str], clear: &[String]| {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+        for var in clear {
+            command.env_remove(var);
+        }
+        let out = command.args(args).output().ok()?;
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (out.status.success() && !s.is_empty()).then_some(s)
+    };
+    let local = run(&["rev-parse", "--local-env-vars"], &[])?;
+    let local: Vec<String> = local.lines().map(str::to_string).collect();
+    run(args, &local)
 }
 
 #[cfg(target_os = "windows")]
