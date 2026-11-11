@@ -81,7 +81,9 @@ impl Env {
 #[test]
 fn version_is_the_release_tag_or_dev_and_the_commit() {
     let e = Env::new();
-    let tag = option_env!("SCLEROX_VERSION").unwrap_or("0.0.0-dev");
+    let tag = option_env!("SCLEROX_VERSION")
+        .filter(|v| !v.is_empty())
+        .unwrap_or("0.0.0-dev");
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .current_dir(env!("CARGO_MANIFEST_DIR"))

@@ -22,11 +22,13 @@ fn build_version() {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
-    let version = match own_checkout().and_then(|_| git(&["rev-parse", "--short", "HEAD"])) {
-        Some(commit) => {
-            rerun_on_new_commit();
-            format!("{version}+{commit}")
-        }
+    // Watched even before the first commit, so that commit shows up.
+    let commit = own_checkout().and_then(|_| {
+        rerun_on_new_commit();
+        git(&["rev-parse", "--short", "HEAD"])
+    });
+    let version = match commit {
+        Some(commit) => format!("{version}+{commit}"),
         None => version,
     };
     println!("cargo:rustc-env=SCLEROX_BUILD_VERSION={version}");
