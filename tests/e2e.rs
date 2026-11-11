@@ -1633,6 +1633,21 @@ fn code_text_is_found_word_for_word_without_embeddings() {
         .map(|h| h["line"].as_i64().unwrap())
         .collect();
     assert_eq!(lines, [2, 5], "{out}");
+
+    // A question no line holds whole finds the symbol and lines holding some
+    // of its words, those with the most first.
+    let question = "how long do we sleep for the backoff";
+    let at = |out: &str, line: u32| {
+        out.find(&format!("{}/lib.rs:{line}", root.display()))
+            .unwrap_or_else(|| panic!("no line {line} in:\n{out}"))
+    };
+    let out = e.run(&["code", "search", question]);
+    assert!(out.starts_with("[const_item] const BACKOFF_MS"), "{out}");
+    let text = &out[out.find("Text matches").unwrap()..];
+    assert!(at(text, 5) < at(text, 2), "sleep and backoff first:\n{out}");
+    let out = e.run(&["search", question]);
+    at(&out, 5);
+    at(&out, 2);
 }
 
 /// (chunks, chunks without a vector) in a repo's index.

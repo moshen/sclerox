@@ -73,9 +73,9 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
             let floor = crate::config::settings().semantic_threshold() as f32;
 
             // Results as `sclerox search` emits them: symbols, then lines
-            // holding the query word for word, then the semantic code-chunk
-            // matches.
-            let mut results: Vec<SearchResult> = Vec::new();
+            // holding the query or some of its words, then the semantic
+            // code-chunk matches.
+            let mut symbols = Vec::new();
             let mut code_text = Vec::new();
             let mut code_chunks: Vec<(&RepoEntry, SimilarChunk)> = Vec::new();
             for entry in &repos {
@@ -94,19 +94,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     Err(_) => continue,
                 };
 
-                for s in repo_db.search_symbols(&needle, &dates)? {
-                    results.push(SearchResult::Symbol {
-                        repo_name: entry.name.clone(),
-                        repo_path: entry.path.clone(),
-                        kind: s.kind,
-                        name: s.name,
-                        signature: s.signature,
-                        file_path: s.file_path,
-                        start_line: s.start_line,
-                        last_modified: s.last_modified,
-                    });
-                }
-
+                crate::search::symbol_hits(&mut symbols, entry, &repo_db, &needle, &dates)?;
                 crate::search::code_text_hits(
                     &mut code_text,
                     entry,
@@ -145,6 +133,7 @@ pub fn run(db: &Database, cmd: CodeCommand, format: OutputFormat) -> Result<()> 
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             code_chunks.truncate(sem.semantic_limit);
+            let mut results = crate::search::rank_symbols(symbols);
             results.extend(crate::search::rank_code_text(
                 code_text,
                 sem.code_text_limit,

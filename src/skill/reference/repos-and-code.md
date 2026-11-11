@@ -31,7 +31,7 @@ SessionStart hook and `sclerox repo index` both skip it.
 Prefer `sclerox code` over Grep/Glob for symbols (see the rule in SKILL.md).
 
 ```bash
-sclerox code search "<query>"                    # symbols by name, then lines holding the query
+sclerox code search "<query>"                    # symbols by name, then lines holding the query or some of its words
 sclerox code search --repo "<name>" "<query>"    # scope to one repo
 sclerox code refs <symbol>                       # what calls/uses this symbol?
 sclerox code calls <symbol>                      # what does this symbol call?
@@ -43,7 +43,11 @@ query; text matches - lines of any indexed file (comments, strings, imports
 included) holding every word of the query, as substrings in any case, the
 exact phrase first (up to `search.code_text_limit` lines, 3 per file; words
 under three characters only narrow the lines, so a query of only those finds
-no text); and, with embeddings, semantic matches.
+no text); and, with embeddings, semantic matches. A query of several words also
+finds up to 10 symbols and 10 lines holding only some of them, the most first,
+after those holding the whole query, so a question in words (`how is the
+password stored`) finds code without embeddings. Stopwords and words under
+three characters are left out of this.
 
 Compose with ast-grep for structural matching: `sclerox code` finds the files,
 ast-grep matches the pattern. NOTE the flag is `--output json` (not `--format`).

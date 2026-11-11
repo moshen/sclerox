@@ -15,9 +15,10 @@ pub const STOPWORDS: &[&str] = &[
     "where", "which", "who", "why", "will", "with", "would", "you", "your",
 ];
 
-/// Most hits the [`loose_query`] tier adds per table: it matches any one term,
-/// so a common term could otherwise bring in most of the table.
-const LOOSE_LIMIT: usize = 10;
+/// Most hits the [`loose_query`] tier adds per table, and code search's
+/// [`code_terms`] tier adds for each of symbols and lines: it matches any one
+/// term, so a common term could otherwise bring in most of the table.
+pub const LOOSE_LIMIT: usize = 10;
 
 /// Sanitize a user-provided query for SQLite FTS5 MATCH.
 ///
@@ -67,6 +68,31 @@ pub fn loose_query(query: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" OR ")
     })
+}
+
+/// The terms code search matches one by one when a query of several words
+/// isn't found whole: each word lowercased and trimmed of punctuation (an
+/// identifier keeps its `_`), without stopwords or words under three
+/// characters, which the trigram index can't look up. `None` for a single
+/// word or nothing left, as the whole-query tiers already search for it.
+pub fn code_terms(query: &str) -> Option<Vec<String>> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let mut terms: Vec<String> = Vec::new();
+    for word in words {
+        let term = word
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .to_lowercase();
+        if term.chars().count() >= 3
+            && !STOPWORDS.contains(&term.as_str())
+            && !terms.contains(&term)
+        {
+            terms.push(term);
+        }
+    }
+    (!terms.is_empty()).then_some(terms)
 }
 
 /// A table and its full-text index `fts`, and how [`search`] ranks matches.
@@ -333,6 +359,22 @@ mod tests {
         assert_eq!(loose_query("the"), None);
         assert_eq!(loose_query("- ?"), None);
         assert_eq!(loose_query(""), None);
+    }
+
+    #[test]
+    fn code_terms_keep_significant_words_and_identifiers() {
+        assert_eq!(
+            code_terms("How is the DB password stored? see rotate_password()"),
+            Some(vec![
+                "password".into(),
+                "stored".into(),
+                "see".into(),
+                "rotate_password".into()
+            ])
+        );
+        assert_eq!(code_terms("parse_invoice"), None);
+        assert_eq!(code_terms("what is it"), None);
+        assert_eq!(code_terms(""), None);
     }
 
     #[test]

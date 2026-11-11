@@ -56,6 +56,8 @@ pub struct TextMatch {
     pub text: String,
     /// The line holds the query's words as one phrase, not just each word.
     pub phrase: bool,
+    /// How many of the terms searched for the line holds.
+    pub terms: usize,
     pub last_modified: Option<String>,
 }
 
@@ -394,21 +396,74 @@ impl RepoDb {
         };
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let phrase = terms.join(" ");
-        let phrase_query = format!("\"{}\"", phrase.replace('"', "\"\""));
+        self.matching_lines(root, &fts_query, Some(&phrase), limit, dates, |lower| {
+            terms
+                .iter()
+                .all(|t| lower.contains(t.as_str()))
+                .then(|| (lower.contains(&phrase), terms.len()))
+        })
+    }
+
+    /// Lines of indexed files under `root` holding any of `terms`
+    /// (lowercase), at most `limit` in all and [`TEXT_MATCH_LINES_PER_FILE`]
+    /// per file: the best-ranked files first, and within a file the lines
+    /// holding the most terms. Each term needs three characters or more (see
+    /// [`fts::code_terms`]).
+    pub fn search_text_any(
+        &self,
+        root: &Path,
+        terms: &[String],
+        limit: usize,
+        dates: &Dates,
+    ) -> Result<Vec<TextMatch>> {
+        let fts_query = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.matching_lines(root, &fts_query, None, limit, dates, |lower| {
+            let n = terms.iter().filter(|t| lower.contains(t.as_str())).count();
+            (n > 0).then_some((false, n))
+        })
+    }
+
+    /// Up to `limit` lines of the files matching the trigram `fts_query`,
+    /// read from disk: files holding `phrase` first, then by rank, and at most
+    /// [`TEXT_MATCH_LINES_PER_FILE`] of each. `line` gives, for a lowercased
+    /// line, whether it holds the phrase and how many terms, or `None` when it
+    /// doesn't match; a file's phrase lines lead, then those with the most
+    /// terms, each group in file order.
+    fn matching_lines(
+        &self,
+        root: &Path,
+        fts_query: &str,
+        phrase: Option<&str>,
+        limit: usize,
+        dates: &Dates,
+        line: impl Fn(&str) -> Option<(bool, usize)>,
+    ) -> Result<Vec<TextMatch>> {
+        let phrase_first = if phrase.is_some() {
+            "files_fts.rowid NOT IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?4),"
+        } else {
+            ""
+        };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT f.path, f.last_modified FROM files_fts JOIN files f ON f.id = files_fts.rowid
                  WHERE files_fts MATCH ?1 AND {dates}
-                 ORDER BY files_fts.rowid NOT IN
-                          (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2),
-                          files_fts.rank",
-            dates = dates.sql("f.last_modified", 3),
+                 ORDER BY {phrase_first} files_fts.rank",
+            dates = dates.sql("f.last_modified", 2),
         ))?;
         // Every read must resolve inside the repo; see below.
         let Ok(root) = root.canonicalize() else {
             return Ok(Vec::new());
         };
         let [from, to] = dates.values();
-        let mut rows = stmt.query(params![fts_query, phrase_query, from, to])?;
+        let mut values: Vec<Option<String>> = vec![Some(fts_query.to_string()), from, to];
+        values.extend(phrase.map(|p| Some(format!("\"{}\"", p.replace('"', "\"\"")))));
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(row) = rows.next()? else { break };
@@ -427,30 +482,24 @@ impl RepoDb {
             let Ok(source) = std::fs::read_to_string(&target) else {
                 continue;
             };
-            // Lines holding every term; those with the terms as one phrase
-            // first (the sort is stable, so each group stays in file order).
-            let mut lines: Vec<(bool, usize, &str)> = source
+            // The sort is stable, so each group stays in file order.
+            let mut lines: Vec<((bool, usize), usize, &str)> = source
                 .lines()
                 .enumerate()
-                .filter_map(|(i, l)| {
-                    let lower = l.to_lowercase();
-                    terms
-                        .iter()
-                        .all(|t| lower.contains(t.as_str()))
-                        .then(|| (!lower.contains(&phrase), i, l))
-                })
+                .filter_map(|(i, l)| line(&l.to_lowercase()).map(|m| (m, i, l)))
                 .collect();
-            lines.sort_by_key(|&(not_phrase, _, _)| not_phrase);
+            lines.sort_by_key(|&((phrase, terms), _, _)| (!phrase, std::cmp::Reverse(terms)));
             let room = (limit - out.len()).min(TEXT_MATCH_LINES_PER_FILE);
             out.extend(
                 lines
                     .into_iter()
                     .take(room)
-                    .map(|(not_phrase, i, l)| TextMatch {
+                    .map(|((phrase, terms), i, l)| TextMatch {
                         file_path: file_path.clone(),
                         line: i as i64 + 1,
                         text: l.trim().to_string(),
-                        phrase: !not_phrase,
+                        phrase,
+                        terms,
                         last_modified: last_modified.clone(),
                     }),
             );
@@ -686,6 +735,73 @@ impl RepoDb {
         let mut symbols = rows.collect::<Result<Vec<_>, _>>()?;
         symbols.sort_by_key(|s| symbol_match(&s.name, query));
         Ok(symbols)
+    }
+
+    /// Up to `limit` symbols whose name or signature holds any of `terms`,
+    /// each with how many it holds: the most terms first, then the most in
+    /// the name, then by name.
+    pub fn search_symbols_any(
+        &self,
+        terms: &[String],
+        limit: usize,
+        dates: &Dates,
+    ) -> Result<Vec<(usize, Symbol)>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `?k` is the k-th term's pattern; the dates and limit follow them.
+        let count = |column: &str| {
+            (1..=terms.len())
+                .map(|k| format!("({column} LIKE ?{k} ESCAPE '\\')"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        let either = (1..=terms.len())
+            .map(|k| {
+                format!(
+                    "(s.name LIKE ?{k} ESCAPE '\\' \
+                      OR coalesce(s.signature, '') LIKE ?{k} ESCAPE '\\')"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let n = terms.len();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT * FROM (
+                 SELECT s.id, s.file_id, f.path, s.kind, s.name, s.signature, s.start_line,
+                        s.end_line, f.last_modified, {either} AS terms, {in_name} AS in_name
+                 FROM symbols s
+                 JOIN files f ON s.file_id = f.id
+                 WHERE {dates})
+             WHERE terms > 0
+             ORDER BY terms DESC, in_name DESC, name
+             LIMIT ?{limit}",
+            in_name = count("s.name"),
+            dates = dates.sql("f.last_modified", n + 1),
+            limit = n + 3,
+        ))?;
+        let [from, to] = dates.values();
+        let mut values: Vec<rusqlite::types::Value> =
+            terms.iter().map(|t| fts::like_contains(t).into()).collect();
+        values.extend([from, to].map(|d| d.map_or(rusqlite::types::Value::Null, Into::into)));
+        values.push((limit as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, i64>(9)? as usize,
+                Symbol {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    file_path: row.get(2)?,
+                    kind: row.get(3)?,
+                    name: row.get(4)?,
+                    signature: row.get(5)?,
+                    start_line: row.get(6)?,
+                    end_line: row.get(7)?,
+                    last_modified: row.get(8)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// The `limit` best regions of code nearest to `query_embedding`, via the sqlite-vec
@@ -1099,6 +1215,56 @@ mod tests {
         let id = db.upsert_file("a.rs", Some("rust"), "h2").unwrap();
         db.delete_file_data(id).unwrap();
         assert!(lines("frobnicate").is_empty());
+    }
+
+    #[test]
+    fn some_terms_find_symbols_and_lines_most_terms_first() {
+        let root = tempfile::tempdir().unwrap();
+        let src = "fn store_secret(path: &str) {}\n\
+                   // Generate a new database password and store it.\n\
+                   fn rotate_password(env: &str) -> String { todo!() }\n";
+        std::fs::write(root.path().join("vault.rs"), src).unwrap();
+        let db = RepoDb::open_in_memory().unwrap();
+        let file = db.upsert_file("vault.rs", Some("rust"), "h").unwrap();
+        db.set_file_text("vault.rs", src).unwrap();
+        db.insert_symbol(file, "function", "store_secret", None, 1, 1)
+            .unwrap();
+        let sig = Some("fn rotate_password(env: &str) -> String");
+        db.insert_symbol(file, "function", "rotate_password", sig, 3, 3)
+            .unwrap();
+        db.insert_symbol(file, "struct", "Unrelated", None, 4, 4)
+            .unwrap();
+        let terms = |t: &[&str]| t.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let dates = Default::default();
+
+        // A symbol with no signature still matches by name.
+        let symbols = db
+            .search_symbols_any(&terms(&["password", "env", "store"]), 10, &dates)
+            .unwrap();
+        let found: Vec<(usize, &str)> =
+            symbols.iter().map(|(n, s)| (*n, s.name.as_str())).collect();
+        assert_eq!(found, [(2, "rotate_password"), (1, "store_secret")]);
+        let one = db
+            .search_symbols_any(&terms(&["password", "store"]), 1, &dates)
+            .unwrap();
+        assert_eq!(one.len(), 1, "the limit applies");
+
+        let lines: Vec<(i64, usize)> = db
+            .search_text_any(
+                root.path(),
+                &terms(&["database", "password", "store"]),
+                10,
+                &dates,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.line, m.terms))
+            .collect();
+        assert_eq!(lines, [(2, 3), (1, 1), (3, 1)]);
+        assert!(db
+            .search_text_any(root.path(), &terms(&["nowhere"]), 10, &dates)
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(unix)]
