@@ -28,10 +28,14 @@ use rusqlite::ffi::{
 pub fn parts(word: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<(usize, char)> = word.char_indices().collect();
     let mut starts = vec![0];
-    // The last letter or digit, past any combining mark (`e\u{301}`).
+    // The letters and digits either side, past any combining mark
+    // (`e\u{301}`).
     let mut prev: Option<char> = None;
     for (i, &(_, c)) in chars.iter().enumerate() {
-        let next_lower = chars.get(i + 1).is_some_and(|(_, n)| n.is_lowercase());
+        let next_lower = chars[i + 1..]
+            .iter()
+            .find(|(_, n)| n.is_alphanumeric())
+            .is_some_and(|(_, n)| n.is_lowercase());
         if let Some(prev) = prev.filter(|_| c.is_uppercase()) {
             if prev.is_lowercase() || prev.is_numeric() || (prev.is_uppercase() && next_lower) {
                 starts.push(i);
@@ -131,6 +135,7 @@ struct WordParts {
     x: fts5_tokenizer,
 }
 
+/// FTS5's `xCreate`: a unicode61 instance with the table's options, wrapped.
 unsafe extern "C" fn create_tokenizer(
     api: *mut c_void,
     args: *mut *const c_char,
@@ -164,6 +169,7 @@ unsafe extern "C" fn create_tokenizer(
     SQLITE_OK
 }
 
+/// FTS5's `xDelete`: drop the instance and the unicode61 one it wraps.
 unsafe extern "C" fn delete_tokenizer(tokenizer: *mut Fts5Tokenizer) {
     let tokenizer = Box::from_raw(tokenizer.cast::<WordParts>());
     if let Some(delete) = tokenizer.x.xDelete {
@@ -183,6 +189,8 @@ struct Call {
     ctx: *mut c_void,
 }
 
+/// FTS5's `xTokenize`: run unicode61 over `text`, with [`on_token`] adding
+/// the parts of each word unless this is a query.
 unsafe extern "C" fn tokenize(
     tokenizer: *mut Fts5Tokenizer,
     ctx: *mut c_void,
@@ -293,6 +301,8 @@ mod tests {
         assert_eq!(split("utf8Decoder"), ["utf8", "Decoder"]);
         assert_eq!(split("CoreML"), ["Core", "ML"]);
         assert_eq!(split("Cafe\u{301}Menu"), ["Cafe\u{301}", "Menu"]);
+        assert_eq!(split("HTTPŚerver"), ["HTTP", "Śerver"]);
+        assert_eq!(split("HTTPS\u{301}erver"), ["HTTP", "S\u{301}erver"]);
         // A one-letter part isn't worth indexing.
         assert_eq!(split("getX"), ["get"]);
         // Nothing to split.
@@ -351,6 +361,8 @@ mod tests {
         assert!(matches(t, "the CaféMenu page", "cafe"));
         assert!(matches(t, "the CaféMenu page", "menu"));
         assert!(matches(t, "the Cafe\u{301}Menu page", "cafe"));
+        assert!(matches(t, "an HTTPŚerver", "server"));
+        assert!(matches(t, "an HTTPS\u{301}erver", "server"));
     }
 
     #[test]
