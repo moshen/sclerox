@@ -1,9 +1,10 @@
 # Meetings
 
 ALWAYS store the FULL transcript when you have one, not just a summary.
-`--notes` is a short summary; `--transcript-file` is the complete text (chunked
-and embedded for semantic search). Write the transcript to a temp file and pass
-its path. Only fall back to notes-only when no transcript exists.
+`--notes` is a short summary; `--transcript-file` is the complete text. Both are
+chunked and embedded for semantic search, each chunk with the meeting title, and
+semantic hits say which one matched. Write the transcript to a temp file and
+pass its path. Only fall back to notes-only when no transcript exists.
 
 ```bash
 sclerox meeting search "<topic>"

@@ -443,13 +443,17 @@ mod tests {
 
     #[test]
     fn default_sizes_fit_every_model() {
+        // A chunk is embedded after its header and a blank line.
+        let header = crate::embed::CONTEXT_CHARS + 2;
+        let text_chunk = crate::embed::DEFAULT_TEXT_CHUNK_CHARS;
         for m in MODELS {
             assert!(m.memory_chars <= m.max_chars(), "{}", m.name);
             assert!(
-                crate::index::DEFAULT_CHUNK_CHARS <= m.max_chars(),
+                crate::index::DEFAULT_CHUNK_CHARS + header <= m.max_chars(),
                 "{}",
                 m.name
             );
+            assert!(text_chunk + header <= m.max_chars(), "{}", m.name);
         }
     }
 

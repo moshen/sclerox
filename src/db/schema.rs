@@ -985,6 +985,19 @@ CREATE TABLE IF NOT EXISTS repo_roots (
 );
 ";
 
+/// Migration v19: which part of an item a text chunk was cut from, and the
+/// header its embedding opens with (see `embed::passage`). Chunks cut before
+/// have neither; `db reembed` re-cuts them, as the text chunker version
+/// changed with this.
+pub const MIGRATION_V19: &str = "
+ALTER TABLE meeting_chunks ADD COLUMN section TEXT;
+ALTER TABLE meeting_chunks ADD COLUMN context TEXT;
+ALTER TABLE todo_chunks ADD COLUMN section TEXT;
+ALTER TABLE todo_chunks ADD COLUMN context TEXT;
+ALTER TABLE investigation_chunks ADD COLUMN section TEXT;
+ALTER TABLE investigation_chunks ADD COLUMN context TEXT;
+";
+
 /// Migration v7: queue embedding work for the model server.
 pub const REPO_MIGRATION_V7: &str = embed_jobs_table!();
 
@@ -1006,6 +1019,11 @@ DROP TRIGGER IF EXISTS symbols_au;
 DROP TRIGGER IF EXISTS symbols_ad;
 DROP TABLE IF EXISTS symbols_fts;
 ";
+
+/// Repo migration v10: the header a code chunk's embedding opens with, its
+/// path and symbol (see `embed::passage`). The index chunker version changed
+/// with this, so the next index run re-cuts every file.
+pub const REPO_MIGRATION_V10: &str = "ALTER TABLE chunks ADD COLUMN context TEXT;";
 
 pub const REPO_SCHEMA: &str = concat!(
     "
@@ -1041,7 +1059,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_text TEXT NOT NULL,
     start_line INTEGER,
     end_line INTEGER,
-    embedding BLOB
+    embedding BLOB,
+    context TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);

@@ -27,7 +27,8 @@ pub struct ReembedTable {
     /// Shown in progress output.
     pub label: &'static str,
     pub table: &'static str,
-    /// SQL expression for the text that gets embedded.
+    /// SQL expression for the text that gets embedded: for chunks, the
+    /// header and text, as the write paths embed them.
     pub text: &'static str,
     /// Column holding the vector.
     pub vector: &'static str,
@@ -66,7 +67,7 @@ pub const PRIMARY: Layout = Layout {
         ReembedTable {
             label: "meeting chunks",
             table: "meeting_chunks",
-            text: "chunk_text",
+            text: crate::embed::PASSAGE_SQL,
             vector: "embedding",
             filter: "1",
             cap: false,
@@ -75,7 +76,7 @@ pub const PRIMARY: Layout = Layout {
         ReembedTable {
             label: "todo chunks",
             table: "todo_chunks",
-            text: "chunk_text",
+            text: crate::embed::PASSAGE_SQL,
             vector: "embedding",
             filter: "1",
             cap: false,
@@ -84,7 +85,7 @@ pub const PRIMARY: Layout = Layout {
         ReembedTable {
             label: "research chunks",
             table: "investigation_chunks",
-            text: "chunk_text",
+            text: crate::embed::PASSAGE_SQL,
             vector: "embedding",
             filter: "1",
             cap: false,
@@ -109,7 +110,7 @@ pub const REPO: Layout = Layout {
     tables: &[ReembedTable {
         label: "code chunks",
         table: "chunks",
-        text: "chunk_text",
+        text: crate::embed::PASSAGE_SQL,
         vector: "embedding",
         filter: "1",
         cap: false,

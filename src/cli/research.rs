@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::cli::text_chunks;
-use crate::db::Database;
+use crate::db::{Database, TextChunkKind};
 use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
@@ -108,8 +108,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
         ResearchCommand::Start { name, slug, plan } => {
             let id = db.investigation_start(&name, &slug, plan.as_deref())?;
             // Embed the plan immediately if one was provided
-            if let Some(ref plan_text) = plan {
-                embed_investigation(db, id, Some(plan_text), None)?;
+            if plan.is_some() {
+                embed_investigation(db, id)?;
             }
             let inv = db.investigation_get(id)?.unwrap();
             print_output(format, &inv, || {
@@ -209,7 +209,13 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                             r.score * 100.0,
                             crate::cli::format::stamp("updated", &r.investigation.updated_at)
                         );
-                        println!("  > {}", truncate(&r.matched_chunk, 100));
+                        println!(
+                            "  > {}",
+                            crate::cli::format::matched(
+                                r.matched_section.as_deref(),
+                                &r.matched_chunk
+                            )
+                        );
                     }
                 },
             );
@@ -236,11 +242,9 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                 findings.as_deref(),
                 None,
             )? {
-                // Re-embed if plan or findings changed
-                if plan.is_some() || findings.is_some() {
-                    if let Some(inv) = db.investigation_get(id)? {
-                        embed_investigation(db, id, inv.plan.as_deref(), inv.findings.as_deref())?;
-                    }
+                // The chunks hold the plan and findings, headed by the name.
+                if name.is_some() || plan.is_some() || findings.is_some() {
+                    embed_investigation(db, id)?;
                 }
                 let inv = db.investigation_get(id)?;
                 print_output(format, &inv, || println!("Updated investigation #{id}"));
@@ -263,8 +267,8 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
 
         ResearchCommand::Conclude { id, findings } => {
             if db.investigation_conclude(id, &findings)? {
+                embed_investigation(db, id)?;
                 if let Some(inv) = db.investigation_get(id)? {
-                    embed_investigation(db, id, inv.plan.as_deref(), Some(&findings))?;
                     print_output(format, &inv, || {
                         println!("Investigation #{id} concluded.");
                         println!(
@@ -418,30 +422,12 @@ fn research_line(inv: &crate::db::investigations::Investigation) -> String {
     crate::cli::format::research_line(inv)
 }
 
-fn embed_investigation(
-    db: &Database,
-    id: i64,
-    plan: Option<&str>,
-    findings: Option<&str>,
-) -> Result<()> {
-    let text = text_chunks::research_source(plan, findings);
-    if text.trim().is_empty() {
+fn embed_investigation(db: &Database, id: i64) -> Result<()> {
+    let Some(inv) = db.investigation_get(id)? else {
         return Ok(());
-    }
-    let raw = text_chunks::chunk(&text);
-    // Without an embedder (embeddings off, model unavailable) the chunks are
-    // stored without vectors; `db reembed` can fill them later.
-    let chunks: Vec<(String, Option<Vec<f32>>)> =
-        if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
-            let texts: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
-            let embeddings = embedder.embed_each(&texts)?;
-            raw.into_iter()
-                .zip(embeddings.into_iter().map(Some))
-                .collect()
-        } else {
-            raw.into_iter().map(|c| (c, None)).collect()
-        };
-    db.investigation_store_chunks(id, &chunks)?;
-    text_chunks::note(db);
-    Ok(())
+    };
+    let source =
+        text_chunks::research_source(&inv.name, inv.plan.as_deref(), inv.findings.as_deref());
+    let mut embedder = crate::embed::optional(db.semantic_ready());
+    text_chunks::store(db, TextChunkKind::Research, id, &source, embedder.as_mut())
 }

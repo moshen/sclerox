@@ -307,32 +307,24 @@ impl Database {
 
     // ---------- embeddings ----------
 
+    /// Store chunks with no section or header, each with its vector when it
+    /// has one, replacing the item's chunks; see [`Database::store_text_chunks`].
+    #[cfg(test)]
     pub fn todo_store_chunks(
         &self,
         todo_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        // Replacing the chunks and deciding whether their vectors may be kept
-        // happen in one transaction; see `write_with_vectors`.
-        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
-        self.write_with_vectors(wants_vectors, |keep_vectors| {
-            self.conn.execute(
-                "DELETE FROM todo_chunks WHERE todo_id = ?1",
-                params![todo_id],
-            )?;
-            for (i, (text, emb)) in chunks.iter().enumerate() {
-                let emb_bytes = emb
-                    .as_deref()
-                    .filter(|_| keep_vectors)
-                    .map(crate::db::embedding_to_bytes);
-                self.conn.execute(
-                    "INSERT INTO todo_chunks (todo_id, chunk_index, chunk_text, embedding)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![todo_id, i as i64, text, emb_bytes],
-                )?;
-            }
-            Ok(())
-        })
+        let chunks: Vec<_> = chunks
+            .iter()
+            .map(|(text, emb)| crate::db::TextChunk {
+                section: None,
+                context: None,
+                text: text.clone(),
+                embedding: emb.clone(),
+            })
+            .collect();
+        self.store_text_chunks(crate::db::TextChunkKind::Todo, todo_id, &chunks)
     }
 
     /// Returns todos that have no rows in todo_chunks yet (need embedding).

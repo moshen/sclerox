@@ -29,6 +29,7 @@ pub struct IndexedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSpan {
     pub text: String,
+    pub context: Option<String>,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
 }
@@ -284,36 +285,39 @@ impl RepoDb {
         Ok(id)
     }
 
-    /// A file's stored chunks as (text, start line, end line), in order.
-    /// Compared on a chunker change, so that a file the new chunker cuts
-    /// identically can be left alone.
+    /// A file's stored chunks as (text, header, start line, end line), in
+    /// order. Compared on a chunker change, so that a file the new chunker
+    /// cuts identically can be left alone.
     pub fn file_chunk_spans(&self, path: &str) -> Result<Vec<ChunkSpan>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_text, c.start_line, c.end_line FROM chunks c
+            "SELECT c.chunk_text, c.context, c.start_line, c.end_line FROM chunks c
              JOIN files f ON c.file_id = f.id
              WHERE f.path = ?1 ORDER BY c.chunk_index",
         )?;
         let rows = stmt.query_map(params![path], |r| {
             Ok(ChunkSpan {
                 text: r.get(0)?,
-                start_line: r.get(1)?,
-                end_line: r.get(2)?,
+                context: r.get(1)?,
+                start_line: r.get(2)?,
+                end_line: r.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// A file's stored vectors keyed by chunk text. Read before the file is
-    /// re-chunked so that chunks whose text did not change keep their vector
-    /// instead of waiting to be embedded again.
+    /// A file's stored vectors keyed by the text they were embedded from,
+    /// header and chunk (see [`crate::embed::passage`]). Read before the file
+    /// is re-chunked so that chunks whose text and header did not change keep
+    /// their vector instead of waiting to be embedded again.
     pub fn file_chunk_vectors(
         &self,
         file_id: i64,
     ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT chunk_text, embedding FROM chunks
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, embedding FROM chunks
              WHERE file_id = ?1 AND embedding IS NOT NULL",
-        )?;
+            crate::embed::PASSAGE_SQL
+        ))?;
         let rows = stmt.query_map(params![file_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
@@ -565,11 +569,13 @@ impl RepoDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk(
         &self,
         file_id: i64,
         chunk_index: i64,
         chunk_text: &str,
+        context: Option<&str>,
         start_line: Option<i64>,
         end_line: Option<i64>,
         embedding: Option<&[f32]>,
@@ -577,12 +583,13 @@ impl RepoDb {
         self.write_with_vectors(embedding.is_some(), |keep| {
             let emb_bytes = embedding.filter(|_| keep).map(embedding_to_bytes);
             self.conn.execute(
-                "INSERT INTO chunks (file_id, chunk_index, chunk_text, start_line, end_line, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO chunks (file_id, chunk_index, chunk_text, context, start_line, end_line, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     file_id,
                     chunk_index,
                     chunk_text,
+                    context,
                     start_line,
                     end_line,
                     emb_bytes
@@ -592,9 +599,6 @@ impl RepoDb {
         })
     }
 
-    /// Chunks missing an embedding: (chunk_id, chunk_text). The backfill work
-    /// list for `sclerox repo reembed` - hook-indexed repos have chunks but no
-    /// embeddings, since the auto-indexer runs without an embedder.
     /// Whether any chunk is still waiting for a vector. Stops at the first one,
     /// so it is cheap enough to ask on every session hook.
     pub fn has_chunks_without_embedding(&self) -> Result<bool> {
@@ -605,10 +609,15 @@ impl RepoDb {
         )?)
     }
 
+    /// Chunks missing an embedding, as (chunk id, the text to embed: its
+    /// header and chunk; see [`crate::embed::passage`]). The backfill work
+    /// list for `sclerox repo reembed` - hook-indexed repos have chunks but no
+    /// embeddings, since the auto-indexer runs without an embedder.
     pub fn chunks_without_embedding(&self) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, chunk_text FROM chunks WHERE embedding IS NULL")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, {} FROM chunks WHERE embedding IS NULL",
+            crate::embed::PASSAGE_SQL
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -829,11 +838,19 @@ mod tests {
         let a = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         for i in 0..20 {
             let weight = 0.99 - i as f32 * 0.01;
-            db.insert_chunk(a, i, "same", Some(1), Some(50), Some(&near(weight)))
+            db.insert_chunk(a, i, "same", None, Some(1), Some(50), Some(&near(weight)))
                 .unwrap();
         }
-        db.insert_chunk(a, 20, "separate", Some(100), Some(150), Some(&near(0.5)))
-            .unwrap();
+        db.insert_chunk(
+            a,
+            20,
+            "separate",
+            None,
+            Some(100),
+            Some(150),
+            Some(&near(0.5)),
+        )
+        .unwrap();
         let hits = db
             .similar_chunks(&near(1.0), 2, &Default::default())
             .unwrap();
@@ -859,8 +876,16 @@ mod tests {
             (b, 0, "same lines, other file", 10, 30, 0.96),
             (a, 3, "past the limit", 200, 220, 0.5),
         ] {
-            db.insert_chunk(file, i, text, Some(start), Some(end), Some(&near(weight)))
-                .unwrap();
+            db.insert_chunk(
+                file,
+                i,
+                text,
+                None,
+                Some(start),
+                Some(end),
+                Some(&near(weight)),
+            )
+            .unwrap();
         }
         let texts: Vec<String> = db
             .similar_chunks(&near(1.0), 3, &Default::default())
@@ -934,6 +959,7 @@ mod tests {
             file_id,
             0,
             "fn foo() { ... }",
+            None,
             Some(1),
             Some(5),
             Some(&v384(0)),
@@ -943,6 +969,7 @@ mod tests {
             file_id,
             1,
             "fn bar() { ... }",
+            None,
             Some(6),
             Some(10),
             Some(&v384(1)),
@@ -962,9 +989,9 @@ mod tests {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db.upsert_file("a.rs", Some("rust"), "h1").unwrap();
         // One embedded chunk, one without.
-        db.insert_chunk(file_id, 0, "embedded", None, None, Some(&v384(0)))
+        db.insert_chunk(file_id, 0, "embedded", None, None, None, Some(&v384(0)))
             .unwrap();
-        db.insert_chunk(file_id, 1, "needs embedding", None, None, None)
+        db.insert_chunk(file_id, 1, "needs embedding", None, None, None, None)
             .unwrap();
 
         let missing = db.chunks_without_embedding().unwrap();
@@ -1107,8 +1134,10 @@ mod tests {
         crate::db::register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(REPO_SCHEMA).unwrap();
-        conn.execute_batch("DROP TABLE files_fts; PRAGMA user_version = 7")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE files_fts; ALTER TABLE chunks DROP COLUMN context; PRAGMA user_version = 7",
+        )
+        .unwrap();
         let db = RepoDb { conn };
         db.init().unwrap();
         assert_eq!(db.user_version().unwrap(), REPO_VERSION);
@@ -1129,10 +1158,12 @@ mod tests {
     fn repo_db_at_v4(embedded: bool) -> RepoDb {
         crate::db::register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
-        // REPO_SCHEMA already holds every table; rewind the version so v5
-        // runs as it would on an upgraded database.
+        // REPO_SCHEMA already holds every table; rewind the version, and drop
+        // the column v10 adds, so later migrations run as they would on an
+        // upgraded database.
         conn.execute_batch(REPO_SCHEMA).unwrap();
-        conn.execute_batch("PRAGMA user_version = 4").unwrap();
+        conn.execute_batch("ALTER TABLE chunks DROP COLUMN context; PRAGMA user_version = 4")
+            .unwrap();
         let db = RepoDb { conn };
         let file_id = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         let emb = embedded.then(|| v384(0));
@@ -1217,10 +1248,10 @@ mod tests {
         let db = RepoDb::open_in_memory().unwrap();
         let file_id = db.upsert_file("a.rs", Some("rust"), "h").unwrap();
         // A chunk without a vector records nothing.
-        db.insert_chunk(file_id, 0, "text only", None, None, None)
+        db.insert_chunk(file_id, 0, "text only", None, None, None, None)
             .unwrap();
         assert_eq!(db.embedding_model().unwrap(), None);
-        db.insert_chunk(file_id, 1, "fn a() {}", None, None, Some(&v384(0)))
+        db.insert_chunk(file_id, 1, "fn a() {}", None, None, None, Some(&v384(0)))
             .unwrap();
         assert_eq!(
             db.embedding_model().unwrap().as_deref(),
@@ -1240,7 +1271,7 @@ mod tests {
 
         // New vectors are refused; the chunk text itself is still stored.
         let file_id = db.upsert_file("b.rs", Some("rust"), "h2").unwrap();
-        db.insert_chunk(file_id, 0, "fn b() {}", None, None, Some(&v384(1)))
+        db.insert_chunk(file_id, 0, "fn b() {}", None, None, None, Some(&v384(1)))
             .unwrap();
         assert_eq!(db.chunks_without_embedding().unwrap().len(), 1);
         let (id, _) = db.chunks_without_embedding().unwrap()[0].clone();
@@ -1262,7 +1293,7 @@ mod tests {
         let db = repo_db_at_v4(true);
         db.init().unwrap();
         let file_id = db.upsert_file("b.rs", Some("rust"), "h2").unwrap();
-        db.insert_chunk(file_id, 0, "fn b() {}", None, None, None)
+        db.insert_chunk(file_id, 0, "fn b() {}", None, None, None, None)
             .unwrap();
         let n = db
             .reembed_all(

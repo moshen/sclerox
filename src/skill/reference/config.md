@@ -41,6 +41,11 @@ How much text each vector covers:
   `index.chunk_lines` (15): lines per chunk for files without a tree-sitter
   grammar. Changing either re-chunks each repo on its next index run.
 
+Each chunk is embedded after a header of up to 200 characters: a meeting's
+title and section (notes or transcript), an investigation's name and section
+(plan or findings), or a code chunk's file path and symbol. The header is not
+part of the chunk shown in results.
+
 A model only reads so much of one input: Granite 2048 tokens (about 8000
 characters of prose), MiniLM 256 (about 1000). Text past the token limit is
 not embedded. Characters per token vary with the text, so a size past the
@@ -83,8 +88,9 @@ be from the version you upgraded from.
 It also embeds main-database items saved without a vector (model unavailable,
 or `--no-embed`); code chunks indexed without vectors are left to
 `sclerox repo reembed`. Meeting, todo and research text cut at other
-`embed.chunk_size` / `chunk_overlap` values (or before sclerox recorded them) is
-re-chunked from its stored text first, and always with `--force`.
+`embed.chunk_size` / `chunk_overlap` values, or by an older sclerox, is
+re-chunked from its stored text first, and always with `--force`. An older
+sclerox's code chunks are re-cut on each repo's next index run.
 
 `sclerox install` runs the same re-embed for you when it finds a database on
 another model or items without a vector (skipped with `--no-model-download`).

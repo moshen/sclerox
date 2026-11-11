@@ -28,6 +28,9 @@ pub struct SimilarMeeting {
     pub meeting: Meeting,
     pub score: f32,
     pub matched_chunk: String,
+    /// Where the chunk came from: "notes" or "transcript".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_section: Option<String>,
 }
 
 /// What dates a meeting for a date range: when it took place, or when it
@@ -181,33 +184,24 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Store pre-chunked text with optional embedding for a meeting.
+    /// Store chunks with no section or header, each with its vector when it
+    /// has one, replacing the item's chunks; see [`Database::store_text_chunks`].
+    #[cfg(test)]
     pub fn meeting_store_chunks(
         &self,
         meeting_id: i64,
         chunks: &[(String, Option<Vec<f32>>)],
     ) -> Result<()> {
-        // Replacing the chunks and deciding whether their vectors may be kept
-        // happen in one transaction; see `write_with_vectors`.
-        let wants_vectors = chunks.iter().any(|(_, e)| e.is_some());
-        self.write_with_vectors(wants_vectors, |keep_vectors| {
-            self.conn.execute(
-                "DELETE FROM meeting_chunks WHERE meeting_id = ?1",
-                params![meeting_id],
-            )?;
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO meeting_chunks (meeting_id, chunk_index, chunk_text, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (i, (text, emb)) in chunks.iter().enumerate() {
-                let emb_bytes = emb
-                    .as_ref()
-                    .filter(|_| keep_vectors)
-                    .map(|e| embedding_to_bytes(e));
-                stmt.execute(params![meeting_id, i as i64, text, emb_bytes])?;
-            }
-            Ok(())
-        })
+        let chunks: Vec<_> = chunks
+            .iter()
+            .map(|(text, emb)| crate::db::TextChunk {
+                section: None,
+                context: None,
+                text: text.clone(),
+                embedding: emb.clone(),
+            })
+            .collect();
+        self.store_text_chunks(crate::db::TextChunkKind::Meeting, meeting_id, &chunks)
     }
 
     /// Meetings whose chunks are nearest to `query_embedding`, via the
@@ -224,7 +218,7 @@ impl Database {
             let query = embedding_to_bytes(query_embedding);
             let mut stmt = self.conn.prepare(
                 "SELECT m.id, m.title, m.meeting_date, m.transcript, m.notes, m.created_at,
-                    mc.chunk_text, v.distance
+                    mc.chunk_text, v.distance, mc.section
              FROM meeting_chunks_vec v
              JOIN meeting_chunks mc ON mc.id = v.rowid
              JOIN meetings m ON mc.meeting_id = m.id
@@ -249,6 +243,7 @@ impl Database {
                             meeting,
                             score: 1.0 - distance as f32,
                             matched_chunk,
+                            matched_section: row.get(8)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -284,6 +279,41 @@ fn row_to_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similar_meetings_say_which_section_matched() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .meeting_add(
+                "Vendors",
+                None,
+                Some("holiday rota"),
+                Some("chose Honeycomb"),
+            )
+            .unwrap();
+        let source = crate::db::TextChunkKind::Meeting.source(
+            Some("Vendors"),
+            Some("chose Honeycomb"),
+            Some("holiday rota"),
+        );
+        let mut chunks = source.cut(&|t| vec![t.to_string()]);
+        // The notes point one way, the transcript the other.
+        let axis = |i: usize| {
+            let mut v = vec![0.0f32; 384];
+            v[i] = 1.0;
+            v
+        };
+        chunks[0].embedding = Some(axis(0));
+        chunks[1].embedding = Some(axis(1));
+        db.store_text_chunks(crate::db::TextChunkKind::Meeting, id, &chunks)
+            .unwrap();
+
+        let hits = db
+            .meeting_similar(&axis(0), 5, &Default::default())
+            .unwrap();
+        assert_eq!(hits[0].matched_chunk, "chose Honeycomb");
+        assert_eq!(hits[0].matched_section.as_deref(), Some("notes"));
+    }
 
     #[test]
     fn test_meeting_add_get() {

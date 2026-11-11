@@ -18,6 +18,8 @@ pub struct CodeChunk {
     pub text: String,
     pub start_line: u32,
     pub end_line: u32,
+    /// The kind and name of the symbol it was cut from, if any.
+    pub symbol: Option<(String, String)>,
 }
 
 /// How confidently the edge was established.
@@ -253,10 +255,12 @@ fn collect_symbols_and_edges(
             end_line: end.row as u32 + 1,
         });
 
+        let (chunk_byte, chunk_row) = chunk_start(node, source);
         out.chunks.push(CodeChunk {
-            text: text.to_string(),
-            start_line: start.row as u32 + 1,
+            text: source[chunk_byte..node.end_byte()].to_string(),
+            start_line: chunk_row as u32 + 1,
             end_line: end.row as u32 + 1,
+            symbol: Some((kind.to_string(), name.clone())),
         });
 
         // Collect inheritance/implements edges for the current node itself.
@@ -305,6 +309,39 @@ fn collect_symbols_and_edges(
     for child in node.children(&mut cursor) {
         collect_symbols_and_edges(&child, source, language, out, enclosing);
     }
+}
+
+/// Where a symbol's chunk starts, as (byte, row): at the comments and
+/// attributes directly above it, which tree-sitter keeps as siblings of the
+/// symbol rather than part of it (a Rust `///` doc comment or `#[derive]`, a
+/// Javadoc or JSDoc block), else at the symbol. A blank line, code before a
+/// comment on its line, or an inner doc comment (`//!`) ends the run.
+fn chunk_start(node: &Node, source: &str) -> (usize, usize) {
+    let mut first = *node;
+    while let Some(prev) = first.prev_sibling() {
+        let text = &source[prev.start_byte()..prev.end_byte()];
+        // A line comment can end with its newline, at column 0 of the next row.
+        let end = prev.end_position();
+        let last_row = if end.column == 0 && end.row > prev.start_position().row {
+            end.row - 1
+        } else {
+            end.row
+        };
+        let attached = (prev.kind().contains("comment") || prev.kind() == "attribute_item")
+            // Inner doc comments describe the enclosing module or item.
+            && !text.starts_with("//!")
+            && !text.starts_with("/*!")
+            && last_row + 1 >= first.start_position().row
+            && source[..prev.start_byte()]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|before| before.trim().is_empty());
+        if !attached {
+            break;
+        }
+        first = prev;
+    }
+    (first.start_byte(), first.start_position().row)
 }
 
 /// Extract call target name from a call expression node.
@@ -878,6 +915,7 @@ fn chunk_by_lines(source: &str, chunk_size: usize) -> Vec<CodeChunk> {
             text,
             start_line: i as u32 + 1,
             end_line: end as u32,
+            symbol: None,
         });
         if end == lines.len() {
             break;
@@ -922,6 +960,7 @@ pub fn split_large_chunk(
             text: lines[start..end].join("\n"),
             start_line: chunk.start_line + start as u32,
             end_line: chunk.start_line + end as u32 - 1,
+            symbol: chunk.symbol.clone(),
         });
 
         if end >= lines.len() {
@@ -1321,11 +1360,52 @@ fn bar() {}
     }
 
     #[test]
+    fn chunks_take_in_the_comments_and_attributes_directly_above() {
+        let source = "\
+//! Module notes stay out.
+
+/// Parse a config file.
+#[inline]
+fn parse() {}
+
+// Separated by a blank line, so not attached.
+
+fn plain() {}
+let x = 1; // trailing, not attached
+fn after() {}
+";
+        let (symbols, chunks, _) = parse_file(source, "rust", 50);
+        let parse = chunks.iter().find(|c| c.text.contains("fn parse")).unwrap();
+        assert_eq!(
+            parse.text,
+            "/// Parse a config file.\n#[inline]\nfn parse() {}"
+        );
+        assert_eq!(parse.start_line, 3);
+        assert_eq!(
+            parse.symbol,
+            Some(("function_item".to_string(), "parse".to_string()))
+        );
+        // The symbol itself still starts at its own line.
+        let sym = symbols.iter().find(|s| s.name == "parse").unwrap();
+        assert_eq!(sym.start_line, 5);
+        let plain = chunks.iter().find(|c| c.text.contains("fn plain")).unwrap();
+        assert_eq!(plain.text, "fn plain() {}");
+
+        let js = "/**\n * Add two numbers.\n */\nfunction add(a, b) { return a + b; }\n";
+        let (_, chunks, _) = parse_file(js, "javascript", 50);
+        assert!(
+            chunks[0].text.starts_with("/**\n * Add two numbers."),
+            "{chunks:?}"
+        );
+    }
+
+    #[test]
     fn test_split_large_chunk_small_is_passthrough() {
         let chunk = CodeChunk {
             text: "fn small() { 42 }".to_string(),
             start_line: 1,
             end_line: 1,
+            symbol: None,
         };
         let result = split_large_chunk(chunk, 800, 3);
         assert_eq!(result.len(), 1);
@@ -1344,6 +1424,7 @@ fn bar() {}
             text: source.clone(),
             start_line: 10,
             end_line: 59,
+            symbol: None,
         };
         let result = split_large_chunk(chunk, 800, 3);
 
@@ -1384,6 +1465,7 @@ fn bar() {}
             text: source,
             start_line: 1,
             end_line: 30,
+            symbol: None,
         };
         let chunks = split_large_chunk(chunk, 400, 3);
 
@@ -1429,6 +1511,7 @@ fn bar() {}
             text: source.clone(),
             start_line: 1,
             end_line: 10,
+            symbol: None,
         };
 
         let chunks = split_large_chunk(chunk, 800, 3);

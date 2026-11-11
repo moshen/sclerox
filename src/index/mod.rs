@@ -63,10 +63,12 @@ fn chunk_lines() -> usize {
 // Overlap when splitting an oversized function chunk into sub-chunks.
 const SPLIT_OVERLAP_LINES: usize = 3;
 
-// Bump when the chunking logic (parse_file, split_large_chunk) changes in a way
-// that cuts files differently. The size constants above are part of the
-// signature already, so tuning one of them needs no bump.
-const CHUNKER_VERSION: u32 = 1;
+// Bump when the chunking logic (parse_file, split_large_chunk, code_context)
+// changes in a way that cuts files differently. The size constants above are
+// part of the signature already, so tuning one of them needs no bump.
+// v2: chunks take in the comments and attributes above a symbol, and carry a
+// header of their path and symbol.
+const CHUNKER_VERSION: u32 = 2;
 
 /// repo_meta key recording which chunker cut a repo's index.
 const CHUNKER_META_KEY: &str = "chunker";
@@ -364,9 +366,13 @@ impl<'a> RepoIndexer<'a> {
             };
 
             // Split any chunk that exceeds the embedding model's context window.
-            let chunks: Vec<parser::CodeChunk> = raw_chunks
+            let chunks: Vec<(parser::CodeChunk, Option<String>)> = raw_chunks
                 .into_iter()
                 .flat_map(|c| parser::split_large_chunk(c, chunk_chars(), SPLIT_OVERLAP_LINES))
+                .map(|c| {
+                    let context = code_context(&rel_path, c.symbol.as_ref());
+                    (c, context)
+                })
                 .collect();
 
             // Here only for a chunker change: if the new chunker cuts this
@@ -374,8 +380,9 @@ impl<'a> RepoIndexer<'a> {
             if hash_matches && !needs_embed {
                 let stored = repo_db.file_chunk_spans(&rel_path)?;
                 let same = stored.len() == chunks.len()
-                    && stored.iter().zip(&chunks).all(|(s, c)| {
+                    && stored.iter().zip(&chunks).all(|(s, (c, context))| {
                         s.text == c.text
+                            && s.context == *context
                             && s.start_line == Some(c.start_line as i64)
                             && s.end_line == Some(c.end_line as i64)
                     });
@@ -390,8 +397,8 @@ impl<'a> RepoIndexer<'a> {
 
             let file_id = repo_db.upsert_file(&rel_path, lang, &hash)?;
             rewritten.insert(rel_path.clone());
-            // Keep the vectors of chunks whose text survives the re-chunk, so
-            // an edit costs only the chunks it actually changed.
+            // Keep the vectors of chunks whose text and header survive the
+            // re-chunk, so an edit costs only the chunks it actually changed.
             let kept_vectors = repo_db.file_chunk_vectors(file_id)?;
             repo_db.delete_file_data(file_id)?;
             repo_db.set_file_text(&rel_path, &source)?;
@@ -426,11 +433,12 @@ impl<'a> RepoIndexer<'a> {
                 }
             }
 
-            for (i, chunk) in chunks.iter().enumerate() {
-                let embedding = match kept_vectors.get(&chunk.text) {
+            for (i, (chunk, context)) in chunks.iter().enumerate() {
+                let passage = crate::embed::passage(context.as_deref(), &chunk.text);
+                let embedding = match kept_vectors.get(&passage) {
                     Some(v) => Some(v.clone()),
                     None => match (embed_here, self.embedder.as_deref_mut()) {
-                        (true, Some(emb)) => emb.embed_one(&chunk.text).ok(),
+                        (true, Some(emb)) => emb.embed_one(&passage).ok(),
                         _ => None,
                     },
                 };
@@ -438,6 +446,7 @@ impl<'a> RepoIndexer<'a> {
                     file_id,
                     i as i64,
                     &chunk.text,
+                    context.as_deref(),
                     Some(chunk.start_line as i64),
                     Some(chunk.end_line as i64),
                     embedding.as_deref(),
@@ -879,6 +888,28 @@ fn parent_indexed_repo(db: &Database, repo_root: &Path) -> Result<Option<String>
     Ok(None)
 }
 
+/// A code chunk's header: its repo-relative path, and the kind and name of
+/// the symbol it was cut from (`src/db/mod.rs: function open`), so a query
+/// naming a file or symbol can find the chunk by meaning.
+fn code_context(path: &str, symbol: Option<&(String, String)>) -> Option<String> {
+    match symbol {
+        Some((kind, name)) => {
+            crate::embed::context(&format!("{path}: {} {name}", symbol_kind(kind)))
+        }
+        None => crate::embed::context(path),
+    }
+}
+
+/// A tree-sitter node kind in words: `function_item` is "function",
+/// `class_declaration` "class", `export_statement` "export statement".
+fn symbol_kind(kind: &str) -> String {
+    let kind = ["_item", "_declaration", "_definition", "_specifier"]
+        .iter()
+        .find_map(|suffix| kind.strip_suffix(suffix))
+        .unwrap_or(kind);
+    kind.replace('_', " ")
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -937,6 +968,45 @@ mod tests {
         let beta = state.iter().find(|(t, _)| t.contains("beta")).unwrap();
         assert!(alpha.1, "unchanged chunk kept its vector: {state:?}");
         assert!(!beta.1, "changed chunk waits for a new vector: {state:?}");
+    }
+
+    #[test]
+    fn chunks_are_embedded_with_their_path_and_symbol() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("src/billing")).unwrap();
+        let file = repo.path().join("src/billing/tax.rs");
+        std::fs::write(&file, "/// The rate for a region.\nfn rate() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut indexer = RepoIndexer::new(None);
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+
+        let rdb = RepoDb::open(&repo.path().join(".sclerox").join("repo.db")).unwrap();
+        let (_, passage) = rdb.chunks_without_embedding().unwrap().remove(0);
+        assert_eq!(
+            passage,
+            "src/billing/tax.rs: function rate\n\n/// The rate for a region.\nfn rate() {}"
+        );
+        assert_eq!(embed_all(repo.path()), 1);
+
+        // Renamed, the header changes, so the old vector is not reused.
+        std::fs::rename(&file, repo.path().join("src/billing/vat.rs")).unwrap();
+        indexer.index_repo(&db, repo.path(), None).unwrap();
+        let missing = rdb.chunks_without_embedding().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0]
+            .1
+            .starts_with("src/billing/vat.rs: function rate"));
+    }
+
+    #[test]
+    fn symbol_kinds_read_as_words() {
+        assert_eq!(symbol_kind("function_item"), "function");
+        assert_eq!(symbol_kind("class_declaration"), "class");
+        assert_eq!(symbol_kind("export_statement"), "export statement");
+        assert_eq!(
+            code_context("notes.txt", None).as_deref(),
+            Some("notes.txt")
+        );
     }
 
     #[test]

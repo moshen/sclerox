@@ -5,7 +5,7 @@ use crate::cli::text_chunks;
 use crate::config::settings;
 use crate::db::dates::Dates;
 use crate::db::todos::{SimilarTodo, Todo, TodoStatus};
-use crate::db::Database;
+use crate::db::{Database, TextChunkKind};
 use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
 #[derive(Subcommand)]
@@ -407,20 +407,8 @@ fn print_todo_line(t: &crate::db::todos::Todo) {
 
 /// Embed a single todo's title+notes and store the chunks. Silent on error.
 fn embed_todo(db: &Database, id: i64, title: &str, notes: Option<&str>) {
-    let text = text_chunks::todo_source(title, notes);
     if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
-        let raw = text_chunks::chunk(&text);
-        if let Ok(embeddings) =
-            embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        {
-            let chunks: Vec<(String, Option<Vec<f32>>)> = raw
-                .into_iter()
-                .zip(embeddings.into_iter().map(Some))
-                .collect();
-            if db.todo_store_chunks(id, &chunks).is_ok() {
-                text_chunks::note(db);
-            }
-        }
+        store_todo_chunks(db, id, title, notes, &mut embedder);
     }
 }
 
@@ -437,19 +425,21 @@ pub fn backfill_todo_embeddings_pub(db: &Database) {
     };
     log::debug!("backfilling embeddings for {} todos", pending.len());
     for t in pending {
-        let text = text_chunks::todo_source(&t.title, t.notes.as_deref());
-        let raw = text_chunks::chunk(&text);
-        if let Ok(embeddings) =
-            embedder.embed_each(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        {
-            let chunks: Vec<(String, Option<Vec<f32>>)> = raw
-                .into_iter()
-                .zip(embeddings.into_iter().map(Some))
-                .collect();
-            if db.todo_store_chunks(t.id, &chunks).is_ok() {
-                text_chunks::note(db);
-            }
-        }
+        store_todo_chunks(db, t.id, &t.title, t.notes.as_deref(), &mut embedder);
+    }
+}
+
+/// Store a todo's chunks with their vectors; nothing when embedding fails.
+fn store_todo_chunks(
+    db: &Database,
+    id: i64,
+    title: &str,
+    notes: Option<&str>,
+    embedder: &mut crate::embed::Embedder,
+) {
+    let source = text_chunks::todo_source(title, notes);
+    if let Err(e) = text_chunks::store(db, TextChunkKind::Todo, id, &source, Some(embedder)) {
+        log::warn!("could not embed todo #{id}: {e:#}");
     }
 }
 

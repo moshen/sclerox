@@ -3,8 +3,8 @@ use clap::Subcommand;
 
 use crate::cli::text_chunks;
 use crate::db::meetings::{Meeting, MeetingPerson};
-use crate::db::Database;
-use crate::output::{floor_char_boundary, print_miss, print_output, truncate, OutputFormat};
+use crate::db::{ChunkSource, Database, TextChunkKind};
+use crate::output::{floor_char_boundary, print_miss, print_output, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum MeetingCommand {
@@ -96,10 +96,9 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
                 notes.as_deref(),
             )?;
 
-            // Chunk and optionally embed the combined text (transcript preferred).
-            let text_to_chunk =
-                text_chunks::meeting_source(transcript.as_deref(), notes.as_deref());
-            store_chunks(db, id, &text_to_chunk, no_embed)?;
+            let source =
+                text_chunks::meeting_source(&title, notes.as_deref(), transcript.as_deref());
+            store_chunks(db, id, &source, no_embed)?;
 
             let m = db.meeting_get(id)?;
             print_output(format, &m, || println!("Added meeting #{id}: {title}"));
@@ -175,7 +174,13 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
                             r.score * 100.0,
                             crate::cli::format::stamp("created", &r.meeting.created_at)
                         );
-                        println!("  > {}", truncate(&r.matched_chunk, 100));
+                        println!(
+                            "  > {}",
+                            crate::cli::format::matched(
+                                r.matched_section.as_deref(),
+                                &r.matched_chunk
+                            )
+                        );
                     }
                 },
             );
@@ -214,11 +219,19 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
                 print_miss(format, &format!("Meeting #{id} not found or no changes"));
                 return Ok(());
             }
-            // A new transcript replaces the stored chunks + embeddings.
-            if let Some(t) = transcript.as_deref() {
-                store_chunks(db, id, t, no_embed)?;
-            }
+            // The chunks hold the notes and transcript, headed by the title.
             let m = db.meeting_get(id)?;
+            if let Some(m) = m
+                .as_ref()
+                .filter(|_| title.is_some() || notes.is_some() || transcript.is_some())
+            {
+                let source = text_chunks::meeting_source(
+                    &m.title,
+                    m.notes.as_deref(),
+                    m.transcript.as_deref(),
+                );
+                store_chunks(db, id, &source, no_embed)?;
+            }
             print_output(format, &m, || println!("Updated meeting #{id}"));
         }
 
@@ -275,33 +288,26 @@ pub fn run(db: &Database, cmd: MeetingCommand, format: OutputFormat) -> Result<(
     Ok(())
 }
 
-/// Chunk `text` and store it as the meeting's embedding chunks, replacing any
-/// existing ones. No-op for empty text. Shared by `add` and `update`.
-fn store_chunks(db: &Database, meeting_id: i64, text: &str, no_embed: bool) -> Result<()> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    let raw_chunks = text_chunks::chunk(text);
-    // Without an embedder (--no-embed, embeddings off, model unavailable)
-    // the chunks are stored without vectors; `db reembed` can fill them later.
-    let embedder = if no_embed {
+/// Store `source` as the meeting's chunks, replacing any existing ones.
+/// Shared by `add` and `update`.
+fn store_chunks(
+    db: &Database,
+    meeting_id: i64,
+    source: &ChunkSource,
+    no_embed: bool,
+) -> Result<()> {
+    let mut embedder = if no_embed {
         None
     } else {
         crate::embed::optional(db.semantic_ready())
     };
-    let chunks: Vec<(String, Option<Vec<f32>>)> = if let Some(mut embedder) = embedder {
-        let texts: Vec<&str> = raw_chunks.iter().map(|s| s.as_str()).collect();
-        let embeddings = embedder.embed_each(&texts)?;
-        raw_chunks
-            .into_iter()
-            .zip(embeddings.into_iter().map(Some))
-            .collect()
-    } else {
-        raw_chunks.into_iter().map(|c| (c, None)).collect()
-    };
-    db.meeting_store_chunks(meeting_id, &chunks)?;
-    text_chunks::note(db);
-    Ok(())
+    text_chunks::store(
+        db,
+        TextChunkKind::Meeting,
+        meeting_id,
+        source,
+        embedder.as_mut(),
+    )
 }
 
 fn print_meeting(m: &Meeting, people: &[MeetingPerson]) {
