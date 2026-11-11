@@ -1,3 +1,4 @@
+use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
@@ -6,9 +7,55 @@ use std::path::PathBuf;
 // into $XDG_CACHE_HOME/sclerox/models/. See src/embed/download.rs.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    build_version();
 
     #[cfg(target_os = "windows")]
     copy_directml_dll();
+}
+
+/// Sets `SCLEROX_BUILD_VERSION` for `src/version.rs`: the release tag the
+/// release workflow passes in `SCLEROX_VERSION`, or Cargo.toml's version,
+/// plus `+<short commit>` when built from a git checkout.
+fn build_version() {
+    println!("cargo:rerun-if-env-changed=SCLEROX_VERSION");
+    let version = std::env::var("SCLEROX_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
+    let version = match git(&["rev-parse", "--short", "HEAD"]) {
+        Some(commit) => {
+            rerun_on_new_commit();
+            format!("{version}+{commit}")
+        }
+        None => version,
+    };
+    println!("cargo:rustc-env=SCLEROX_BUILD_VERSION={version}");
+}
+
+/// Rerun when HEAD moves: a checkout changes `HEAD`, a commit changes the
+/// branch's ref (loose, or in `packed-refs` after a gc). In a worktree,
+/// `HEAD` is its own but refs are shared with the main checkout.
+fn rerun_on_new_commit() {
+    let (Some(git_dir), Some(common)) = (
+        git(&["rev-parse", "--git-dir"]),
+        git(&["rev-parse", "--git-common-dir"]),
+    ) else {
+        return;
+    };
+    let (git_dir, common) = (Path::new(&git_dir), Path::new(&common));
+    let mut watch = vec![git_dir.join("HEAD"), common.join("packed-refs")];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watch.push(common.join(branch));
+    }
+    for path in watch {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
 }
 
 #[cfg(target_os = "windows")]

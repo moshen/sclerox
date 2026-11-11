@@ -78,6 +78,20 @@ impl Env {
     }
 }
 
+#[test]
+fn version_is_the_release_tag_or_dev_and_the_commit() {
+    let e = Env::new();
+    let tag = option_env!("SCLEROX_VERSION").unwrap_or("0.0.0-dev");
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .unwrap();
+    let commit = String::from_utf8(commit.stdout).unwrap();
+    let expected = format!("{tag}+{}", commit.trim());
+    assert_eq!(e.run(&["--version"]), format!("sclerox {expected}"));
+    assert_eq!(sclerox::version::VERSION, expected);
+}
+
 // ─── Memory ──────────────────────────────────────────────────────────────────
 
 #[test]

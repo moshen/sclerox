@@ -84,6 +84,8 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build
+        env:
+          SCLEROX_VERSION: ${{ needs.version.outputs.version }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage artifact (unix)

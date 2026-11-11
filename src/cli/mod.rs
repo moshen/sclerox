@@ -32,7 +32,7 @@ use crate::output::OutputFormat;
 #[command(
     name = "sclerox",
     about = "Sclerox CLI - your persistent knowledge base",
-    version
+    version = crate::version::VERSION
 )]
 pub struct Cli {
     /// Output format

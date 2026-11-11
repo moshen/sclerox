@@ -36,7 +36,7 @@ impl Build {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::version::VERSION.to_string(),
             exe_modified,
             exe_len: meta.map_or(0, |m| m.len()),
         }
