@@ -13,6 +13,7 @@ pub mod repos;
 pub mod schema;
 pub mod todos;
 pub mod usage;
+pub mod word_parts;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -243,6 +244,7 @@ impl Database {
         }
         register_vec_extension();
         let conn = Connection::open(path)?;
+        word_parts::register(&conn)?;
         // Enforce the schema's FOREIGN KEY / ON DELETE CASCADE constraints.
         // This pragma is per-connection and OFF by default; it must be set
         // outside a transaction (open is), so set it before init/migrations.
@@ -260,6 +262,7 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         register_vec_extension();
         let conn = Connection::open_in_memory()?;
+        word_parts::register(&conn)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.init()?;
@@ -279,6 +282,16 @@ impl Database {
         run_migrations(&self.conn, current, PRIMARY_MIGRATIONS, PRIMARY_VERSION)
             .context("primary database migration failed")?;
         Ok(())
+    }
+
+    /// What SQLite's `integrity_check` finds wrong, full-text indexes
+    /// included; empty when the database is sound. The `sqlite3` shell can't
+    /// check those indexes, as it lacks the [`word_parts`] tokenizer.
+    pub fn integrity_problems(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let problems: Vec<String> = rows.collect::<Result<_, _>>()?;
+        Ok(problems.into_iter().filter(|p| p != "ok").collect())
     }
 
     pub fn user_version(&self) -> Result<u32> {

@@ -371,3 +371,10 @@ relevant = ["code:src/billing/sales_tax.rs", "symbol:rate_for"]
 q = "where does the delay between attempts double"
 kind = "natural_language"
 relevant = ["code:src/retry.rs", "symbol:with_backoff"]
+
+# Neither word starts a word of the records: they match only the parts of
+# FinancialDocument.
+[[query]]
+q = "document parser"
+kind = "identifier"
+relevant = ["memory:invoice-parser-owner", "project:1", "symbol:FinancialDocument", "code:src/invoice.rs"]

@@ -1650,6 +1650,34 @@ fn code_text_is_found_word_for_word_without_embeddings() {
     at(&out, 2);
 }
 
+#[test]
+fn db_check_reads_the_search_indexes() {
+    let e = Env::new();
+    e.run(&[
+        "memory",
+        "set",
+        "owner",
+        "Owns FinancialDocument",
+        "--no-embed",
+    ]);
+
+    // SQLite alone can't open the prose indexes, which split joined words
+    // with a tokenizer only sclerox registers.
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    let plain = conn.query_row(
+        "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'document'",
+        [],
+        |r| r.get::<_, i64>(0),
+    );
+    assert!(plain.is_err(), "{plain:?}");
+    drop(conn);
+
+    assert_eq!(e.run(&["db", "check"]), "ok");
+    let json: serde_json::Value =
+        serde_json::from_str(&e.run(&["db", "check", "--output", "json"])).unwrap();
+    assert_eq!(json["ok"], true, "{json}");
+}
+
 /// (chunks, chunks without a vector) in a repo's index.
 fn chunk_counts(repo: &std::path::Path) -> (i64, i64) {
     let conn = rusqlite::Connection::open(repo.join(".sclerox/repo.db")).unwrap();

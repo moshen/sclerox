@@ -1105,3 +1105,57 @@ CREATE INDEX IF NOT EXISTS idx_edges_to_name ON symbol_edges(to_name);
     embed_jobs_table!(),
     files_fts_table!()
 );
+
+/// Migration v20: prose indexes also hold the parts of camelCase words, so
+/// "document" finds "FinancialDocument" (see `db::word_parts`). Rebuilt as in
+/// v18, whose triggers carry over.
+pub const MIGRATION_V20: &str = "
+DROP TABLE memory_fts;
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    key, value, memory_type, tags,
+    content=memory, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
+
+DROP TABLE people_fts;
+CREATE VIRTUAL TABLE people_fts USING fts5(
+    name, notes,
+    content=people, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO people_fts(people_fts) VALUES('rebuild');
+
+DROP TABLE meetings_fts;
+CREATE VIRTUAL TABLE meetings_fts USING fts5(
+    title, transcript, notes,
+    content=meetings, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO meetings_fts(meetings_fts) VALUES('rebuild');
+
+DROP TABLE projects_fts;
+CREATE VIRTUAL TABLE projects_fts USING fts5(
+    name, description,
+    content=projects, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO projects_fts(projects_fts) VALUES('rebuild');
+
+DROP TABLE repos_fts;
+CREATE VIRTUAL TABLE repos_fts USING fts5(
+    name, description,
+    content=repos, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO repos_fts(repos_fts) VALUES('rebuild');
+
+DROP TABLE todos_fts;
+CREATE VIRTUAL TABLE todos_fts USING fts5(
+    title, notes, category, status,
+    content=todos, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO todos_fts(todos_fts) VALUES('rebuild');
+
+DROP TABLE investigations_fts;
+CREATE VIRTUAL TABLE investigations_fts USING fts5(
+    name, slug, plan, findings,
+    content=investigations, content_rowid=id, tokenize='porter word_parts'
+);
+INSERT INTO investigations_fts(investigations_fts) VALUES('rebuild');
+";
