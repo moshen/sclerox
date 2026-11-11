@@ -38,8 +38,8 @@ pub enum TodoCommand {
     Get { id: i64 },
     /// List todos
     List {
-        /// Filter by status (open, done, watch, all)
-        #[arg(long, default_value = "open")]
+        /// Only todos with this status
+        #[arg(long, default_value = "open", value_parser = ["open", "done", "watch", "all"])]
         status: String,
         /// Filter by category
         #[arg(long)]
@@ -50,11 +50,11 @@ pub enum TodoCommand {
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,
     },
-    /// Full-text search todos (includes done items)
+    /// Full-text search todos (open only by default)
     Search {
         query: String,
         /// Only todos with this status
-        #[arg(long, default_value = "all", value_parser = ["open", "done", "watch", "all"])]
+        #[arg(long, default_value = "open", value_parser = ["open", "done", "watch", "all"])]
         status: String,
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,

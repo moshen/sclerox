@@ -7,6 +7,27 @@ use crate::db::Database;
 use crate::embed::Embedder;
 use crate::output::{print_miss, print_output, truncate, OutputFormat};
 
+#[derive(clap::Args)]
+pub struct StatusArg {
+    /// Only entries with this status
+    #[arg(long, default_value = "active",
+          value_parser = ["active", "stale", "superseded", "all"])]
+    status: String,
+    /// Same as `--status all`
+    #[arg(long, hide = true, conflicts_with = "status")]
+    all: bool,
+}
+
+impl StatusArg {
+    fn get(&self) -> &str {
+        if self.all {
+            "all"
+        } else {
+            &self.status
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum MemoryCommand {
     /// Set or update a memory entry
@@ -44,18 +65,16 @@ pub enum MemoryCommand {
     List {
         #[arg(long, value_parser = ["general","user","feedback","project","reference","session"])]
         r#type: Option<String>,
-        /// Include stale and superseded entries
-        #[arg(long)]
-        all: bool,
+        #[command(flatten)]
+        status: StatusArg,
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,
     },
     /// Full-text search memory (active only by default)
     Search {
         query: String,
-        /// Also search stale and superseded entries
-        #[arg(long)]
-        all: bool,
+        #[command(flatten)]
+        status: StatusArg,
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,
     },
@@ -314,10 +333,13 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             }
         }
 
-        MemoryCommand::List { r#type, all, dates } => {
+        MemoryCommand::List {
+            r#type,
+            status,
+            dates,
+        } => {
             let dates = dates.dates()?;
-            let status = if all { Some("all") } else { None };
-            let mut entries = db.memory_list(r#type.as_deref(), status)?;
+            let mut entries = db.memory_list(r#type.as_deref(), Some(status.get()))?;
             entries.retain(|e| dates.keeps(&e.updated_at, &e.created_at));
             print_output(format, &entries, || {
                 if entries.is_empty() {
@@ -342,20 +364,21 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
             });
         }
 
-        MemoryCommand::Search { query, all, dates } => {
+        MemoryCommand::Search {
+            query,
+            status,
+            dates,
+        } => {
             let dates = dates.dates()?;
-            let mut results = if all {
-                db.memory_search_filtered(&query, "all", &dates)?
-            } else {
-                db.memory_search(&query, &dates)?
-            };
-            // Add a semantic tier for active search: embeddings live only on
-            // active rows, so this is skipped for --all (which includes stale).
+            let status = status.get();
+            let mut results = db.memory_search_filtered(&query, status, &dates)?;
+            // Add a semantic tier when active rows are wanted: embeddings live
+            // only on active rows.
             let mut logged: Vec<_> = results
                 .iter()
                 .map(|m| crate::cli::usage::keyword("memory", &m.key))
                 .collect();
-            if !all {
+            if matches!(status, "active" | "all") {
                 let seen: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
                 if let Some(mut embedder) = crate::embed::optional(db.semantic_ready()) {
                     if let Ok(qe) = embedder.embed_query(&query) {
@@ -401,12 +424,7 @@ pub fn run(db: &Database, cmd: MemoryCommand, format: OutputFormat) -> Result<()
                     println!("\n{} results", results.len());
                 }
             });
-            let command = if all {
-                "memory search --all"
-            } else {
-                "memory search"
-            };
-            crate::cli::usage::search(db, command, &query, &logged);
+            crate::cli::usage::search(db, "memory search", &query, &logged);
         }
 
         MemoryCommand::Delete { key } => {

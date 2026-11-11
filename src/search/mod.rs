@@ -455,7 +455,7 @@ pub fn search_hits_embedded(
         }
     }
 
-    let inv_fts = db.investigation_search(query, dates)?;
+    let inv_fts = db.investigation_search(query, None, dates)?;
     let inv_fts_ids: std::collections::HashSet<i64> = inv_fts.iter().map(|i| i.id).collect();
     let scores = fts_scores(
         ScoredTable::Investigation,
@@ -484,7 +484,7 @@ pub fn search_hits_embedded(
     }
     if let Some(qe) = query_emb {
         let hits = db
-            .investigation_similar(qe, semantic_limit, dates)
+            .investigation_similar(qe, semantic_limit, None, dates)
             .unwrap_or_default();
         let cut = cutoff(&mut hits.iter().map(|r| r.score));
         for r in hits {
