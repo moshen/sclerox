@@ -127,7 +127,7 @@ DB=~/.local/share/sclerox/sclerox.db
 for t in memory todos people meetings projects repos; do
   printf '%-10s ' "$t"; sqlite3 "$DB" "SELECT COUNT(*) FROM $t;"
 done
-sclerox db check
+SCLEROX_DB="$DB" sclerox db check
 ```
 
 The database checksum WILL differ from your backup even on a clean migration:

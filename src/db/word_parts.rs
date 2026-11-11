@@ -28,13 +28,17 @@ use rusqlite::ffi::{
 pub fn parts(word: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<(usize, char)> = word.char_indices().collect();
     let mut starts = vec![0];
-    for i in 1..chars.len() {
-        let (prev, c) = (chars[i - 1].1, chars[i].1);
+    // The last letter or digit, past any combining mark (`e\u{301}`).
+    let mut prev: Option<char> = None;
+    for (i, &(_, c)) in chars.iter().enumerate() {
         let next_lower = chars.get(i + 1).is_some_and(|(_, n)| n.is_lowercase());
-        if c.is_uppercase()
-            && (prev.is_lowercase() || prev.is_numeric() || (prev.is_uppercase() && next_lower))
-        {
-            starts.push(i);
+        if let Some(prev) = prev.filter(|_| c.is_uppercase()) {
+            if prev.is_lowercase() || prev.is_numeric() || (prev.is_uppercase() && next_lower) {
+                starts.push(i);
+            }
+        }
+        if c.is_alphanumeric() {
+            prev = Some(c);
         }
     }
     if starts.len() < 2 {
@@ -255,7 +259,8 @@ unsafe extern "C" fn on_token(
 
 /// The `part` of `word` as unicode61 folded the whole word to `folded`: the
 /// same characters of it when folding kept one per character (it drops
-/// diacritics), else the part lower-cased.
+/// diacritics), else the part's letters and digits lower-cased, which drops
+/// combining marks as unicode61 does.
 fn fold(word: &str, folded: &str, part: std::ops::Range<usize>) -> String {
     let (from, to) = (
         word[..part.start].chars().count(),
@@ -264,7 +269,11 @@ fn fold(word: &str, folded: &str, part: std::ops::Range<usize>) -> String {
     if folded.chars().count() == word.chars().count() {
         folded.chars().skip(from).take(to - from).collect()
     } else {
-        word[part].to_lowercase()
+        word[part]
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
     }
 }
 
@@ -283,6 +292,7 @@ mod tests {
         assert_eq!(split("HTTPServer"), ["HTTP", "Server"]);
         assert_eq!(split("utf8Decoder"), ["utf8", "Decoder"]);
         assert_eq!(split("CoreML"), ["Core", "ML"]);
+        assert_eq!(split("Cafe\u{301}Menu"), ["Cafe\u{301}", "Menu"]);
         // A one-letter part isn't worth indexing.
         assert_eq!(split("getX"), ["get"]);
         // Nothing to split.
@@ -296,6 +306,10 @@ mod tests {
     fn parts_take_the_folded_form() {
         assert_eq!(fold("CaféMenu", "cafemenu", 0..5), "cafe");
         assert_eq!(fold("CaféMenu", "cafemenu", 5..9), "menu");
+        // A decomposed é folds to one character fewer.
+        let word = "Cafe\u{301}Menu";
+        assert_eq!(fold(word, "cafemenu", 0..6), "cafe");
+        assert_eq!(fold(word, "cafemenu", 6..10), "menu");
     }
 
     fn matches(tokenize: &str, text: &str, query: &str) -> bool {
@@ -336,6 +350,7 @@ mod tests {
         let t = "porter word_parts remove_diacritics 2";
         assert!(matches(t, "the CaféMenu page", "cafe"));
         assert!(matches(t, "the CaféMenu page", "menu"));
+        assert!(matches(t, "the Cafe\u{301}Menu page", "cafe"));
     }
 
     #[test]
