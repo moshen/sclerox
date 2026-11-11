@@ -1688,6 +1688,21 @@ fn db_check_compares_the_search_indexes_with_their_tables() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("memory_fts: "), "{stdout}");
 
+    // A row whose parent is gone, written where foreign keys are off.
+    let orphaned = Env::new();
+    orphaned.run(&["memory", "set", "k", "v", "--no-embed"]);
+    let conn = rusqlite::Connection::open(&orphaned.db).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO memory_projects (memory_id, project_id) VALUES (1, 999);",
+    )
+    .unwrap();
+    drop(conn);
+    let out = orphaned.cmd().args(["db", "check"]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("memory_projects row "), "{stdout}");
+
     // A database that isn't there isn't created and checked.
     let missing = Env::new();
     let out = missing.cmd().args(["db", "check"]).output().unwrap();

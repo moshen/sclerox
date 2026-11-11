@@ -284,15 +284,28 @@ impl Database {
         Ok(())
     }
 
-    /// What SQLite's `integrity_check` finds wrong, then any prose index out
-    /// of step with its table (which that check doesn't compare); empty when
-    /// the database is sound. The `sqlite3` shell can't check those indexes,
+    /// What SQLite's `integrity_check` finds wrong, then rows whose parent
+    /// is gone and any prose index out of step with its table (which that
+    /// check doesn't look at); empty when the database is sound. The `sqlite3` shell can't check those indexes,
     /// as it lacks the [`word_parts`] tokenizer.
     pub fn integrity_problems(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut problems: Vec<String> = rows.collect::<Result<_, _>>()?;
         problems.retain(|p| p != "ok");
+        let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let orphans = stmt.query_map([], |r| {
+            Ok(format!(
+                "{} row {}: no row in {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?
+                    .map_or("?".into(), |id| id.to_string()),
+                r.get::<_, String>(2)?
+            ))
+        })?;
+        for orphan in orphans {
+            problems.push(orphan?);
+        }
         for index in schema::PROSE_INDEXES {
             // A rank of 1 compares the index with its content table.
             let check = format!("INSERT INTO {index}({index}, rank) VALUES ('integrity-check', 1)");

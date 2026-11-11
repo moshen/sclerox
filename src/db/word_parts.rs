@@ -345,7 +345,9 @@ mod tests {
         let folded = word.to_lowercase();
         let started = std::time::Instant::now();
         assert_eq!(folded_parts(&word, &folded).len(), 50_000);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // A few milliseconds; folding each part from the start of the word
+        // took minutes, so a busy runner can't make this fail.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     fn matches(tokenize: &str, text: &str, query: &str) -> bool {
