@@ -67,6 +67,13 @@ pub enum DbCommand {
         #[arg(long)]
         wait: bool,
     },
+
+    /// Check that the database is sound, full-text indexes included.
+    ///
+    /// Runs SQLite's integrity check, which the `sqlite3` shell can't run
+    /// on the search indexes: they use a word splitter only sclerox has.
+    /// Exits non-zero when it finds a problem.
+    Check,
 }
 
 pub fn run(db: &Database, cmd: DbCommand, format: OutputFormat) -> Result<()> {
@@ -79,6 +86,23 @@ pub fn run(db: &Database, cmd: DbCommand, format: OutputFormat) -> Result<()> {
                 print_output(format, &result, || {});
             }
             Ok(())
+        }
+        DbCommand::Check => {
+            let problems = db.integrity_problems()?;
+            let result = serde_json::json!({ "ok": problems.is_empty(), "problems": problems });
+            print_output(format, &result, || {
+                if problems.is_empty() {
+                    println!("ok");
+                }
+                for p in &problems {
+                    println!("{p}");
+                }
+            });
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("the database has {} problem(s)", problems.len())
+            }
         }
     }
 }

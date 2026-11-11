@@ -127,12 +127,13 @@ DB=~/.local/share/sclerox/sclerox.db
 for t in memory todos people meetings projects repos; do
   printf '%-10s ' "$t"; sqlite3 "$DB" "SELECT COUNT(*) FROM $t;"
 done
-sqlite3 "$DB" 'PRAGMA integrity_check;'
+SCLEROX_DB="$DB" sclerox db check
 ```
 
 The database checksum WILL differ from your backup even on a clean migration:
 SQLite folds the write-ahead log into the main file when it closes. Row counts
-and `integrity_check` are the real signals, not the hash.
+and `sclerox db check` (SQLite's integrity check, which the `sqlite3` shell
+can't run on the search indexes) are the real signals, not the hash.
 
 Confirm exactly one set of hooks, no leftover `ol` markers, and a working
 index:

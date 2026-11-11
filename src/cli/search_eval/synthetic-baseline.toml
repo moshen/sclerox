@@ -2,16 +2,16 @@
 
 ["cosine-order.all"]
 false_rate = 1.0
-mrr = 0.933
-ndcg10 = 0.821
-r10 = 0.816
-r5 = 0.805
+mrr = 0.936
+ndcg10 = 0.813
+r10 = 0.806
+r5 = 0.794
 
 ["cosine-order.identifier"]
 mrr = 1.0
-ndcg10 = 0.682
-r10 = 0.583
-r5 = 0.583
+ndcg10 = 0.668
+r10 = 0.571
+r5 = 0.571
 
 ["cosine-order.known_item"]
 mrr = 0.642
@@ -36,16 +36,16 @@ r5 = 1.0
 
 ["cosine.all"]
 false_rate = 1.0
-mrr = 0.914
-ndcg10 = 0.784
-r10 = 0.753
-r5 = 0.753
+mrr = 0.917
+ndcg10 = 0.777
+r10 = 0.744
+r5 = 0.744
 
 ["cosine.identifier"]
 mrr = 1.0
-ndcg10 = 0.682
-r10 = 0.583
-r5 = 0.583
+ndcg10 = 0.668
+r10 = 0.571
+r5 = 0.571
 
 ["cosine.known_item"]
 mrr = 0.5
@@ -70,16 +70,16 @@ r5 = 1.0
 
 ["current.all"]
 false_rate = 1.0
-mrr = 0.937
-ndcg10 = 0.901
-r10 = 0.937
-r5 = 0.92
+mrr = 0.939
+ndcg10 = 0.904
+r10 = 0.939
+r5 = 0.922
 
 ["current.identifier"]
 mrr = 1.0
-ndcg10 = 0.922
-r10 = 0.917
-r5 = 0.917
+ndcg10 = 0.933
+r10 = 0.929
+r5 = 0.929
 
 ["current.known_item"]
 mrr = 0.833
@@ -104,16 +104,16 @@ r5 = 1.0
 
 ["keyword.all"]
 false_rate = 0.5
-mrr = 0.733
-ndcg10 = 0.727
-r10 = 0.839
-r5 = 0.822
+mrr = 0.742
+ndcg10 = 0.735
+r10 = 0.844
+r5 = 0.828
 
 ["keyword.identifier"]
-mrr = 0.75
-ndcg10 = 0.779
-r10 = 0.833
-r5 = 0.833
+mrr = 0.786
+ndcg10 = 0.808
+r10 = 0.857
+r5 = 0.857
 
 ["keyword.known_item"]
 mrr = 0.583

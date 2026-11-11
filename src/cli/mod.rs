@@ -143,13 +143,20 @@ pub fn run(cli: Cli) -> Result<()> {
             let db = Database::open(&settings().db_path)?;
             hook::run(&db, cmd)
         }
+        // Opening would create an empty database, which would check out fine.
+        Commands::Db(db::DbCommand::Check) if !settings().db_path.exists() => {
+            anyhow::bail!("no database at {}", settings().db_path.display())
+        }
         cmd => {
             let db = Database::open(&settings().db_path)?;
             // Run any pending embedding backfills once, right after the DB opens.
             // This is the Rust-level equivalent of what a schema migration can't do
             // (migrations are pure SQL; fastembed is Rust). Runs once after upgrade,
             // then the todos_without_embeddings() check returns empty immediately.
-            todos::backfill_todo_embeddings_pub(&db);
+            // Not for `db check`, which only reads what is there.
+            if !matches!(cmd, Commands::Db(db::DbCommand::Check)) {
+                todos::backfill_todo_embeddings_pub(&db);
+            }
             match cmd {
                 Commands::Memory(c) => memory::run(&db, c, format),
                 Commands::People(c) => people::run(&db, c, format),

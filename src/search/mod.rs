@@ -1076,4 +1076,48 @@ mod tests {
             "missing investigation results"
         );
     }
+
+    #[test]
+    fn later_parts_of_joined_words_are_found_in_every_prose_table() {
+        let db = Database::open_in_memory().unwrap();
+        let text = "Owns FinancialDocument and InvoiceParser";
+        db.memory_set("owner", text, "general", None).unwrap();
+        db.people_add("Priya", Some(text)).unwrap();
+        db.meeting_add("Sync", None, None, Some(text)).unwrap();
+        db.project_add("Billing", Some(text), &[]).unwrap();
+        // A repo whose clone is gone is pruned before search.
+        let clone = tempfile::tempdir().unwrap();
+        let path = clone.path().to_str().unwrap();
+        db.repo_register(
+            path,
+            "billing",
+            Some(text),
+            &format!("{path}/repo.db"),
+            None,
+        )
+        .unwrap();
+        db.todo_add(
+            "Ask about the FinancialDocument and InvoiceParser",
+            None,
+            crate::db::todos::TodoStatus::Open,
+            None,
+            "general",
+            None,
+            None,
+        )
+        .unwrap();
+        db.investigation_start("Billing", "billing", Some(text))
+            .unwrap();
+
+        // Neither word starts a word of the text, and the text doesn't hold
+        // the query whole, so only the parts can match.
+        let hits =
+            search_hits_embedded(&db, "document parser", None, &TUNING, &Dates::default()).unwrap();
+        let mut kinds: Vec<&str> = hits.iter().map(|h| h.result.item().0).collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            ["meeting", "memory", "person", "project", "repo", "research", "todo"]
+        );
+    }
 }

@@ -151,8 +151,9 @@ meetings go by their meeting date and code by its last change.
 
 Plain questions work: records holding every word come first, then a limited
 number holding only some of them, ignoring words like "why" and "did". Word
-forms match, so `retries` finds "Retry". Semantic hits list a record once, and
-code hits list each separate region of a file once.
+forms match, so `retries` finds "Retry", and so do the parts of joined words:
+`document parser` finds "FinancialDocument" and "InvoiceParser". Semantic hits
+list a record once, and code hits list each separate region of a file once.
 
 Add the global `--full` flag to see every field and untruncated content as
 text. On `sclerox search` it returns each hit's whole record, as that type's
