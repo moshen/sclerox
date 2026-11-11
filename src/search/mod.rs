@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use crate::db::dates::Dates;
+use crate::db::fts;
 use crate::db::Database;
 use crate::db::SnippetTable;
 use crate::output::{excerpt, full, truncate};
@@ -566,26 +569,10 @@ pub fn search_hits_embedded(
             log::error!("could not open repo db for '{}'", repo.name);
             continue;
         };
-        let Ok(repo_symbols) = repo_db.search_symbols(query, dates) else {
-            log::error!("symbol search failed for repo '{}'", repo.name);
+        if let Err(e) = symbol_hits(&mut symbols, &repo, &repo_db, query, dates) {
+            log::error!("symbol search failed for repo '{}': {e:#}", repo.name);
             continue;
-        };
-        log::debug!(
-            "repo '{}': {} symbol hits for '{}'",
-            repo.name,
-            repo_symbols.len(),
-            query
-        );
-        symbols.extend(repo_symbols.into_iter().map(|sym| SearchResult::Symbol {
-            repo_name: repo.name.clone(),
-            repo_path: repo.path.clone(),
-            kind: sym.kind,
-            name: sym.name,
-            signature: sym.signature,
-            file_path: sym.file_path,
-            start_line: sym.start_line,
-            last_modified: sym.last_modified,
-        }));
+        }
         code_text_hits(
             &mut code_text,
             &repo,
@@ -605,12 +592,7 @@ pub fn search_hits_embedded(
             }
         }
     }
-    // Each repo's symbols come best first; keep that order across repos.
-    symbols.sort_by_key(|s| match s {
-        SearchResult::Symbol { name, .. } => crate::index::repo_db::symbol_match(name, query),
-        _ => unreachable!(),
-    });
-    results.extend(symbols.into_iter().map(|result| Hit {
+    results.extend(rank_symbols(symbols).into_iter().map(|result| Hit {
         score: None,
         source: HitSource::Keyword,
         result,
@@ -664,17 +646,117 @@ fn keyword_snippet(found: Option<&String>, texts: &[Option<&str>], query: &str) 
         .unwrap_or_default()
 }
 
-/// A line holding the query word for word, from one repo, before the lines
-/// of all repos are ranked together by [`rank_code_text`].
-pub struct CodeTextHit {
-    phrase: bool,
-    result: SearchResult,
+/// Where a code hit ranks among those of every repo, best first: one holding
+/// the whole query (`whole` is 0 for a line holding it as a phrase, else 1),
+/// then one holding only some of its [`fts::code_terms`], the most first.
+/// `name` breaks ties between symbols (see `repo_db::symbol_match`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CodeRank {
+    Whole {
+        whole: u8,
+        name: u8,
+    },
+    Some {
+        terms: std::cmp::Reverse<usize>,
+        name: u8,
+    },
 }
 
+impl CodeRank {
+    fn some(terms: usize, name: u8) -> Self {
+        Self::Some {
+            terms: std::cmp::Reverse(terms),
+            name,
+        }
+    }
+}
+
+/// Order `hits` best first, keeping at most [`fts::LOOSE_LIMIT`] that hold
+/// only some terms and `limit` in all. The sort is stable, so ties stay in
+/// repo order.
+fn rank_code<T>(mut hits: Vec<(CodeRank, T)>, limit: usize) -> Vec<T> {
+    hits.sort_by_key(|(rank, _)| *rank);
+    let mut some = 0;
+    hits.into_iter()
+        .filter(|(rank, _)| match rank {
+            CodeRank::Whole { .. } => true,
+            CodeRank::Some { .. } => {
+                some += 1;
+                some <= fts::LOOSE_LIMIT
+            }
+        })
+        .take(limit)
+        .map(|(_, hit)| hit)
+        .collect()
+}
+
+/// A symbol of one repo, before the symbols of all repos are ranked together
+/// by [`rank_symbols`].
+pub struct SymbolHit(CodeRank, SearchResult);
+
+/// Add `repo`'s symbols whose name or signature holds `query` to `out`, then
+/// up to [`fts::LOOSE_LIMIT`] holding only some of its terms, so a question
+/// in words finds code without an embedder.
+pub fn symbol_hits(
+    out: &mut Vec<SymbolHit>,
+    repo: &crate::db::repos::RepoEntry,
+    repo_db: &crate::index::repo_db::RepoDb,
+    query: &str,
+    dates: &Dates,
+) -> Result<()> {
+    let result = |sym: crate::index::repo_db::Symbol| SearchResult::Symbol {
+        repo_name: repo.name.clone(),
+        repo_path: repo.path.clone(),
+        kind: sym.kind,
+        name: sym.name,
+        signature: sym.signature,
+        file_path: sym.file_path,
+        start_line: sym.start_line,
+        last_modified: sym.last_modified,
+    };
+    let whole = repo_db.search_symbols(query, dates)?;
+    let seen: HashSet<i64> = whole.iter().map(|s| s.id).collect();
+    out.extend(whole.into_iter().map(|sym| {
+        let name = crate::index::repo_db::symbol_match(&sym.name, query);
+        SymbolHit(CodeRank::Whole { whole: 0, name }, result(sym))
+    }));
+    let Some(terms) = fts::code_terms(query) else {
+        return Ok(());
+    };
+    // Only adds to the hits above, so a failure here leaves them standing.
+    let some = match repo_db.search_symbols_any(&terms, seen.len() + fts::LOOSE_LIMIT, dates) {
+        Ok(some) => some,
+        Err(e) => {
+            log::error!(
+                "term search of symbols failed for repo '{}': {e:#}",
+                repo.name
+            );
+            return Ok(());
+        }
+    };
+    out.extend(
+        some.into_iter()
+            .filter(|(_, sym)| !seen.contains(&sym.id))
+            .take(fts::LOOSE_LIMIT)
+            .map(|(n, sym)| SymbolHit(CodeRank::some(n, 4), result(sym))),
+    );
+    Ok(())
+}
+
+/// Every repo's [`symbol_hits`], best first.
+pub fn rank_symbols(hits: Vec<SymbolHit>) -> Vec<SearchResult> {
+    rank_code(hits.into_iter().map(|h| (h.0, h.1)).collect(), usize::MAX)
+}
+
+/// A line of one repo, before the lines of all repos are ranked together by
+/// [`rank_code_text`].
+pub struct CodeTextHit(CodeRank, SearchResult);
+
 /// Add up to `limit` of `repo`'s lines holding `query` word for word to
-/// `out`; [`rank_code_text`] then applies `limit` across all repos. Each line
-/// is cut to a snippet, as a minified file can hold megabytes on one. A
-/// failed lookup is logged and leaves the other search tiers running.
+/// `out`, then up to [`fts::LOOSE_LIMIT`] holding only some of its terms;
+/// [`rank_code_text`] then applies `limit` across all repos. Each line is cut
+/// to a snippet, as a minified file can hold megabytes on one. A failed
+/// lookup is logged and leaves the other search tiers running.
 pub fn code_text_hits(
     out: &mut Vec<CodeTextHit>,
     repo: &crate::db::repos::RepoEntry,
@@ -683,27 +765,52 @@ pub fn code_text_hits(
     limit: usize,
     dates: &Dates,
 ) {
-    match repo_db.search_text(std::path::Path::new(&repo.path), query, limit, dates) {
-        Ok(lines) => out.extend(lines.into_iter().map(|m| CodeTextHit {
-            phrase: m.phrase,
-            result: SearchResult::CodeText {
-                repo_name: repo.name.clone(),
-                repo_path: repo.path.clone(),
-                file_path: m.file_path,
-                line: m.line,
-                text: excerpt(&m.text, query, 120).unwrap_or_else(|| truncate(&m.text, 120)),
-                last_modified: m.last_modified,
-            },
-        })),
-        Err(e) => log::error!("full-text search failed for repo '{}': {e:#}", repo.name),
+    let root = std::path::Path::new(&repo.path);
+    let result = |m: crate::index::repo_db::TextMatch, near: &str| SearchResult::CodeText {
+        repo_name: repo.name.clone(),
+        repo_path: repo.path.clone(),
+        file_path: m.file_path,
+        line: m.line,
+        text: excerpt(&m.text, near, 120).unwrap_or_else(|| truncate(&m.text, 120)),
+        last_modified: m.last_modified,
+    };
+    let whole = match repo_db.search_text(root, query, limit, dates) {
+        Ok(lines) => lines,
+        Err(e) => {
+            log::error!("full-text search failed for repo '{}': {e:#}", repo.name);
+            Vec::new()
+        }
+    };
+    let seen: HashSet<(String, i64)> = whole
+        .iter()
+        .map(|m| (m.file_path.clone(), m.line))
+        .collect();
+    out.extend(whole.into_iter().map(|m| {
+        let whole = u8::from(!m.phrase);
+        CodeTextHit(CodeRank::Whole { whole, name: 0 }, result(m, query))
+    }));
+    let Some(terms) = fts::code_terms(query) else {
+        return;
+    };
+    // Without stopwords, so a snippet shows the line around a term.
+    let near = terms.join(" ");
+    match repo_db.search_text_any(root, &terms, seen.len() + fts::LOOSE_LIMIT, dates) {
+        Ok(lines) => out.extend(
+            lines
+                .into_iter()
+                .filter(|m| !seen.contains(&(m.file_path.clone(), m.line)))
+                .take(fts::LOOSE_LIMIT)
+                .map(|m| CodeTextHit(CodeRank::some(m.terms, 0), result(m, &near))),
+        ),
+        Err(e) => log::error!("term search failed for repo '{}': {e:#}", repo.name),
     }
 }
 
 /// The best `limit` of every repo's [`code_text_hits`]: lines holding the
-/// query as one phrase first, wherever they are, each group in repo order.
-pub fn rank_code_text(mut hits: Vec<CodeTextHit>, limit: usize) -> Vec<SearchResult> {
-    hits.sort_by_key(|h| !h.phrase);
-    hits.into_iter().take(limit).map(|h| h.result).collect()
+/// query as one phrase first, wherever they are, then the other lines holding
+/// it, then those holding only some of its terms; each group in repo order.
+pub fn rank_code_text(hits: Vec<CodeTextHit>, limit: usize) -> Vec<SearchResult> {
+    rank_code(hits.into_iter().map(|h| (h.0, h.1)).collect(), limit)
 }
 
 #[cfg(test)]
@@ -863,26 +970,51 @@ mod tests {
 
     #[test]
     fn rank_code_text_puts_phrase_lines_first_across_repos() {
-        let hit = |repo: &str, phrase| CodeTextHit {
-            phrase,
-            result: SearchResult::CodeText {
-                repo_name: repo.into(),
-                repo_path: String::new(),
-                file_path: String::new(),
-                line: 1,
-                text: String::new(),
-                last_modified: None,
-            },
+        let hit = |repo: &str, rank| {
+            CodeTextHit(
+                rank,
+                SearchResult::CodeText {
+                    repo_name: repo.into(),
+                    repo_path: String::new(),
+                    file_path: String::new(),
+                    line: 1,
+                    text: String::new(),
+                    last_modified: None,
+                },
+            )
         };
-        let repos: Vec<String> =
-            rank_code_text(vec![hit("a1", false), hit("a2", false), hit("b1", true)], 2)
+        let phrase = CodeRank::Whole { whole: 0, name: 0 };
+        let words = CodeRank::Whole { whole: 1, name: 0 };
+        let ranked = |hits, limit| -> Vec<String> {
+            rank_code_text(hits, limit)
                 .into_iter()
                 .map(|r| match r {
                     SearchResult::CodeText { repo_name, .. } => repo_name,
                     _ => unreachable!(),
                 })
-                .collect();
-        assert_eq!(repos, ["b1", "a1"]);
+                .collect()
+        };
+        let hits = vec![
+            hit("a-one-term", CodeRank::some(1, 0)),
+            hit("a-words", words),
+            hit("a-two-terms", CodeRank::some(2, 0)),
+            hit("b-phrase", phrase),
+        ];
+        assert_eq!(
+            ranked(hits, 3),
+            ["b-phrase", "a-words", "a-two-terms"],
+            "a phrase anywhere, then the whole query, then the most terms"
+        );
+
+        let some = (0..fts::LOOSE_LIMIT + 5).map(|_| hit("some", CodeRank::some(1, 0)));
+        let hits: Vec<CodeTextHit> = some.chain([hit("whole", words)]).collect();
+        let kept = ranked(hits, 100);
+        assert_eq!(
+            kept.len(),
+            fts::LOOSE_LIMIT + 1,
+            "lines with some terms are capped"
+        );
+        assert_eq!(kept[0], "whole");
     }
 
     #[test]

@@ -2,10 +2,10 @@
 
 ["cosine-order.all"]
 false_rate = 1.0
-mrr = 0.945
-ndcg10 = 0.842
-r10 = 0.827
-r5 = 0.827
+mrr = 0.933
+ndcg10 = 0.821
+r10 = 0.816
+r5 = 0.805
 
 ["cosine-order.identifier"]
 mrr = 1.0
@@ -20,10 +20,10 @@ r10 = 0.75
 r5 = 0.75
 
 ["cosine-order.natural_language"]
-mrr = 1.0
-ndcg10 = 0.931
-r10 = 0.917
-r5 = 0.917
+mrr = 0.967
+ndcg10 = 0.873
+r10 = 0.878
+r5 = 0.856
 
 ["cosine-order.no_answer"]
 false_rate = 1.0
@@ -36,10 +36,10 @@ r5 = 1.0
 
 ["cosine.all"]
 false_rate = 1.0
-mrr = 0.923
-ndcg10 = 0.818
-r10 = 0.788
-r5 = 0.788
+mrr = 0.914
+ndcg10 = 0.784
+r10 = 0.753
+r5 = 0.753
 
 ["cosine.identifier"]
 mrr = 1.0
@@ -54,10 +54,10 @@ r10 = 0.5
 r5 = 0.5
 
 ["cosine.natural_language"]
-mrr = 1.0
-ndcg10 = 0.931
-r10 = 0.917
-r5 = 0.917
+mrr = 0.967
+ndcg10 = 0.843
+r10 = 0.822
+r5 = 0.822
 
 ["cosine.no_answer"]
 false_rate = 1.0
@@ -70,10 +70,10 @@ r5 = 1.0
 
 ["current.all"]
 false_rate = 1.0
-mrr = 0.974
-ndcg10 = 0.929
-r10 = 0.952
-r5 = 0.933
+mrr = 0.937
+ndcg10 = 0.901
+r10 = 0.937
+r5 = 0.92
 
 ["current.identifier"]
 mrr = 1.0
@@ -88,10 +88,10 @@ r10 = 1.0
 r5 = 1.0
 
 ["current.natural_language"]
-mrr = 1.0
-ndcg10 = 0.926
-r10 = 0.938
-r5 = 0.896
+mrr = 0.922
+ndcg10 = 0.873
+r10 = 0.911
+r5 = 0.878
 
 ["current.no_answer"]
 false_rate = 1.0
@@ -104,10 +104,10 @@ r5 = 1.0
 
 ["keyword.all"]
 false_rate = 0.5
-mrr = 0.728
-ndcg10 = 0.722
-r10 = 0.824
-r5 = 0.824
+mrr = 0.733
+ndcg10 = 0.727
+r10 = 0.839
+r5 = 0.822
 
 ["keyword.identifier"]
 mrr = 0.75
@@ -122,10 +122,10 @@ r10 = 1.0
 r5 = 1.0
 
 ["keyword.natural_language"]
-mrr = 0.813
-ndcg10 = 0.73
-r10 = 0.785
-r5 = 0.785
+mrr = 0.806
+ndcg10 = 0.738
+r10 = 0.822
+r5 = 0.789
 
 ["keyword.no_answer"]
 false_rate = 0.5
