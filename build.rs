@@ -59,6 +59,19 @@ fn rerun_on_new_commit() {
         return;
     };
     let (git_dir, common) = (Path::new(&git_dir), Path::new(&common));
+    // The reftable backend keeps every ref, HEAD included, in tables
+    // listed by `reftable/tables.list`, which each update rewrites (any
+    // branch's, so a commit elsewhere reruns this too). A worktree's HEAD
+    // is in its own reftable directory.
+    if common.join("reftable").is_dir() {
+        for dir in [common, git_dir] {
+            let list = dir.join("reftable").join("tables.list");
+            if list.exists() {
+                println!("cargo:rerun-if-changed={}", list.display());
+            }
+        }
+        return;
+    }
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     // A detached HEAD holds the commit itself.
     let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
