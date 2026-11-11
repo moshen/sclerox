@@ -15,14 +15,14 @@ fn main() {
 
 /// Sets `SCLEROX_BUILD_VERSION` for `src/version.rs`: the release tag the
 /// release workflow passes in `SCLEROX_VERSION`, or Cargo.toml's version,
-/// plus `+<short commit>` when built from a git checkout.
+/// plus `+<short commit>` when built from a git checkout of this source.
 fn build_version() {
     println!("cargo:rerun-if-env-changed=SCLEROX_VERSION");
     let version = std::env::var("SCLEROX_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
-    let version = match git(&["rev-parse", "--short", "HEAD"]) {
+    let version = match own_checkout().and_then(|_| git(&["rev-parse", "--short", "HEAD"])) {
         Some(commit) => {
             rerun_on_new_commit();
             format!("{version}+{commit}")
@@ -32,9 +32,19 @@ fn build_version() {
     println!("cargo:rustc-env=SCLEROX_BUILD_VERSION={version}");
 }
 
+/// Whether git finds a checkout whose top is this package, not one this
+/// source was merely unpacked inside.
+fn own_checkout() -> Option<()> {
+    let top = std::fs::canonicalize(git(&["rev-parse", "--show-toplevel"])?).ok()?;
+    let manifest = std::fs::canonicalize(std::env::var("CARGO_MANIFEST_DIR").ok()?).ok()?;
+    (top == manifest).then_some(())
+}
+
 /// Rerun when HEAD moves: a checkout changes `HEAD`, a commit changes the
 /// branch's ref (loose, or in `packed-refs` after a gc). In a worktree,
-/// `HEAD` is its own but refs are shared with the main checkout.
+/// `HEAD` is its own but refs are shared with the main checkout. Cargo reruns
+/// on every build for a path that doesn't exist, so a missing file is watched
+/// through its nearest existing directory, which catches it being created.
 fn rerun_on_new_commit() {
     let (Some(git_dir), Some(common)) = (
         git(&["rev-parse", "--git-dir"]),
@@ -48,7 +58,9 @@ fn rerun_on_new_commit() {
         watch.push(common.join(branch));
     }
     for path in watch {
-        println!("cargo:rerun-if-changed={}", path.display());
+        if let Some(existing) = path.ancestors().find(|p| p.exists()) {
+            println!("cargo:rerun-if-changed={}", existing.display());
+        }
     }
 }
 
