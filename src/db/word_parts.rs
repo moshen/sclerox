@@ -248,8 +248,7 @@ unsafe extern "C" fn on_token(
     ) else {
         return rc;
     };
-    for part in parts(word) {
-        let text = fold(word, folded, part.clone());
+    for (part, text) in folded_parts(word, folded) {
         let rc = (call.token)(
             call.ctx,
             FTS5_TOKEN_COLOCATED,
@@ -265,24 +264,38 @@ unsafe extern "C" fn on_token(
     SQLITE_OK
 }
 
-/// The `part` of `word` as unicode61 folded the whole word to `folded`: the
-/// same characters of it when folding kept one per character (it drops
-/// diacritics), else the part's letters and digits lower-cased, which drops
-/// combining marks as unicode61 does.
-fn fold(word: &str, folded: &str, part: std::ops::Range<usize>) -> String {
-    let (from, to) = (
-        word[..part.start].chars().count(),
-        word[..part.end].chars().count(),
-    );
-    if folded.chars().count() == word.chars().count() {
-        folded.chars().skip(from).take(to - from).collect()
-    } else {
-        word[part]
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect()
+/// The [`parts`] of `word` with their text as unicode61 folded the whole
+/// word to `folded`: the same characters of it when folding kept one per
+/// character (it drops diacritics), else the part's letters and digits
+/// lower-cased, which drops combining marks as unicode61 does. Linear in the
+/// word, however many parts it has.
+fn folded_parts(word: &str, folded: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let parts = parts(word);
+    if parts.is_empty() {
+        return Vec::new();
     }
+    let starts: Vec<usize> = word.char_indices().map(|(b, _)| b).collect();
+    let folded: Vec<char> = folded.chars().collect();
+    let same = folded.len() == starts.len();
+    // A part's bounds are character boundaries, so each is found.
+    let char_at = |b: usize| starts.binary_search(&b).unwrap_or(starts.len());
+    parts
+        .into_iter()
+        .map(|part| {
+            let text = if same {
+                folded[char_at(part.start)..char_at(part.end)]
+                    .iter()
+                    .collect()
+            } else {
+                word[part.clone()]
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect()
+            };
+            (part, text)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -314,12 +327,25 @@ mod tests {
 
     #[test]
     fn parts_take_the_folded_form() {
-        assert_eq!(fold("CaféMenu", "cafemenu", 0..5), "cafe");
-        assert_eq!(fold("CaféMenu", "cafemenu", 5..9), "menu");
+        let texts = |word, folded| -> Vec<String> {
+            folded_parts(word, folded)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect()
+        };
+        assert_eq!(texts("CaféMenu", "cafemenu"), ["cafe", "menu"]);
         // A decomposed é folds to one character fewer.
-        let word = "Cafe\u{301}Menu";
-        assert_eq!(fold(word, "cafemenu", 0..6), "cafe");
-        assert_eq!(fold(word, "cafemenu", 6..10), "menu");
+        assert_eq!(texts("Cafe\u{301}Menu", "cafemenu"), ["cafe", "menu"]);
+        assert!(texts("Menu", "menu").is_empty());
+    }
+
+    #[test]
+    fn a_long_joined_word_folds_in_linear_time() {
+        let word = "Ab".repeat(50_000);
+        let folded = word.to_lowercase();
+        let started = std::time::Instant::now();
+        assert_eq!(folded_parts(&word, &folded).len(), 50_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     fn matches(tokenize: &str, text: &str, query: &str) -> bool {
