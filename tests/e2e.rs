@@ -546,6 +546,82 @@ fn session_distill_keeps_hand_written_memory_and_flags_rewrite() {
     assert!(out.contains("API host"), "{out}");
 }
 
+#[test]
+fn a_score_merge_keeps_the_settled_key_and_its_provenance() {
+    let e = Env::new();
+    let home = e._dir.path().join("home");
+    let proj = home.join(".claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    // Distill session `id` with a stub distiller answering `memories`.
+    let distill = |id: &str, memories: serde_json::Value| {
+        let transcript: String = ["ok", "ok", "ok", "noted", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let role = if i % 2 == 1 { "assistant" } else { "user" };
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type": role, "message": {"content": text}})
+                )
+            })
+            .collect();
+        std::fs::write(proj.join(format!("{id}.jsonl")), transcript).unwrap();
+        let resp = e._dir.path().join(format!("{id}.json"));
+        std::fs::write(&resp, memories.to_string()).unwrap();
+        let resp_arg = resp.display().to_string().replace('\\', "/");
+        e.cmd()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".state"))
+            .env("SCLEROX_EMBED_ENABLED", "false")
+            .args(["hook", "distill-session", "--session-id", id])
+            .args(["--via", &format!("sh -c 'cat \"{resp_arg}\"' sh")])
+            .assert()
+            .success();
+    };
+    let queue = "The job queue listens on port 5672 for the invoicing workers.";
+    let cache = "Cache entries expire after ten minutes unless an admin pins them.";
+    let memory = |key: &str, value: &str| serde_json::json!({"key": key, "value": value, "type": "project", "supersedes": null});
+    distill(
+        "first",
+        serde_json::json!([
+            memory("queue-port", queue),
+            memory("cache-ttl", cache),
+            memory(
+                "deploy-day",
+                "Deploys go out on Tuesdays after the standup."
+            ),
+        ]),
+    );
+    distill(
+        "second",
+        serde_json::json!([
+            // A fresh slug for a stored fact: the settled key absorbs it.
+            memory("queue-listen-port", queue),
+            // An existing key reused for another stored fact: that one is
+            // retired into it, leaving one key.
+            memory("deploy-day", cache),
+        ]),
+    );
+
+    let out = e.run(&["memory", "get", "queue-port"]);
+    assert!(
+        out.contains("second"),
+        "the merge is traced to its session: {out}"
+    );
+    e.cmd()
+        .args(["memory", "get", "queue-listen-port"])
+        .assert()
+        .stdout(predicate::str::contains("Not found"));
+
+    let out = e.run(&["memory", "get", "deploy-day"]);
+    assert!(out.contains("admin pins them"), "{out}");
+    let out = e.run(&["--output", "json", "memory", "get", "cache-ttl"]);
+    let entry: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(entry["status"], "superseded", "{out}");
+}
+
 /// Run git in `dir` with a fixed identity; trimmed stdout.
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let mut command = std::process::Command::new("git");

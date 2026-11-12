@@ -1368,61 +1368,108 @@ fn distill_chunked(
                 })
                 .collect();
 
+            // A key the distiller reused from the existing memories is a name
+            // it chose, as much as one it declared in `supersedes`.
+            let reused = db
+                .memory_get(&m.key)
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.status == "active");
+            let action = decide_dedup_action(declared, &candidates, merge_threshold, reused);
+            // The key that holds this value once the write succeeds.
+            let settled_key = match &action {
+                DedupAction::Absorb(into) => into.clone(),
+                _ => m.key.clone(),
+            };
             // Ok(None): stored. Ok(Some(why)): a guarded write refused and
             // stored nothing. Err: the write failed.
-            let outcome: Result<Option<&str>> =
-                match decide_dedup_action(declared, &candidates, merge_threshold) {
-                    DedupAction::Insert => db
-                        .memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
-                        .map(|id| id.is_none().then_some("key is hand-written")),
-                    DedupAction::Merge(old_key) => {
-                        let merged = db.memory_supersede_unless_manual(
-                            &old_key,
-                            &m.key,
-                            &m.value,
-                            &m.memory_type,
-                            source,
+            let outcome: Result<Option<&str>> = match action {
+                DedupAction::Insert => db
+                    .memory_set_unless_manual(&m.key, &m.value, &m.memory_type, None, source)
+                    .map(|id| id.is_none().then_some("key is hand-written")),
+                DedupAction::Supersede(old_key) => {
+                    let merged = db.memory_supersede_unless_manual(
+                        &old_key,
+                        &m.key,
+                        &m.value,
+                        &m.memory_type,
+                        source,
+                    );
+                    if let Ok(true) = merged {
+                        log::info!("memory '{}' superseded '{old_key}'", m.key);
+                    }
+                    merged.map(|ok| {
+                        (!ok).then_some("merge target no longer active, or key is hand-written")
+                    })
+                }
+                DedupAction::Absorb(into) => {
+                    // Update in place under the key that is already there.
+                    // Superseding it into `m.key` would rename a settled
+                    // memory to whatever slug this run happened to mint,
+                    // and the next run mints another, which is how one
+                    // fact ends up cycling through a chain of names.
+                    //
+                    // Update only the matched row: an upsert would recreate
+                    // the target if a concurrent distillation retired it
+                    // since the match, resurrecting the very key this is
+                    // meant to settle, and a write by key alone would land on
+                    // whatever row took the key since.
+                    let matched = near_dups
+                        .iter()
+                        .find(|sm| sm.entry.key == into)
+                        .map(|sm| sm.entry.id)
+                        .expect("an absorb target is one of the near-duplicates");
+                    let absorbed = db.memory_update_unless_manual(
+                        matched,
+                        &into,
+                        &m.value,
+                        &m.memory_type,
+                        source,
+                    );
+                    if let Ok(Some(_)) = absorbed {
+                        log::info!(
+                            "memory '{}' absorbed into '{into}', which keeps its key",
+                            m.key
                         );
-                        if let Ok(true) = merged {
-                            log::info!("memory '{}' merged into '{old_key}'", m.key);
-                        }
-                        merged.map(|ok| {
-                            (!ok).then_some("merge target no longer active, or key is hand-written")
-                        })
                     }
-                    DedupAction::Flag => {
-                        // Genuinely ambiguous, or the only matches are hand-written:
-                        // store and flag rather than guess which side should win.
-                        match db.memory_set_unless_manual(
-                            &m.key,
-                            &m.value,
-                            &m.memory_type,
-                            None,
-                            source,
-                        ) {
-                            Ok(Some(new_id)) => {
-                                for sm in near_dups.iter().filter(|sm| {
-                                    !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
-                                }) {
-                                    let _ = db.memory_conflict_add(
-                                        new_id,
-                                        sm.entry.id,
-                                        Some(sm.score as f64),
-                                    );
-                                }
-                                log::info!(
-                                    "memory '{}' near-duplicates {} existing entries; flagged \
-                                     in memory_conflicts for review",
-                                    m.key,
-                                    near_dups.len()
+                    absorbed.map(|id| {
+                        id.is_none()
+                            .then_some("merge target no longer active, or key is hand-written")
+                    })
+                }
+                DedupAction::Flag => {
+                    // Genuinely ambiguous, or the only matches are hand-written:
+                    // store and flag rather than guess which side should win.
+                    match db.memory_set_unless_manual(
+                        &m.key,
+                        &m.value,
+                        &m.memory_type,
+                        None,
+                        source,
+                    ) {
+                        Ok(Some(new_id)) => {
+                            for sm in near_dups.iter().filter(|sm| {
+                                !db.memory_is_distinct(new_id, sm.entry.id).unwrap_or(false)
+                            }) {
+                                let _ = db.memory_conflict_add(
+                                    new_id,
+                                    sm.entry.id,
+                                    Some(sm.score as f64),
                                 );
-                                Ok(None)
                             }
-                            Ok(None) => Ok(Some("key is hand-written")),
-                            Err(e) => Err(e),
+                            log::info!(
+                                "memory '{}' near-duplicates {} existing entries; flagged \
+                                     in memory_conflicts for review",
+                                m.key,
+                                near_dups.len()
+                            );
+                            Ok(None)
                         }
+                        Ok(None) => Ok(Some("key is hand-written")),
+                        Err(e) => Err(e),
                     }
-                };
+                }
+            };
             // Nothing stored means no vector either: on a refused write the
             // active row is someone else's, and must not get this value's.
             match outcome {
@@ -1436,11 +1483,11 @@ fn distill_chunked(
                     continue;
                 }
             }
-            // Persist the embedding for the (possibly new) key.
+            // Persist the embedding for the key that now holds the value.
             if let Some(v) = &emb {
-                let _ = db.memory_set_embedding(&m.key, v);
+                let _ = db.memory_set_embedding(&settled_key, v);
             }
-            note(&m.key, m);
+            note(&settled_key, m);
             stored += 1;
         }
     }
@@ -1453,8 +1500,13 @@ fn distill_chunked(
 enum DedupAction {
     /// No close match: store it as a new memory.
     Insert,
-    /// Merge into this existing key, superseding it.
-    Merge(String),
+    /// Retire this key into the new one. The distiller chose the new name:
+    /// it named this key via `supersedes`, having read both values, or it
+    /// reused an existing key while a score matched this one.
+    Supersede(String),
+    /// A score says this restates the memory under this key. Nothing chose the
+    /// new name, so the existing key keeps it and only the value is updated.
+    Absorb(String),
     /// Too ambiguous to merge: store it and flag every match for review.
     Flag,
 }
@@ -1486,13 +1538,18 @@ struct Candidate<'a> {
 /// `merge_threshold` of `None` means the embedding model's scores have not
 /// been calibrated for merging: nothing merges on score alone, single match or
 /// many, and every match is flagged for review instead.
+///
+/// A merge keeps whichever name was chosen: the matched key absorbs the value
+/// unless `reused`, when the distiller picked an existing key for it, which
+/// then supersedes the match.
 fn decide_dedup_action(
     declared: Option<&str>,
     candidates: &[Candidate<'_>],
     merge_threshold: Option<f64>,
+    reused: bool,
 ) -> DedupAction {
     if let Some(key) = declared {
-        return DedupAction::Merge(key.to_string());
+        return DedupAction::Supersede(key.to_string());
     }
     let Some(merge_threshold) = merge_threshold else {
         return if candidates.is_empty() {
@@ -1509,7 +1566,13 @@ fn decide_dedup_action(
         .filter(|c| c.source != "manual")
         .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
         .filter(|c| c.score as f64 >= merge_threshold)
-        .map(|c| DedupAction::Merge(c.key.to_string()))
+        .map(|c| {
+            if reused {
+                DedupAction::Supersede(c.key.to_string())
+            } else {
+                DedupAction::Absorb(c.key.to_string())
+            }
+        })
         .unwrap_or(DedupAction::Flag)
 }
 
@@ -2027,7 +2090,7 @@ mod tests {
     #[test]
     fn dedup_inserts_when_nothing_matches() {
         assert_eq!(
-            decide_dedup_action(None, &[], Some(0.95)),
+            decide_dedup_action(None, &[], Some(0.95), false),
             DedupAction::Insert
         );
     }
@@ -2036,12 +2099,15 @@ mod tests {
     fn dedup_merges_single_distilled_match_only_at_threshold() {
         let c = [cand("existing", "session", 0.96)];
         assert_eq!(
-            decide_dedup_action(None, &c, Some(0.95)),
-            DedupAction::Merge("existing".to_string())
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Absorb("existing".to_string())
         );
         // A lone match below the threshold may be a similar but distinct fact.
         let c = [cand("existing", "session", 0.86)];
-        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Flag
+        );
     }
 
     #[test]
@@ -2049,7 +2115,10 @@ mod tests {
         // The user wrote it deliberately; a distilled near-match must not
         // silently replace it, however high the score.
         let c = [cand("hand-written", "manual", 0.99)];
-        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Flag
+        );
     }
 
     #[test]
@@ -2061,15 +2130,18 @@ mod tests {
             cand("closest", "session", 0.97),
         ];
         assert_eq!(
-            decide_dedup_action(None, &c, Some(0.95)),
-            DedupAction::Merge("closest".to_string())
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Absorb("closest".to_string())
         );
     }
 
     #[test]
     fn dedup_flags_ambiguous_cluster_below_threshold() {
         let c = [cand("one", "session", 0.88), cand("two", "session", 0.90)];
-        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Flag
+        );
     }
 
     #[test]
@@ -2081,8 +2153,8 @@ mod tests {
             cand("distilled", "session", 0.96),
         ];
         assert_eq!(
-            decide_dedup_action(None, &c, Some(0.95)),
-            DedupAction::Merge("distilled".to_string())
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Absorb("distilled".to_string())
         );
     }
 
@@ -2092,7 +2164,70 @@ mod tests {
             cand("hand-a", "manual", 0.99),
             cand("hand-b", "manual", 0.97),
         ];
-        assert_eq!(decide_dedup_action(None, &c, Some(0.95)), DedupAction::Flag);
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), false),
+            DedupAction::Flag
+        );
+    }
+
+    /// The chain this prevents: before, a score-driven merge superseded the
+    /// settled key into whatever slug the run had just minted, so one fact
+    /// walked through a new name every time it came up.
+    #[test]
+    fn a_score_driven_merge_keeps_the_settled_key() {
+        let c = [cand("settled-key", "session", 0.98)];
+        match decide_dedup_action(None, &c, Some(0.95), false) {
+            DedupAction::Absorb(into) => assert_eq!(
+                into, "settled-key",
+                "the existing key survives; the fresh slug is discarded"
+            ),
+            other => panic!("expected Absorb, got {other:?}"),
+        }
+    }
+
+    /// Absorbing writes the new value under the key already in the database,
+    /// so repeated mentions of one fact cannot walk it through a chain of
+    /// names however many slugs the distiller invents.
+    #[test]
+    fn repeated_absorbs_leave_exactly_one_key() {
+        let db = Database::open_in_memory().unwrap();
+        db.memory_set_full("settled-key", "first", "project", None, "session")
+            .unwrap();
+
+        for (slug, value) in [("fresh-slug-one", "second"), ("fresh-slug-two", "third")] {
+            let c = [cand("settled-key", "session", 0.98)];
+            let DedupAction::Absorb(into) = decide_dedup_action(None, &c, Some(0.95), false) else {
+                panic!("expected Absorb");
+            };
+            db.memory_set_unless_manual(&into, value, "project", None, "session")
+                .unwrap();
+            assert!(
+                db.memory_get(slug).unwrap().is_none(),
+                "{slug} must never become a memory of its own"
+            );
+        }
+
+        let active = db.memory_list(None, Some("active")).unwrap();
+        assert_eq!(active.len(), 1, "one fact, one key: {active:?}");
+        assert_eq!(active[0].key, "settled-key");
+        assert_eq!(active[0].value, "third", "the value still updates");
+    }
+
+    /// A key the distiller reused is a chosen name too: the match is retired
+    /// into it instead of absorbing the value and leaving both keys active.
+    #[test]
+    fn a_score_match_supersedes_into_a_reused_key() {
+        let c = [cand("other-key", "session", 0.98)];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), true),
+            DedupAction::Supersede("other-key".to_string())
+        );
+        // Below the threshold it is still only flagged.
+        let c = [cand("other-key", "session", 0.90)];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.95), true),
+            DedupAction::Flag
+        );
     }
 
     #[test]
@@ -2101,8 +2236,8 @@ mod tests {
         // says they are worded alike. Below-threshold matches must not override.
         let c = [cand("some-other", "session", 0.60)];
         assert_eq!(
-            decide_dedup_action(Some("declared-key"), &c, Some(0.95)),
-            DedupAction::Merge("declared-key".to_string())
+            decide_dedup_action(Some("declared-key"), &c, Some(0.95), false),
+            DedupAction::Supersede("declared-key".to_string())
         );
     }
 
@@ -2111,22 +2246,31 @@ mod tests {
         // An uncalibrated model: even a lone, near-identical distilled match is
         // flagged for review rather than merged on its score.
         let single = [cand("existing", "session", 0.99)];
-        assert_eq!(decide_dedup_action(None, &single, None), DedupAction::Flag);
+        assert_eq!(
+            decide_dedup_action(None, &single, None, false),
+            DedupAction::Flag
+        );
         let many = [cand("a", "session", 0.99), cand("b", "session", 0.98)];
-        assert_eq!(decide_dedup_action(None, &many, None), DedupAction::Flag);
-        assert_eq!(decide_dedup_action(None, &[], None), DedupAction::Insert);
+        assert_eq!(
+            decide_dedup_action(None, &many, None, false),
+            DedupAction::Flag
+        );
+        assert_eq!(
+            decide_dedup_action(None, &[], None, false),
+            DedupAction::Insert
+        );
         // The distiller's own judgement still applies: it is not a score.
         assert_eq!(
-            decide_dedup_action(Some("declared-key"), &single, None),
-            DedupAction::Merge("declared-key".to_string())
+            decide_dedup_action(Some("declared-key"), &single, None, false),
+            DedupAction::Supersede("declared-key".to_string())
         );
     }
 
     #[test]
     fn dedup_declared_supersedes_applies_with_no_matches_at_all() {
         assert_eq!(
-            decide_dedup_action(Some("declared-key"), &[], Some(0.95)),
-            DedupAction::Merge("declared-key".to_string())
+            decide_dedup_action(Some("declared-key"), &[], Some(0.95), false),
+            DedupAction::Supersede("declared-key".to_string())
         );
     }
 

@@ -106,7 +106,7 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
     ) -> Result<i64> {
-        self.memory_upsert(key, value, memory_type, tags, source, false, None)
+        self.memory_upsert(key, value, memory_type, tags, source, false, None, None)
             .map(|id| id.expect("an unguarded upsert always writes"))
     }
 
@@ -122,7 +122,26 @@ impl Database {
         tags: Option<&[String]>,
         source: &str,
     ) -> Result<Option<i64>> {
-        self.memory_upsert(key, value, memory_type, tags, source, true, None)
+        self.memory_upsert(key, value, memory_type, tags, source, true, None, None)
+    }
+
+    /// [`memory_set_unless_manual`](Self::memory_set_unless_manual) that only
+    /// updates row `id`, and only while it is still the active row under
+    /// `key`. Otherwise (it was retired, perhaps with a new row under `key`
+    /// since) it writes nothing and returns `None`, where an upsert would make
+    /// a new active row and bring a retired key back, or overwrite a row the
+    /// caller never matched. The check and the write are one statement, so a
+    /// supersede landing between a caller's lookup and this write can't be
+    /// undone by it.
+    pub fn memory_update_unless_manual(
+        &self,
+        id: i64,
+        key: &str,
+        value: &str,
+        memory_type: &str,
+        source: &str,
+    ) -> Result<Option<i64>> {
+        self.memory_upsert(key, value, memory_type, None, source, true, None, Some(id))
     }
 
     /// [`memory_set_unless_manual`](Self::memory_set_unless_manual) that also
@@ -146,6 +165,7 @@ impl Database {
             source,
             true,
             Some(original_id),
+            None,
         )
     }
 
@@ -159,9 +179,15 @@ impl Database {
         source: &str,
         protect_manual: bool,
         distinct_from: Option<i64>,
+        update_id: Option<i64>,
     ) -> Result<Option<i64>> {
         let tags_json = tags.map(|t| serde_json::to_string(t).unwrap());
         let mut guards = Vec::new();
+        // An integer, so safe to inline; the snapshot shares the guard.
+        let only_row = update_id.map(|id| format!("memory.id = {id}"));
+        if let Some(only_row) = &only_row {
+            guards.push(only_row.as_str());
+        }
         if protect_manual {
             guards.push("memory.source != 'manual'");
         }
@@ -172,8 +198,29 @@ impl Database {
             );
         }
         let guard = guards.join(" AND ");
-        let sql = format!(
-            "INSERT INTO memory (key, value, memory_type, tags, source)
+        let sql = if update_id.is_some() {
+            format!(
+                "UPDATE memory SET
+                   value       = ?2,
+                   embedding   = CASE WHEN value IS ?2 THEN embedding END,
+                   -- A review vouched for the old fact, not this one.
+                   reviewed_at = CASE WHEN value IS ?2 AND memory_type IS ?3
+                                      THEN reviewed_at END,
+                   memory_type = ?3,
+                   -- An update brings no tags of its own; keep the row's.
+                   tags        = COALESCE(?4, tags),
+                   source      = CASE WHEN ?5 = 'manual' THEN 'manual' ELSE source END,
+                   updated_at  = datetime('now')
+                 WHERE key = ?1 AND status = 'active'{}",
+                if guard.is_empty() {
+                    String::new()
+                } else {
+                    format!(" AND {guard}")
+                }
+            )
+        } else {
+            format!(
+                "INSERT INTO memory (key, value, memory_type, tags, source)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) WHERE status = 'active' DO UPDATE SET
                value      = excluded.value,
@@ -188,12 +235,13 @@ impl Database {
                                  THEN 'manual' ELSE memory.source END,
                updated_at = datetime('now')
              {}",
-            if guard.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {guard}")
-            }
-        );
+                if guard.is_empty() {
+                    String::new()
+                } else {
+                    format!("WHERE {guard}")
+                }
+            )
+        };
         let write = |conn: &Connection| -> Result<Option<i64>> {
             // Same guard as the update, so a refused write keeps no copy.
             snapshot_active(
@@ -201,7 +249,9 @@ impl Database {
                 key,
                 value,
                 memory_type,
-                Some(tags_json.as_deref()),
+                // An update without tags leaves them alone, so they don't
+                // count as a change.
+                (update_id.is_none() || tags_json.is_some()).then_some(tags_json.as_deref()),
                 &guard,
                 distinct_from,
             )?;
@@ -1252,6 +1302,75 @@ mod tests {
             .memory_set_unless_manual("fresh", "v", "project", None, "session")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn test_update_only_never_brings_a_retired_key_back() {
+        let db = Database::open_in_memory().unwrap();
+        let tags = ["infra".to_string()];
+        let settled = db
+            .memory_set_full("settled", "v1", "project", Some(&tags), "session")
+            .unwrap();
+        let hand = db
+            .memory_set("hand", "written by a human", "project", None)
+            .unwrap();
+
+        db.memory_review("settled").unwrap();
+        // Rewriting the same fact keeps its review.
+        db.memory_update_unless_manual(settled, "settled", "v1", "project", "session")
+            .unwrap();
+        let same = db.memory_get("settled").unwrap().unwrap();
+        assert!(same.reviewed_at.is_some());
+        // An update brings no tags, so it keeps the row's and, being the
+        // same fact, adds no history.
+        assert_eq!(same.tags, Some(vec!["infra".to_string()]));
+        assert_eq!(db.memory_history("settled").unwrap().len(), 1);
+
+        let id = db
+            .memory_update_unless_manual(settled, "settled", "v2", "project", "session")
+            .unwrap();
+        assert_eq!(id, Some(settled));
+        let updated = db.memory_get("settled").unwrap().unwrap();
+        assert_eq!(updated.value, "v2");
+        // A new value has not been reviewed.
+        assert!(updated.reviewed_at.is_none());
+        // The replaced value is kept in history, as for any update.
+        assert_eq!(db.memory_history("settled").unwrap().len(), 2);
+
+        // Retired by another writer since the caller looked: nothing written.
+        db.memory_supersede("settled", "renamed", "v3", "project", "session")
+            .unwrap();
+        assert!(db
+            .memory_update_unless_manual(settled, "settled", "v4", "project", "session")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.memory_get("settled").unwrap().unwrap().status,
+            "superseded"
+        );
+
+        // A new row under the key since is not the row the caller matched.
+        let successor = db
+            .memory_set_full("settled", "new fact", "project", None, "session")
+            .unwrap();
+        let history = db.memory_history("settled").unwrap().len();
+        assert!(db
+            .memory_update_unless_manual(settled, "settled", "v5", "project", "session")
+            .unwrap()
+            .is_none());
+        let active = db.memory_get("settled").unwrap().unwrap();
+        assert_eq!((active.id, active.value.as_str()), (successor, "new fact"));
+        assert_eq!(db.memory_history("settled").unwrap().len(), history);
+
+        // Nor a hand-written row.
+        assert!(db
+            .memory_update_unless_manual(hand, "hand", "distilled", "project", "session")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.memory_get("hand").unwrap().unwrap().value,
+            "written by a human"
+        );
     }
 
     #[test]
