@@ -8,6 +8,7 @@ mod logging;
 mod migrate;
 mod output;
 mod search;
+mod version;
 mod xdg;
 
 use anyhow::Result;

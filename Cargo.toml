@@ -1,6 +1,6 @@
 [package]
 name = "sclerox"
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2021"
 description = "Sclerox CLI - SQLite-backed knowledge base for AI-augmented engineering"
 

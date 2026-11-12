@@ -191,7 +191,7 @@ fn agent() -> ureq::Agent {
         // Per read, not for the whole file: a slow link still finishes, a dead
         // one does not hang a session hook forever.
         .timeout_recv_body(Some(Duration::from_secs(60)))
-        .user_agent(concat!("sclerox/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("sclerox/{}", crate::version::VERSION))
         // Trust the OS certificate store, not ureq's bundled Mozilla roots.
         // Corporate networks that inspect TLS install their root CA in the OS
         // store (e.g. the macOS Keychain); with bundled roots only, every

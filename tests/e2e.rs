@@ -78,6 +78,34 @@ impl Env {
     }
 }
 
+#[test]
+fn version_is_the_release_tag_or_dev_and_the_commit() {
+    let e = Env::new();
+    let tag = option_env!("SCLEROX_VERSION")
+        .filter(|v| !v.is_empty())
+        .unwrap_or("0.0.0-dev");
+    let git = |args: &[&str]| {
+        let out = sclerox::git::git_command(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(String::from_utf8(out.stdout).unwrap().trim().to_string())
+    };
+    // Built from a source archive, or one unpacked inside another checkout,
+    // the version has no commit.
+    let manifest = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let expected = match git(&["rev-parse", "--show-toplevel"])
+        .filter(|top| std::fs::canonicalize(top).ok() == Some(manifest))
+        .and_then(|_| git(&["rev-parse", "--short", "HEAD"]))
+    {
+        Some(commit) => format!("{tag}+{commit}"),
+        None => tag.to_string(),
+    };
+    assert_eq!(e.run(&["--version"]), format!("sclerox {expected}"));
+    assert_eq!(sclerox::version::VERSION, expected);
+}
+
 // ─── Memory ──────────────────────────────────────────────────────────────────
 
 #[test]

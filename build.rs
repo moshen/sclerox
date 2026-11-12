@@ -1,3 +1,4 @@
+use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
@@ -6,9 +7,116 @@ use std::path::PathBuf;
 // into $XDG_CACHE_HOME/sclerox/models/. See src/embed/download.rs.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    build_version();
 
     #[cfg(target_os = "windows")]
     copy_directml_dll();
+}
+
+/// Sets `SCLEROX_BUILD_VERSION` for `src/version.rs`: the release tag the
+/// release workflow passes in `SCLEROX_VERSION`, or Cargo.toml's version,
+/// plus `+<short commit>` when built from a git checkout of this source.
+fn build_version() {
+    println!("cargo:rerun-if-env-changed=SCLEROX_VERSION");
+    let version = std::env::var("SCLEROX_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
+    // Watched even before the first commit, so that commit shows up.
+    let commit = own_checkout().and_then(|_| {
+        rerun_on_new_commit();
+        git(&["rev-parse", "--short", "HEAD"])
+    });
+    let version = match commit {
+        Some(commit) => format!("{version}+{commit}"),
+        None => version,
+    };
+    println!("cargo:rustc-env=SCLEROX_BUILD_VERSION={version}");
+}
+
+/// Whether git finds a checkout whose top is this package, not one this
+/// source was merely unpacked inside.
+fn own_checkout() -> Option<()> {
+    let top = std::fs::canonicalize(git(&["rev-parse", "--show-toplevel"])?).ok()?;
+    let manifest = std::fs::canonicalize(std::env::var("CARGO_MANIFEST_DIR").ok()?).ok()?;
+    (top == manifest).then_some(())
+}
+
+/// Rerun when HEAD moves: a checkout changes `HEAD`, a commit changes the
+/// branch's ref. In a worktree, `HEAD` is its own but refs are shared with
+/// the main checkout. A loose ref file wins over `packed-refs`, so that is
+/// watched when it exists (a gc that packs it deletes it, which Cargo sees).
+/// Otherwise the branch is in `packed-refs` or not yet created, and its next
+/// commit writes the loose file, caught by watching its nearest existing
+/// directory under `refs/`. Cargo reruns on every build for a watched path
+/// that doesn't exist, and scans a watched directory whole, so nothing
+/// outside `refs/` is watched as a directory.
+fn rerun_on_new_commit() {
+    let (Some(git_dir), Some(common)) = (
+        git(&["rev-parse", "--git-dir"]),
+        git(&["rev-parse", "--git-common-dir"]),
+    ) else {
+        return;
+    };
+    let (git_dir, common) = (Path::new(&git_dir), Path::new(&common));
+    // The reftable backend keeps every ref, HEAD included, in tables
+    // listed by `reftable/tables.list`, which each update rewrites (any
+    // branch's, so a commit elsewhere reruns this too). A worktree's HEAD
+    // is in its own reftable directory.
+    if common.join("reftable").is_dir() {
+        for dir in [common, git_dir] {
+            let list = dir.join("reftable").join("tables.list");
+            if list.exists() {
+                println!("cargo:rerun-if-changed={}", list.display());
+            }
+        }
+        return;
+    }
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    // A detached HEAD holds the commit itself.
+    let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    let loose = common.join(branch);
+    let mut watch = Vec::new();
+    if loose.exists() {
+        watch.push(loose.as_path());
+    } else {
+        let packed = common.join("packed-refs");
+        if packed.exists() {
+            println!("cargo:rerun-if-changed={}", packed.display());
+        }
+        let refs = common.join("refs");
+        watch.extend(
+            loose
+                .ancestors()
+                .take_while(|p| p.starts_with(&refs))
+                .find(|p| p.exists()),
+        );
+    }
+    for path in watch {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// Runs git on this package's directory. Variables that tie git to one
+/// repository (`git rev-parse --local-env-vars`: `GIT_DIR` and the like,
+/// which git sets while running hooks) are cleared, so they can't point it
+/// at another repository.
+fn git(args: &[&str]) -> Option<String> {
+    let run = |args: &[&str], clear: &[String]| {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+        for var in clear {
+            command.env_remove(var);
+        }
+        let out = command.args(args).output().ok()?;
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (out.status.success() && !s.is_empty()).then_some(s)
+    };
+    let local = run(&["rev-parse", "--local-env-vars"], &[])?;
+    let local: Vec<String> = local.lines().map(str::to_string).collect();
+    run(args, &local)
 }
 
 #[cfg(target_os = "windows")]
