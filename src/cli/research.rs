@@ -27,15 +27,20 @@ pub enum ResearchCommand {
     },
     /// List investigations
     List {
+        /// Only investigations with this status
         #[arg(long, default_value = "open",
               value_parser = ["open","concluded","all"])]
         status: String,
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,
     },
-    /// Search investigations (FTS + semantic similarity combined)
+    /// Search investigations (FTS + semantic similarity combined; open only by default)
     Search {
         query: String,
+        /// Only investigations with this status
+        #[arg(long, default_value = "open",
+              value_parser = ["open","concluded","all"])]
+        status: String,
         #[command(flatten)]
         dates: crate::cli::dates::DateArgs,
     },
@@ -168,17 +173,26 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
             });
         }
 
-        ResearchCommand::Search { query, dates } => {
+        ResearchCommand::Search {
+            query,
+            status,
+            dates,
+        } => {
             let dates = dates.dates()?;
+            let command = crate::cli::usage::with_status("research search", &status, "open");
+            let status = (status != "all").then_some(status.as_str());
             // FTS results first
-            let fts_hits = db.investigation_search(&query, &dates)?;
+            let fts_hits = db.investigation_search(&query, status, &dates)?;
             let fts_ids: std::collections::HashSet<i64> = fts_hits.iter().map(|i| i.id).collect();
 
             // Semantic results - appended, deduped against FTS hits
             let query_emb = crate::embed::optional(db.semantic_ready())
                 .and_then(|mut e| e.embed_query(&query).ok());
             let semantic: Vec<_> = query_emb
-                .map(|qe| db.investigation_similar(&qe, 5, &dates).unwrap_or_default())
+                .map(|qe| {
+                    db.investigation_similar(&qe, 5, status, &dates)
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|r| !fts_ids.contains(&r.investigation.id))
@@ -226,7 +240,7 @@ pub fn run(db: &Database, cmd: ResearchCommand, format: OutputFormat) -> Result<
                     crate::cli::usage::semantic("research", &r.investigation.slug, r.score)
                 }))
                 .collect();
-            crate::cli::usage::search(db, "research search", &query, &logged);
+            crate::cli::usage::search(db, &command, &query, &logged);
         }
 
         ResearchCommand::Update {

@@ -134,8 +134,8 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 |---------|-------------|
 | `sclerox memory set <key> <value>` | Set a memory (types: general, user, feedback, project, reference) |
 | `sclerox memory get <key> [--history]` | Get a memory by key |
-| `sclerox memory list [--type <t>] [--all]` | List memories (active only by default) |
-| `sclerox memory search <query>` | FTS search (active memories only; `--all` includes stale) |
+| `sclerox memory list [--type <t>] [--status active\|stale\|superseded\|all]` | List memories (active only by default) |
+| `sclerox memory search <query> [--status active\|stale\|superseded\|all]` | FTS search (active only by default) |
 | `sclerox memory delete <key>` | Delete a memory permanently |
 | `sclerox memory stale <key>` | Mark as stale (preserved for history) |
 | `sclerox memory supersede <old> <new> <value>` | Replace with traceable back-link |
@@ -153,7 +153,7 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `sclerox todo list [--status open\|done\|watch\|all]` | List todos |
 | `sclerox todo add --title <title>` | Add a todo |
 | `sclerox todo get <id>` | Get a todo by ID |
-| `sclerox todo search <query> [--status open\|done\|watch\|all]` | Search todos (all statuses by default) |
+| `sclerox todo search <query> [--status open\|done\|watch\|all]` | Search todos (open only by default) |
 | `sclerox todo update <id> [--title\|--notes\|...]` | Edit a todo's fields |
 | `sclerox todo done <id> [--note]` | Mark done |
 | `sclerox todo watch <id>` | Convert to watch item |
@@ -178,7 +178,7 @@ Search symbols across all indexed repos. `--repo` filters by repo name substring
 | `sclerox research start --name <n> --slug <s>` | Start investigation |
 | `sclerox research get <id_or_slug>` | Get an investigation by ID or slug |
 | `sclerox research list [--status open\|concluded\|all]` | List investigations |
-| `sclerox research search <query>` | FTS + semantic similarity search combined |
+| `sclerox research search <query> [--status open\|concluded\|all]` | FTS + semantic similarity search combined (open only by default) |
 | `sclerox research update <id> [--name\|--plan\|--findings]` | Update plan, findings, or status |
 | `sclerox research add-source <id> --url <url>` | Add evidence URL |
 | `sclerox research sources <id>` | List sources for an investigation |

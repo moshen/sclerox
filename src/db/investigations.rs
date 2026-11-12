@@ -84,7 +84,12 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn investigation_search(&self, query: &str, dates: &Dates) -> Result<Vec<Investigation>> {
+    pub fn investigation_search(
+        &self,
+        query: &str,
+        status: Option<&str>,
+        dates: &Dates,
+    ) -> Result<Vec<Investigation>> {
         let source = fts::Source {
             fts: "investigations_fts",
             table: "investigations",
@@ -94,7 +99,7 @@ impl Database {
             like: "name LIKE ?1 ESCAPE '\\' OR slug LIKE ?1 ESCAPE '\\'
                 OR plan LIKE ?1 ESCAPE '\\' OR findings LIKE ?1 ESCAPE '\\'",
             then_by: "updated_at DESC",
-            status: None,
+            status,
             dates,
             changed: "updated_at",
             created: "created_at",
@@ -341,6 +346,7 @@ impl Database {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        status: Option<&str>,
         dates: &Dates,
     ) -> Result<Vec<SimilarInvestigation>> {
         self.semantic_read(|| {
@@ -384,7 +390,8 @@ impl Database {
                 },
                 |rows| {
                     let rows = rows.into_iter().filter(|r| {
-                        dates.keeps(&r.investigation.updated_at, &r.investigation.created_at)
+                        status.is_none_or(|s| r.investigation.status == s)
+                            && dates.keeps(&r.investigation.updated_at, &r.investigation.created_at)
                     });
                     crate::db::best_per_record(rows.collect(), |r| r.investigation.id, limit)
                 },
@@ -501,12 +508,12 @@ mod tests {
         .unwrap();
 
         let results = db
-            .investigation_search("Temporal", &Default::default())
+            .investigation_search("Temporal", None, &Default::default())
             .unwrap();
         assert_eq!(results.len(), 1);
 
         let results = db
-            .investigation_search("report-gen-worker", &Default::default())
+            .investigation_search("report-gen-worker", None, &Default::default())
             .unwrap();
         assert_eq!(results.len(), 1);
     }

@@ -73,6 +73,16 @@ pub fn search(db: &Database, command: &str, query: &str, results: &[UsageItem]) 
     search_as(db, &context(), command, query, results);
 }
 
+/// The command a search is logged under: `base`, plus `--status` when it
+/// isn't the default, so searches over different records stay apart.
+pub fn with_status(base: &str, status: &str, default: &str) -> String {
+    if status == default {
+        base.to_string()
+    } else {
+        format!("{base} --status {status}")
+    }
+}
+
 /// [`search`] for a caller that knows its own context, such as a hook given
 /// the session on stdin.
 pub fn search_as(

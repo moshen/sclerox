@@ -1,7 +1,6 @@
 # Research / Investigations
 
-`--name` is REQUIRED as a flag, never positional. Use `--status all` (not
-`--all`). Aliases: start = create/add/new, get = show, conclude = close/finish.
+`--name` is REQUIRED as a flag, never positional. Aliases: start = create/add/new, get = show, conclude = close/finish.
 
 ```bash
 sclerox research list                           # open investigations (default)
@@ -13,7 +12,7 @@ sclerox research sources <id>
 sclerox research update <id> [--plan "<text>"] [--findings "<text>"]
 sclerox research conclude <id> --findings "<findings>"
 sclerox research reopen <id>
-sclerox research search "<query>"
+sclerox research search "<query>"               # open only by default; --status concluded|all
 sclerox research people add|remove|list <id> <person_id>   # NOT link-person
 sclerox research projects add|remove|list <id> <project_id>
 ```

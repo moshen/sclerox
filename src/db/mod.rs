@@ -854,7 +854,7 @@ mod tests {
             1
         );
         assert_eq!(
-            db.investigation_search(query, &Default::default())
+            db.investigation_search(query, None, &Default::default())
                 .unwrap()
                 .len(),
             1
@@ -1027,7 +1027,7 @@ mod tests {
             .unwrap();
         db.investigation_store_chunks(b, &other()).unwrap();
         let hits = db
-            .investigation_similar(&query, 2, &Default::default())
+            .investigation_similar(&query, 2, None, &Default::default())
             .unwrap();
         assert_eq!(
             hits.iter().map(|h| h.investigation.id).collect::<Vec<_>>(),

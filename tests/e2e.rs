@@ -1282,13 +1282,67 @@ fn research_search_plan_and_findings() {
         "report-gen-worker had 30s limit; increased to 120s",
     ]);
 
+    // Concluded, so only found when asked for
+    let open = e.run(&["research", "search", "Temporal"]);
+    assert!(!open.contains("Timeout investigation"), "{open}");
+
     // Search by plan content
-    let by_plan = e.run(&["research", "search", "Temporal"]);
+    let by_plan = e.run(&["research", "search", "Temporal", "--status", "concluded"]);
     assert!(by_plan.contains("Timeout investigation"));
 
     // Search by findings content (hyphenated identifier)
-    let by_findings = e.run(&["research", "search", "report-gen-worker"]);
+    let by_findings = e.run(&["research", "search", "report-gen-worker", "--status", "all"]);
     assert!(by_findings.contains("Timeout investigation"));
+}
+
+#[test]
+fn list_and_search_default_to_current_records() {
+    let e = Env::new();
+    e.run(&["memory", "set", "old-port", "the queue listens on 5672"]);
+    e.run(&["memory", "stale", "old-port"]);
+    e.run(&["memory", "set", "new-port", "the queue listens on 5673"]);
+    let done = e.run_get_id(&["todo", "add", "--title", "Rotate queue password"]);
+    e.run(&["todo", "done", &done.to_string()]);
+    e.run(&["todo", "add", "--title", "Upgrade queue client"]);
+
+    for args in [&["memory", "list"][..], &["memory", "search", "queue"]] {
+        let out = e.run(args);
+        assert!(
+            out.contains("new-port") && !out.contains("old-port"),
+            "{out}"
+        );
+        for status in [&["--status", "all"][..], &["--all"]] {
+            let out = e.run(&[args, status].concat());
+            assert!(
+                out.contains("new-port") && out.contains("old-port"),
+                "{out}"
+            );
+        }
+        let out = e.run(&[args, &["--status", "stale"]].concat());
+        assert!(
+            !out.contains("new-port") && out.contains("old-port"),
+            "{out}"
+        );
+    }
+    e.cmd()
+        .args(["memory", "list", "--status", "gone"])
+        .assert()
+        .failure();
+    e.cmd()
+        .args(["memory", "list", "--all", "--status", "stale"])
+        .assert()
+        .failure();
+
+    for args in [&["todo", "list"][..], &["todo", "search", "queue"]] {
+        let out = e.run(args);
+        assert!(out.contains("Upgrade") && !out.contains("Rotate"), "{out}");
+        let out = e.run(&[args, &["--status", "done"]].concat());
+        assert!(!out.contains("Upgrade") && out.contains("Rotate"), "{out}");
+    }
+    e.cmd()
+        .args(["todo", "list", "--status", "gone"])
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -2111,6 +2165,39 @@ fn search_and_get_are_recorded_with_the_session() {
     assert_eq!(
         read,
         ("todo get".into(), "todo:1".into(), "session-1".into())
+    );
+}
+
+#[test]
+fn a_search_is_logged_with_its_status_when_not_the_default() {
+    let e = Env::new();
+    for args in [
+        &["memory", "search", "queue"][..],
+        &["memory", "search", "queue", "--all"],
+        &["todo", "search", "queue", "--status", "open"],
+        &["todo", "search", "queue", "--status", "done"],
+        &["research", "search", "queue", "--status", "all"],
+    ] {
+        e.run(args);
+    }
+    let conn = rusqlite::Connection::open(&e.db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT command FROM retrieval_events ORDER BY id")
+        .unwrap();
+    let commands: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "memory search",
+            "memory search --status all",
+            "todo search",
+            "todo search --status done",
+            "research search --status all",
+        ]
     );
 }
 
