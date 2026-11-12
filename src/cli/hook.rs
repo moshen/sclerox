@@ -1409,11 +1409,23 @@ fn distill_chunked(
                     // and the next run mints another, which is how one
                     // fact ends up cycling through a chain of names.
                     //
-                    // Update only: an upsert would recreate the target if a
-                    // concurrent distillation retired it since the match,
-                    // resurrecting the very key this is meant to settle.
-                    let absorbed =
-                        db.memory_update_unless_manual(&into, &m.value, &m.memory_type, source);
+                    // Update only the matched row: an upsert would recreate
+                    // the target if a concurrent distillation retired it
+                    // since the match, resurrecting the very key this is
+                    // meant to settle, and a write by key alone would land on
+                    // whatever row took the key since.
+                    let matched = near_dups
+                        .iter()
+                        .find(|sm| sm.entry.key == into)
+                        .map(|sm| sm.entry.id)
+                        .expect("an absorb target is one of the near-duplicates");
+                    let absorbed = db.memory_update_unless_manual(
+                        matched,
+                        &into,
+                        &m.value,
+                        &m.memory_type,
+                        source,
+                    );
                     if let Ok(Some(_)) = absorbed {
                         log::info!(
                             "memory '{}' absorbed into '{into}', which keeps its key",
