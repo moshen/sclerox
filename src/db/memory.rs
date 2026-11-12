@@ -207,7 +207,8 @@ impl Database {
                    reviewed_at = CASE WHEN value IS ?2 AND memory_type IS ?3
                                       THEN reviewed_at END,
                    memory_type = ?3,
-                   tags        = ?4,
+                   -- An update brings no tags of its own; keep the row's.
+                   tags        = COALESCE(?4, tags),
                    source      = CASE WHEN ?5 = 'manual' THEN 'manual' ELSE source END,
                    updated_at  = datetime('now')
                  WHERE key = ?1 AND status = 'active'{}",
@@ -248,7 +249,9 @@ impl Database {
                 key,
                 value,
                 memory_type,
-                Some(tags_json.as_deref()),
+                // An update without tags leaves them alone, so they don't
+                // count as a change.
+                (update_id.is_none() || tags_json.is_some()).then_some(tags_json.as_deref()),
                 &guard,
                 distinct_from,
             )?;
@@ -1304,8 +1307,9 @@ mod tests {
     #[test]
     fn test_update_only_never_brings_a_retired_key_back() {
         let db = Database::open_in_memory().unwrap();
+        let tags = ["infra".to_string()];
         let settled = db
-            .memory_set_full("settled", "v1", "project", None, "session")
+            .memory_set_full("settled", "v1", "project", Some(&tags), "session")
             .unwrap();
         let hand = db
             .memory_set("hand", "written by a human", "project", None)
@@ -1315,12 +1319,12 @@ mod tests {
         // Rewriting the same fact keeps its review.
         db.memory_update_unless_manual(settled, "settled", "v1", "project", "session")
             .unwrap();
-        assert!(db
-            .memory_get("settled")
-            .unwrap()
-            .unwrap()
-            .reviewed_at
-            .is_some());
+        let same = db.memory_get("settled").unwrap().unwrap();
+        assert!(same.reviewed_at.is_some());
+        // An update brings no tags, so it keeps the row's and, being the
+        // same fact, adds no history.
+        assert_eq!(same.tags, Some(vec!["infra".to_string()]));
+        assert_eq!(db.memory_history("settled").unwrap().len(), 1);
 
         let id = db
             .memory_update_unless_manual(settled, "settled", "v2", "project", "session")

@@ -115,7 +115,9 @@ duplicate), and that merge keeps the key already in the database: the new
 value is written under it and the freshly distilled key is discarded, so one
 fact cannot walk through a chain of names. A rename needs the distiller to
 choose the name: name the old key in `supersedes`, or reuse an existing key,
-which then replaces the match. Between
+which then replaces the match. `supersedes` only takes a key from the related
+memories the distiller was shown, so it renames nothing when
+`distill.context_memories = 0` or no embedder is available. Between
 `dedup.cosine_threshold` and the merge threshold, a score cannot tell a
 restated fact from a similar but distinct one, so both are kept and flagged in
 `sclerox memory conflicts` instead.
