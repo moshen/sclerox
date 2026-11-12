@@ -203,6 +203,9 @@ impl Database {
                 "UPDATE memory SET
                    value       = ?2,
                    embedding   = CASE WHEN value IS ?2 THEN embedding END,
+                   -- A review vouched for the old fact, not this one.
+                   reviewed_at = CASE WHEN value IS ?2 AND memory_type IS ?3
+                                      THEN reviewed_at END,
                    memory_type = ?3,
                    tags        = ?4,
                    source      = CASE WHEN ?5 = 'manual' THEN 'manual' ELSE source END,
@@ -1308,11 +1311,25 @@ mod tests {
             .memory_set("hand", "written by a human", "project", None)
             .unwrap();
 
+        db.memory_review("settled").unwrap();
+        // Rewriting the same fact keeps its review.
+        db.memory_update_unless_manual(settled, "settled", "v1", "project", "session")
+            .unwrap();
+        assert!(db
+            .memory_get("settled")
+            .unwrap()
+            .unwrap()
+            .reviewed_at
+            .is_some());
+
         let id = db
             .memory_update_unless_manual(settled, "settled", "v2", "project", "session")
             .unwrap();
         assert_eq!(id, Some(settled));
-        assert_eq!(db.memory_get("settled").unwrap().unwrap().value, "v2");
+        let updated = db.memory_get("settled").unwrap().unwrap();
+        assert_eq!(updated.value, "v2");
+        // A new value has not been reviewed.
+        assert!(updated.reviewed_at.is_none());
         // The replaced value is kept in history, as for any update.
         assert_eq!(db.memory_history("settled").unwrap().len(), 2);
 
