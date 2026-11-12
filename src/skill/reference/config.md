@@ -114,7 +114,8 @@ above `dedup.merge_threshold` (Granite 0.97, where every pair read was a real
 duplicate), and that merge keeps the key already in the database: the new
 value is written under it and the freshly distilled key is discarded, so one
 fact cannot walk through a chain of names. A rename needs the distiller to
-name the replacement itself through `supersedes`. Between
+choose the name: name the old key in `supersedes`, or reuse an existing key,
+which then replaces the match. Between
 `dedup.cosine_threshold` and the merge threshold, a score cannot tell a
 restated fact from a similar but distinct one, so both are kept and flagged in
 `sclerox memory conflicts` instead.
