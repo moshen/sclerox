@@ -111,7 +111,11 @@ type's keyword order with semantic score.
 best hit for the query (Granite default 0.05; `1.0` turns it off).
 Distillation merges a near-duplicate into the memory it matched only at or
 above `dedup.merge_threshold` (Granite 0.97, where every pair read was a real
-duplicate). Between `dedup.cosine_threshold` and that, a score cannot tell a
+duplicate), and that merge keeps the key already in the database: the new
+value is written under it and the freshly distilled key is discarded, so one
+fact cannot walk through a chain of names. A rename needs the distiller to
+name the replacement itself through `supersedes`. Between
+`dedup.cosine_threshold` and the merge threshold, a score cannot tell a
 restated fact from a similar but distinct one, so both are kept and flagged in
 `sclerox memory conflicts` instead.
 
