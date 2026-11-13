@@ -156,7 +156,11 @@ pub fn run_agent(db: &Database, cmd: AgentCommand, format: OutputFormat) -> Resu
             )?;
             prune(db);
             print_output(format, &agent, || {
-                println!("Registered as {}: {}", agent.address(), agent.summary);
+                println!(
+                    "Registered as {}: {}",
+                    terminal_safe(&agent.address()),
+                    terminal_safe(&agent.summary)
+                );
                 if agent.unread > 0 {
                     println!(
                         "{} unread message(s) waiting: run `sclerox mail inbox`",
@@ -279,9 +283,13 @@ pub fn run_mail(db: &Database, cmd: MailCommand, format: OutputFormat) -> Result
 
         MailCommand::Show { id } => match db.mail_get(id)? {
             Some(m) => {
-                if m.read_at.is_none() && me(db)?.is_some_and(|me| me.id == m.recipient_id) {
+                let m = if m.read_at.is_none() && me(db)?.is_some_and(|me| me.id == m.recipient_id)
+                {
                     db.mail_mark_read(id)?;
-                }
+                    db.mail_get(id)?.unwrap_or(m)
+                } else {
+                    m
+                };
                 print_output(format, &m, || print_message(&m));
             }
             None => print_miss(format, &format!("No message #{id}")),
@@ -337,19 +345,17 @@ fn send(
         agent_id: sender_id,
     };
     let message = db.mail_send(&sender, recipient.id, &body, reply_to)?;
+    let to = terminal_safe(&message.recipient);
     print_output(format, &message, || {
-        println!("Sent #{} to {}", message.id, message.recipient);
+        println!("Sent #{} to {to}", message.id);
         if !recipient.active {
             println!(
-                "note: {} was last seen {} UTC; the message waits until it checks its mail",
-                message.recipient, recipient.last_seen_at
+                "note: {to} was last seen {} UTC; the message waits until it checks its mail",
+                recipient.last_seen_at
             );
         }
         if sender_id.is_none() {
-            println!(
-                "note: this session isn't registered, so {} can't reply until it is",
-                message.recipient
-            );
+            println!("note: this session isn't registered, so {to} can't reply until it is");
         }
     });
     Ok(())
@@ -357,12 +363,12 @@ fn send(
 
 fn print_agent_detail(a: &Agent) {
     println!("{}", agent_line(a));
-    println!("  session:    {}", a.session_id);
+    println!("  session:    {}", terminal_safe(&a.session_id));
     if let Some(agent) = &a.agent {
-        println!("  agent:      {agent}");
+        println!("  agent:      {}", terminal_safe(agent));
     }
     if let Some(repo) = &a.repo_path {
-        println!("  repo:       {repo}");
+        println!("  repo:       {}", terminal_safe(repo));
     }
     println!("  registered: {} UTC", a.registered_at);
     if let Some(left) = &a.left_at {

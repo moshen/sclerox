@@ -2527,6 +2527,34 @@ fn the_mail_hook_uses_an_explicit_session_over_the_hooks_own() {
 }
 
 #[test]
+fn the_mail_hook_leaves_mail_alone_inside_a_distillation_child() {
+    let e = Env::new();
+    e.run_as(Some("parent"), &["agent", "register", "--summary", "p"]);
+    e.run_as(None, &["mail", "send", "parent", "for the parent"]);
+    let child = e
+        .session_cmd(Some("parent"))
+        .env("SCLEROX_HOOK_RUNNING", "1")
+        .args(["hook", "mail"])
+        .write_stdin(r#"{"session_id": "parent", "hook_event_name": "UserPromptSubmit"}"#)
+        .output()
+        .unwrap();
+    assert!(child.status.success());
+    assert!(child.stdout.is_empty());
+    let parent = e.run_as(Some("parent"), &["agent", "show"]);
+    assert!(parent.contains("(1 unread)"), "still unread: {parent}");
+    let shown: serde_json::Value =
+        serde_json::from_str(&e.run_as(Some("parent"), &["--output", "json", "mail", "show", "1"]))
+            .unwrap();
+    assert!(
+        !shown["read_at"].is_null(),
+        "show reports what it marked read"
+    );
+    assert!(e
+        .run_as(Some("parent"), &["mail", "history"])
+        .contains("for the parent"));
+}
+
+#[test]
 fn mail_to_an_agent_past_retention_is_refused_not_lost() {
     let e = Env::new();
     e.run_as(

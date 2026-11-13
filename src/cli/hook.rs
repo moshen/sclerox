@@ -188,6 +188,11 @@ fn run_start(db: &Database) -> Result<()> {
 fn run_mail(db: &Database) -> Result<()> {
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
+    // A distillation child inherits the session's environment: its hooks
+    // must not read the session's mail, which it would never pass on.
+    if std::env::var("SCLEROX_HOOK_RUNNING").is_ok() {
+        return Ok(());
+    }
     let hook = serde_json::from_str::<serde_json::Value>(&buf).unwrap_or_default();
     // An explicit SCLEROX_SESSION_ID is what the agent registered under, so
     // it wins over the hook's own session, as in `usage::context`.
