@@ -284,9 +284,14 @@ impl Database {
         if address.chars().count() < 4 {
             return Ok(None);
         }
-        let pattern = format!("{}%", address.replace(['%', '_'], ""));
+        let escaped = address
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
         let sql = format!(
-            "SELECT {AGENT_COLUMNS} FROM agents a WHERE a.session_id LIKE ?2 ORDER BY a.id LIMIT 2"
+            "SELECT {AGENT_COLUMNS} FROM agents a
+             WHERE a.session_id LIKE ?2 ESCAPE '\\' ORDER BY a.id LIMIT 2"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let found: Vec<Agent> = stmt
@@ -363,16 +368,31 @@ impl Database {
         Ok(())
     }
 
-    /// Take agent `agent_id`'s unread mail, oldest first, marking it read,
-    /// and note that the agent was seen. With `max_chars`, stops before the
-    /// message whose body would take the total past it (always taking at
-    /// least one). Returns the messages and how many are left unread.
+    /// Take the unread mail of the mailbox `session_id` holds, oldest first,
+    /// marking it read, and note that the agent was seen. With `max_chars`,
+    /// stops before the message whose body would take the total past it
+    /// (always taking at least one). Returns the messages and how many are
+    /// left unread; nothing if the session holds no mailbox, or left.
+    ///
+    /// The mailbox is looked up in the same transaction that reads the mail,
+    /// so mail is never shown to a session that has just lost its mailbox to
+    /// another.
     pub fn mail_take_unread(
         &self,
-        agent_id: i64,
+        session_id: &str,
         max_chars: Option<usize>,
     ) -> Result<(Vec<Message>, usize)> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(agent_id) = tx
+            .query_row(
+                "SELECT id FROM agents WHERE session_id = ?1 AND left_at IS NULL",
+                params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok((Vec::new(), 0));
+        };
         let unread: Vec<Message> = {
             let mut stmt = tx.prepare(&format!(
                 "{MESSAGE_SELECT} WHERE m.recipient_id = ?1 AND m.read_at IS NULL ORDER BY m.id"
@@ -450,11 +470,12 @@ impl Database {
             .optional()?)
     }
 
-    /// Note that agent `agent_id` was seen now.
-    pub fn agent_touch(&self, agent_id: i64) -> Result<()> {
+    /// Note that the agent `session_id` holds was seen now.
+    pub fn agent_touch(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE agents SET last_seen_at = datetime('now') WHERE id = ?1",
-            params![agent_id],
+            "UPDATE agents SET last_seen_at = datetime('now')
+             WHERE session_id = ?1 AND left_at IS NULL",
+            params![session_id],
         )?;
         Ok(())
     }
@@ -476,9 +497,9 @@ impl Database {
         }
         self.conn.busy_timeout(HOOK_BUSY_TIMEOUT)?;
         let result = if peek.unread {
-            self.mail_take_unread(peek.agent_id, Some(max_chars))
+            self.mail_take_unread(session_id, Some(max_chars))
         } else {
-            self.agent_touch(peek.agent_id).map(|()| (Vec::new(), 0))
+            self.agent_touch(session_id).map(|()| (Vec::new(), 0))
         };
         self.conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         result
@@ -640,6 +661,10 @@ mod tests {
         assert_eq!(resolve("abcd9999-0000"), Some(b.id));
         assert_eq!(resolve("abcd99"), Some(b.id));
         assert_eq!(resolve("abc"), None, "too short to be a prefix");
+        let c = register(&db, "work_er-0003", None).unwrap();
+        register(&db, "workXer-0004", None).unwrap();
+        assert_eq!(resolve("work_e"), Some(c.id), "`_` is literal");
+        assert_eq!(resolve("work%"), None, "`%` is literal");
         assert_eq!(resolve("zzzz"), None);
         assert!(db.agent_resolve("abcd", WINDOW).is_err(), "ambiguous");
     }
@@ -651,15 +676,16 @@ mod tests {
         for body in ["aaaa", "bbbb", "cccc"] {
             db.mail_send(&user(), me.id, body, None).unwrap();
         }
-        let (taken, left) = db.mail_take_unread(me.id, Some(9)).unwrap();
+        let (taken, left) = db.mail_take_unread("s1", Some(9)).unwrap();
         let bodies: Vec<_> = taken.iter().map(|m| m.body.as_str()).collect();
         assert_eq!((bodies, left), (vec!["aaaa", "bbbb"], 1));
         assert!(taken.iter().all(|m| m.read_at.is_some()));
 
-        let (taken, left) = db.mail_take_unread(me.id, Some(1)).unwrap();
+        let (taken, left) = db.mail_take_unread("s1", Some(1)).unwrap();
         assert_eq!(taken.len(), 1, "always at least one");
         assert_eq!(left, 0);
-        assert!(db.mail_take_unread(me.id, None).unwrap().0.is_empty());
+        assert!(db.mail_take_unread("s1", None).unwrap().0.is_empty());
+        assert!(db.mail_take_unread("nobody", None).unwrap().0.is_empty());
     }
 
     #[test]
@@ -683,6 +709,22 @@ mod tests {
 
         db.agent_leave("s1").unwrap();
         assert_eq!(db.mail_peek("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_session_that_lost_its_mailbox_is_not_shown_its_mail() {
+        let db = Database::open_in_memory().unwrap();
+        let old = register(&db, "old-session", Some("reviewer")).unwrap();
+        db.mail_send(&user(), old.id, "for whoever holds reviewer", None)
+            .unwrap();
+        // The old session's hook peeked, then the name changed hands.
+        assert!(db.mail_peek("old-session").unwrap().unwrap().unread);
+        age(&db, old.id, "-2 hours");
+        register(&db, "new-session", Some("reviewer")).unwrap();
+
+        assert!(db.mail_hook_take("old-session", 1000).unwrap().0.is_empty());
+        let (taken, _) = db.mail_take_unread("new-session", None).unwrap();
+        assert_eq!(taken.len(), 1);
     }
 
     #[test]

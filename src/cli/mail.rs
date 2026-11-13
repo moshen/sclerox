@@ -212,6 +212,11 @@ pub fn run_agent(db: &Database, cmd: AgentCommand, format: OutputFormat) -> Resu
 
 pub fn run_mail(db: &Database, cmd: MailCommand, format: OutputFormat) -> Result<()> {
     let window = active_minutes();
+    // Prune before a recipient is looked up: pruning after a send could
+    // delete the long-idle agent it just went to, and the message with it.
+    if matches!(cmd, MailCommand::Send { .. } | MailCommand::Reply { .. }) {
+        prune(db);
+    }
     match cmd {
         MailCommand::Send { to, body, reply_to } => {
             let recipient = db
@@ -242,7 +247,7 @@ pub fn run_mail(db: &Database, cmd: MailCommand, format: OutputFormat) -> Result
 
         MailCommand::Inbox => {
             let me = require_me(db)?;
-            let (messages, _) = db.mail_take_unread(me.id, None)?;
+            let (messages, _) = db.mail_take_unread(&me.session_id, None)?;
             print_messages(format, &messages, "No unread mail.");
         }
 
@@ -255,10 +260,10 @@ pub fn run_mail(db: &Database, cmd: MailCommand, format: OutputFormat) -> Result
                     .mail_peek(&session)?
                     .context("this session stopped being registered for mail while waiting")?;
                 if peek.unread {
-                    break db.mail_take_unread(me.id, None)?.0;
+                    break db.mail_take_unread(&session, None)?.0;
                 }
                 if peek.seen_stale {
-                    db.agent_touch(me.id)?;
+                    db.agent_touch(&session)?;
                 }
                 if Instant::now() >= deadline {
                     break Vec::new();
@@ -328,7 +333,6 @@ fn send(
         agent_id: sender_id,
     };
     let message = db.mail_send(&sender, recipient.id, &body, reply_to)?;
-    prune(db);
     print_output(format, &message, || {
         println!("Sent #{} to {}", message.id, message.recipient);
         if !recipient.active {

@@ -2511,6 +2511,48 @@ fn mail_needs_a_registered_session_and_a_live_recipient() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("no longer receives mail"));
 }
 
+#[test]
+fn the_mail_hook_uses_an_explicit_session_over_the_hooks_own() {
+    let e = Env::new();
+    e.run_as(Some("worker-x"), &["agent", "register", "--summary", "w"]);
+    e.run_as(None, &["mail", "send", "worker-x", "hello"]);
+    let out = e
+        .session_cmd(Some("worker-x"))
+        .args(["hook", "mail"])
+        .write_stdin(r#"{"session_id": "claude-abc", "hook_event_name": "PostToolUse"}"#)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("hello"), "{out}");
+}
+
+#[test]
+fn mail_to_an_agent_past_retention_is_refused_not_lost() {
+    let e = Env::new();
+    e.run_as(
+        Some("old-1"),
+        &["agent", "register", "--name", "old", "--summary", "o"],
+    );
+    rusqlite::Connection::open(&e.db)
+        .unwrap()
+        .execute(
+            "UPDATE agents SET last_seen_at = datetime('now', '-30 days')",
+            [],
+        )
+        .unwrap();
+    let out = e
+        .session_cmd(None)
+        .args(["mail", "send", "old", "anyone home?"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no agent 'old'"));
+}
+
 // ─── Migration ────────────────────────────────────────────────────────────────
 
 #[test]

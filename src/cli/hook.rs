@@ -189,10 +189,18 @@ fn run_mail(db: &Database) -> Result<()> {
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
     let hook = serde_json::from_str::<serde_json::Value>(&buf).unwrap_or_default();
-    let Some(session) = hook["session_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
+    // An explicit SCLEROX_SESSION_ID is what the agent registered under, so
+    // it wins over the hook's own session, as in `usage::context`.
+    let explicit = std::env::var("SCLEROX_SESSION_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    let Some(session) = explicit
+        .or_else(|| {
+            hook["session_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| crate::cli::usage::context().session_id)
     else {
         return Ok(());
