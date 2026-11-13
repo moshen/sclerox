@@ -1179,7 +1179,9 @@ INSERT INTO investigations_fts(investigations_fts) VALUES('rebuild');
 /// now, and a new session can take over a named mailbox, unread mail and all.
 /// `messages` is the outbox: a message is one row, unread until its
 /// recipient is shown it. `sender_session` is the session that sent it, kept
-/// even when the sender never registered or its mailbox changes hands. Neither is searched, distilled or exported.
+/// even when the sender never registered or its mailbox changes hands.
+/// Message IDs are never reused after pruning, so a late reply to a pruned
+/// message fails rather than going to another message's sender. Neither is searched, distilled or exported.
 pub const MIGRATION_V21: &str = "
 CREATE TABLE IF NOT EXISTS agents (
     id            INTEGER PRIMARY KEY,
@@ -1194,7 +1196,7 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     sender_id    INTEGER REFERENCES agents(id) ON DELETE SET NULL,
     sender       TEXT NOT NULL,
     sender_session TEXT,

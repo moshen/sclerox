@@ -319,7 +319,8 @@ waits for it.
 # In one session: opt in, saying what this agent handles
 sclerox agent register --name reviewer --summary "Reviews diffs for correctness"
 
-# In another: see who is around, and ask
+# In another: register too (so it can be answered), see who is around, and ask
+sclerox agent register --name planner --summary "Plans and hands out work"
 sclerox agent list
 sclerox mail send reviewer "Please review branch fix-retries"
 sclerox mail wait --timeout 300          # block until the answer arrives

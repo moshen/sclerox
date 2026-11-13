@@ -260,7 +260,11 @@ pub fn run_mail(db: &Database, cmd: MailCommand, format: OutputFormat) -> Result
                     .mail_peek(&session)?
                     .context("this session stopped being registered for mail while waiting")?;
                 if peek.unread {
-                    break db.mail_take_unread(&session, None)?.0;
+                    // Another reader may have taken it since the peek.
+                    let (taken, _) = db.mail_take_unread(&session, None)?;
+                    if !taken.is_empty() {
+                        break taken;
+                    }
                 }
                 if peek.seen_stale {
                     db.agent_touch(&session)?;

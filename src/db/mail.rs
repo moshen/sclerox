@@ -320,7 +320,8 @@ impl Database {
     }
 
     /// Queue `body` from `sender` for agent `recipient_id` and return the
-    /// message.
+    /// message. Fails if the recipient has left or is gone: that is checked
+    /// by the insert itself, so it can't change in between.
     pub fn mail_send(
         &self,
         sender: &Sender,
@@ -331,10 +332,10 @@ impl Database {
         if body.trim().is_empty() {
             bail!("the message is empty");
         }
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO messages
                  (sender, sender_session, sender_id, recipient_id, body, reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             SELECT ?1, ?2, ?3, id, ?5, ?6 FROM agents WHERE id = ?4 AND left_at IS NULL",
             params![
                 sender.label,
                 sender.session_id,
@@ -344,6 +345,9 @@ impl Database {
                 reply_to
             ],
         )?;
+        if inserted == 0 {
+            bail!("the recipient has left or is no longer registered");
+        }
         let id = self.conn.last_insert_rowid();
         Ok(self.mail_get(id)?.expect("the message was just written"))
     }
@@ -717,14 +721,42 @@ mod tests {
         let old = register(&db, "old-session", Some("reviewer")).unwrap();
         db.mail_send(&user(), old.id, "for whoever holds reviewer", None)
             .unwrap();
-        // The old session's hook peeked, then the name changed hands.
+        // The old session's hook peeked and saw mail, then the name changed
+        // hands before the hook took it.
         assert!(db.mail_peek("old-session").unwrap().unwrap().unread);
         age(&db, old.id, "-2 hours");
         register(&db, "new-session", Some("reviewer")).unwrap();
 
+        assert!(db
+            .mail_take_unread("old-session", Some(1000))
+            .unwrap()
+            .0
+            .is_empty());
         assert!(db.mail_hook_take("old-session", 1000).unwrap().0.is_empty());
         let (taken, _) = db.mail_take_unread("new-session", None).unwrap();
         assert_eq!(taken.len(), 1);
+    }
+
+    #[test]
+    fn mail_to_an_agent_that_left_is_refused_by_the_insert() {
+        let db = Database::open_in_memory().unwrap();
+        let gone = register(&db, "s1", None).unwrap();
+        db.agent_leave("s1").unwrap();
+        let err = db.mail_send(&user(), gone.id, "hello?", None).unwrap_err();
+        assert!(err.to_string().contains("left"), "{err}");
+        assert!(db.mail_send(&user(), 999, "nobody", None).is_err());
+    }
+
+    #[test]
+    fn message_ids_are_not_reused_after_pruning() {
+        let db = Database::open_in_memory().unwrap();
+        let me = register(&db, "s1", None).unwrap();
+        let first = db.mail_send(&user(), me.id, "one", None).unwrap();
+        db.conn
+            .execute("DELETE FROM messages WHERE id = ?1", params![first.id])
+            .unwrap();
+        let second = db.mail_send(&user(), me.id, "two", None).unwrap();
+        assert!(second.id > first.id);
     }
 
     #[test]
