@@ -63,7 +63,7 @@ sclerox install          # sets up Claude Code skill + hooks + global gitignore
 
 `sclerox install` writes:
 - `~/.claude/skills/sclerox-kb/` - skill dir: `SKILL.md` + `reference/*.md` (or `~/.config/opencode/skills/` for OpenCode)
-- `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories
+- `~/.claude/settings.json` - `SessionStart` and `Stop` hooks that auto-index repos and distill memories, and `UserPromptSubmit` and `PostToolUse` hooks that deliver [agent mail](#agent-mail)
 - `~/.config/git/ignore` - excludes `.sclerox/` from all repos
 - `~/.cache/sclerox/models/` - the embedding model and tokenizer (~55 MB, downloaded once and hash-checked; `--no-model-download` defers it to first use)
 
@@ -205,6 +205,15 @@ sclerox people add --name "Alice" --email "alice@example.com" --github alicegit
 sclerox people search "alice"
 ```
 
+### `sclerox agent` / `sclerox mail`
+See [Agent mail](#agent-mail).
+```bash
+sclerox agent register --name reviewer --summary "Reviews diffs for correctness"
+sclerox agent list [--all]
+sclerox mail send reviewer "Please review branch fix-retries"
+sclerox mail inbox | wait | reply <id> "..." | show <id> | history
+```
+
 ## Configuration
 
 Tunables live in `~/.config/sclerox/config.toml` (created, all-commented, by `sclerox install`).
@@ -281,12 +290,16 @@ Environment variables still work and override the file:
 
 ## How hooks work
 
-After `sclerox install`, two Claude Code lifecycle hooks are active:
+After `sclerox install`, these Claude Code lifecycle hooks are active:
 
 - **`SessionStart`** - `sclerox hook start` indexes the current repo if it has a `.git` directory (incremental, fast)
 - **`Stop`** - `sclerox hook stop` re-indexes the repo, then spawns a background
   process that distills session memories via `claude -p` and stores them in
   `sclerox memory`
+
+- **`UserPromptSubmit`, `PostToolUse`** - `sclerox hook mail` shows a session
+  that registered for [agent mail](#agent-mail) its unread messages. For any
+  other session it is one indexed read and prints nothing.
 
 Distillation is tracked per-session: re-runs only when the session has grown by 50+ new turns.
 
@@ -295,6 +308,30 @@ repo's index then has any chunk without a vector (new or edited files, or gaps
 from before), the hook spawns a detached `sclerox hook embed-repo` that embeds
 them in the background. One runs per repo at a time (`.sclerox/embed.lock`);
 when nothing is missing, nothing is spawned and the model is not loaded.
+
+## Agent mail
+
+Agent sessions on one machine can message each other. Mail is a table in the
+main database, so a message sent to an agent that is busy, or not running,
+waits for it.
+
+```bash
+# In one session: opt in, saying what this agent handles
+sclerox agent register --name reviewer --summary "Reviews diffs for correctness"
+
+# In another: see who is around, and ask
+sclerox agent list
+sclerox mail send reviewer "Please review branch fix-retries"
+sclerox mail wait --timeout 300          # block until the answer arrives
+```
+
+The session is identified by `CLAUDE_CODE_SESSION_ID` (set by Claude Code) or
+`SCLEROX_SESSION_ID`. In Claude Code a registered session's unread mail is
+injected after its next tool call or prompt, and showing a message marks it
+read; elsewhere use `sclerox mail inbox`. Agents not seen for
+`[mail] active_minutes` (30) are left out of `agent list`, and read mail is
+deleted after `[mail] retain_days` (14). Mail is not searched, distilled or
+exported.
 
 ## Supported languages
 

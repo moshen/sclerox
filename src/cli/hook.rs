@@ -33,6 +33,13 @@ pub enum HookCommand {
         no_distill: bool,
     },
 
+    /// Run the Claude Code UserPromptSubmit / PostToolUse hook: show this
+    /// session's unread mail, if it registered for mail.
+    ///
+    /// Reads the hook JSON from stdin. Prints nothing for a session that
+    /// isn't registered or has no mail, and never fails the hook.
+    Mail,
+
     /// Background distillation worker spawned by `hook stop`.
     ///
     /// Not intended to be called directly; `hook stop` spawns this detached
@@ -83,6 +90,12 @@ pub enum HookCommand {
 pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
     match cmd {
         HookCommand::Start => run_start(db),
+        HookCommand::Mail => {
+            if let Err(e) = run_mail(db) {
+                log::warn!("mail hook failed: {e:#}");
+            }
+            Ok(())
+        }
         HookCommand::DistillSession {
             session_id,
             via,
@@ -169,6 +182,34 @@ fn run_start(db: &Database) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_mail(db: &Database) -> Result<()> {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buf);
+    let hook = serde_json::from_str::<serde_json::Value>(&buf).unwrap_or_default();
+    let Some(session) = hook["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::cli::usage::context().session_id)
+    else {
+        return Ok(());
+    };
+    let max_chars = crate::config::settings().mail.hook_max_chars;
+    let (messages, left) = db.mail_hook_take(&session, max_chars)?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let event = hook["hook_event_name"].as_str().unwrap_or("PostToolUse");
+    let payload = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": crate::cli::mail::hook_context(&messages, left, max_chars),
+        }
+    });
+    println!("{payload}");
     Ok(())
 }
 

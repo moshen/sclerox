@@ -199,7 +199,7 @@ pub fn config_template() -> String {
          # Refresh each managed artifact on a re-install/upgrade. Set false to keep\n\
          # your customizations; a fresh install still creates a missing artifact.\n\
          # overwrite_skill = {ow_skill}               # skills/sclerox-kb.md\n\
-         # overwrite_hooks = {ow_hooks}               # SessionStart/Stop hooks + opencode plugin\n\
+         # overwrite_hooks = {ow_hooks}               # Claude Code hooks + opencode plugin\n\
          # overwrite_instructions = {ow_instr}        # the <!-- sclerox-kb --> section body\n\
          \n\
          [log]\n\
@@ -208,7 +208,12 @@ pub fn config_template() -> String {
          \n\
          [usage]\n\
          # enabled = {usage_enabled}                   # record searches, their ranked results and record reads in the main database, to measure retrieval; never exported\n\
-         # retain_days = {usage_retain}               # delete usage rows older than this (0 = keep forever)\n",
+         # retain_days = {usage_retain}               # delete usage rows older than this (0 = keep forever)\n\
+         \n\
+         [mail]\n\
+         # active_minutes = {mail_active}              # an agent is active while seen within this many minutes; only active agents are listed\n\
+         # retain_days = {mail_retain}                 # delete read mail, and agents not seen for this long (0 = keep forever)\n\
+         # hook_max_chars = {mail_hook_chars}           # most characters of mail a hook shows at once; the rest waits for the next\n",
         model_thresholds = model_thresholds_doc(),
         sem_thr = dm.semantic,
         sem_lim = d.search.semantic_limit,
@@ -264,6 +269,9 @@ pub fn config_template() -> String {
         retain_days = d.log.retain_days,
         usage_enabled = d.usage.enabled,
         usage_retain = d.usage.retain_days,
+        mail_active = d.mail.active_minutes,
+        mail_retain = d.mail.retain_days,
+        mail_hook_chars = d.mail.hook_max_chars,
     )
 }
 
@@ -560,6 +568,7 @@ mod tests {
             "[server]",
             "[log]",
             "[usage]",
+            "[mail]",
         ] {
             assert!(t.contains(section), "template missing {section}");
         }

@@ -1171,3 +1171,42 @@ CREATE VIRTUAL TABLE investigations_fts USING fts5(
 );
 INSERT INTO investigations_fts(investigations_fts) VALUES('rebuild');
 ";
+
+/// Migration v21: the agent mailbox (see `db::mail`).
+///
+/// `agents` is the directory of sessions that opted in to receive mail, each
+/// with what it is for. A row is a mailbox: `session_id` is whoever holds it
+/// now, and a new session can take over a named mailbox, unread mail and all.
+/// `messages` is the outbox: a message is one row, unread until its
+/// recipient is shown it. `sender_session` is the session that sent it, kept
+/// even when the sender never registered or its mailbox changes hands. Neither is searched, distilled or exported.
+pub const MIGRATION_V21: &str = "
+CREATE TABLE IF NOT EXISTS agents (
+    id            INTEGER PRIMARY KEY,
+    session_id    TEXT NOT NULL UNIQUE,
+    name          TEXT UNIQUE,
+    summary       TEXT NOT NULL,
+    agent         TEXT,
+    repo_path     TEXT,
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    left_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY,
+    sender_id    INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    sender       TEXT NOT NULL,
+    sender_session TEXT,
+    recipient_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    body         TEXT NOT NULL,
+    reply_to     INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    read_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS messages_unread
+    ON messages(recipient_id, id) WHERE read_at IS NULL;
+CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, created_at);
+CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
+CREATE INDEX IF NOT EXISTS messages_sender_session ON messages(sender_session);
+";
