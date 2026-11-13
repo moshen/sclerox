@@ -2555,6 +2555,29 @@ fn the_mail_hook_leaves_mail_alone_inside_a_distillation_child() {
 }
 
 #[test]
+fn sending_mail_keeps_the_sender_listed() {
+    let e = Env::new();
+    e.run_as(
+        Some("talker"),
+        &["agent", "register", "--name", "talker", "--summary", "t"],
+    );
+    e.run_as(
+        Some("other"),
+        &["agent", "register", "--name", "other", "--summary", "o"],
+    );
+    rusqlite::Connection::open(&e.db)
+        .unwrap()
+        .execute(
+            "UPDATE agents SET last_seen_at = datetime('now', '-2 hours')",
+            [],
+        )
+        .unwrap();
+    assert!(!e.run_as(None, &["agent", "list"]).contains("talker"));
+    e.run_as(Some("talker"), &["mail", "send", "other", "ping"]);
+    assert!(e.run_as(None, &["agent", "list"]).contains("talker"));
+}
+
+#[test]
 fn mail_to_an_agent_past_retention_is_refused_not_lost() {
     let e = Env::new();
     e.run_as(

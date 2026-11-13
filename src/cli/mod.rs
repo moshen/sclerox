@@ -162,8 +162,12 @@ pub fn run(cli: Cli) -> Result<()> {
             // This is the Rust-level equivalent of what a schema migration can't do
             // (migrations are pure SQL; fastembed is Rust). Runs once after upgrade,
             // then the todos_without_embeddings() check returns empty immediately.
-            // Not for `db check`, which only reads what is there.
-            if !matches!(cmd, Commands::Db(db::DbCommand::Check)) {
+            // Not for `db check`, which only reads what is there, nor for the
+            // mailbox, which never touches todos and shouldn't wait on a model.
+            if !matches!(
+                cmd,
+                Commands::Db(db::DbCommand::Check) | Commands::Agent(_) | Commands::Mail(_)
+            ) {
                 todos::backfill_todo_embeddings_pub(&db);
             }
             match cmd {

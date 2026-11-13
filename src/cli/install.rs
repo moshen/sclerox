@@ -753,9 +753,7 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     for (event, _) in CLAUDE_HOOKS {
         let key = format!("/hooks/{event}");
         if let Some(arr) = settings.pointer_mut(&key).and_then(|v| v.as_array_mut()) {
-            let before = arr.len();
-            strip_sclerox_hooks(arr);
-            if arr.len() < before {
+            if strip_sclerox_hooks(arr) {
                 modified = true;
             }
         }
@@ -806,21 +804,29 @@ fn sclerox_hook_present(settings: &Value) -> bool {
     })
 }
 
-fn strip_sclerox_hooks(arr: &mut Vec<Value>) {
-    arr.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains(HOOK_MARKER))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+/// Remove sclerox's commands (those holding [`HOOK_MARKER`]) from an event's
+/// hook groups, keeping any other command that shares a group, and drop a
+/// group only if that leaves it empty. Returns whether anything was removed.
+fn strip_sclerox_hooks(arr: &mut Vec<Value>) -> bool {
+    let is_sclerox = |h: &Value| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains(HOOK_MARKER))
+    };
+    let mut removed = false;
+    arr.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|h| !is_sclerox(h));
+        if hooks.len() == before {
+            return true;
+        }
+        removed = true;
+        !hooks.is_empty()
     });
+    removed
 }
 
 const OPENCODE_PLUGIN_MARKER: &str = "// sclerox-kb-plugin";
@@ -1327,5 +1333,25 @@ mod tests {
             "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }] }
         });
         assert!(sclerox_hook_present(&with_hook));
+    }
+
+    #[test]
+    fn stripping_keeps_a_users_command_that_shares_a_group() {
+        let ours = serde_json::json!({ "type": "command", "command": format!("{HOOK_MARKER}\nsclerox hook mail") });
+        let theirs = serde_json::json!({ "type": "command", "command": "my-linter" });
+        let mut arr = vec![
+            serde_json::json!({ "hooks": [ours.clone(), theirs.clone()] }),
+            serde_json::json!({ "hooks": [ours] }),
+            serde_json::json!({ "matcher": "Bash" }),
+        ];
+        assert!(strip_sclerox_hooks(&mut arr));
+        assert_eq!(
+            arr,
+            vec![
+                serde_json::json!({ "hooks": [theirs] }),
+                serde_json::json!({ "matcher": "Bash" }),
+            ]
+        );
+        assert!(!strip_sclerox_hooks(&mut arr), "nothing left to remove");
     }
 }

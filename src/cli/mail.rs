@@ -345,6 +345,10 @@ fn send(
         agent_id: sender_id,
     };
     let message = db.mail_send(&sender, recipient.id, &body, reply_to)?;
+    // Sending is activity: a session that only sends stays listed.
+    if let (Some(session), Some(_)) = (&session, sender_id) {
+        db.agent_touch(session)?;
+    }
     let to = terminal_safe(&message.recipient);
     print_output(format, &message, || {
         println!("Sent #{} to {to}", message.id);
