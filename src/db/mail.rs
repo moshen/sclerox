@@ -44,19 +44,11 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// How others address it: its name, else its session ID's first eight
-    /// characters.
+    /// How others address it: its name, else its whole session ID (a
+    /// prefix could match another agent's session).
     pub fn address(&self) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| short_session(&self.session_id))
+        self.name.clone().unwrap_or_else(|| self.session_id.clone())
     }
-}
-
-/// The first eight characters of a session ID, the address of an agent
-/// without a name.
-pub fn short_session(session_id: &str) -> String {
-    session_id.chars().take(8).collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,7 +109,7 @@ const AGENT_COLUMNS: &str = "a.id, a.session_id, a.name, a.summary, a.agent, a.r
     (SELECT count(*) FROM messages m WHERE m.recipient_id = a.id AND m.read_at IS NULL)";
 
 const MESSAGE_SELECT: &str = "SELECT m.id, m.sender, m.sender_session, m.sender_id,
-    COALESCE(r.name, substr(r.session_id, 1, 8)), m.recipient_id, m.body, m.reply_to,
+    COALESCE(r.name, r.session_id), m.recipient_id, m.body, m.reply_to,
     m.created_at, m.read_at
     FROM messages m JOIN agents r ON r.id = m.recipient_id";
 
@@ -188,7 +180,7 @@ impl Database {
                         "'{}' is held by active session {} (last seen {} UTC); \
                          pass --replace to take it over",
                         holder.address(),
-                        short_session(&holder.session_id),
+                        holder.session_id,
                         holder.last_seen_at
                     );
                 }
@@ -397,41 +389,49 @@ impl Database {
         else {
             return Ok((Vec::new(), 0));
         };
-        let unread: Vec<Message> = {
-            let mut stmt = tx.prepare(&format!(
-                "{MESSAGE_SELECT} WHERE m.recipient_id = ?1 AND m.read_at IS NULL ORDER BY m.id"
-            ))?;
-            let rows = stmt.query_map(params![agent_id], row_to_message)?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let mut taken = Vec::new();
-        let mut chars = 0;
-        for message in unread.iter() {
-            let len = message.body.chars().count();
-            if !taken.is_empty() && max_chars.is_some_and(|max| chars + len > max) {
-                break;
+        // Choose the batch by body length, so a backlog's bodies aren't
+        // loaded only to be left for the next hook.
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, length(body) FROM messages
+                 WHERE recipient_id = ?1 AND read_at IS NULL ORDER BY id",
+            )?;
+            let mut rows = stmt.query(params![agent_id])?;
+            let mut ids = Vec::new();
+            let mut chars = 0;
+            while let Some(row) = rows.next()? {
+                let len = row.get::<_, i64>(1)? as usize;
+                if !ids.is_empty() && max_chars.is_some_and(|max| chars + len > max) {
+                    break;
+                }
+                chars += len;
+                ids.push(row.get(0)?);
             }
-            chars += len;
-            taken.push(message.clone());
-        }
-        for message in &mut taken {
+            ids
+        };
+        let mut taken = Vec::with_capacity(ids.len());
+        for id in ids {
             tx.execute(
                 "UPDATE messages SET read_at = datetime('now') WHERE id = ?1",
-                params![message.id],
+                params![id],
             )?;
-            message.read_at = tx.query_row(
-                "SELECT read_at FROM messages WHERE id = ?1",
-                params![message.id],
-                |r| r.get(0),
-            )?;
+            taken.push(tx.query_row(
+                &format!("{MESSAGE_SELECT} WHERE m.id = ?1"),
+                params![id],
+                row_to_message,
+            )?);
         }
+        let left: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE recipient_id = ?1 AND read_at IS NULL",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
         tx.execute(
             "UPDATE agents SET last_seen_at = datetime('now') WHERE id = ?1",
             params![agent_id],
         )?;
         tx.commit()?;
-        let left = unread.len() - taken.len();
-        Ok((taken, left))
+        Ok((taken, left as usize))
     }
 
     /// `agent`'s latest mail, newest first: received, and sent by it or by
@@ -690,6 +690,25 @@ mod tests {
         assert_eq!(left, 0);
         assert!(db.mail_take_unread("s1", None).unwrap().0.is_empty());
         assert!(db.mail_take_unread("nobody", None).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn taking_within_a_budget_counts_what_is_left() {
+        let db = Database::open_in_memory().unwrap();
+        let me = register(&db, "s1", None).unwrap();
+        for _ in 0..5 {
+            db.mail_send(&user(), me.id, &"x".repeat(10), None).unwrap();
+        }
+        let (taken, left) = db.mail_take_unread("s1", Some(25)).unwrap();
+        assert_eq!((taken.len(), left), (2, 3));
+        assert!(taken
+            .iter()
+            .all(|m| m.read_at.is_some() && m.body.len() == 10));
+        assert_eq!(
+            me.address(),
+            "s1",
+            "an unnamed agent goes by its whole session"
+        );
     }
 
     #[test]

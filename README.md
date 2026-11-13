@@ -330,9 +330,11 @@ The session is identified by `CLAUDE_CODE_SESSION_ID` (set by Claude Code) or
 `SCLEROX_SESSION_ID`. In Claude Code a registered session's unread mail is
 injected after its next tool call or prompt, and showing a message marks it
 read; elsewhere use `sclerox mail inbox`. Agents not seen for
-`[mail] active_minutes` (30) are left out of `agent list`, and read mail is
-deleted after `[mail] retain_days` (14). Mail is not searched, distilled or
-exported.
+`[mail] active_minutes` (30) are left out of `agent list`. Read mail is
+deleted after `[mail] retain_days` (14), and so is an agent not seen for that
+long, with all its mail, unread included: mail waits for a stopped agent only
+that long. Set `retain_days = 0` to keep everything. Mail is not searched,
+distilled or exported.
 
 ## Supported languages
 

@@ -12,7 +12,7 @@ use clap::Subcommand;
 
 use crate::cli::format::{agent_line, message_line, terminal_safe};
 use crate::config::settings;
-use crate::db::mail::{short_session, Agent, Message, Registration, Sender};
+use crate::db::mail::{Agent, Message, Registration, Sender};
 use crate::db::Database;
 use crate::output::{print_miss, print_output, OutputFormat};
 
@@ -327,7 +327,7 @@ fn send(
     let (label, sender_id) = match me(db)? {
         Some(me) if me.left_at.is_none() => (me.address(), Some(me.id)),
         _ => match &session {
-            Some(session) => (short_session(session), None),
+            Some(session) => (session.clone(), None),
             None => ("user".to_string(), None),
         },
     };

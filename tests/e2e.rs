@@ -2482,7 +2482,7 @@ fn mail_needs_a_registered_session_and_a_live_recipient() {
     ))
     .unwrap();
     assert_eq!(sent["sender_session"], "s-3-unregistered");
-    assert_eq!(sent["sender"], "s-3-unre");
+    assert_eq!(sent["sender"], "s-3-unregistered");
     let id = sent["id"].to_string();
     let refused = e
         .session_cmd(Some("s-2"))

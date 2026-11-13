@@ -20,8 +20,8 @@ sclerox mail show <id>                     # one message in full
 sclerox mail history [--limit 20]          # recent mail sent and received
 ```
 
-An agent is addressed by its name, or by its session ID or a unique prefix of
-one (four or more characters). Names are unique: registering a name an active
+An agent is addressed by its name, or by its session ID (shown in full for
+an agent without a name) or a unique prefix of one (four or more characters). Names are unique: registering a name an active
 agent holds fails unless you pass `--replace`. An agent counts as active while
 it was seen in the last 30 minutes (`[mail] active_minutes`). Taking over a
 name whose holder left or went idle needs no flag, and keeps that mailbox's
@@ -39,8 +39,10 @@ In Claude Code, mail for a registered session is shown to you automatically:
 after your next tool call or the user's next prompt, its text appears as
 `## sclerox mail: N new message(s)`. Being shown is what reads a message: it
 will not appear again (`mail show <id>` still prints it). Up to about 4000
-characters arrive at once (`[mail] hook_max_chars`); the rest wait for the
-next hook or `sclerox mail inbox`.
+characters of mail arrive at once (`[mail] hook_max_chars`); further messages
+wait for the next hook or `sclerox mail inbox`. A single message longer than
+that is cut, ending `(cut: run sclerox mail show <id> for the rest)`: it is
+already read, so run that command to see the rest.
 
 Elsewhere, or while you are waiting on an answer with nothing else to do, run
 `sclerox mail inbox` or `sclerox mail wait`.

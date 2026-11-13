@@ -1180,11 +1180,14 @@ INSERT INTO investigations_fts(investigations_fts) VALUES('rebuild');
 /// `messages` is the outbox: a message is one row, unread until its
 /// recipient is shown it. `sender_session` is the session that sent it, kept
 /// even when the sender never registered or its mailbox changes hands.
-/// Message IDs are never reused after pruning, so a late reply to a pruned
-/// message fails rather than going to another message's sender. Neither is searched, distilled or exported.
+/// Neither table is searched, distilled or exported.
+///
+/// IDs are never reused after pruning: a stale agent ID can't reach a newer
+/// agent's mailbox, and a late reply to a pruned message fails rather than
+/// going to another message's sender.
 pub const MIGRATION_V21: &str = "
 CREATE TABLE IF NOT EXISTS agents (
-    id            INTEGER PRIMARY KEY,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id    TEXT NOT NULL UNIQUE,
     name          TEXT UNIQUE,
     summary       TEXT NOT NULL,
