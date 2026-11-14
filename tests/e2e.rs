@@ -2410,6 +2410,17 @@ fn agents_exchange_mail_and_a_hook_delivers_it_once() {
     // A session that never registered gets nothing, and neither fails.
     assert_eq!(e.mail_hook("someone-else", "PostToolUse"), "");
 
+    // A subagent's tool call carries the parent's session: it leaves the mail.
+    let subagent = e
+        .session_cmd(None)
+        .args(["hook", "mail"])
+        .write_stdin(
+            r#"{"session_id": "reviewer-session-0002", "agent_id": "sub-1", "hook_event_name": "PostToolUse"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(subagent.status.success() && subagent.stdout.is_empty());
+
     let hook = e.mail_hook("reviewer-session-0002", "UserPromptSubmit");
     let payload: serde_json::Value = serde_json::from_str(&hook).unwrap();
     assert_eq!(

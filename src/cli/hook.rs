@@ -194,6 +194,11 @@ fn run_mail(db: &Database) -> Result<()> {
         return Ok(());
     }
     let hook = serde_json::from_str::<serde_json::Value>(&buf).unwrap_or_default();
+    // A subagent's events carry its `agent_id` with the parent's session: the
+    // mail is the parent's, and a subagent shown it would never pass it on.
+    if hook["agent_id"].as_str().is_some_and(|id| !id.is_empty()) {
+        return Ok(());
+    }
     // An explicit SCLEROX_SESSION_ID is what the agent registered under, so
     // it wins over the hook's own session, as in `usage::context`.
     let explicit = std::env::var("SCLEROX_SESSION_ID")

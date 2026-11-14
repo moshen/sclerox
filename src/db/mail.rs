@@ -767,6 +767,34 @@ mod tests {
     }
 
     #[test]
+    fn foreign_keys_from_messages_are_indexed() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("SELECT \"from\" FROM pragma_foreign_key_list('messages')")
+            .unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in columns {
+            let indexed: bool = db
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_index_list('messages') l,
+                                       pragma_index_info(l.name) i
+                         WHERE i.name = ?1 AND i.seqno = 0)",
+                    params![column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(indexed, "messages.{column} has no index for deletes to use");
+        }
+    }
+
+    #[test]
     fn message_ids_are_not_reused_after_pruning() {
         let db = Database::open_in_memory().unwrap();
         let me = register(&db, "s1", None).unwrap();
