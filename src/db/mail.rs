@@ -818,6 +818,35 @@ mod tests {
     }
 
     #[test]
+    fn pruning_finds_what_to_delete_by_index() {
+        let db = Database::open_in_memory().unwrap();
+        for (sql, index) in [
+            (
+                "DELETE FROM messages WHERE read_at IS NOT NULL AND read_at < datetime('now', '-14 days')",
+                "messages_read",
+            ),
+            (
+                "DELETE FROM agents WHERE last_seen_at < datetime('now', '-14 days')",
+                "agents_last_seen",
+            ),
+        ] {
+            let mut stmt = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = stmt
+                .query_map([], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|p| p.contains(&format!("INDEX {index} "))),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn message_ids_are_not_reused_after_pruning() {
         let db = Database::open_in_memory().unwrap();
         let me = register(&db, "s1", None).unwrap();

@@ -1215,4 +1215,6 @@ CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, created_
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS messages_sender_session ON messages(sender_session);
 CREATE INDEX IF NOT EXISTS messages_reply_to ON messages(reply_to);
+CREATE INDEX IF NOT EXISTS messages_read ON messages(read_at) WHERE read_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agents_last_seen ON agents(last_seen_at);
 ";
