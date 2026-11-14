@@ -329,7 +329,10 @@ impl Database {
         if body.contains('\0') {
             bail!("the message holds a NUL character");
         }
-        let inserted = self.conn.execute(
+        // The insert and the read back are one transaction, so a prune in
+        // another process can't delete the message in between.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
             "INSERT INTO messages
                  (sender, sender_session, sender_id, recipient_id, body, reply_to)
              SELECT ?1, ?2, ?3, id, ?5, ?6 FROM agents WHERE id = ?4 AND left_at IS NULL",
@@ -345,8 +348,13 @@ impl Database {
         if inserted == 0 {
             bail!("the recipient has left or is no longer registered");
         }
-        let id = self.conn.last_insert_rowid();
-        Ok(self.mail_get(id)?.expect("the message was just written"))
+        let message = tx.query_row(
+            &format!("{MESSAGE_SELECT} WHERE m.id = ?1"),
+            params![tx.last_insert_rowid()],
+            row_to_message,
+        )?;
+        tx.commit()?;
+        Ok(message)
     }
 
     pub fn mail_get(&self, id: i64) -> Result<Option<Message>> {
