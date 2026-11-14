@@ -212,7 +212,7 @@ pub fn config_template() -> String {
          \n\
          [mail]\n\
          # active_minutes = {mail_active}              # an agent is active while seen within this many minutes; only active agents are listed\n\
-         # retain_days = {mail_retain}                 # delete read mail, and agents not seen for this long (0 = keep forever)\n\
+         # retain_days = {mail_retain}                 # delete read mail, and agents not seen for this long, except named ones with unread mail (0 = keep forever)\n\
          # hook_max_chars = {mail_hook_chars}           # most characters of mail a hook shows at once; the rest waits for the next\n",
         model_thresholds = model_thresholds_doc(),
         sem_thr = dm.semantic,

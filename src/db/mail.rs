@@ -523,7 +523,10 @@ impl Database {
     }
 
     /// Delete read mail older than `retain_days`, and agents not seen for as
-    /// long with all their mail. 0 keeps everything.
+    /// long, with their mail. A named agent with unread mail is kept: its
+    /// name is a mailbox a new session can take over, unread mail and all.
+    /// An unnamed one only its own session could read, and that session is
+    /// gone. 0 keeps everything.
     pub fn mail_prune(&self, retain_days: u32) -> Result<()> {
         if retain_days == 0 {
             return Ok(());
@@ -534,7 +537,11 @@ impl Database {
             params![cutoff],
         )?;
         self.conn.execute(
-            "DELETE FROM agents WHERE last_seen_at < datetime('now', ?1)",
+            "DELETE FROM agents
+             WHERE last_seen_at < datetime('now', ?1)
+               AND (name IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM messages m
+                                   WHERE m.recipient_id = agents.id AND m.read_at IS NULL))",
             params![cutoff],
         )?;
         Ok(())
@@ -826,7 +833,11 @@ mod tests {
                 "messages_read",
             ),
             (
-                "DELETE FROM agents WHERE last_seen_at < datetime('now', '-14 days')",
+                "DELETE FROM agents
+                 WHERE last_seen_at < datetime('now', '-14 days')
+                   AND (name IS NULL
+                        OR NOT EXISTS (SELECT 1 FROM messages m
+                                       WHERE m.recipient_id = agents.id AND m.read_at IS NULL))",
                 "agents_last_seen",
             ),
         ] {
@@ -896,6 +907,17 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let keep = register(&db, "s1", None).unwrap();
         let gone = register(&db, "s2", None).unwrap();
+        // Long gone with unread mail: a named mailbox waits to be taken over,
+        // an unnamed one goes with its session.
+        let role = register(&db, "s3", Some("reviewer")).unwrap();
+        let unnamed = register(&db, "s4", None).unwrap();
+        let empty_role = register(&db, "s5", Some("builder")).unwrap();
+        for id in [role.id, unnamed.id] {
+            db.mail_send(&user(), id, "waiting", None).unwrap();
+        }
+        for id in [role.id, unnamed.id, empty_role.id] {
+            age(&db, id, "-30 days");
+        }
         let old = db.mail_send(&user(), keep.id, "old", None).unwrap();
         db.mail_send(&user(), keep.id, "unread", None).unwrap();
         db.conn
@@ -908,7 +930,19 @@ mod tests {
 
         db.mail_prune(14).unwrap();
         assert!(db.mail_get(old.id).unwrap().is_none());
-        assert_eq!(db.agent_list(true, WINDOW).unwrap().len(), 1);
+        let mut left: Vec<String> = db
+            .agent_list(true, WINDOW)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.session_id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["s1", "s3"]);
+        let taken = register(&db, "s6", Some("reviewer")).unwrap();
+        assert_eq!(
+            taken.unread, 1,
+            "the waiting mail goes to whoever takes the name"
+        );
         assert_eq!(
             db.agent_by_session("s1", WINDOW).unwrap().unwrap().unread,
             1

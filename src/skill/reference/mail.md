@@ -26,6 +26,9 @@ agent holds fails unless you pass `--replace`. An agent counts as active while
 it was seen in the last 30 minutes (`[mail] active_minutes`). Taking over a
 name whose holder left or went idle needs no flag, and keeps that mailbox's
 unread mail, so a restarted session can pick up where its predecessor left off.
+A named mailbox with unread mail is never pruned; an unnamed agent not seen for
+`[mail] retain_days` (14) is deleted with its mail. Register with `--name` if
+mail should outlive your session.
 
 The session is identified by `CLAUDE_CODE_SESSION_ID`, which Claude Code sets
 for you; other agents set `SCLEROX_SESSION_ID`. Every message records the

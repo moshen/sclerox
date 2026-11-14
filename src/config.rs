@@ -252,7 +252,8 @@ pub struct MailSettings {
     /// (its hooks note it at most once a minute). Only active agents are
     /// listed, and a name an active agent holds needs `--replace` to take.
     pub active_minutes: usize,
-    /// Delete read mail, and agents not seen for this many days (0 = keep forever).
+    /// Delete read mail, and agents not seen for this many days with their mail;
+    /// a named agent holding unread mail is kept (0 = keep forever).
     pub retain_days: u32,
     /// Most characters of message bodies a hook shows at once; the rest wait
     /// for the next hook or `sclerox mail inbox`.
