@@ -324,6 +324,11 @@ impl Database {
         if body.trim().is_empty() {
             bail!("the message is empty");
         }
+        // SQLite's length() stops at a NUL, which would let a message slip
+        // past a hook's character budget; a message has no use for one.
+        if body.contains('\0') {
+            bail!("the message holds a NUL character");
+        }
         let inserted = self.conn.execute(
             "INSERT INTO messages
                  (sender, sender_session, sender_id, recipient_id, body, reply_to)
@@ -792,6 +797,16 @@ mod tests {
                 .unwrap();
             assert!(indexed, "messages.{column} has no index for deletes to use");
         }
+    }
+
+    #[test]
+    fn a_body_with_a_nul_is_refused() {
+        let db = Database::open_in_memory().unwrap();
+        let me = register(&db, "s1", None).unwrap();
+        let err = db
+            .mail_send(&user(), me.id, &format!("\0{}", "x".repeat(10)), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("NUL"), "{err}");
     }
 
     #[test]
