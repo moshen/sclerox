@@ -24,7 +24,7 @@ pub struct InstallArgs {
     /// Skip writing the skill file
     #[arg(long)]
     no_skill: bool,
-    /// Skip adding the Stop hook (Claude Code only)
+    /// Skip adding the session hooks (Claude Code) or plugin (OpenCode)
     #[arg(long)]
     no_hooks: bool,
     /// Skip appending sclerox-kb instructions to the global instructions file
@@ -668,6 +668,26 @@ fn remove_if_exists(path: &Path, dry_run: bool) -> Result<()> {
 
 const HOOK_MARKER: &str = "# sclerox-kb-hook";
 
+/// The Claude Code hook events sclerox installs, with the command each runs:
+/// SessionStart indexes the repo, Stop indexes it and distills the session's
+/// memories, and UserPromptSubmit and PostToolUse show a registered agent its
+/// mail.
+const CLAUDE_HOOKS: &[(&str, &str)] = &[
+    ("SessionStart", "hook start"),
+    ("Stop", "hook stop"),
+    ("UserPromptSubmit", "hook mail"),
+    ("PostToolUse", "hook mail"),
+];
+
+/// [`CLAUDE_HOOKS`]' events, for messages: `SessionStart + Stop + ...`.
+fn hook_events() -> String {
+    CLAUDE_HOOKS
+        .iter()
+        .map(|(event, _)| *event)
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 fn install_claude_hook(
     claude_dir: &Path,
     sclerox_bin: &str,
@@ -693,37 +713,28 @@ fn install_claude_hook(
         .as_object_mut()
         .context("hooks is not an object")?;
 
-    // SessionStart: index the repo immediately when entering a git directory.
-    let start_cmd = format!("{HOOK_MARKER}\n{sclerox_bin} hook start 2>/dev/null || true");
-    let start_arr = hooks_obj
-        .entry("SessionStart")
-        .or_insert_with(|| serde_json::json!([]));
-    let start_arr = start_arr
-        .as_array_mut()
-        .context("hooks.SessionStart is not an array")?;
-    strip_sclerox_hooks(start_arr);
-    start_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": start_cmd }] }));
-
-    // Stop: index the repo + distill session memories from the transcript.
-    let stop_cmd = format!("{HOOK_MARKER}\n{sclerox_bin} hook stop 2>/dev/null || true");
-    let stop_arr = hooks_obj
-        .entry("Stop")
-        .or_insert_with(|| serde_json::json!([]));
-    let stop_arr = stop_arr
-        .as_array_mut()
-        .context("hooks.Stop is not an array")?;
-    strip_sclerox_hooks(stop_arr);
-    stop_arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": stop_cmd }] }));
+    for (event, subcommand) in CLAUDE_HOOKS {
+        let cmd = format!("{HOOK_MARKER}\n{sclerox_bin} {subcommand} 2>/dev/null || true");
+        let arr = hooks_obj
+            .entry(*event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .with_context(|| format!("hooks.{event} is not an array"))?;
+        strip_sclerox_hooks(arr);
+        arr.push(serde_json::json!({ "hooks": [{ "type": "command", "command": cmd }] }));
+    }
 
     if dry_run {
         progress(format_args!(
-            "  would add SessionStart + Stop hooks to: {}",
+            "  would add {} hooks to: {}",
+            hook_events(),
             settings_path.display()
         ));
     } else {
         write_json(&settings_path, &settings)?;
         progress(format_args!(
-            "  added SessionStart + Stop hooks: {}",
+            "  added {} hooks: {}",
+            hook_events(),
             settings_path.display()
         ));
     }
@@ -739,12 +750,10 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     let mut settings = read_json(&settings_path)?;
     let mut modified = false;
 
-    for event in ["SessionStart", "Stop"] {
+    for (event, _) in CLAUDE_HOOKS {
         let key = format!("/hooks/{event}");
         if let Some(arr) = settings.pointer_mut(&key).and_then(|v| v.as_array_mut()) {
-            let before = arr.len();
-            strip_sclerox_hooks(arr);
-            if arr.len() < before {
+            if strip_sclerox_hooks(arr) {
                 modified = true;
             }
         }
@@ -753,7 +762,8 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     if modified {
         if dry_run {
             progress(format_args!(
-                "  would remove SessionStart + Stop hooks from: {}",
+                "  would remove {} hooks from: {}",
+                hook_events(),
                 settings_path.display()
             ));
         } else {
@@ -766,11 +776,11 @@ fn uninstall_claude_hook(claude_dir: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// True if any SessionStart/Stop entry is an sclerox-installed hook (matched by the
+/// True if any [`CLAUDE_HOOKS`] entry is an sclerox-installed hook (matched by the
 /// HOOK_MARKER embedded in its command). Used to protect a customized hook set
 /// when `install.overwrite_hooks = false`.
 fn sclerox_hook_present(settings: &Value) -> bool {
-    ["SessionStart", "Stop"].iter().any(|event| {
+    CLAUDE_HOOKS.iter().any(|(event, _)| {
         settings
             .pointer(&format!("/hooks/{event}"))
             .and_then(|v| v.as_array())
@@ -794,21 +804,29 @@ fn sclerox_hook_present(settings: &Value) -> bool {
     })
 }
 
-fn strip_sclerox_hooks(arr: &mut Vec<Value>) {
-    arr.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains(HOOK_MARKER))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+/// Remove sclerox's commands (those holding [`HOOK_MARKER`]) from an event's
+/// hook groups, keeping any other command that shares a group, and drop a
+/// group only if that leaves it empty. Returns whether anything was removed.
+fn strip_sclerox_hooks(arr: &mut Vec<Value>) -> bool {
+    let is_sclerox = |h: &Value| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains(HOOK_MARKER))
+    };
+    let mut removed = false;
+    arr.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|h| !is_sclerox(h));
+        if hooks.len() == before {
+            return true;
+        }
+        removed = true;
+        !hooks.is_empty()
     });
+    removed
 }
 
 const OPENCODE_PLUGIN_MARKER: &str = "// sclerox-kb-plugin";
@@ -1047,6 +1065,10 @@ fn skill_files() -> &'static [(&'static str, &'static str)] {
         (
             "reference/repos-and-code.md",
             include_str!("../skill/reference/repos-and-code.md"),
+        ),
+        (
+            "reference/mail.md",
+            include_str!("../skill/reference/mail.md"),
         ),
         (
             "reference/config.md",
@@ -1311,5 +1333,25 @@ mod tests {
             "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }] }
         });
         assert!(sclerox_hook_present(&with_hook));
+    }
+
+    #[test]
+    fn stripping_keeps_a_users_command_that_shares_a_group() {
+        let ours = serde_json::json!({ "type": "command", "command": format!("{HOOK_MARKER}\nsclerox hook mail") });
+        let theirs = serde_json::json!({ "type": "command", "command": "my-linter" });
+        let mut arr = vec![
+            serde_json::json!({ "hooks": [ours.clone(), theirs.clone()] }),
+            serde_json::json!({ "hooks": [ours] }),
+            serde_json::json!({ "matcher": "Bash" }),
+        ];
+        assert!(strip_sclerox_hooks(&mut arr));
+        assert_eq!(
+            arr,
+            vec![
+                serde_json::json!({ "hooks": [theirs] }),
+                serde_json::json!({ "matcher": "Bash" }),
+            ]
+        );
+        assert!(!strip_sclerox_hooks(&mut arr), "nothing left to remove");
     }
 }

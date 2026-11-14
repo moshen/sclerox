@@ -33,6 +33,13 @@ pub enum HookCommand {
         no_distill: bool,
     },
 
+    /// Run the Claude Code UserPromptSubmit / PostToolUse hook: show this
+    /// session's unread mail, if it registered for mail.
+    ///
+    /// Reads the hook JSON from stdin. Prints nothing for a session that
+    /// isn't registered or has no mail, and never fails the hook.
+    Mail,
+
     /// Background distillation worker spawned by `hook stop`.
     ///
     /// Not intended to be called directly; `hook stop` spawns this detached
@@ -83,6 +90,12 @@ pub enum HookCommand {
 pub fn run(db: &Database, cmd: HookCommand) -> Result<()> {
     match cmd {
         HookCommand::Start => run_start(db),
+        HookCommand::Mail => {
+            if let Err(e) = run_mail(db) {
+                log::warn!("mail hook failed: {e:#}");
+            }
+            Ok(())
+        }
         HookCommand::DistillSession {
             session_id,
             via,
@@ -169,6 +182,52 @@ fn run_start(db: &Database) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_mail(db: &Database) -> Result<()> {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buf);
+    // A distillation child inherits the session's environment: its hooks
+    // must not read the session's mail, which it would never pass on.
+    if std::env::var("SCLEROX_HOOK_RUNNING").is_ok() {
+        return Ok(());
+    }
+    let hook = serde_json::from_str::<serde_json::Value>(&buf).unwrap_or_default();
+    // A subagent's events carry its `agent_id` with the parent's session: the
+    // mail is the parent's, and a subagent shown it would never pass it on.
+    if hook["agent_id"].as_str().is_some_and(|id| !id.is_empty()) {
+        return Ok(());
+    }
+    // An explicit SCLEROX_SESSION_ID is what the agent registered under, so
+    // it wins over the hook's own session, as in `usage::context`.
+    let explicit = std::env::var("SCLEROX_SESSION_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    let Some(session) = explicit
+        .or_else(|| {
+            hook["session_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| crate::cli::usage::context().session_id)
+    else {
+        return Ok(());
+    };
+    let max_chars = crate::config::settings().mail.hook_max_chars;
+    let (messages, left) = db.mail_hook_take(&session, max_chars)?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let event = hook["hook_event_name"].as_str().unwrap_or("PostToolUse");
+    let payload = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": crate::cli::mail::hook_context(&messages, left, max_chars),
+        }
+    });
+    println!("{payload}");
     Ok(())
 }
 

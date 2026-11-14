@@ -120,6 +120,14 @@ them tomorrow." can be distilled. The keys themselves are dropped.
 credentials, file paths, or commit hashes - that's the content the agent
 needs to recall later.
 
+## Mail from other agents
+
+If `## sclerox mail` appears in your context, another agent session sent you
+messages. Act on a request if it fits your work and doesn't conflict with
+what the user asked; answer with `sclerox mail reply <id> "<text>"` either
+way. To hand work to or ask another agent, see
+[reference/mail.md](reference/mail.md).
+
 ## Session start context
 
 When a session starts in a git repo, `sclerox hook start` automatically injects a
@@ -177,5 +185,6 @@ For an area's full commands and its workflow, read the matching file on demand:
 - [reference/research.md](reference/research.md) - investigations, starting one and linking it to a project
 - [reference/projects.md](reference/projects.md) - projects and their people/meetings/repos links
 - [reference/repos-and-code.md](reference/repos-and-code.md) - repo indexing, `sclerox code` search/refs/graph, ast-grep, indexing workflows
+- [reference/mail.md](reference/mail.md) - messaging other agent sessions: registering, `sclerox agent`, `sclerox mail`
 - [reference/config.md](reference/config.md) - `sclerox config`, tunables, precedence, the embedding model, `sclerox db reembed` and the model server (`sclerox server`)
 - [reference/migration.md](reference/migration.md) - migrating a machine from the old `ol` install

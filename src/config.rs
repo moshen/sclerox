@@ -31,6 +31,7 @@ pub struct Settings {
     pub install: InstallSettings,
     pub log: LogSettings,
     pub usage: UsageSettings,
+    pub mail: MailSettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -244,6 +245,20 @@ pub struct UsageSettings {
     pub retain_days: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MailSettings {
+    /// An agent counts as active while it was seen within this many minutes
+    /// (its hooks note it at most once a minute). Only active agents are
+    /// listed, and a name an active agent holds needs `--replace` to take.
+    pub active_minutes: usize,
+    /// Delete read mail, and agents not seen for this many days (0 = keep forever).
+    pub retain_days: u32,
+    /// Most characters of message bodies a hook shows at once; the rest wait
+    /// for the next hook or `sclerox mail inbox`.
+    pub hook_max_chars: usize,
+}
+
 // ── Defaults ────────────────────────────────────────────────────────────────
 // These are the single source of truth for built-in values; the previously
 // scattered `const`s now live here.
@@ -264,6 +279,7 @@ impl Default for Settings {
             install: InstallSettings::default(),
             log: LogSettings::default(),
             usage: UsageSettings::default(),
+            mail: MailSettings::default(),
         }
     }
 }
@@ -273,6 +289,16 @@ impl Default for UsageSettings {
         Self {
             enabled: true,
             retain_days: 180,
+        }
+    }
+}
+
+impl Default for MailSettings {
+    fn default() -> Self {
+        Self {
+            active_minutes: 30,
+            retain_days: 14,
+            hook_max_chars: 4000,
         }
     }
 }
@@ -640,6 +666,8 @@ impl Settings {
             1_000_000,
         );
         require_positive("index.max_files", &mut self.index.max_files, 50_000);
+        require_positive("mail.active_minutes", &mut self.mail.active_minutes, 30);
+        require_positive("mail.hook_max_chars", &mut self.mail.hook_max_chars, 4000);
 
         match crate::embed::server::parse_mode(&self.embed.server) {
             Some(crate::embed::server::Mode::Auto) => self.embed.server = "auto".to_string(),

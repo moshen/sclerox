@@ -2,6 +2,7 @@ pub mod dates;
 pub mod fts;
 pub mod investigations;
 pub mod jobs;
+pub mod mail;
 pub mod meetings;
 pub mod memory;
 pub mod migrations;

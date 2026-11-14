@@ -1,6 +1,10 @@
 /// Shared single-line formatters used by list, search, and any other output.
 /// One place to change means every command stays in sync.
-use crate::db::{investigations::Investigation, todos::Todo};
+use crate::db::{
+    investigations::Investigation,
+    mail::{Agent, Message},
+    todos::Todo,
+};
 
 pub fn todo_line(t: &Todo) -> String {
     let checkbox = match t.status.as_str() {
@@ -34,6 +38,47 @@ pub fn research_line(inv: &Investigation) -> String {
     };
     let id_col = format!("{:<5}", format!("#{}", inv.id));
     format!("{checkbox} {id_col} {}  ({})", inv.name, inv.slug)
+}
+
+/// An agent in the mailbox directory: `address  [state]  seen <at>  summary`,
+/// with its unread count when it has mail waiting.
+pub fn agent_line(a: &Agent) -> String {
+    let state = if a.left_at.is_some() {
+        "[left]"
+    } else if a.active {
+        "[active]"
+    } else {
+        "[idle]"
+    };
+    let unread = if a.unread > 0 {
+        format!("  ({} unread)", a.unread)
+    } else {
+        String::new()
+    };
+    terminal_safe(&format!(
+        "{:<12} {state:<8}  seen {}  {}{unread}",
+        a.address(),
+        a.last_seen_at,
+        crate::output::truncate(&a.summary, 80)
+    ))
+}
+
+/// A message on one line: `#id  sender -> recipient  <at>  first line`.
+pub fn message_line(m: &Message) -> String {
+    let unread = if m.read_at.is_none() {
+        "  [unread]"
+    } else {
+        ""
+    };
+    let first = m.body.lines().next().unwrap_or_default();
+    terminal_safe(&format!(
+        "{:<5} {} -> {}  {}{unread}  {}",
+        format!("#{}", m.id),
+        m.sender,
+        m.recipient,
+        m.created_at,
+        crate::output::truncate(first, 80)
+    ))
 }
 
 /// When a search hit was last changed, appended to its line:
