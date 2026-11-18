@@ -2326,6 +2326,295 @@ fn a_failed_usage_write_changes_no_output_or_exit_code() {
     }
 }
 
+// ─── Agent mail ──────────────────────────────────────────────────────────────
+
+impl Env {
+    /// `cmd` as the agent session `session`, or outside any session.
+    fn session_cmd(&self, session: Option<&str>) -> Command {
+        let mut c = self.cmd();
+        c.env_remove("CLAUDE_CODE_SESSION_ID");
+        c.env_remove("SCLEROX_SESSION_ID");
+        if let Some(session) = session {
+            c.env("SCLEROX_SESSION_ID", session);
+        }
+        c
+    }
+
+    fn run_as(&self, session: Option<&str>, args: &[&str]) -> String {
+        let out = self.session_cmd(session).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "sclerox {} failed:\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// What `hook mail` prints for a hook event in `session`.
+    fn mail_hook(&self, session: &str, event: &str) -> String {
+        let out = self
+            .session_cmd(None)
+            .args(["hook", "mail"])
+            .write_stdin(
+                serde_json::json!({ "session_id": session, "hook_event_name": event }).to_string(),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+}
+
+#[test]
+fn agents_exchange_mail_and_a_hook_delivers_it_once() {
+    let e = Env::new();
+    let planner = Some("planner-session-0001");
+    let reviewer = Some("reviewer-session-0002");
+
+    e.run_as(
+        reviewer,
+        &[
+            "agent",
+            "register",
+            "--name",
+            "reviewer",
+            "--summary",
+            "Reviews diffs",
+        ],
+    );
+    e.run_as(
+        planner,
+        &[
+            "agent",
+            "register",
+            "--name",
+            "planner",
+            "--summary",
+            "Plans work",
+        ],
+    );
+    let listed = e.run_as(None, &["agent", "list"]);
+    assert!(
+        listed.contains("reviewer") && listed.contains("Reviews diffs"),
+        "{listed}"
+    );
+
+    let sent = e.run_as(
+        planner,
+        &["mail", "send", "reviewer", "Please review fix-retries"],
+    );
+    assert!(sent.starts_with("Sent #1 to reviewer"), "{sent}");
+
+    // A session that never registered gets nothing, and neither fails.
+    assert_eq!(e.mail_hook("someone-else", "PostToolUse"), "");
+
+    // A subagent's tool call carries the parent's session: it leaves the mail.
+    let subagent = e
+        .session_cmd(None)
+        .args(["hook", "mail"])
+        .write_stdin(
+            r#"{"session_id": "reviewer-session-0002", "agent_id": "sub-1", "hook_event_name": "PostToolUse"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(subagent.status.success() && subagent.stdout.is_empty());
+
+    let hook = e.mail_hook("reviewer-session-0002", "UserPromptSubmit");
+    let payload: serde_json::Value = serde_json::from_str(&hook).unwrap();
+    assert_eq!(
+        payload["hookSpecificOutput"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+    let ctx = payload["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        ctx.contains("#1 from planner") && ctx.contains("Please review fix-retries"),
+        "{ctx}"
+    );
+    assert_eq!(
+        e.mail_hook("reviewer-session-0002", "PostToolUse"),
+        "",
+        "shown once"
+    );
+    assert_eq!(e.run_as(reviewer, &["mail", "inbox"]), "No unread mail.");
+
+    e.run_as(reviewer, &["mail", "reply", "1", "Looks good"]);
+    let inbox = e.run_as(planner, &["mail", "inbox"]);
+    assert!(
+        inbox.contains("#2 from reviewer to planner") && inbox.contains("re #1"),
+        "{inbox}"
+    );
+    assert!(inbox.contains("Looks good"), "{inbox}");
+
+    let history = e.run_as(planner, &["mail", "history"]);
+    assert_eq!(history.lines().count(), 2, "{history}");
+}
+
+#[test]
+fn mail_needs_a_registered_session_and_a_live_recipient() {
+    let e = Env::new();
+    let err = e
+        .session_cmd(None)
+        .args(["agent", "register", "--summary", "x"])
+        .output()
+        .unwrap();
+    assert!(!err.status.success());
+    assert!(String::from_utf8_lossy(&err.stderr).contains("no session ID"));
+
+    let unregistered = e
+        .session_cmd(Some("s-1"))
+        .args(["mail", "inbox"])
+        .output()
+        .unwrap();
+    assert!(!unregistered.status.success());
+    assert!(String::from_utf8_lossy(&unregistered.stderr).contains("agent register"));
+
+    e.run_as(
+        Some("s-2"),
+        &["agent", "register", "--name", "worker", "--summary", "w"],
+    );
+    // From outside a session the sender is "user", who can't be replied to.
+    let sent = e.run_as(None, &["mail", "send", "worker", "hello"]);
+    assert!(sent.contains("can't reply"), "{sent}");
+    let waited = e.run_as(Some("s-2"), &["mail", "wait", "--timeout", "0"]);
+    assert!(
+        waited.contains("#1 from user") && waited.contains("hello"),
+        "{waited}"
+    );
+
+    // An unregistered session is recorded as the sender, and can be replied
+    // to once it registers.
+    let sent: serde_json::Value = serde_json::from_str(&e.run_as(
+        Some("s-3-unregistered"),
+        &["--output", "json", "mail", "send", "worker", "need a hand"],
+    ))
+    .unwrap();
+    assert_eq!(sent["sender_session"], "s-3-unregistered");
+    assert_eq!(sent["sender"], "s-3-unregistered");
+    let id = sent["id"].to_string();
+    let refused = e
+        .session_cmd(Some("s-2"))
+        .args(["mail", "reply", &id, "sure"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    e.run_as(
+        Some("s-3-unregistered"),
+        &["agent", "register", "--summary", "asks"],
+    );
+    e.run_as(Some("s-2"), &["mail", "reply", &id, "sure"]);
+    let inbox = e.run_as(Some("s-3-unregistered"), &["mail", "inbox"]);
+    assert!(
+        inbox.contains("from worker") && inbox.contains("from session s-2"),
+        "{inbox}"
+    );
+
+    e.run_as(Some("s-2"), &["agent", "leave"]);
+    let refused = e
+        .session_cmd(None)
+        .args(["mail", "send", "worker", "still there?"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no longer receives mail"));
+}
+
+#[test]
+fn the_mail_hook_uses_an_explicit_session_over_the_hooks_own() {
+    let e = Env::new();
+    e.run_as(Some("worker-x"), &["agent", "register", "--summary", "w"]);
+    e.run_as(None, &["mail", "send", "worker-x", "hello"]);
+    let out = e
+        .session_cmd(Some("worker-x"))
+        .args(["hook", "mail"])
+        .write_stdin(r#"{"session_id": "claude-abc", "hook_event_name": "PostToolUse"}"#)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("hello"), "{out}");
+}
+
+#[test]
+fn the_mail_hook_leaves_mail_alone_inside_a_distillation_child() {
+    let e = Env::new();
+    e.run_as(Some("parent"), &["agent", "register", "--summary", "p"]);
+    e.run_as(None, &["mail", "send", "parent", "for the parent"]);
+    let child = e
+        .session_cmd(Some("parent"))
+        .env("SCLEROX_HOOK_RUNNING", "1")
+        .args(["hook", "mail"])
+        .write_stdin(r#"{"session_id": "parent", "hook_event_name": "UserPromptSubmit"}"#)
+        .output()
+        .unwrap();
+    assert!(child.status.success());
+    assert!(child.stdout.is_empty());
+    let parent = e.run_as(Some("parent"), &["agent", "show"]);
+    assert!(parent.contains("(1 unread)"), "still unread: {parent}");
+    let shown: serde_json::Value =
+        serde_json::from_str(&e.run_as(Some("parent"), &["--output", "json", "mail", "show", "1"]))
+            .unwrap();
+    assert!(
+        !shown["read_at"].is_null(),
+        "show reports what it marked read"
+    );
+    assert!(e
+        .run_as(Some("parent"), &["mail", "history"])
+        .contains("for the parent"));
+}
+
+#[test]
+fn sending_mail_keeps_the_sender_listed() {
+    let e = Env::new();
+    e.run_as(
+        Some("talker"),
+        &["agent", "register", "--name", "talker", "--summary", "t"],
+    );
+    e.run_as(
+        Some("other"),
+        &["agent", "register", "--name", "other", "--summary", "o"],
+    );
+    rusqlite::Connection::open(&e.db)
+        .unwrap()
+        .execute(
+            "UPDATE agents SET last_seen_at = datetime('now', '-2 hours')",
+            [],
+        )
+        .unwrap();
+    assert!(!e.run_as(None, &["agent", "list"]).contains("talker"));
+    e.run_as(Some("talker"), &["mail", "send", "other", "ping"]);
+    assert!(e.run_as(None, &["agent", "list"]).contains("talker"));
+}
+
+#[test]
+fn mail_to_an_agent_past_retention_is_refused_not_lost() {
+    let e = Env::new();
+    e.run_as(
+        Some("old-1"),
+        &["agent", "register", "--name", "old", "--summary", "o"],
+    );
+    rusqlite::Connection::open(&e.db)
+        .unwrap()
+        .execute(
+            "UPDATE agents SET last_seen_at = datetime('now', '-30 days')",
+            [],
+        )
+        .unwrap();
+    let out = e
+        .session_cmd(None)
+        .args(["mail", "send", "old", "anyone home?"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no agent 'old'"));
+}
+
 // ─── Migration ────────────────────────────────────────────────────────────────
 
 #[test]

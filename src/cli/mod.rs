@@ -6,6 +6,7 @@ pub mod db;
 pub mod format;
 pub mod hook;
 pub mod install;
+pub mod mail;
 pub mod meetings;
 pub mod memory;
 pub mod migrate;
@@ -82,6 +83,14 @@ pub enum Commands {
     #[command(subcommand)]
     Research(research::ResearchCommand),
 
+    /// Register this session as an agent that receives mail, and list agents
+    #[command(subcommand)]
+    Agent(mail::AgentCommand),
+
+    /// Send and read messages between agent sessions
+    #[command(subcommand)]
+    Mail(mail::MailCommand),
+
     /// Index and search code repositories
     #[command(subcommand)]
     Repo(repos::RepoCommand),
@@ -153,8 +162,12 @@ pub fn run(cli: Cli) -> Result<()> {
             // This is the Rust-level equivalent of what a schema migration can't do
             // (migrations are pure SQL; fastembed is Rust). Runs once after upgrade,
             // then the todos_without_embeddings() check returns empty immediately.
-            // Not for `db check`, which only reads what is there.
-            if !matches!(cmd, Commands::Db(db::DbCommand::Check)) {
+            // Not for `db check`, which only reads what is there, nor for the
+            // mailbox, which never touches todos and shouldn't wait on a model.
+            if !matches!(
+                cmd,
+                Commands::Db(db::DbCommand::Check) | Commands::Agent(_) | Commands::Mail(_)
+            ) {
                 todos::backfill_todo_embeddings_pub(&db);
             }
             match cmd {
@@ -164,6 +177,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 Commands::Project(c) => projects::run(&db, c, format),
                 Commands::Todo(c) => todos::run(&db, c, format),
                 Commands::Research(c) => research::run(&db, c, format),
+                Commands::Agent(c) => mail::run_agent(&db, c, format),
+                Commands::Mail(c) => mail::run_mail(&db, c, format),
                 Commands::Repo(c) => repos::run(&db, c, format),
                 Commands::Code(c) => code::run(&db, c, format),
                 Commands::Db(c) => db::run(&db, c, format),
