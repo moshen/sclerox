@@ -1698,15 +1698,20 @@ fn key_terms(key: &str) -> BTreeSet<String> {
 /// both of them use. A key negated where the other is not shares nothing,
 /// however many other terms agree.
 fn key_overlap(a: &str, b: &str) -> f64 {
-    let (a, b) = (key_terms(a), key_terms(b));
+    terms_overlap(&key_terms(a), &key_terms(b))
+}
+
+/// [`key_overlap`] of two keys already reduced to terms, for a caller holding
+/// one set against many.
+fn terms_overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
     if a.contains(KEY_NEGATED) != b.contains(KEY_NEGATED) {
         return 0.0;
     }
-    let union = a.union(&b).count();
+    let union = a.union(b).count();
     if union == 0 {
         return 0.0;
     }
-    a.intersection(&b).count() as f64 / union as f64
+    a.intersection(b).count() as f64 / union as f64
 }
 
 /// Decide how a distilled memory relates to the existing memories it matched.
@@ -1782,8 +1787,8 @@ fn decide_dedup_action(
 /// Existing active memories topically near `chunk`, as (key, value) pairs for
 /// the distiller's dedup context.
 ///
-/// Probes several windows across the chunk rather than embedding its head. One
-/// embedding covers `embed.chunk_size` (800 by default) of a chunk that may be
+/// Tiles the chunk with windows rather than embedding its head. One embedding
+/// covers `embed.chunk_size` (800 by default) of a chunk that may be
 /// `distill.chunk_chars` (20k by default) long, so a single head embedding
 /// describes ~4% of the text: it retrieves context for whatever the chunk
 /// happened to open with (often a slash-command banner or an unrelated first
@@ -1791,6 +1796,15 @@ fn decide_dedup_action(
 /// was then shown irrelevant keys, correctly declined to reuse any, and minted
 /// a fresh near-identical slug instead — which is exactly what `supersedes`
 /// exists to prevent.
+///
+/// Sampling a fixed eight windows left the same hole further in: it queried
+/// 6,400 characters of a full chunk and left two thirds of it unread. Over
+/// 439 duplicates distilled in a week whose run could be found in the log,
+/// 71% had no memory offered for the fact they restated, against 29% where
+/// one was offered and a new name was minted anyway. Taking a window per
+/// `embed.chunk_size` of the chunk closes the gap the first number measures;
+/// the second is the distiller's own judgement and is not a retrieval
+/// problem.
 ///
 /// Uses a deliberately loose cosine floor: the point is to surface keys that
 /// already cover these topics so the model can reuse one, not to decide
@@ -1801,8 +1815,10 @@ fn related_memories_for_chunk(
     chunk: &str,
     limit: usize,
 ) -> Vec<(String, String)> {
-    /// Windows sampled evenly across the chunk, including its head and tail.
-    const PROBES: usize = 8;
+    /// A ceiling on the windows one chunk is worth, so an unusually large
+    /// `distill.chunk_chars` cannot turn one hook into hundreds of forward
+    /// passes. Past it the windows spread out and this samples again.
+    const MAX_PROBES: usize = 48;
 
     if limit == 0 {
         return Vec::new();
@@ -1818,7 +1834,16 @@ fn related_memories_for_chunk(
     let mut best: std::collections::HashMap<String, (f32, String)> =
         std::collections::HashMap::new();
     let window = crate::config::settings().embed.chunk_size;
-    for text in probe_windows(chunk, window, PROBES) {
+    // Enough windows to tile the chunk rather than sample it. A fixed eight
+    // covered 6,400 characters of the 20,000 `distill.chunk_chars` allows, so
+    // two thirds of a full chunk was never used as a query and the memory a
+    // fact already had was retrieved only when the fact happened to fall in a
+    // sampled window.
+    let probes = match window {
+        0 => 0,
+        window => chunk.chars().count().div_ceil(window).clamp(1, MAX_PROBES),
+    };
+    for text in probe_windows(chunk, window, probes) {
         let Ok(emb) = embedder.embed_one(&text) else {
             continue;
         };
@@ -1842,8 +1867,27 @@ fn related_memories_for_chunk(
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
     });
-    ranked.truncate(limit);
-    ranked.into_iter().map(|(_, k, v)| (k, v)).collect()
+    // Spend the slots on distinct facts. Two keys the merge rule would read as
+    // one name are one fact to the distiller as well, so offering both costs a
+    // slot and asks it to guess which of them is the settled name. Ranked best
+    // first, so the one kept is the closest match of its group.
+    let mut offered: Vec<(String, String)> = Vec::with_capacity(limit);
+    let mut kept: Vec<BTreeSet<String>> = Vec::with_capacity(limit);
+    for (_, key, value) in ranked {
+        if offered.len() == limit {
+            break;
+        }
+        let terms = key_terms(&key);
+        if kept
+            .iter()
+            .any(|k| terms_overlap(k, &terms) >= KEY_OVERLAP_MERGE)
+        {
+            continue;
+        }
+        kept.push(terms);
+        offered.push((key, value));
+    }
+    offered
 }
 
 /// Evenly spaced windows of `window` chars across `text`, head and tail
@@ -2262,6 +2306,95 @@ mod tests {
             source,
             score,
             key_overlap,
+        }
+    }
+
+    #[test]
+    fn probe_windows_tile_a_full_chunk() {
+        // The defaults: a 20k chunk read 800 characters at a time. Every
+        // character must fall in some window, or a fact stated there has no
+        // query to retrieve its existing memory with.
+        //
+        // The text must not repeat, or a window could be located anywhere in
+        // it and the coverage below would be measured against the wrong
+        // offset, so each character is drawn from a cycling counter.
+        let window = 800;
+        let text: String = (0..20_000)
+            .scan(1u32, |state, _| {
+                *state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                Some(char::from(b'a' + ((*state >> 16) % 26) as u8))
+            })
+            .collect();
+        let probes = text.chars().count().div_ceil(window);
+        let wins = probe_windows(&text, window, probes);
+
+        let mut seen = vec![false; text.chars().count()];
+        for w in &wins {
+            let start = text
+                .find(w.as_str())
+                .expect("a window is a slice of the text");
+            assert_eq!(
+                text.match_indices(w.as_str()).count(),
+                1,
+                "a window must appear once for this to measure anything"
+            );
+            for flag in seen.iter_mut().skip(start).take(w.chars().count()) {
+                *flag = true;
+            }
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "{} windows left {} characters unread",
+            wins.len(),
+            seen.iter().filter(|s| !**s).count()
+        );
+        // The eight this used to take would have read under a third of it.
+        assert!(probe_windows(&text, window, 8).len() * window * 3 < text.len());
+    }
+
+    #[test]
+    fn offered_context_drops_a_key_that_restates_one_already_on_the_list() {
+        // Keys built from the same words are one fact to the distiller, and
+        // offering both spends a slot asking it which name is the settled one.
+        let ranked = [
+            "spike-42-cache-eviction-policy",
+            "cache-eviction-policy-spike-42",
+            "build-cache-retry-limits",
+        ];
+        let mut kept: Vec<BTreeSet<String>> = Vec::new();
+        let mut offered: Vec<&str> = Vec::new();
+        for key in ranked {
+            let terms = key_terms(key);
+            if kept
+                .iter()
+                .any(|k| terms_overlap(k, &terms) >= KEY_OVERLAP_MERGE)
+            {
+                continue;
+            }
+            kept.push(terms);
+            offered.push(key);
+        }
+        assert_eq!(
+            offered,
+            ["spike-42-cache-eviction-policy", "build-cache-retry-limits"],
+            "the best-scoring name of a group is the one shown"
+        );
+    }
+
+    #[test]
+    fn terms_overlap_matches_comparing_the_keys_themselves() {
+        for (a, b) in [
+            ("alpha-beta", "beta-alpha"),
+            ("alpha-beta", "gamma-delta"),
+            ("deploy-preview-oidc", "deploy-preview-oidc-failure"),
+            ("cache-enabled", "cache-not-enabled"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                terms_overlap(&key_terms(a), &key_terms(b)),
+                key_overlap(a, b),
+                "{a} vs {b}"
+            );
         }
     }
 

@@ -21,7 +21,12 @@ Two settings govern how hard distillation works to avoid duplicate memories:
 match instead of being flagged) and
 `distill.context_memories` (how many related existing memories the distiller is
 shown so it can reuse a key rather than invent a near-identical one). Set
-`distill.context_memories = 0` to distill without that context.
+`distill.context_memories = 0` to distill without that context. Those memories
+are retrieved by embedding the chunk a window of `embed.chunk_size` at a time,
+taking enough windows to read all of it, so a fact stated late in a long chunk
+is as likely to find its existing memory as one stated at the top. No two of
+the memories shown carry the same name in different words: the slots go to
+distinct facts rather than to variants of one.
 `distill.context_projects` (default 50) is how many projects, most recently
 updated first, the distiller is shown so it can link a memory to one.
 
