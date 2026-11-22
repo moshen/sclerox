@@ -1867,13 +1867,22 @@ fn related_memories_for_chunk(
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
     });
-    // Spend the slots on distinct facts. Two keys the merge rule would read as
-    // one name are one fact to the distiller as well, so offering both costs a
-    // slot and asks it to guess which of them is the settled name. Ranked best
-    // first, so the one kept is the closest match of its group.
+    distinct_facts(ranked.into_iter().map(|(_, k, v)| (k, v)), limit)
+}
+
+/// The first `limit` of `ranked` (key, value) pairs, best first, skipping any
+/// whose key the merge rule would read as one already taken.
+///
+/// Two such keys are one fact to the distiller as well, so offering both costs
+/// a slot and asks it to guess which of them is the settled name. The one kept
+/// is the closest match of its group, since `ranked` comes best first.
+fn distinct_facts(
+    ranked: impl IntoIterator<Item = (String, String)>,
+    limit: usize,
+) -> Vec<(String, String)> {
     let mut offered: Vec<(String, String)> = Vec::with_capacity(limit);
     let mut kept: Vec<BTreeSet<String>> = Vec::with_capacity(limit);
-    for (_, key, value) in ranked {
+    for (key, value) in ranked {
         if offered.len() == limit {
             break;
         }
@@ -2360,24 +2369,29 @@ mod tests {
             "spike-42-cache-eviction-policy",
             "cache-eviction-policy-spike-42",
             "build-cache-retry-limits",
-        ];
-        let mut kept: Vec<BTreeSet<String>> = Vec::new();
-        let mut offered: Vec<&str> = Vec::new();
-        for key in ranked {
-            let terms = key_terms(key);
-            if kept
-                .iter()
-                .any(|k| terms_overlap(k, &terms) >= KEY_OVERLAP_MERGE)
-            {
-                continue;
-            }
-            kept.push(terms);
-            offered.push(key);
-        }
+            // The opposite fact, not another name for the first.
+            "build-cache-not-retry-limits",
+        ]
+        .map(|k| (k.to_string(), String::new()));
+        let keys = |limit| -> Vec<String> {
+            distinct_facts(ranked.clone(), limit)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
         assert_eq!(
-            offered,
-            ["spike-42-cache-eviction-policy", "build-cache-retry-limits"],
+            keys(8),
+            [
+                "spike-42-cache-eviction-policy",
+                "build-cache-retry-limits",
+                "build-cache-not-retry-limits"
+            ],
             "the best-scoring name of a group is the one shown"
+        );
+        // A skipped variant does not use up a slot.
+        assert_eq!(
+            keys(2),
+            ["spike-42-cache-eviction-policy", "build-cache-retry-limits"]
         );
     }
 
