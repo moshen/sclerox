@@ -21,11 +21,21 @@ use rusqlite::ffi::{
 };
 
 /// The byte ranges of the parts of a camelCase `word`, each at least two
-/// characters: a new part starts at an upper-case letter after a lower-case
-/// letter or digit (`utf8Decoder`), and at the last of a run of capitals
-/// that a lower-case letter follows (`HTTPServer`). Empty for a word of one
-/// part.
+/// characters, which is what the tokenizer indexes. See [`every_part`] for
+/// where a part starts. Empty for a word of one part.
 pub fn parts(word: &str) -> Vec<std::ops::Range<usize>> {
+    every_part(word)
+        .into_iter()
+        .filter(|r| word[r.clone()].chars().count() >= 2)
+        .collect()
+}
+
+/// The byte ranges of all the parts of a camelCase `word`, one-character
+/// ones included (`cacheX`): a new part starts at an upper-case letter after
+/// a lower-case letter or digit (`utf8Decoder`), and at the last of a run of
+/// capitals that a lower-case letter follows (`HTTPServer`). Empty for a word
+/// of one part.
+pub fn every_part(word: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<(usize, char)> = word.char_indices().collect();
     let mut starts = vec![0];
     // The letters and digits either side, past any combining mark
@@ -50,11 +60,7 @@ pub fn parts(word: &str) -> Vec<std::ops::Range<usize>> {
     }
     starts.push(chars.len());
     let byte = |i: usize| chars.get(i).map_or(word.len(), |(b, _)| *b);
-    starts
-        .windows(2)
-        .filter(|w| w[1] - w[0] >= 2)
-        .map(|w| byte(w[0])..byte(w[1]))
-        .collect()
+    starts.windows(2).map(|w| byte(w[0])..byte(w[1])).collect()
 }
 
 /// Make `word_parts` available on `conn`, which must happen before the
@@ -316,8 +322,10 @@ mod tests {
         assert_eq!(split("Cafe\u{301}Menu"), ["Cafe\u{301}", "Menu"]);
         assert_eq!(split("HTTPŚerver"), ["HTTP", "Śerver"]);
         assert_eq!(split("HTTPS\u{301}erver"), ["HTTP", "S\u{301}erver"]);
-        // A one-letter part isn't worth indexing.
+        // A one-letter part isn't worth indexing, but it is still a part.
         assert_eq!(split("getX"), ["get"]);
+        let every: Vec<&str> = every_part("getX").into_iter().map(|r| &"getX"[r]).collect();
+        assert_eq!(every, ["get", "X"]);
         // Nothing to split.
         assert!(split("Document").is_empty());
         assert!(split("HTTP").is_empty());

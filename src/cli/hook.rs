@@ -1425,7 +1425,14 @@ fn distill_chunked(
                     key: &sm.entry.key,
                     source: &sm.entry.source,
                     score: sm.score,
-                    key_overlap: key_overlap(&m.key, &sm.entry.key),
+                    // The key rule leans on the value already scoring close by
+                    // cosine. A lexical match has no such score, so its key
+                    // decides nothing.
+                    key_overlap: if emb.is_some() {
+                        key_overlap(&m.key, &sm.entry.key)
+                    } else {
+                        0.0
+                    },
                 })
                 .collect();
 
@@ -1577,7 +1584,8 @@ struct Candidate<'a> {
     key: &'a str,
     source: &'a str,
     score: f32,
-    /// [`key_overlap`] of this key with the key being written.
+    /// [`key_overlap`] of this key with the key being written, or 0.0 when the
+    /// match came from the lexical fallback rather than by cosine.
     key_overlap: f64,
 }
 
@@ -1585,8 +1593,12 @@ struct Candidate<'a> {
 /// of them are the same name.
 const KEY_FILLER: &[&str] = &[
     "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with", "is", "are", "be", "by",
-    "at", "from", "as", "it", "its", "that", "this", "no", "not",
+    "at", "from", "as", "it", "its", "that", "this",
 ];
+
+/// Words that turn a slug into its opposite: `cache-enabled` and
+/// `cache-not-enabled` share every other term and state contrary facts.
+const KEY_NEGATION: &[&str] = &["no", "not"];
 
 /// Key wording alike enough to merge a match the value score alone would leave
 /// for review.
@@ -1635,11 +1647,12 @@ fn stem_key_word(word: &str) -> String {
 /// `spike-42-cache-eviction` and `cache-eviction-spike-42` reduce alike.
 ///
 /// Keys are kebab-case by convention, but a run sometimes mints `camelCase`,
-/// and `word_parts` already knows where those split.
+/// and `word_parts` already knows where those split. Every part counts, a
+/// one-letter one too: `cacheX-mode` and `cacheY-mode` differ only there.
 fn key_terms(key: &str) -> BTreeSet<String> {
     let mut terms = BTreeSet::new();
     for word in key.split(|c: char| !c.is_alphanumeric()) {
-        let parts = crate::db::word_parts::parts(word);
+        let parts = crate::db::word_parts::every_part(word);
         let pieces: Vec<&str> = if parts.is_empty() {
             vec![word]
         } else {
@@ -1657,9 +1670,14 @@ fn key_terms(key: &str) -> BTreeSet<String> {
 
 /// How alike two keys' wording is, from 0.0 (nothing in common) to 1.0 (the
 /// same terms in any order): the share of all the terms either key uses that
-/// both of them use.
+/// both of them use. A key negated where the other is not shares nothing,
+/// however many other terms agree.
 fn key_overlap(a: &str, b: &str) -> f64 {
     let (a, b) = (key_terms(a), key_terms(b));
+    let negated = |terms: &BTreeSet<String>| KEY_NEGATION.iter().any(|n| terms.contains(*n));
+    if negated(&a) != negated(&b) {
+        return 0.0;
+    }
     let union = a.union(&b).count();
     if union == 0 {
         return 0.0;
@@ -2444,6 +2462,8 @@ mod tests {
         assert!(same("embed_worker_ci_path", "embed-worker-ci-path"));
         // Different facts about one subject keep different terms.
         assert!(!same("metrics-endpoint-prod", "metrics-endpoint-staging"));
+        // Down to a one-letter camelCase part.
+        assert!(!same("cacheX-mode", "cacheY-mode"));
     }
 
     #[test]
@@ -2462,6 +2482,17 @@ mod tests {
         );
         assert!(narrowed >= KEY_OVERLAP_MERGE, "{narrowed}");
         assert!(narrowed < 1.0, "{narrowed}");
+        // A negation on one side only is the opposite fact, not a variant.
+        assert_eq!(
+            key_overlap(
+                "remote-build-cache-enabled-default",
+                "remote-build-cache-not-enabled-default"
+            ),
+            0.0
+        );
+        assert_eq!(key_overlap("cache-enabled", "no-cache-enabled"), 0.0);
+        // Negated on both sides, word order is again all that differs.
+        assert_eq!(key_overlap("not-cache-enabled", "cache-not-enabled"), 1.0);
     }
 
     #[test]
