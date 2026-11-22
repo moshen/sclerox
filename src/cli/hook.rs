@@ -1600,6 +1600,10 @@ const KEY_FILLER: &[&str] = &[
 /// `cache-not-enabled` share every other term and state contrary facts.
 const KEY_NEGATION: &[&str] = &["no", "not"];
 
+/// The term [`key_terms`] records for any of [`KEY_NEGATION`]. Not
+/// alphanumeric, so no stemmed word reaches it (`notes` stems to `not`).
+const KEY_NEGATED: &str = "!not";
+
 /// Key wording alike enough to merge a match the value score alone would leave
 /// for review.
 ///
@@ -1619,8 +1623,9 @@ const KEY_NEGATION: &[&str] = &["no", "not"];
 /// drops them before the decision.
 const KEY_OVERLAP_MERGE: f64 = 0.7;
 
-/// `word` without a plural or tense ending, so `failures` meets `failure` and
-/// `isolate` meets `isolated`. Deliberately blunt: it only has to make two
+/// `word` without a plural or tense ending, so `failures` meets `failure`,
+/// `isolate` meets `isolated` and `settings` meets `setting`. Deliberately
+/// blunt: it only has to make two
 /// spellings of one slug agree, not to stem English. Non-ASCII words are left
 /// alone, both because slicing them by byte is unsafe and because the endings
 /// below are English ones.
@@ -1629,10 +1634,14 @@ fn stem_key_word(word: &str) -> String {
         return word.to_string();
     }
     let mut word = word;
-    for suffix in ["ing", "ed", "es", "s"] {
-        if word.len() >= suffix.len() + 3 && word.ends_with(suffix) {
+    // The plural first, then the tense under it: `settings` -> `setting` ->
+    // `sett`.
+    for endings in [["es", "s"], ["ing", "ed"]] {
+        if let Some(suffix) = endings
+            .into_iter()
+            .find(|suffix| word.len() >= suffix.len() + 3 && word.ends_with(suffix))
+        {
             word = &word[..word.len() - suffix.len()];
-            break;
         }
     }
     // `isolate` -> `isolat`, which `isolated` also reaches.
@@ -1660,7 +1669,9 @@ fn key_terms(key: &str) -> BTreeSet<String> {
         };
         for piece in pieces {
             let piece = piece.to_lowercase();
-            if !piece.is_empty() && !KEY_FILLER.contains(&piece.as_str()) {
+            if KEY_NEGATION.contains(&piece.as_str()) {
+                terms.insert(KEY_NEGATED.to_string());
+            } else if !piece.is_empty() && !KEY_FILLER.contains(&piece.as_str()) {
                 terms.insert(stem_key_word(&piece));
             }
         }
@@ -1674,8 +1685,7 @@ fn key_terms(key: &str) -> BTreeSet<String> {
 /// however many other terms agree.
 fn key_overlap(a: &str, b: &str) -> f64 {
     let (a, b) = (key_terms(a), key_terms(b));
-    let negated = |terms: &BTreeSet<String>| KEY_NEGATION.iter().any(|n| terms.contains(*n));
-    if negated(&a) != negated(&b) {
+    if a.contains(KEY_NEGATED) != b.contains(KEY_NEGATED) {
         return 0.0;
     }
     let union = a.union(&b).count();
@@ -2455,6 +2465,8 @@ mod tests {
             "headless-claude-isolate-from-user-config",
             "headless-claude-isolated-from-user-config"
         ));
+        // A plural on top of a tense.
+        assert!(same("cache-setting", "settings-cache"));
         // Filler words carry no meaning in a slug.
         assert!(same("flag-for-the-search-api", "flag-search-api"));
         // Separators and case, including a camelCase key.
@@ -2493,6 +2505,10 @@ mod tests {
         assert_eq!(key_overlap("cache-enabled", "no-cache-enabled"), 0.0);
         // Negated on both sides, word order is again all that differs.
         assert_eq!(key_overlap("not-cache-enabled", "cache-not-enabled"), 1.0);
+        assert_eq!(key_overlap("no-cache-enabled", "cache-not-enabled"), 1.0);
+        // `notes` stems to `not` but negates nothing.
+        assert!(!key_terms("release-notes-flag").contains(KEY_NEGATED));
+        assert!(key_overlap("release-notes-flag", "release-notes-flag-default") > 0.7);
     }
 
     #[test]
