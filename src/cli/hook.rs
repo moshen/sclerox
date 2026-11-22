@@ -1624,7 +1624,8 @@ const KEY_NEGATED: &str = "!not";
 const KEY_OVERLAP_MERGE: f64 = 0.7;
 
 /// `word` without a plural or tense ending, so `failures` meets `failure`,
-/// `isolate` meets `isolated` and `settings` meets `setting`. Deliberately
+/// `isolate` meets `isolated`, `settings` meets `setting` and `policies` meets
+/// `policy`. Deliberately
 /// blunt: it only has to make two
 /// spellings of one slug agree, not to stem English. Non-ASCII words are left
 /// alone, both because slicing them by byte is unsafe and because the endings
@@ -1633,16 +1634,29 @@ fn stem_key_word(word: &str) -> String {
     if !word.is_ascii() {
         return word.to_string();
     }
-    let mut word = word;
-    // The plural first, then the tense under it: `settings` -> `setting` ->
-    // `sett`.
-    for endings in [["es", "s"], ["ing", "ed"]] {
-        if let Some(suffix) = endings
+    let strip = |word: &str, endings: [&str; 2]| -> Option<usize> {
+        endings
             .into_iter()
             .find(|suffix| word.len() >= suffix.len() + 3 && word.ends_with(suffix))
-        {
-            word = &word[..word.len() - suffix.len()];
-        }
+            .map(|suffix| word.len() - suffix.len())
+    };
+    // The plural first, then the tense under it: `settings` -> `setting` ->
+    // `sett`. A consonant before `ies` makes a `y` singular (`policies`), but
+    // not after a vowel (`movies`).
+    let singular;
+    let mut word = word;
+    let before_ies = word.len().checked_sub(4).map(|i| word.as_bytes()[i]);
+    if word.len() >= 5
+        && word.ends_with("ies")
+        && before_ies.is_some_and(|c| !b"aeiou".contains(&c))
+    {
+        singular = format!("{}y", &word[..word.len() - 3]);
+        word = &singular;
+    } else if let Some(end) = strip(word, ["es", "s"]) {
+        word = &word[..end];
+    }
+    if let Some(end) = strip(word, ["ing", "ed"]) {
+        word = &word[..end];
     }
     // `isolate` -> `isolat`, which `isolated` also reaches.
     if word.len() > 3 && word.ends_with('e') {
@@ -2467,6 +2481,9 @@ mod tests {
         ));
         // A plural on top of a tense.
         assert!(same("cache-setting", "settings-cache"));
+        // A `y` plural.
+        assert!(same("cache-policy", "cache-policies"));
+        assert!(same("search-query-limit", "search-queries-limit"));
         // Filler words carry no meaning in a slug.
         assert!(same("flag-for-the-search-api", "flag-search-api"));
         // Separators and case, including a camelCase key.
