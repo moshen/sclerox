@@ -24,9 +24,11 @@ shown so it can reuse a key rather than invent a near-identical one). Set
 `distill.context_memories = 0` to distill without that context. Those memories
 are retrieved by embedding the chunk a window of `embed.chunk_size` at a time,
 taking enough windows to read all of it, up to 48 windows; a chunk longer than
-that is sampled at 48 evenly spaced windows. A memory whose key shares 70% of
-its terms with one already shown is left out as another name for it, unless
-the two were marked distinct.
+that is sampled at 48 evenly spaced windows. A memory is left out as another
+name for one already shown when the terms their keys share make up at least
+70% of all the terms either key uses, by the same rule as the merge below
+(negated against unnegated never matches), unless the two were marked
+distinct.
 `distill.context_projects` (default 50) is how many projects, most recently
 updated first, the distiller is shown so it can link a memory to one.
 
