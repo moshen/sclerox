@@ -1819,6 +1819,11 @@ fn related_memories_for_chunk(
     /// `distill.chunk_chars` cannot turn one hook into hundreds of forward
     /// passes. Past it the windows spread out and this samples again.
     const MAX_PROBES: usize = 48;
+    /// Candidates fetched per probe, as a multiple of `limit`. `distinct_facts`
+    /// skips reworded keys after the fetch, so fetching only `limit` would
+    /// leave the slots a skipped variant frees empty. About 6% of slots went
+    /// to such variants, so twice the slots leaves a wide margin.
+    const CANDIDATES_PER_SLOT: usize = 2;
 
     if limit == 0 {
         return Vec::new();
@@ -1848,7 +1853,11 @@ fn related_memories_for_chunk(
             continue;
         };
         for sm in db
-            .memory_find_near_duplicates_semantic(&emb, context_floor, limit)
+            .memory_find_near_duplicates_semantic(
+                &emb,
+                context_floor,
+                limit.saturating_mul(CANDIDATES_PER_SLOT),
+            )
             .unwrap_or_default()
         {
             let slot = best.entry(sm.entry.key.clone()).or_insert((
