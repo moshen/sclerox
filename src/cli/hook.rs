@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::io::Read;
 
 use crate::db::provenance::RepoScope;
@@ -1424,6 +1425,14 @@ fn distill_chunked(
                     key: &sm.entry.key,
                     source: &sm.entry.source,
                     score: sm.score,
+                    // The key rule leans on the value already scoring close by
+                    // cosine. A lexical match has no such score, so its key
+                    // decides nothing.
+                    key_overlap: if emb.is_some() {
+                        key_overlap(&m.key, &sm.entry.key)
+                    } else {
+                        0.0
+                    },
                 })
                 .collect();
 
@@ -1575,6 +1584,129 @@ struct Candidate<'a> {
     key: &'a str,
     source: &'a str,
     score: f32,
+    /// [`key_overlap`] of this key with the key being written, or 0.0 when the
+    /// match came from the lexical fallback rather than by cosine.
+    key_overlap: f64,
+}
+
+/// Words that carry no meaning in a slug, so two keys differing only by one
+/// of them are the same name.
+const KEY_FILLER: &[&str] = &[
+    "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with", "is", "are", "be", "by",
+    "at", "from", "as", "it", "its", "that", "this",
+];
+
+/// Words that turn a slug into its opposite: `cache-enabled` and
+/// `cache-not-enabled` share every other term and state contrary facts.
+const KEY_NEGATION: &[&str] = &["no", "not"];
+
+/// The term [`key_terms`] records for any of [`KEY_NEGATION`]. Not
+/// alphanumeric, so no stemmed word reaches it (`notes` stems to `not`).
+const KEY_NEGATED: &str = "!not";
+
+/// Key wording alike enough to merge a match the value score alone would leave
+/// for review.
+///
+/// Measured over the 456 pairs then queued in `memory_conflicts` on a
+/// 5,000-memory knowledge base, counting only the 402 a score could merge at
+/// all (at or above `dedup_cosine`, neither side hand-written): 0.7 merges 47
+/// of them, 0.6 merges 90 and 0.5 merges 143. Reading the pairs, every one at
+/// or above 0.8 restated the same fact, and of the 35 between 0.6 and 0.8 two
+/// did not (`wiki-no-local-references` against
+/// `skills-no-local-references-in-wiki`: one is a rule about published
+/// content, the other about which skills to edit). 0.7 sits inside the band
+/// that read clean; 0.6 roughly doubles the yield for those two misses, so it
+/// is the next step if the queue is still mostly variant names.
+///
+/// Deliberate splits do not collide with this: the 24 pairs hand-marked
+/// `memory_distinct` peak at 0.12 overlap, and `memory_is_distinct` already
+/// drops them before the decision.
+const KEY_OVERLAP_MERGE: f64 = 0.7;
+
+/// `word` without a plural or tense ending, so `failures` meets `failure`,
+/// `isolate` meets `isolated`, `settings` meets `setting` and `policies` meets
+/// `policy`. Deliberately
+/// blunt: it only has to make two
+/// spellings of one slug agree, not to stem English. Non-ASCII words are left
+/// alone, both because slicing them by byte is unsafe and because the endings
+/// below are English ones.
+fn stem_key_word(word: &str) -> String {
+    if !word.is_ascii() {
+        return word.to_string();
+    }
+    let strip = |word: &str, endings: [&str; 2]| -> Option<usize> {
+        endings
+            .into_iter()
+            .find(|suffix| word.len() >= suffix.len() + 3 && word.ends_with(suffix))
+            .map(|suffix| word.len() - suffix.len())
+    };
+    // The plural first, then the tense under it: `settings` -> `setting` ->
+    // `sett`. A consonant before `ies` makes a `y` singular (`policies`), but
+    // not after a vowel (`movies`).
+    let singular;
+    let mut word = word;
+    let before_ies = word.len().checked_sub(4).map(|i| word.as_bytes()[i]);
+    if word.len() >= 5
+        && word.ends_with("ies")
+        && before_ies.is_some_and(|c| !b"aeiou".contains(&c))
+    {
+        singular = format!("{}y", &word[..word.len() - 3]);
+        word = &singular;
+    } else if let Some(end) = strip(word, ["es", "s"]) {
+        word = &word[..end];
+    }
+    if let Some(end) = strip(word, ["ing", "ed"]) {
+        word = &word[..end];
+    }
+    // `isolate` -> `isolat`, which `isolated` also reaches.
+    if word.len() > 3 && word.ends_with('e') {
+        word = &word[..word.len() - 1];
+    }
+    word.to_string()
+}
+
+/// The comparable terms of a memory key: each word lower-cased and stemmed,
+/// with [`KEY_FILLER`] dropped. Order is discarded, so
+/// `spike-42-cache-eviction` and `cache-eviction-spike-42` reduce alike.
+///
+/// Keys are kebab-case by convention, but a run sometimes mints `camelCase`,
+/// and `word_parts` already knows where those split. Every part counts, a
+/// one-letter one too: `cacheX-mode` and `cacheY-mode` differ only there.
+fn key_terms(key: &str) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    for word in key.split(|c: char| !c.is_alphanumeric()) {
+        let parts = crate::db::word_parts::every_part(word);
+        let pieces: Vec<&str> = if parts.is_empty() {
+            vec![word]
+        } else {
+            parts.into_iter().map(|part| &word[part]).collect()
+        };
+        for piece in pieces {
+            let piece = piece.to_lowercase();
+            if KEY_NEGATION.contains(&piece.as_str()) {
+                terms.insert(KEY_NEGATED.to_string());
+            } else if !piece.is_empty() && !KEY_FILLER.contains(&piece.as_str()) {
+                terms.insert(stem_key_word(&piece));
+            }
+        }
+    }
+    terms
+}
+
+/// How alike two keys' wording is, from 0.0 (nothing in common) to 1.0 (the
+/// same terms in any order): the share of all the terms either key uses that
+/// both of them use. A key negated where the other is not shares nothing,
+/// however many other terms agree.
+fn key_overlap(a: &str, b: &str) -> f64 {
+    let (a, b) = (key_terms(a), key_terms(b));
+    if a.contains(KEY_NEGATED) != b.contains(KEY_NEGATED) {
+        return 0.0;
+    }
+    let union = a.union(&b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f64 / union as f64
 }
 
 /// Decide how a distilled memory relates to the existing memories it matched.
@@ -1594,9 +1726,21 @@ struct Candidate<'a> {
 /// multi-match ratchets a cluster wider (once a topic has two entries, each
 /// later mention matches 2+ and adds a third).
 ///
+/// A match whose key is worded like this one merges on a lesser score, at
+/// `KEY_OVERLAP_MERGE` overlap. Every candidate already clears `dedup_cosine`,
+/// so the values are known to be close; a key built from the same words on top
+/// of that is a second, independent witness that this is the same fact under a
+/// re-minted name, and two weak agreeing signals settle what either alone
+/// leaves ambiguous. This is what stops `spike-42-cache-eviction-policy` and
+/// `cache-eviction-policy-spike-42` from both existing: they describe one
+/// fact, score below the merge bar, and would otherwise sit in the review
+/// queue forever.
+///
 /// `merge_threshold` of `None` means the embedding model's scores have not
-/// been calibrated for merging: nothing merges on score alone, single match or
-/// many, and every match is flagged for review instead.
+/// been calibrated for merging: nothing merges, single match or many, and
+/// every match is flagged for review instead. The key rule does not apply
+/// either, because the candidates it would judge were themselves chosen by the
+/// uncalibrated score.
 ///
 /// A merge keeps whichever name was chosen: the matched key absorbs the value
 /// unless `reused`, when the distiller picked an existing key for it, which
@@ -1623,8 +1767,8 @@ fn decide_dedup_action(
     candidates
         .iter()
         .filter(|c| c.source != "manual")
+        .filter(|c| c.score as f64 >= merge_threshold || c.key_overlap >= KEY_OVERLAP_MERGE)
         .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
-        .filter(|c| c.score as f64 >= merge_threshold)
         .map(|c| {
             if reused {
                 DedupAction::Supersede(c.key.to_string())
@@ -2097,7 +2241,28 @@ mod tests {
     }
 
     fn cand<'a>(key: &'a str, source: &'a str, score: f32) -> Candidate<'a> {
-        Candidate { key, source, score }
+        Candidate {
+            key,
+            source,
+            score,
+            key_overlap: 0.0,
+        }
+    }
+
+    /// A candidate whose key is worded `key_overlap` like the one being
+    /// written, which `cand` leaves at nothing in common.
+    fn cand_alike<'a>(
+        key: &'a str,
+        source: &'a str,
+        score: f32,
+        key_overlap: f64,
+    ) -> Candidate<'a> {
+        Candidate {
+            key,
+            source,
+            score,
+            key_overlap,
+        }
     }
 
     #[test]
@@ -2286,6 +2451,150 @@ mod tests {
         assert_eq!(
             decide_dedup_action(None, &c, Some(0.95), true),
             DedupAction::Flag
+        );
+    }
+
+    #[test]
+    fn key_terms_ignore_order_filler_and_endings() {
+        let same = |a: &str, b: &str| key_terms(a) == key_terms(b);
+        // Word order is what the distiller varies most between runs.
+        assert!(same(
+            "spike-42-cache-eviction-policy-findings",
+            "cache-eviction-policy-findings-spike-42"
+        ));
+        assert!(same(
+            "release-notes-auto-publish-flag",
+            "auto-publish-flag-release-notes"
+        ));
+        // A plural or a tense.
+        assert!(same(
+            "git-fetch-failures-transient",
+            "git-fetch-transient-failure"
+        ));
+        assert!(same(
+            "todos-cli-notes-flag-replaces",
+            "todo-cli-notes-flag-replaces"
+        ));
+        assert!(same(
+            "headless-claude-isolate-from-user-config",
+            "headless-claude-isolated-from-user-config"
+        ));
+        // A plural on top of a tense.
+        assert!(same("cache-setting", "settings-cache"));
+        // A `y` plural.
+        assert!(same("cache-policy", "cache-policies"));
+        assert!(same("search-query-limit", "search-queries-limit"));
+        // Filler words carry no meaning in a slug.
+        assert!(same("flag-for-the-search-api", "flag-search-api"));
+        // Separators and case, including a camelCase key.
+        assert!(same("parse-config-lines", "parseConfigLines"));
+        assert!(same("embed_worker_ci_path", "embed-worker-ci-path"));
+        // Different facts about one subject keep different terms.
+        assert!(!same("metrics-endpoint-prod", "metrics-endpoint-staging"));
+        // Down to a one-letter camelCase part.
+        assert!(!same("cacheX-mode", "cacheY-mode"));
+    }
+
+    #[test]
+    fn key_overlap_scores_from_nothing_shared_to_the_same_terms() {
+        assert_eq!(key_overlap("alpha-beta", "beta-alpha"), 1.0);
+        assert_eq!(key_overlap("alpha-beta", "gamma-delta"), 0.0);
+        // Two terms of three shared. ("a" would not count: it is filler.)
+        assert!((key_overlap("alpha-beta-gamma", "alpha-beta-delta") - 0.5).abs() < 1e-9);
+        // Nothing to compare is not a match.
+        assert_eq!(key_overlap("", ""), 0.0);
+        assert_eq!(key_overlap("---", "the-of-and"), 0.0);
+        // A key that only adds a qualifier stays close but not identical.
+        let narrowed = key_overlap(
+            "deploy-preview-oidc-role-failure",
+            "deploy-preview-oidc-role-failure-context",
+        );
+        assert!(narrowed >= KEY_OVERLAP_MERGE, "{narrowed}");
+        assert!(narrowed < 1.0, "{narrowed}");
+        // A negation on one side only is the opposite fact, not a variant.
+        assert_eq!(
+            key_overlap(
+                "remote-build-cache-enabled-default",
+                "remote-build-cache-not-enabled-default"
+            ),
+            0.0
+        );
+        assert_eq!(key_overlap("cache-enabled", "no-cache-enabled"), 0.0);
+        // Negated on both sides, word order is again all that differs.
+        assert_eq!(key_overlap("not-cache-enabled", "cache-not-enabled"), 1.0);
+        assert_eq!(key_overlap("no-cache-enabled", "cache-not-enabled"), 1.0);
+        // `notes` stems to `not` but negates nothing.
+        assert!(!key_terms("release-notes-flag").contains(KEY_NEGATED));
+        assert!(key_overlap("release-notes-flag", "release-notes-flag-default") > 0.7);
+    }
+
+    #[test]
+    fn a_re_minted_key_merges_below_the_score_bar() {
+        // The value scores in the judgement band, where a score alone is
+        // flagged. The key is the same words in another order, which says
+        // the run re-minted a name for a fact already stored.
+        let c = [cand_alike("existing", "session", 0.94, 1.0)];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.97), false),
+            DedupAction::Absorb("existing".to_string()),
+            "the settled key keeps its name and takes the value"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_key_in_the_same_band_is_still_flagged() {
+        // Same score, no shared wording: this is the case the band exists for,
+        // and it must still reach a human.
+        let c = [cand_alike("existing", "session", 0.94, 0.25)];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.97), false),
+            DedupAction::Flag
+        );
+        // Just under the bar is under it.
+        let c = [cand_alike(
+            "existing",
+            "session",
+            0.94,
+            KEY_OVERLAP_MERGE - 0.01,
+        )];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.97), false),
+            DedupAction::Flag
+        );
+    }
+
+    #[test]
+    fn a_hand_written_match_is_not_merged_however_alike_the_key() {
+        // The manual rule is not a score, so the key cannot talk past it.
+        let c = [cand_alike("hand-written", "manual", 0.94, 1.0)];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.97), false),
+            DedupAction::Flag
+        );
+    }
+
+    #[test]
+    fn an_uncalibrated_model_flags_an_alike_key_too() {
+        // Without a merge threshold the candidates themselves come from an
+        // uncalibrated score, so the key has nothing trustworthy to agree with.
+        let c = [cand_alike("existing", "session", 0.99, 1.0)];
+        assert_eq!(
+            decide_dedup_action(None, &c, None, false),
+            DedupAction::Flag
+        );
+    }
+
+    #[test]
+    fn the_highest_scoring_eligible_match_wins() {
+        // One match is eligible on its score, another only on its key. The
+        // better score takes it, as it did before the key rule existed.
+        let c = [
+            cand_alike("on-key", "session", 0.94, 1.0),
+            cand_alike("on-score", "session", 0.98, 0.0),
+        ];
+        assert_eq!(
+            decide_dedup_action(None, &c, Some(0.97), false),
+            DedupAction::Absorb("on-score".to_string())
         );
     }
 

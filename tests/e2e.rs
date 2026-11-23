@@ -622,6 +622,63 @@ fn a_score_merge_keeps_the_settled_key_and_its_provenance() {
     assert_eq!(entry["status"], "superseded", "{out}");
 }
 
+#[test]
+fn without_embeddings_an_alike_key_does_not_merge_a_lexical_match() {
+    let e = Env::new();
+    let home = e._dir.path().join("home");
+    let proj = home.join(".claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let distill = |id: &str, key: &str, value: &str| {
+        let transcript: String = ["ok", "ok", "ok", "noted", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let role = if i % 2 == 1 { "assistant" } else { "user" };
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type": role, "message": {"content": text}})
+                )
+            })
+            .collect();
+        std::fs::write(proj.join(format!("{id}.jsonl")), transcript).unwrap();
+        let resp = e._dir.path().join(format!("{id}.json"));
+        let memories = serde_json::json!([
+            {"key": key, "value": value, "type": "project", "supersedes": null}
+        ]);
+        std::fs::write(&resp, memories.to_string()).unwrap();
+        let resp_arg = resp.display().to_string().replace('\\', "/");
+        e.cmd()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".state"))
+            .env("SCLEROX_EMBED_ENABLED", "false")
+            .args(["hook", "distill-session", "--session-id", id])
+            .args(["--via", &format!("sh -c 'cat \"{resp_arg}\"' sh")])
+            .assert()
+            .success();
+    };
+    // The same words in another order, and values that share most of their
+    // words but not all: a cosine score would be needed to call them one fact.
+    distill(
+        "first",
+        "cache-ttl-local",
+        "Cache entries expire after ten minutes unless an admin pins them for local builds.",
+    );
+    distill(
+        "second",
+        "local-cache-ttl",
+        "Cache entries expire after ten minutes unless an operator pins them for remote builds.",
+    );
+
+    let out = e.run(&["memory", "get", "cache-ttl-local"]);
+    assert!(out.contains("local builds"), "{out}");
+    let out = e.run(&["memory", "get", "local-cache-ttl"]);
+    assert!(out.contains("remote builds"), "{out}");
+    let out = e.run(&["memory", "conflicts"]);
+    assert!(out.contains("local-cache-ttl"), "flagged for review: {out}");
+}
+
 /// Run git in `dir` with a fixed identity; trimmed stdout.
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let mut command = std::process::Command::new("git");

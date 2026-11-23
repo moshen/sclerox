@@ -120,7 +120,14 @@ memories the distiller was shown, so it renames nothing when
 `distill.context_memories = 0` or no embedder is available. Between
 `dedup.cosine_threshold` and the merge threshold, a score cannot tell a
 restated fact from a similar but distinct one, so both are kept and flagged in
-`sclerox memory conflicts` instead.
+`sclerox memory conflicts` instead - unless the two keys are built from the
+same words. A match already above `dedup.cosine_threshold` merges on that
+agreement when the terms both keys share make up at least 70% of all the terms
+either key uses, in any order and ignoring plurals, tenses and filler words:
+`spike-42-cache-eviction` and `cache-eviction-spike-42` are one fact under a
+re-minted name, not two. A key negated (`no`, `not`) where the other is not
+never matches this way, and neither does a match found without embeddings.
+Hand-written memories are exempt, as they are from every automatic merge.
 
 ## Model server
 
