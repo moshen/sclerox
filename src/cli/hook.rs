@@ -1831,7 +1831,7 @@ fn related_memories_for_chunk(
     let context_floor = crate::config::settings().context_threshold() as f32;
 
     // Best score wins when several probes surface the same memory.
-    let mut best: std::collections::HashMap<String, (f32, String)> =
+    let mut best: std::collections::HashMap<String, (f32, i64, String)> =
         std::collections::HashMap::new();
     let window = crate::config::settings().embed.chunk_size;
     // Enough windows to tile the chunk rather than sample it. A fixed eight
@@ -1851,49 +1851,58 @@ fn related_memories_for_chunk(
             .memory_find_near_duplicates_semantic(&emb, context_floor, limit)
             .unwrap_or_default()
         {
-            let slot = best
-                .entry(sm.entry.key.clone())
-                .or_insert((sm.score, sm.entry.value.clone()));
+            let slot = best.entry(sm.entry.key.clone()).or_insert((
+                sm.score,
+                sm.entry.id,
+                sm.entry.value.clone(),
+            ));
             if sm.score > slot.0 {
-                *slot = (sm.score, sm.entry.value);
+                *slot = (sm.score, sm.entry.id, sm.entry.value);
             }
         }
     }
 
-    let mut ranked: Vec<(f32, String, String)> =
-        best.into_iter().map(|(k, (s, v))| (s, k, v)).collect();
+    let mut ranked: Vec<(f32, String, i64, String)> = best
+        .into_iter()
+        .map(|(k, (s, id, v))| (s, k, id, v))
+        .collect();
     ranked.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
     });
-    distinct_facts(ranked.into_iter().map(|(_, k, v)| (k, v)), limit)
+    distinct_facts(
+        ranked.into_iter().map(|(_, k, id, v)| (id, k, v)),
+        limit,
+        |a, b| db.memory_is_distinct(a, b).unwrap_or(false),
+    )
 }
 
-/// The first `limit` of `ranked` (key, value) pairs, best first, skipping any
-/// whose key the merge rule would read as one already taken.
+/// The first `limit` of `ranked` (id, key, value) memories, best first, as
+/// (key, value) pairs, skipping any whose key the merge rule would read as one
+/// already taken, unless `is_distinct` says a human marked the two apart.
 ///
 /// Two such keys are one fact to the distiller as well, so offering both costs
 /// a slot and asks it to guess which of them is the settled name. The one kept
 /// is the closest match of its group, since `ranked` comes best first.
 fn distinct_facts(
-    ranked: impl IntoIterator<Item = (String, String)>,
+    ranked: impl IntoIterator<Item = (i64, String, String)>,
     limit: usize,
+    is_distinct: impl Fn(i64, i64) -> bool,
 ) -> Vec<(String, String)> {
     let mut offered: Vec<(String, String)> = Vec::with_capacity(limit);
-    let mut kept: Vec<BTreeSet<String>> = Vec::with_capacity(limit);
-    for (key, value) in ranked {
+    let mut kept: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(limit);
+    for (id, key, value) in ranked {
         if offered.len() == limit {
             break;
         }
         let terms = key_terms(&key);
-        if kept
-            .iter()
-            .any(|k| terms_overlap(k, &terms) >= KEY_OVERLAP_MERGE)
-        {
+        if kept.iter().any(|(kept_id, k)| {
+            terms_overlap(k, &terms) >= KEY_OVERLAP_MERGE && !is_distinct(*kept_id, id)
+        }) {
             continue;
         }
-        kept.push(terms);
+        kept.push((id, terms));
         offered.push((key, value));
     }
     offered
@@ -2371,10 +2380,18 @@ mod tests {
             "build-cache-retry-limits",
             // The opposite fact, not another name for the first.
             "build-cache-not-retry-limits",
-        ]
-        .map(|k| (k.to_string(), String::new()));
+            // Worded alike, but a human marked it apart from the first.
+            "deploy-preview-oidc-role-failure-prod",
+            "deploy-preview-oidc-role-failure-staging",
+        ];
+        let ranked: Vec<(i64, String, String)> = ranked
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (i as i64, k.to_string(), String::new()))
+            .collect();
+        let marked = |a: i64, b: i64| (a.min(b), a.max(b)) == (4, 5);
         let keys = |limit| -> Vec<String> {
-            distinct_facts(ranked.clone(), limit)
+            distinct_facts(ranked.clone(), limit, marked)
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect()
@@ -2384,9 +2401,20 @@ mod tests {
             [
                 "spike-42-cache-eviction-policy",
                 "build-cache-retry-limits",
-                "build-cache-not-retry-limits"
+                "build-cache-not-retry-limits",
+                "deploy-preview-oidc-role-failure-prod",
+                "deploy-preview-oidc-role-failure-staging",
             ],
             "the best-scoring name of a group is the one shown"
+        );
+        // Unmarked, the same pair is one fact.
+        let unmarked: Vec<String> = distinct_facts(ranked.clone(), 8, |_, _| false)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !unmarked.contains(&"deploy-preview-oidc-role-failure-staging".to_string()),
+            "{unmarked:?}"
         );
         // A skipped variant does not use up a slot.
         assert_eq!(

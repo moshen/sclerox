@@ -23,10 +23,10 @@ match instead of being flagged) and
 shown so it can reuse a key rather than invent a near-identical one). Set
 `distill.context_memories = 0` to distill without that context. Those memories
 are retrieved by embedding the chunk a window of `embed.chunk_size` at a time,
-taking enough windows to read all of it, so a fact stated late in a long chunk
-is as likely to find its existing memory as one stated at the top. No two of
-the memories shown carry the same name in different words: the slots go to
-distinct facts rather than to variants of one.
+taking enough windows to read all of it, up to 48 windows; a chunk longer than
+that is sampled at 48 evenly spaced windows. A memory whose key shares 70% of
+its terms with one already shown is left out as another name for it, unless
+the two were marked distinct.
 `distill.context_projects` (default 50) is how many projects, most recently
 updated first, the distiller is shown so it can link a memory to one.
 
